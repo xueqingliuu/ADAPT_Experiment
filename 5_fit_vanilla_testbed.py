@@ -1,0 +1,952 @@
+# %%
+# 0. import libraries
+#
+# Run order:
+#   1) ``perceived_utility.py``  → fits the joint state-space model, writes
+#      ``params_env_<id>.json`` / ``pred_<id>.json`` with the ``theta_ml_*`` /
+#      ``resid_ml_*`` keys, and adds ``perceived_utility`` /
+#      ``perceived_utility_lastweek`` columns to ``df_fit.csv``.
+#   2) ``2_fit_vanilla_testbed.py`` (this script) → fits the vanilla mediator
+#      / outcome models that consume ``perceived_utility_lastweek`` as a
+#      predictor and **merges** their ``theta_*`` / ``resid_*`` keys into the
+#      same JSON files (existing ML keys are preserved).
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import RidgeCV, Ridge, LogisticRegressionCV, LogisticRegression
+import os
+import matplotlib.pyplot as plt
+plt.ion()
+from matplotlib.ticker import MaxNLocator
+import matplotlib.dates as mdates
+import datetime
+import json
+import statsmodels.api as sm
+from patsy import dmatrix
+from pathlib import Path
+
+
+# %%
+# read data
+PROJECT_ROOT = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed")
+COMBINED_DIR = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined")
+WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
+WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# Aliases for later cells that use `folder` / `work_folder` (Path so `/` joins work)
+folder = COMBINED_DIR
+work_folder = Path(WORK_DIR)
+
+df_fit = pd.read_csv(folder / 'df_fit.csv')
+
+file_params_env_prefix = str(work_folder / 'params_env_')
+file_pred_prefix = str(work_folder / 'pred_')
+file_user_ids = str(work_folder / 'user_ids.txt')
+
+for userid in df_fit["ParticipantIdentifier"].unique():
+    vc = df_fit.loc[df_fit["ParticipantIdentifier"] == userid, "week"].value_counts()
+    if vc.get(0, 0) > 2:
+        m = df_fit["ParticipantIdentifier"] == userid
+        df_fit.loc[m, "week"] = df_fit.loc[m, "week"] + 1
+df_fit = df_fit[df_fit["week"] < 13]
+
+# remove week 0 and week 1 data
+df_fit = df_fit[df_fit['week'] > 1]
+
+# turn week 2 into week 1
+df_fit['week'] = df_fit['week'] - 1
+# %%
+# import warnings
+# from sklearn.exceptions import UndefinedMetricWarning
+def json_float(x, digits=3):
+    """Round finite values; convert NaN/inf/None to JSON null."""
+    if x is None:
+        return None
+    xf = float(x)
+    if not np.isfinite(xf):
+        return None
+    return float(np.round(xf, digits))
+
+
+def json_float_list(x, digits=3):
+    """Serialize vector-like object as a JSON-safe flat list."""
+    return [json_float(v, digits) for v in np.asarray(x, dtype=float).ravel()]
+
+
+def merge_json_file(path, new_values):
+    """Merge new values into an existing JSON file, preserving old keys."""
+    path = Path(path)
+    existing = {}
+    if path.is_file():
+        with open(path, encoding="utf-8") as f:
+            existing = json.load(f)
+
+    existing.update(new_values)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, allow_nan=False)
+
+THETA_PRIOR2HOUR_STEP_COUNT_NAMES = [
+    "intercept",
+    "prior2hour_step_count_lag1",
+    "dow",
+    "decision_time",
+]
+
+THETA_RECORDED_PHYSICAL_ACTIVITY_NAMES = [
+    "intercept",
+    "recorded_physical_activity_lag1",
+    "dow",
+    "decision_time",
+]
+
+THETA_WS_INTERACTION_NAMES = [
+    "intercept",
+    "Interacted_7d_walk",
+    "Interacted_7d_salience",
+    "dow",
+    "decision_time",
+]
+
+THETA_SALIENCE_INTERACTION_NAMES = [
+    "intercept",
+    "Interacted_7d_walk",
+    "Interacted_7d_salience",
+    "dow",
+    "decision_time",
+]
+
+THETA_FOURSC_NAMES = [
+    "intercept",
+    "fourSC_lag1",
+    "yesterday_step_count",
+    "seven_day_step_count_avg",
+    "prior2hour_step_count",
+    "Previous7DaysRPA",
+    "recent_burden",
+    "seven_day_pageview_count",
+    "past7days_morning_wearing",
+    "yesterday_salience_message",
+    "Interacted_7d_walk",
+    "Interacted_7d_salience",
+    "anticipated_affect_yesterday",
+    "dow",
+    "decision_time",
+    "perceived_utility_lastweek",
+    "CAE_avg_lastweek",
+    "WalkingSuggestion",
+    "WalkingSuggestion_by_yesterday_step_count",
+    "WalkingSuggestion_by_prior2hour_step_count",
+    "WalkingSuggestion_by_recent_burden",
+    "WalkingSuggestion_by_seven_day_pageview_count",
+    "WalkingSuggestion_by_past7days_morning_wearing",
+    "WalkingSuggestion_by_yesterday_salience_message",
+    "WalkingSuggestion_by_Interacted_7d_walk",
+    "WalkingSuggestion_by_Interacted_7d_salience",
+    "WalkingSuggestion_by_anticipated_affect_yesterday",
+    "WalkingSuggestion_by_dow",
+    "WalkingSuggestion_by_decision_time",
+    "WalkingSuggestion_by_perceived_utility_lastweek",
+    "WalkingSuggestion_by_CAE_avg_lastweek",
+]
+
+THETA_ANTIC_NAMES = [
+    "intercept",
+    "anticipated_affect_yesterday",
+    "today_step_count",
+    "recorded_physical_activity",
+    "salience_message",
+    "dow",
+    "perceived_utility_lastweek",
+    "CAE_avg_lastweek",
+    "A0_morning",
+    "A1_afternoon",
+    "A0_morning_by_today_step_count",
+    "A1_afternoon_by_today_step_count",
+    "A0_morning_by_recorded_physical_activity",
+    "A1_afternoon_by_recorded_physical_activity",
+    "A0_morning_by_salience_message",
+    "A1_afternoon_by_salience_message",
+    "A0_morning_by_dow",
+    "A1_afternoon_by_dow",
+    "A0_morning_by_perceived_utility_lastweek",
+    "A1_afternoon_by_perceived_utility_lastweek",
+    "A0_morning_by_CAE_avg_lastweek",
+    "A1_afternoon_by_CAE_avg_lastweek",
+]
+
+THETA_CAE_NAMES = (
+    ["intercept", "CAE_avg_lastweek", "week"]
+    + [f"fourSC_slot_{j}" for j in range(14)]
+    + [f"anticipated_affect_day_{j}" for j in range(7)]
+)
+
+THETA_CAE_SHORT_AVG_NAMES = [
+    "intercept",
+    "CAE_avg",
+]
+
+alpha_l2_list = [0.2, 0.5, 1, 2, 5]
+alpha_lap_list = [0.5, 1, 2, 5]
+ncv = 5
+seed = 2026
+
+dat_user_all = []
+
+userid_all = df_fit['ParticipantIdentifier'].unique()
+theta_pageview_list = []
+theta_fitbitwearing_list = []
+theta_eodcomplete_list = []
+for i, userid in enumerate(userid_all):
+    dat_user = df_fit[df_fit['ParticipantIdentifier'] == userid].copy()
+    dat_user = dat_user.sort_values(['Date', 'DecisionTime'], na_position='last').reset_index(drop=True)
+
+    # fill in initial values (last week's affective association, and perceived utility)
+    # set the first 0-13 days to 0
+    # if len(dat_user) > 0:
+    #     dat_user.loc[dat_user.index[:14], 'week_present_lastweek'] = 0
+    #     dat_user.loc[dat_user.index[:14], 'CAE_avg_lastweek_norm'] = 0
+    #     dat_user.loc[dat_user.index[:14], 'perceived_utility_lastweek_norm'] = 0
+    #     dat_user.loc[dat_user.index[:2], 'view_status_lastdecision'] = 0
+
+    # extract the response
+    # M^Y_{w,d,t}
+    fourSC = dat_user['4hour_step_norm'].to_numpy()
+    fourSC_lag1 = dat_user['FourSC_lag1'].to_numpy()
+
+
+    # M^Y_{w,d}
+    anticipated_affect = dat_user['anticipated_affect_norm'].to_numpy()
+    anticipated_affect_yesterday = dat_user['anticipated_affect_yesterday_norm'].to_numpy()
+    # anticipated_affect_lag1 = dat_user['anticipated_affect_lag1'].to_numpy()
+
+    # Y_w: CAE
+    CAE_avg = dat_user['CAE_avg_norm'].to_numpy()
+    # print(userid, CAE_avg_norm.shape)
+    CAE_avg_lastweek = dat_user['CAE_avg_lastweek_norm'].to_numpy()
+    # tilde Y_w
+    CAE_short_avg = dat_user['CAE_short_avg_norm'].to_numpy()
+
+    if 'perceived_utility_lastweek' not in dat_user.columns:
+        raise KeyError(
+            "df_fit is missing 'perceived_utility_lastweek'; "
+            "run perceived_utility.py first to populate it."
+        )
+    perceived_utility_lastweek = dat_user['perceived_utility_lastweek'].to_numpy(dtype=float)
+    if np.all(np.isnan(perceived_utility_lastweek)):
+        raise ValueError(
+            f"All 'perceived_utility_lastweek' values are NaN for user {userid}; "
+            "re-run perceived_utility.py."
+        )
+    perceived_utility_lastweek = np.where(
+        np.isnan(perceived_utility_lastweek),
+        np.nanmean(perceived_utility_lastweek),
+        perceived_utility_lastweek,
+    )
+
+    # extract the predictors
+    Intercept = np.ones(len(fourSC))
+
+    today_step_count = dat_user['TodayStepCount_norm'].to_numpy()
+    yesterday_step_count = dat_user['YesterdayStepCount_norm'].to_numpy()
+    seven_day_step_count_avg = dat_user['EMA_StepCount_norm'].to_numpy()
+
+    prior2hour_step_count = dat_user['prior2hour_step_norm'].to_numpy()
+    prior2hour_step_count_lag1 = dat_user['prior2hour_step_count_lag1'].to_numpy()
+
+    
+    recent_burden = dat_user['recent_burden_norm'].to_numpy()
+
+    recorded_physical_activity = dat_user['RecordedPhysicalActivity'].to_numpy()
+    recorded_physical_activity_lag1 = dat_user['recorded_physical_activity_lag1'].to_numpy()
+    Previous7DaysRPA = dat_user['Previous7DaysRPA'].to_numpy()
+    
+    DailyPageviewCount = dat_user['DailyPageviewCount_norm'].to_numpy()
+    seven_day_pageview_count = dat_user['Past7DaysPageviewEMA_norm'].to_numpy()
+    past7days_hourly_pageview_count = dat_user['Past7DaysHourlyPageviewEMA_norm'].to_numpy()
+    
+    past7days_morning_wearing = dat_user['past7days_morning_wearing'].to_numpy()
+
+    ws_interaction = dat_user['Interacted_walk'].to_numpy()
+    salience_interaction = dat_user['Interacted_salience'].to_numpy()
+    Interacted_7d_walk = dat_user['Interacted_7d_walk'].to_numpy()
+    Interacted_7d_salience = dat_user['Interacted_7d_salience'].to_numpy()
+
+    week_present = dat_user['week_present'].to_numpy()
+    week_present_lastweek = dat_user['week_present_lastweek'].to_numpy()
+    
+    WalkingSuggestion = dat_user['WalkingSuggestion'].to_numpy()
+    # WalkingSuggestion_lag1 = dat_user['WalkingSuggestion_lag1'].to_numpy()
+    salience_message = dat_user['SalienceMessage'].to_numpy()
+    # planning_prompt = dat_user['planning_prompt'].to_numpy()
+    # yesterday_planning_prompt = dat_user['yesterday_planning_prompt'].to_numpy()
+    yesterday_salience_message = dat_user['yesterday_SalienceMessage'].to_numpy()
+
+    is_weekend = dat_user['is_weekend'].to_numpy()
+    day = dat_user['day_norm'].to_numpy()
+    week = dat_user['week_norm'].to_numpy() #TODO: check this
+    decision_time = dat_user['DecisionTime'].to_numpy()
+    dow = dat_user['dow_norm'].to_numpy()
+    
+    
+
+    # fill in missing values (NAN) with mean for predictors except for FourSC and Intercept
+    fourSC_lag1 = np.where(np.isnan(fourSC_lag1), np.nanmean(fourSC_lag1), fourSC_lag1)
+    today_step_count = np.where(np.isnan(today_step_count), np.nanmean(today_step_count), today_step_count)
+    yesterday_step_count = np.where(np.isnan(yesterday_step_count), np.nanmean(yesterday_step_count), yesterday_step_count)
+    seven_day_step_count_avg = np.where(np.isnan(seven_day_step_count_avg), np.nanmean(seven_day_step_count_avg), seven_day_step_count_avg)
+    prior2hour_step_count_filled = np.where(np.isnan(prior2hour_step_count), np.nanmean(prior2hour_step_count), prior2hour_step_count)
+    prior2hour_step_count_lag1 = np.where(np.isnan(prior2hour_step_count_lag1), np.nanmean(prior2hour_step_count_lag1), prior2hour_step_count_lag1)
+    Previous7DaysRPA = np.where(np.isnan(Previous7DaysRPA), np.nanmean(Previous7DaysRPA), Previous7DaysRPA)
+    recorded_physical_activity_lag1 = np.where(np.isnan(recorded_physical_activity_lag1), np.nanmean(recorded_physical_activity_lag1), recorded_physical_activity_lag1)
+
+    recent_burden = np.where(np.isnan(recent_burden), np.nanmean(recent_burden), recent_burden)
+    
+    seven_day_pageview_count = np.where(np.isnan(seven_day_pageview_count), np.nanmean(seven_day_pageview_count), seven_day_pageview_count)
+    past7days_hourly_pageview_count = np.where(np.isnan(past7days_hourly_pageview_count), np.nanmean(past7days_hourly_pageview_count), past7days_hourly_pageview_count)
+    past7days_morning_wearing = np.where(np.isnan(past7days_morning_wearing), np.nanmean(past7days_morning_wearing), past7days_morning_wearing)
+
+    Interacted_7d_walk = np.where(np.isnan(Interacted_7d_walk), np.nanmean(Interacted_7d_walk), Interacted_7d_walk)
+    Interacted_7d_salience = np.where(np.isnan(Interacted_7d_salience), np.nanmean(Interacted_7d_salience), Interacted_7d_salience)
+    # anticipated_affect = np.where(np.isnan(anticipated_affect), np.nanmean(anticipated_affect), anticipated_affect)
+    anticipated_affect_yesterday = np.where(np.isnan(anticipated_affect_yesterday), np.nanmean(anticipated_affect_yesterday), anticipated_affect_yesterday)
+    
+    CAE_avg_lastweek = np.where(np.isnan(CAE_avg_lastweek), np.nanmean(CAE_avg_lastweek), CAE_avg_lastweek)
+
+    ws_morning = WalkingSuggestion * (1.0 - decision_time)
+    ws_afternoon = WalkingSuggestion * decision_time
+
+    # Per calendar day: AM/PM walking suggestions (rows ordered AM then PM for each Date).
+    Walking_pair = WalkingSuggestion.reshape(-1, 2)
+    ws_morning_day = Walking_pair[:, 0]
+    ws_afternoon_day = Walking_pair[:, 1]
+    idx_morning = decision_time == 0
+
+    ###### fit the models ######
+
+    #### Model 1: Prior 2-hour step count model #### 
+
+    prior2hour_step_count_cond = np.stack([
+        Intercept,
+        prior2hour_step_count_lag1,
+        dow, decision_time
+    ], axis=1)
+    #filter out rows where prior2hour_step_count is NaN
+    idx_obs_prior2hour_step_count = ~np.isnan(prior2hour_step_count)
+    cv_prior2hour_step_count = min(5, int(idx_obs_prior2hour_step_count.sum()))
+    prior2hour_step_count_cond_obs = prior2hour_step_count_cond[idx_obs_prior2hour_step_count, :]
+    prior2hour_step_count_obs = prior2hour_step_count[idx_obs_prior2hour_step_count]
+
+    model_prior2hour_step_count = RidgeCV(
+        alphas=alpha_l2_list,
+        fit_intercept=False,
+        cv=cv_prior2hour_step_count,
+        scoring="neg_mean_squared_error",
+    )
+    model_prior2hour_step_count.fit(prior2hour_step_count_cond_obs, prior2hour_step_count_obs)
+    alpha_prior2hour_step_count_l2 = model_prior2hour_step_count.alpha_
+
+    theta_prior2hour_step_count_mean = model_prior2hour_step_count.coef_
+    pred_prior2hour_step_count = model_prior2hour_step_count.predict(prior2hour_step_count_cond)
+    resid_obs_prior2hour_step_count = prior2hour_step_count_obs - pred_prior2hour_step_count[idx_obs_prior2hour_step_count]
+    
+    resid_prior2hour_step_count = np.full_like(prior2hour_step_count, np.nan)
+    resid_prior2hour_step_count[idx_obs_prior2hour_step_count] = resid_obs_prior2hour_step_count
+    sigma2_prior2hour_step_count_mean = np.var(resid_obs_prior2hour_step_count)
+
+    # print that this fit is good
+    print(f"The fit of prior2hour_step_count is good for user {userid}")
+
+    #### Model 2: Recorded physical activity model #### 
+    # Recorded PA
+    recorded_physical_activity_cond = np.stack([
+        Intercept,
+        recorded_physical_activity_lag1,
+        dow, decision_time
+    ], axis=1)
+    Cs_recorded_physical_activity = np.sort(1.0 / np.asarray(alpha_l2_list, dtype=float))
+
+    idx_obs_recorded_physical_activity = (decision_time == 0) & ~np.isnan(recorded_physical_activity)
+    cv_recorded_physical_activity = min(5, int(idx_obs_recorded_physical_activity.sum()))
+    recorded_physical_activity_cond_obs = recorded_physical_activity_cond[idx_obs_recorded_physical_activity, :]
+    recorded_physical_activity_obs = recorded_physical_activity[idx_obs_recorded_physical_activity]
+
+    if np.var(recorded_physical_activity_obs.astype(float)) > 0:
+        n0, n1 = int(np.sum(recorded_physical_activity_obs == 0)), int(np.sum(recorded_physical_activity_obs == 1))
+        min_class = min(n0, n1)
+        cv_rpa = min(cv_recorded_physical_activity, min_class)
+        if cv_rpa >= 2:
+            model_recorded_physical_activity = LogisticRegressionCV(
+                Cs=Cs_recorded_physical_activity,
+                cv=cv_rpa,
+                penalty="l2",
+                solver="lbfgs",
+                fit_intercept=False,
+                scoring="neg_log_loss",
+                max_iter=5000,
+                random_state=seed,
+            )
+            model_recorded_physical_activity.fit(
+                recorded_physical_activity_cond_obs, recorded_physical_activity_obs
+            )
+            C_sel = float(model_recorded_physical_activity.C_[0])
+        else:
+            C_sel = float(Cs_recorded_physical_activity[len(Cs_recorded_physical_activity) // 2])
+            model_recorded_physical_activity = LogisticRegression(
+                penalty="l2",
+                C=C_sel,
+                solver="lbfgs",
+                fit_intercept=False,
+                max_iter=5000,
+                random_state=seed,
+            )
+            model_recorded_physical_activity.fit(
+                recorded_physical_activity_cond_obs, recorded_physical_activity_obs
+            )
+        alpha_recorded_physical_activity_l2 = 1.0 / C_sel
+        theta_recorded_physical_activity_mean = model_recorded_physical_activity.coef_.ravel()
+        pred_recorded_physical_activity = model_recorded_physical_activity.predict_proba(
+            recorded_physical_activity_cond
+        )[:, 1]
+        resid_obs_recorded_physical_activity = (
+            recorded_physical_activity_obs.astype(float)
+            - pred_recorded_physical_activity[idx_obs_recorded_physical_activity]
+        )
+        resid_recorded_physical_activity = np.full_like(recorded_physical_activity, np.nan, dtype=float)
+        resid_recorded_physical_activity[idx_obs_recorded_physical_activity] = resid_obs_recorded_physical_activity
+        sigma2_recorded_physical_activity_mean = np.var(resid_obs_recorded_physical_activity)
+    else:
+        print(f"the variance of recorded_physical_activity is 0 for user {userid}")
+        const = float(np.nanmean(recorded_physical_activity_obs.astype(float)))
+        alpha_recorded_physical_activity_l2 = float(alpha_l2_list[0])
+        theta_recorded_physical_activity_mean = np.zeros(recorded_physical_activity_cond.shape[1])
+        if const <= 0.0:
+            theta_recorded_physical_activity_mean[0] = -25.0
+        elif const >= 1.0:
+            theta_recorded_physical_activity_mean[0] = 25.0
+        else:
+            theta_recorded_physical_activity_mean[0] = float(np.log(const / (1.0 - const)))
+        pred_recorded_physical_activity = np.full(len(recorded_physical_activity), const, dtype=float)
+        resid_recorded_physical_activity = np.full_like(recorded_physical_activity, np.nan, dtype=float)
+        resid_recorded_physical_activity[idx_obs_recorded_physical_activity] = 0.0
+        sigma2_recorded_physical_activity_mean = 0.0
+
+    print(f"The fit of recorded_physical_activity is good for user {userid}")
+
+    #### Model 3: Walking suggestion interaction model #### 
+
+    # P(WalkingSuggestion = 1 | context): L2 logistic CV (rows with observed WS and predictors)
+    ws_interaction_cond = np.stack([
+        Intercept,
+        Interacted_7d_walk, Interacted_7d_salience,
+        dow, decision_time
+    ], axis=1)
+    Cs_ws_interaction = np.sort(1.0 / np.asarray(alpha_l2_list, dtype=float))
+    idx_obs_ws_interaction = ~np.isnan(ws_interaction)
+    cv_ws_interaction = min(5, int(idx_obs_ws_interaction.sum()))
+    ws_interaction_cond_obs = ws_interaction_cond[idx_obs_ws_interaction, :]
+    ws_interaction_obs =  ws_interaction[idx_obs_ws_interaction]
+
+
+    if np.var(ws_interaction_obs.astype(float)) > 0:
+        n0, n1 = int(np.sum(ws_interaction_obs == 0)), int(np.sum(ws_interaction_obs == 1))
+        min_class = min(n0, n1)
+        cv_ws = min(cv_ws_interaction, min_class)
+        if cv_ws >= 2:
+            model_ws_interaction = LogisticRegressionCV(
+                Cs=Cs_ws_interaction,
+                cv=cv_ws,
+                penalty="l2",
+                solver="lbfgs",
+                fit_intercept=False,
+                scoring="neg_log_loss",
+                max_iter=5000,
+                random_state=seed,
+            )
+            model_ws_interaction.fit(ws_interaction_cond_obs, ws_interaction_obs)
+            C_sel = float(model_ws_interaction.C_[0])
+        else:
+            C_sel = float(Cs_ws_interaction[len(Cs_ws_interaction) // 2])
+            model_ws_interaction = LogisticRegression(
+                penalty="l2",
+                C=C_sel,
+                solver="lbfgs",
+                fit_intercept=False,
+                max_iter=5000,
+                random_state=seed,
+            )
+            model_ws_interaction.fit(ws_interaction_cond_obs, ws_interaction_obs)
+        alpha_ws_interaction_l2 = 1.0 / C_sel
+        theta_ws_interaction_mean = model_ws_interaction.coef_.ravel()
+        pred_ws_interaction = model_ws_interaction.predict_proba(ws_interaction_cond)[:, 1]
+        resid_obs_ws_interaction = ws_interaction_obs.astype(float) - pred_ws_interaction[idx_obs_ws_interaction]
+        resid_ws_interaction = np.full_like(ws_interaction, np.nan, dtype=float)
+        resid_ws_interaction[idx_obs_ws_interaction] = resid_obs_ws_interaction
+        sigma2_ws_interaction_mean = np.var(resid_obs_ws_interaction)
+    else:
+        print(f"the variance of Interacted_walk is 0 for user {userid}")
+        const = float(np.nanmean(ws_interaction_obs.astype(float)))
+        alpha_ws_interaction_l2 = float(alpha_l2_list[0])
+        theta_ws_interaction_mean = np.zeros(ws_interaction_cond.shape[1])
+        if const <= 0.0:
+            theta_ws_interaction_mean[0] = -25.0
+        elif const >= 1.0:
+            theta_ws_interaction_mean[0] = 25.0
+        else:
+            theta_ws_interaction_mean[0] = float(np.log(const / (1.0 - const)))
+        pred_ws_interaction = np.full(len(ws_interaction), const, dtype=float)
+        resid_ws_interaction = np.full_like(ws_interaction, np.nan, dtype=float)
+        resid_ws_interaction[idx_obs_ws_interaction] = 0.0
+        sigma2_ws_interaction_mean = 0.0
+
+    print(f"The fit of ws_interaction is good for user {userid}")
+
+    #### Model 4: Salience interaction model #### 
+    # P(WalkingSuggestion = 1 | context): L2 logistic CV (rows with observed WS and predictors)
+    salience_interaction_cond = np.stack([
+        Intercept,
+        Interacted_7d_walk, Interacted_7d_salience,
+        dow, decision_time
+    ], axis=1)
+    Cs_salience_interaction = np.sort(1.0 / np.asarray(alpha_l2_list, dtype=float))
+    idx_obs_salience_interaction = ~np.isnan(salience_interaction)
+    cv_salience_interaction = min(5, int(idx_obs_salience_interaction.sum()))
+    salience_interaction_cond_obs = salience_interaction_cond[idx_obs_salience_interaction, :]
+    salience_interaction_obs =  salience_interaction[idx_obs_salience_interaction]
+
+
+    if np.var(salience_interaction_obs.astype(float)) > 0:
+        n0, n1 = int(np.sum(salience_interaction_obs == 0)), int(np.sum(salience_interaction_obs == 1))
+        min_class = min(n0, n1)
+        cv_salience = min(cv_salience_interaction, min_class)
+        if cv_salience >= 2:
+            model_salience_interaction = LogisticRegressionCV(
+                Cs=Cs_salience_interaction,
+                cv=cv_salience,
+                penalty="l2",
+                solver="lbfgs",
+                fit_intercept=False,
+                scoring="neg_log_loss",
+                max_iter=5000,
+                random_state=seed,
+            )
+            model_salience_interaction.fit(salience_interaction_cond_obs, salience_interaction_obs)
+            C_sel = float(model_salience_interaction.C_[0])
+        else:
+            C_sel = float(Cs_salience_interaction[len(Cs_salience_interaction) // 2])
+            model_salience_interaction = LogisticRegression(
+                penalty="l2",
+                C=C_sel,
+                solver="lbfgs",
+                fit_intercept=False,
+                max_iter=5000,
+                random_state=seed,
+            )
+            model_salience_interaction.fit(salience_interaction_cond_obs, salience_interaction_obs)
+        alpha_salience_interaction_l2 = 1.0 / C_sel
+        theta_salience_interaction_mean = model_salience_interaction.coef_.ravel()
+        pred_salience_interaction = model_salience_interaction.predict_proba(salience_interaction_cond)[:, 1]
+        resid_obs_salience_interaction = salience_interaction_obs.astype(float) - pred_salience_interaction[idx_obs_salience_interaction]
+        resid_salience_interaction = np.full_like(salience_interaction, np.nan, dtype=float)
+        resid_salience_interaction[idx_obs_salience_interaction] = resid_obs_salience_interaction
+        sigma2_salience_interaction_mean = np.var(resid_obs_salience_interaction)
+    else:
+        print(f"the variance of salience_interaction is 0 for user {userid}")
+        const = float(np.nanmean(salience_interaction_obs.astype(float)))
+        alpha_salience_interaction_l2 = float(alpha_l2_list[0])
+        theta_salience_interaction_mean = np.zeros(salience_interaction_cond.shape[1])
+        if const <= 0.0:
+            theta_salience_interaction_mean[0] = -25.0
+        elif const >= 1.0:
+            theta_salience_interaction_mean[0] = 25.0
+        else:
+            theta_salience_interaction_mean[0] = float(np.log(const / (1.0 - const)))
+        pred_salience_interaction = np.full(len(salience_interaction), const, dtype=float)
+        resid_salience_interaction = np.full_like(salience_interaction, np.nan, dtype=float)
+        resid_salience_interaction[idx_obs_salience_interaction] = 0.0
+        sigma2_salience_interaction_mean = 0.0
+
+    print(f"The fit of salience_interaction is good for user {userid}")
+
+    #### Model 5: FourSC model #### 
+    fourSC_cond = np.stack([
+        Intercept,
+        fourSC_lag1,
+        yesterday_step_count, seven_day_step_count_avg, 
+        prior2hour_step_count_filled, Previous7DaysRPA,
+        recent_burden, seven_day_pageview_count, past7days_morning_wearing, 
+        yesterday_salience_message,
+        Interacted_7d_walk, Interacted_7d_salience,
+        anticipated_affect_yesterday,
+        # is_weekend, 
+        dow, decision_time,
+        perceived_utility_lastweek,
+        CAE_avg_lastweek, 
+        WalkingSuggestion, WalkingSuggestion * yesterday_step_count,
+        WalkingSuggestion * prior2hour_step_count_filled,
+        WalkingSuggestion * recent_burden,
+        WalkingSuggestion * seven_day_pageview_count,
+        WalkingSuggestion * past7days_morning_wearing,
+        WalkingSuggestion * yesterday_salience_message,
+        WalkingSuggestion * Interacted_7d_walk,
+        WalkingSuggestion * Interacted_7d_salience,
+        WalkingSuggestion * anticipated_affect_yesterday,
+        # WalkingSuggestion * is_weekend,
+        WalkingSuggestion * dow,
+        WalkingSuggestion * decision_time,
+        WalkingSuggestion * perceived_utility_lastweek,
+        WalkingSuggestion * CAE_avg_lastweek
+    ], axis=1)
+
+    # check if there are any NaN values in the condition matrix
+    if np.isnan(fourSC_cond).any():
+        print(f"NaN values in condition matrix for user {userid}")
+        print(np.isnan(fourSC_cond))
+
+    # filter out rows where FourSC is NaN
+    idx_obs_fourSC = ~np.isnan(fourSC)
+    fourSC_cond_obs = fourSC_cond[idx_obs_fourSC, :]
+    FourSC_obs = fourSC[idx_obs_fourSC]
+
+    cv_fourSC = min(5, int(idx_obs_fourSC.sum()))
+    
+    model_fourSC = RidgeCV(
+        alphas=alpha_l2_list,
+        fit_intercept=False,
+        cv=cv_fourSC,
+        scoring="neg_mean_squared_error",
+    )
+    model_fourSC.fit(fourSC_cond_obs, FourSC_obs)
+    alpha_fourSC_l2 = model_fourSC.alpha_
+    theta_fourSC_mean = model_fourSC.coef_
+    pred_fourSC = model_fourSC.predict(fourSC_cond)
+    resid_obs_fourSC = FourSC_obs - pred_fourSC[idx_obs_fourSC]
+    # fill in the full residual array with NaN for unobserved
+    resid_fourSC = np.full_like(fourSC, np.nan)
+    resid_fourSC[idx_obs_fourSC] = resid_obs_fourSC
+    sigma2_fourSC_mean = np.var(resid_obs_fourSC)
+
+    print(f"The fit of fourSC is good for user {userid}")
+
+
+    #### Model 6: Anticipated affect model #### 
+    # Daily outcome: one row per calendar day (morning row). Predictors from that row except treatment,
+    # which enters as both ws_morning_day and ws_afternoon_day for that day.
+    recorded_physical_activity_filled = np.where(np.isnan(recorded_physical_activity), np.nanmean(recorded_physical_activity), recorded_physical_activity)
+    # planning_prompt_filled = np.where(np.isnan(planning_prompt), 0, planning_prompt)
+    _am = idx_morning
+    anticipated_affect_cond_day = np.stack([
+        Intercept[_am],
+        anticipated_affect_yesterday[_am],
+        today_step_count[_am],
+        recorded_physical_activity_filled[_am],
+        salience_message[_am],
+        dow[_am],
+        perceived_utility_lastweek[_am],
+        CAE_avg_lastweek[_am],
+        ws_morning_day,
+        ws_afternoon_day,
+        ws_morning_day * today_step_count[_am],
+        ws_afternoon_day * today_step_count[_am],
+        ws_morning_day * recorded_physical_activity_filled[_am],
+        ws_afternoon_day * recorded_physical_activity_filled[_am],
+        ws_morning_day * salience_message[_am],
+        ws_afternoon_day * salience_message[_am],
+        ws_morning_day * dow[_am],
+        ws_afternoon_day * dow[_am],
+        ws_morning_day * perceived_utility_lastweek[_am],
+        ws_afternoon_day * perceived_utility_lastweek[_am],
+        ws_morning_day * CAE_avg_lastweek[_am],
+        ws_afternoon_day * CAE_avg_lastweek[_am],
+    ], axis=1)
+
+    y_antic_day = anticipated_affect[_am]
+    idx_daily_antic = ~np.isnan(y_antic_day)
+    cv_anticipated_affect = min(5, int(idx_daily_antic.sum()))
+
+    model_anticipated_affect = RidgeCV(
+        alphas=alpha_l2_list,
+        fit_intercept=False,
+        cv=cv_anticipated_affect,
+        scoring="neg_mean_squared_error",
+    )
+    model_anticipated_affect.fit(
+        anticipated_affect_cond_day[idx_daily_antic],
+        y_antic_day[idx_daily_antic],
+    )
+    alpha_anticipated_affect_l2 = model_anticipated_affect.alpha_
+    theta_anticipated_affect_mean = model_anticipated_affect.coef_
+    pred_anticipated_affect = model_anticipated_affect.predict(
+        anticipated_affect_cond_day
+    )
+    resid_obs_anticipated_affect = (
+        y_antic_day[idx_daily_antic]
+        - pred_anticipated_affect[idx_daily_antic]
+    )
+    resid_anticipated_affect = np.full_like(y_antic_day, np.nan, dtype=float)
+    resid_anticipated_affect[idx_daily_antic] = resid_obs_anticipated_affect
+    sigma2_anticipated_affect_mean = np.var(resid_obs_anticipated_affect)
+
+    print(f"The fit of anticipated_affect is good for user {userid}")
+
+
+    #### Model 10: CAE model #### 
+    # change the length of the condition matrix
+    K = 14
+    CAE_avg_sw = CAE_avg.reshape(-1, K)[:, 0]
+    # perceived_utility_norm_sw = perceived_utility_norm.reshape(-1, K)[:, 0]
+    CAE_avg_lastweek_sw = CAE_avg_lastweek.reshape(-1, K)[:, 0]
+    week_sw = week.reshape(-1, K)[:, 0]
+    Intercept_sw = np.ones(len(week_sw))
+    
+    # FourSC: 14 decision slots/week. Anticipated affect is daily (repeated across 2 decisions/day) → 7 columns/week
+    foursc_wk = fourSC.reshape(-1, K)
+    _mu_foursc = np.nanmean(fourSC)
+    _mu_antic = np.nanmean(anticipated_affect)
+    foursc_wk = np.where(np.isnan(foursc_wk), _mu_foursc, foursc_wk)
+    _af = anticipated_affect.reshape(-1, K)
+    _af = np.where(np.isnan(_af), _mu_antic, _af)
+    antic_wk = _af.reshape(-1, 7, 2).mean(axis=2)
+    antic_wk = np.where(np.isnan(antic_wk), _mu_antic, antic_wk)
+
+    CAE_cond = np.hstack([
+        Intercept_sw[:, None],
+        CAE_avg_lastweek_sw[:, None],
+        week_sw[:, None],
+        foursc_wk,
+        antic_wk
+    ])
+
+    ncv_w = 2
+    
+    idx_obs_CAE = ~np.isnan(CAE_avg_sw)
+    CAE_cond_obs = CAE_cond[idx_obs_CAE, :]
+    CAE_avg_sw_obs = CAE_avg_sw[idx_obs_CAE]
+
+    # print(len(AA_avg_norm_sw_obs))
+
+    if CAE_avg_sw_obs.size >= 2:
+        model_CAE = RidgeCV(
+            alphas=alpha_l2_list,
+            fit_intercept=False,
+            cv=None,
+        )
+        model_CAE.fit(CAE_cond_obs, CAE_avg_sw_obs)
+
+        alpha_CAE_l2 = model_CAE.alpha_
+        theta_CAE_mean = model_CAE.coef_
+        pred_CAE = model_CAE.predict(CAE_cond)
+
+        resid_obs_CAE = CAE_avg_sw_obs - pred_CAE[idx_obs_CAE]
+        resid_CAE = np.full_like(CAE_avg_sw, np.nan, dtype=float)
+        resid_CAE[idx_obs_CAE] = resid_obs_CAE
+        sigma2_CAE_mean = np.var(resid_obs_CAE)
+
+    elif CAE_avg_sw_obs.size == 1:
+        print(f"fallback to fixed alpha for CAE (Y_w) model for user {userid}")
+
+        alpha_CAE_l2 = 1.0
+        model_CAE = Ridge(alpha=alpha_CAE_l2, fit_intercept=False)
+        model_CAE.fit(CAE_cond_obs, CAE_avg_sw_obs)
+
+        theta_CAE_mean = model_CAE.coef_
+        pred_CAE = model_CAE.predict(CAE_cond)
+
+        resid_obs_CAE = CAE_avg_sw_obs - pred_CAE[idx_obs_CAE]
+        resid_CAE = np.full_like(CAE_avg_sw, np.nan, dtype=float)
+        resid_CAE[idx_obs_CAE] = resid_obs_CAE
+        sigma2_CAE_mean = np.var(resid_obs_CAE)
+
+    else:
+        print(f"no observed CAE (Y_w) values for user {userid}; using zero fallback")
+
+        alpha_CAE_l2 = 1.0
+        theta_CAE_mean = np.zeros(CAE_cond.shape[1], dtype=float)
+        pred_CAE = np.zeros(len(CAE_avg_sw), dtype=float)
+
+        resid_CAE = np.full_like(CAE_avg_sw, np.nan, dtype=float)
+        sigma2_CAE_mean = 0.0
+    
+    
+    
+    print(f"The fit of CAE is good for user {userid}")
+
+
+    #### Model 13: CAE short average model #### 
+
+    # if j = 1, then the emission is 3 questions from CAE
+    CAE_short_avg_sw = CAE_short_avg.reshape(-1, K)[:, 0]
+    CAE_avg_sw_filled = np.where(np.isnan(CAE_avg_sw), np.nanmean(CAE_avg_sw), CAE_avg_sw)
+    idx_obs_CAE_short_avg = ~np.isnan(CAE_short_avg_sw)
+    CAE_short_avg_sw_obs = CAE_short_avg_sw[idx_obs_CAE_short_avg]
+    
+    CAE_short_avg_cond = np.stack([
+        Intercept_sw,
+        CAE_avg_sw_filled,
+    ], axis=1)
+    
+    idx_obs_CAE_short_avg = ~np.isnan(CAE_short_avg_sw)
+    CAE_short_avg_cond_obs = CAE_short_avg_cond[idx_obs_CAE_short_avg, :]
+    CAE_short_avg_sw_obs = CAE_short_avg_sw[idx_obs_CAE_short_avg]
+
+    if CAE_short_avg_sw_obs.size >= 2:
+        # Use Generalized Cross-Validation; no explicit folds.
+        model_CAE_short_avg = RidgeCV(
+            alphas=alpha_l2_list,
+            fit_intercept=False,
+            cv=None,
+        )
+        model_CAE_short_avg.fit(CAE_short_avg_cond_obs, CAE_short_avg_sw_obs)
+
+        alpha_CAE_short_avg_l2 = model_CAE_short_avg.alpha_
+        theta_CAE_short_avg_mean = model_CAE_short_avg.coef_
+        pred_CAE_short_avg = model_CAE_short_avg.predict(CAE_short_avg_cond)
+
+        resid_obs_CAE_short_avg = (
+            CAE_short_avg_sw_obs
+            - pred_CAE_short_avg[idx_obs_CAE_short_avg]
+        )
+
+        resid_CAE_short_avg = np.full_like(CAE_short_avg_sw, np.nan, dtype=float)
+        resid_CAE_short_avg[idx_obs_CAE_short_avg] = resid_obs_CAE_short_avg
+
+        sigma2_CAE_short_avg_mean = np.var(resid_obs_CAE_short_avg)
+
+    elif CAE_short_avg_sw_obs.size == 1:
+        print(f"fallback to fixed alpha for CAE_short_avg model for user {userid}")
+
+        alpha_CAE_short_avg_l2 = 1.0
+
+        model_CAE_short_avg = Ridge(
+            alpha=alpha_CAE_short_avg_l2,
+            fit_intercept=False,
+        )
+        model_CAE_short_avg.fit(CAE_short_avg_cond_obs, CAE_short_avg_sw_obs)
+
+        theta_CAE_short_avg_mean = model_CAE_short_avg.coef_
+        pred_CAE_short_avg = model_CAE_short_avg.predict(CAE_short_avg_cond)
+
+        resid_obs_CAE_short_avg = (
+            CAE_short_avg_sw_obs
+            - pred_CAE_short_avg[idx_obs_CAE_short_avg]
+        )
+
+        resid_CAE_short_avg = np.full_like(CAE_short_avg_sw, np.nan, dtype=float)
+        resid_CAE_short_avg[idx_obs_CAE_short_avg] = resid_obs_CAE_short_avg
+
+        sigma2_CAE_short_avg_mean = np.var(resid_obs_CAE_short_avg)
+
+    else:
+        print(f"no observed CAE_short_avg values for user {userid}; using zero fallback")
+
+        alpha_CAE_short_avg_l2 = float(alpha_l2_list[0])
+
+        theta_CAE_short_avg_mean = np.zeros(CAE_short_avg_cond.shape[1], dtype=float)
+
+        pred_CAE_short_avg = np.zeros(len(CAE_short_avg_sw), dtype=float)
+
+        resid_CAE_short_avg = np.full_like(CAE_short_avg_sw, np.nan, dtype=float)
+
+        sigma2_CAE_short_avg_mean = 0.0
+    
+    print(f"The fit of CAE_short_avg is good for user {userid}")
+
+    #### Store the parameters and residuals #### 
+ 
+    digits = 3
+
+    env_para = {
+        "theta_prior2hour_step_count": json_float_list(theta_prior2hour_step_count_mean, digits),
+        "theta_prior2hour_step_count_names": THETA_PRIOR2HOUR_STEP_COUNT_NAMES,
+
+        "theta_recorded_physical_activity": json_float_list(theta_recorded_physical_activity_mean, digits),
+        "theta_recorded_physical_activity_names": THETA_RECORDED_PHYSICAL_ACTIVITY_NAMES,
+
+        "theta_ws_interaction": json_float_list(theta_ws_interaction_mean, digits),
+        "theta_ws_interaction_names": THETA_WS_INTERACTION_NAMES,
+
+        "theta_salience_interaction": json_float_list(theta_salience_interaction_mean, digits),
+        "theta_salience_interaction_names": THETA_SALIENCE_INTERACTION_NAMES,
+
+        "theta_fourSC": json_float_list(theta_fourSC_mean, digits),
+        "theta_fourSC_names": THETA_FOURSC_NAMES,
+
+        "theta_antic": json_float_list(theta_anticipated_affect_mean, digits),
+        "theta_antic_names": THETA_ANTIC_NAMES,
+
+        "theta_CAE": json_float_list(theta_CAE_mean, digits),
+        "theta_CAE_names": THETA_CAE_NAMES,
+
+        "theta_CAE_short_avg": json_float_list(theta_CAE_short_avg_mean, digits),
+        "theta_CAE_short_avg_names": THETA_CAE_SHORT_AVG_NAMES,
+
+        "resid_prior2hour_step_count": json_float_list(resid_prior2hour_step_count, digits),
+        "resid_recorded_physical_activity": json_float_list(resid_recorded_physical_activity, digits),
+        "resid_ws_interaction": json_float_list(resid_ws_interaction, digits),
+        "resid_salience_interaction": json_float_list(resid_salience_interaction, digits),
+        "resid_fourSC": json_float_list(resid_fourSC, digits),
+        "resid_antic": json_float_list(resid_anticipated_affect, digits),
+        "resid_CAE": json_float_list(resid_CAE, digits),
+        "resid_CAE_short_avg": json_float_list(resid_CAE_short_avg, digits),
+
+        "alpha_prior2hour_step_count_l2": json_float(alpha_prior2hour_step_count_l2, digits),
+        "alpha_recorded_physical_activity_l2": json_float(alpha_recorded_physical_activity_l2, digits),
+        "alpha_ws_interaction_l2": json_float(alpha_ws_interaction_l2, digits),
+        "alpha_salience_interaction_l2": json_float(alpha_salience_interaction_l2, digits),
+        "alpha_fourSC_l2": json_float(alpha_fourSC_l2, digits),
+        "alpha_anticipated_affect_l2": json_float(alpha_anticipated_affect_l2, digits),
+        "alpha_CAE_l2": json_float(alpha_CAE_l2, digits),
+        "alpha_CAE_short_avg_l2": json_float(alpha_CAE_short_avg_l2, digits),
+    }
+
+    predicted = {
+        "pred_prior2hour_step_count": json_float_list(pred_prior2hour_step_count, digits),
+        "pred_recorded_physical_activity": json_float_list(pred_recorded_physical_activity, digits),
+        "pred_ws_interaction": json_float_list(pred_ws_interaction, digits),
+        "pred_salience_interaction": json_float_list(pred_salience_interaction, digits),
+        "pred_fourSC": json_float_list(pred_fourSC, digits),
+        "pred_antic": json_float_list(pred_anticipated_affect, digits),
+        "pred_CAE": json_float_list(pred_CAE, digits),
+        "pred_CAE_short_avg": json_float_list(pred_CAE_short_avg, digits),
+    }
+
+    # Sanity checks: theta length must match theta-name length.
+    for key in [
+        "theta_prior2hour_step_count",
+        "theta_recorded_physical_activity",
+        "theta_ws_interaction",
+        "theta_salience_interaction",
+        "theta_fourSC",
+        "theta_antic",
+        "theta_CAE",
+        "theta_CAE_short_avg",
+    ]:
+        n_theta = len(env_para[key])
+        n_names = len(env_para[f"{key}_names"])
+        if n_theta != n_names:
+            raise RuntimeError(
+                f"Participant {userid}: {key} length {n_theta} != "
+                f"{key}_names length {n_names}"
+            )
+
+    p_env_path = Path(file_params_env_prefix + str(userid) + ".json")
+    p_pred_path = Path(file_pred_prefix + str(userid) + ".json")
+
+    merge_json_file(p_env_path, env_para)
+    merge_json_file(p_pred_path, predicted)
+
+
+    
+np.savetxt(file_user_ids, userid_all, fmt='%d')
+
+# save df_fit.csv with the predicted columns
+df_fit.to_csv(work_folder / "df_fit_11week.csv", index=False)
+
+# %%
+
+
+
+
+
