@@ -26,12 +26,15 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 from pathlib import Path
 
 import numpy as np
 import numpy.random as rd
 
-PROJECT_ROOT = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed")
+PROJECT_ROOT = Path(
+    os.environ.get("ADAPR_PROJECT_ROOT", Path(__file__).resolve().parent)
+).expanduser().resolve()
 PARAMS_DIR = PROJECT_ROOT / "env_para_vanilla"
 
 # Design sizes (``2_fit_vanilla_testbed.py``)
