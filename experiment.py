@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import json
 import pickle
-import importlib.util
 from datetime import datetime
 from pathlib import Path
 from copy import deepcopy
@@ -48,18 +47,11 @@ from algorithm import (  # WeekPacket.k = RL week (0-based)
     build_phi_action_rewardshaping,
     build_phi_bottleneck,
 )
-_EW_WEIGHTS_MODULE_PATH = Path(__file__).with_name("6_est_Ew_weights.py")
-_ew_weights_spec = importlib.util.spec_from_file_location(
-    "est_Ew_weights", _EW_WEIGHTS_MODULE_PATH
+from ew_coefs_runtime import (
+    apply_pooled_coefs,
+    initial_Ew_hat_for_user,
+    load_pooled_coefs,
 )
-if _ew_weights_spec is None or _ew_weights_spec.loader is None:
-    raise ImportError(f"Could not load module from {_EW_WEIGHTS_MODULE_PATH}")
-_ew_weights_module = importlib.util.module_from_spec(_ew_weights_spec)
-_ew_weights_spec.loader.exec_module(_ew_weights_module)
-
-apply_pooled_coefs = _ew_weights_module.apply_pooled_coefs
-initial_Ew_hat_for_user = _ew_weights_module.initial_Ew_hat_for_user
-load_pooled_coefs = _ew_weights_module.load_pooled_coefs
 
 # %%
 # ──────────────────────────────────────────────────────────────────
@@ -257,9 +249,8 @@ class OnlineEnv:
         df_fit_11week_csv=None, df_fit_full=None,
     ):
         # ``start_dow``: civil weekday index in ``{1,…,7}`` with **1 = Monday** (``df_fit`` / study).
-        # ``df_fit_full``: optional pre-loaded df_fit DataFrame (multi-week aggregates).
-        # If ``None`` we lazily load via ``est_Ew_weights.load_df_fit()`` only for the
-        # week-0 E_w_hat bootstrap.
+        # ``df_fit_full``: optional pre-loaded df_fit DataFrame (multi-week aggregates)
+        # for week-0 E_w_hat bootstrap. If omitted, runtime falls back to 0.0.
         if seed is not None:
             rd.seed(seed)
 
@@ -397,13 +388,12 @@ class OnlineEnv:
         self._Iw_per_week = np.zeros(self.nweek, dtype=int)
 
         # Pooled linear coefficients for the agent-visible E_w_hat approximation
-        # (``est_Ew_weights.fit_pooled_linear_Ew``).  Saved by running
-        # ``python est_Ew_weights.py`` after ``perceived_utility.py``.
+        # (fitted offline by ``6_est_Ew_weights.py``).
         try:
             self._ew_coefs = load_pooled_coefs()
         except FileNotFoundError as exc:
             raise RuntimeError(
-                "Ew_pooled_linear_coefs.json missing; run est_Ew_weights.py first."
+                "Ew_pooled_linear_coefs.json missing; run 6_est_Ew_weights.py first."
             ) from exc
 
         # Approximated E_w available to the agent at the start of each week.

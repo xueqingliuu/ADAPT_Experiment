@@ -22,14 +22,22 @@ The regression has **no intercept** (``fit_intercept=False``).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 
-PROJECT_ROOT = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed")
-COMBINED_DIR = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined")
+PROJECT_ROOT = Path(
+    os.getenv("ADAPR_PROJECT_ROOT", str(Path(__file__).resolve().parent))
+).expanduser().resolve()
+COMBINED_DIR = Path(
+    os.getenv(
+        "ADAPR_COMBINED_DIR",
+        "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined",
+    )
+).expanduser().resolve()
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
 EW_POOLED_COEF_JSON = WORK_DIR / "Ew_pooled_linear_coefs.json"
 
@@ -155,66 +163,6 @@ def build_pooled_regression_frame(
                 }
             )
     return pd.DataFrame(out_rows)
-
-
-FEATURE_COLS = ("J_w", "half_J_tool8", "PV_sum", "FW_sum", "PJ_sum")
-
-
-def load_pooled_coefs(work_dir: Path = WORK_DIR) -> dict[str, float]:
-    """Load the pooled linear-approximation coefficients written by ``__main__``."""
-    p = (work_dir or WORK_DIR) / "Ew_pooled_linear_coefs.json"
-    with open(p, encoding="utf-8") as f:
-        return {k: float(v) for k, v in json.load(f).items()}
-
-
-def apply_pooled_coefs(
-    coefs: dict,
-    J_w: float,
-    half_J_tool8: float,
-    PV_sum: float,
-    FW_sum: float,
-    PJ_sum: float,
-) -> float:
-    """Linear combination ``\\hat E_w = sum_k w_k x_k`` (no intercept)."""
-    return float(
-        coefs["J_w"] * float(J_w)
-        + coefs["half_J_tool8"] * float(half_J_tool8)
-        + coefs["PV_sum"] * float(PV_sum)
-        + coefs["FW_sum"] * float(FW_sum)
-        + coefs["PJ_sum"] * float(PJ_sum)
-    )
-
-
-def initial_Ew_hat_for_user(
-    user_id,
-    df_fit: pd.DataFrame | None = None,
-    work_dir: Path = WORK_DIR,
-    coefs: dict | None = None,
-) -> float:
-    """``\\hat E_w`` for the last pre-RL week of ``user_id`` via the pooled formula.
-
-    Returns ``0.0`` if no eligible week exists in ``df_fit`` for the participant.
-    """
-    if df_fit is None:
-        df_fit = load_df_fit()
-    if coefs is None:
-        coefs = load_pooled_coefs(work_dir)
-
-    sub = df_fit[df_fit["ParticipantIdentifier"] == user_id]
-    if sub.empty:
-        return 0.0
-    tbl = weekly_predictor_table(sub).dropna(subset=list(FEATURE_COLS))
-    if tbl.empty:
-        return 0.0
-    last = tbl.sort_values("week").iloc[-1]
-    return apply_pooled_coefs(
-        coefs,
-        last["J_w"],
-        last["half_J_tool8"],
-        last["PV_sum"],
-        last["FW_sum"],
-        last["PJ_sum"],
-    )
 
 
 def fit_pooled_linear_Ew(
