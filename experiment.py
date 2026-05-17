@@ -1,4 +1,6 @@
 # %%
+import argparse
+import os
 import numpy as np
 import numpy.random as rd
 import matplotlib.pyplot as plt
@@ -1283,9 +1285,41 @@ def _snapshot_oenv(oenv):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run RL experiments; optionally select a single seed by index."
+    )
+    parser.add_argument(
+        "--seed-idx",
+        type=int,
+        default=None,
+        help=(
+            "1-based seed index in [1, N_EXPERIMENTS]. If omitted and "
+            "SLURM_ARRAY_TASK_ID is set, that value is used."
+        ),
+    )
+    args = parser.parse_args()
+
     user_ids = np.loadtxt(PARAMS_DIR / "user_ids.txt", dtype=int)
     N_EXPERIMENTS = 100
-    SEEDS = list(range(N_EXPERIMENTS))
+    all_seeds = list(range(N_EXPERIMENTS))
+    seed_idx = args.seed_idx
+    if seed_idx is None:
+        slurm_seed_idx = os.getenv("SLURM_ARRAY_TASK_ID")
+        if slurm_seed_idx:
+            seed_idx = int(slurm_seed_idx)
+    if seed_idx is not None:
+        if not (1 <= seed_idx <= N_EXPERIMENTS):
+            raise ValueError(
+                f"--seed-idx must be in [1, {N_EXPERIMENTS}], got {seed_idx}"
+            )
+        SEEDS = [all_seeds[seed_idx - 1]]
+        print(
+            f"Running a single seed from index {seed_idx}: "
+            f"seed={SEEDS[0]} (N_EXPERIMENTS={N_EXPERIMENTS})"
+        )
+    else:
+        SEEDS = all_seeds
+        print(f"Running all seeds: {len(SEEDS)} experiments")
     uid_draw_rng = np.random.default_rng(0)
     n_users = 100
 
@@ -1359,7 +1393,16 @@ if __name__ == "__main__":
     # ──────────────────────────────────────────────────────────────────
     # Persist results to disk (timestamped folder under ./results/)
     # ──────────────────────────────────────────────────────────────────
-    OUTPUT_DIR = Path("results") / datetime.now().strftime("%Y%m%d-%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    run_tag = f"seed{SEEDS[0]}" if len(SEEDS) == 1 else f"all{len(SEEDS)}"
+    slurm_job_id = os.getenv("SLURM_JOB_ID")
+    slurm_task_id = os.getenv("SLURM_ARRAY_TASK_ID")
+    slurm_suffix = ""
+    if slurm_job_id:
+        slurm_suffix = f"_job{slurm_job_id}"
+        if slurm_task_id:
+            slurm_suffix += f"_task{slurm_task_id}"
+    OUTPUT_DIR = Path("results") / f"{ts}_{run_tag}{slurm_suffix}"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Saving results to {OUTPUT_DIR.resolve()}")
 
@@ -1368,7 +1411,8 @@ if __name__ == "__main__":
         json.dump({
             "nweek":          NWEEK,
             "n_users":        n_users,
-            "n_experiments":  N_EXPERIMENTS,
+            "n_experiments":  len(SEEDS),
+            "n_experiments_configured": N_EXPERIMENTS,
             "seeds":          list(SEEDS),
             "algorithms":     list(ALGORITHMS.keys()),
             "labels":         {n: ALGORITHMS[n][1] for n in ALGORITHMS},
