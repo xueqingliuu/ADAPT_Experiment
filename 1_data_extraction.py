@@ -229,11 +229,10 @@ print(summary_surveytask)
 complete_participant_ids = summary_surveytask[summary_surveytask['span_days'] >= 83]['ParticipantIdentifier'].unique()
 print(complete_participant_ids, len(complete_participant_ids))
 
-# remove 112, 138 from complete_participant_ids
-# the notification dilvery time is not correct for user 138
+# remove participants with clearly problematic wearable quality
 # remove 117 because the step count/heart rate data is not correct
 # remove 219 because the step count/heart rate data is very sparse
-complete_participant_ids = np.setdiff1d(complete_participant_ids, ['112', '138', '117', '219'])
+complete_participant_ids = np.setdiff1d(complete_participant_ids, ['112', '117', '219'])
 print(complete_participant_ids, len(complete_participant_ids))
 
 # filter out incomplete participants from surveytask and surveyquestionresults
@@ -772,67 +771,198 @@ for pid, time1s, time2s, time3s, time4s, dates in zip(
 
 df_wakeup_bedtime = pd.DataFrame(rows)
 
-# error with participant 22, 37, 13
-# mask_22 = df_wakeup_bedtime['ParticipantIdentifier'] == 22
-# df_wakeup_bedtime.loc[mask_22, 'WeekdayBedtime'] = pd.to_datetime('23:00:00').time()
-# df_wakeup_bedtime.loc[mask_22, 'WeekendBedtime'] = pd.to_datetime('23:59:59').time()  # '24:00:00' is invalid
-# df_wakeup_bedtime.loc[df_wakeup_bedtime['ParticipantIdentifier'] == 37, 'WeekendWakeup'] = pd.to_datetime('07:00:00').time()
-# df_wakeup_bedtime.loc[df_wakeup_bedtime['ParticipantIdentifier'] == 13, 'WeekendBedtime'] = pd.to_datetime('23:59:59').time()
+# recover wakeup and bedtime for users with missing survey data
+def _time_to_minutes(t):
+    if pd.isna(t):
+        return np.nan
+    return t.hour * 60 + t.minute + t.second / 60
 
 
-# recover wakeup and bedtime for some users who have missing data
-participant_without_wakeup_bedtime = complete_participant_ids[
-    ~np.isin(complete_participant_ids, df_wakeup_bedtime["ParticipantIdentifier"].unique())
+def _minutes_to_time(total_minutes):
+    total_minutes = int(round(total_minutes)) % (24 * 60)
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    return pd.to_datetime(f"{hours:02d}:{minutes:02d}:00").time()
+
+
+def _round_minutes(total_minutes, step=30):
+    total_minutes = int(round(total_minutes)) % (24 * 60)
+    return int(step * round(total_minutes / step)) % (24 * 60)
+
+
+def _canonical_time_from_daily_estimates(daily_estimates):
+    if len(daily_estimates) == 0:
+        return pd.NaT
+    rounded = [_round_minutes(v, step=30) for v in daily_estimates]
+    mode_vals = pd.Series(rounded).mode()
+    if len(mode_vals):
+        return _minutes_to_time(mode_vals.iloc[0])
+    return _minutes_to_time(_round_minutes(np.median(rounded), step=30))
+
+
+def _median_time(series):
+    vals = [v for v in (_time_to_minutes(x) for x in series) if not pd.isna(v)]
+    if len(vals) == 0:
+        return pd.NaT
+    return _minutes_to_time(np.median(vals))
+
+
+def _infer_wakeup_from_gif(gif_participant):
+    if gif_participant.empty:
+        return pd.NaT, pd.NaT
+
+    gif_participant = gif_participant.copy()
+    gif_participant["Timestamp"] = pd.to_datetime(gif_participant["Timestamp"])
+    gif_participant["date"] = gif_participant["Timestamp"].dt.date
+    gif_participant["minute_of_day"] = (
+        gif_participant["Timestamp"].dt.hour * 60 + gif_participant["Timestamp"].dt.minute
+    )
+
+    weekday_candidates = []
+    weekend_candidates = []
+    for date, day_rows in gif_participant.groupby("date"):
+        mins = np.sort(day_rows["minute_of_day"].to_numpy())
+        if len(mins) == 0:
+            continue
+        # Protocol rule: first daily gif is wakeup + 1h; second is wakeup + 6h.
+        # We prioritize first delivery when present.
+        first_delivery = mins[0]
+        wake_est = (first_delivery - 60) % (24 * 60)
+
+        if pd.to_datetime(date).weekday() < 5:
+            weekday_candidates.append(wake_est)
+        else:
+            weekend_candidates.append(wake_est)
+
+    weekday_wakeup = _canonical_time_from_daily_estimates(weekday_candidates)
+    weekend_wakeup = _canonical_time_from_daily_estimates(weekend_candidates)
+    return weekday_wakeup, weekend_wakeup
+
+
+def _infer_bedtime_from_end(end_participant):
+    if end_participant.empty:
+        return pd.NaT, pd.NaT
+
+    end_participant = end_participant.copy()
+    end_participant["Timestamp"] = pd.to_datetime(end_participant["Timestamp"])
+    end_participant["date"] = end_participant["Timestamp"].dt.date
+    bedtime_minute = (
+        end_participant["Timestamp"].dt.hour * 60
+        + end_participant["Timestamp"].dt.minute
+        + 120  # end-of-day delivery is bedtime - 2h
+    ) % (24 * 60)
+    end_participant["bedtime_minute"] = bedtime_minute
+
+    weekday_vals = end_participant.loc[
+        end_participant["date"].map(lambda d: pd.to_datetime(d).weekday() < 5),
+        "bedtime_minute",
+    ].to_numpy()
+    weekend_vals = end_participant.loc[
+        end_participant["date"].map(lambda d: pd.to_datetime(d).weekday() >= 5),
+        "bedtime_minute",
+    ].to_numpy()
+
+    weekday_bedtime = _canonical_time_from_daily_estimates(weekday_vals.tolist())
+    weekend_bedtime = _canonical_time_from_daily_estimates(weekend_vals.tolist())
+    return weekday_bedtime, weekend_bedtime
+
+
+required_cols = ["WeekdayWakeup", "WeekendWakeup", "WeekdayBedtime", "WeekendBedtime"]
+participant_has_data = (
+    df_wakeup_bedtime.assign(ParticipantIdentifier=df_wakeup_bedtime["ParticipantIdentifier"].astype(str))
+    .groupby("ParticipantIdentifier")[required_cols]
+    .apply(lambda x: x.notna().any().any())
+)
+participant_without_wakeup_bedtime = [
+    str(pid) for pid in complete_participant_ids if not bool(participant_has_data.get(str(pid), False))
 ]
+print("Participants without wakeup/bedtime from survey extraction:")
 print(participant_without_wakeup_bedtime)
 
-# Manual defaults for participants missing from survey extraction
-MANUAL_WAKEUP_BEDTIME = {
-    "117": {
-        "WeekdayWakeup": "07:00:00",
-        "WeekendWakeup": "08:30:00",
-        "WeekdayBedtime": "23:00:00",
-        "WeekendBedtime": "23:00:00",
-    },
-    "118": {
-        "WeekdayWakeup": "07:30:00",
-        "WeekendWakeup": "07:30:00",
-        "WeekdayBedtime": "23:00:00",
-        "WeekendBedtime": "23:00:00",
-    },
-    "143": {
-        "WeekdayWakeup": "05:30:00",
-        "WeekendWakeup": "06:30:00",
-        "WeekdayBedtime": "23:00:00",
-        "WeekendBedtime": "23:00:00",
-    },
-    "151": {
-        "WeekdayWakeup": "05:30:00",
-        "WeekendWakeup": "06:30:00",
-        "WeekdayBedtime": "23:00:00",
-        "WeekendBedtime": "23:00:00",
-    },
+# infer missing wakeup/bedtime from local-time delivery schedules
+push_sent_for_impute = pd.read_csv(folder / "AnalyticsEvents_PushNotificationSent.csv")
+push_sent_for_impute = convert_utc_columns_to_user_local(
+    push_sent_for_impute,
+    datetime_cols=["Timestamp"],
+    participant_col="ParticipantIdentifier",
+    join_date_col="Timestamp",
+)
+gif_rows_for_impute = push_sent_for_impute.loc[
+    push_sent_for_impute["Properties.NotificationIdentifier"].str.startswith("gif", na=False)
+].copy()
+end_rows_for_impute = push_sent_for_impute.loc[
+    push_sent_for_impute["Properties.NotificationIdentifier"].str.startswith("endOfDay", na=False)
+].copy()
+
+cohort_fallback = {
+    col: _median_time(df_wakeup_bedtime[col]) for col in required_cols
 }
-def _to_time(s: str):
-    return pd.to_datetime(s).time()
-# --- apply / append ---
-for pid, cols in MANUAL_WAKEUP_BEDTIME.items():
-    mask = df_wakeup_bedtime["ParticipantIdentifier"] == pid
-    if mask.any():
-        # update existing row(s) — use first match if duplicates
-        idx = df_wakeup_bedtime.index[mask][0]
-        for k, v in cols.items():
-            df_wakeup_bedtime.loc[idx, k] = _to_time(v)
-        if "QuestionEndDate" in df_wakeup_bedtime.columns and pd.isna(df_wakeup_bedtime.loc[idx, "QuestionEndDate"]):
-            df_wakeup_bedtime.loc[idx, "QuestionEndDate"] = pd.NaT
+
+recovered_from_delivery = []
+fallback_used = []
+still_missing = []
+for pid in participant_without_wakeup_bedtime:
+    gif_participant = gif_rows_for_impute.loc[
+        gif_rows_for_impute["ParticipantIdentifier"].astype(str) == pid
+    ].copy()
+    end_participant = end_rows_for_impute.loc[
+        end_rows_for_impute["ParticipantIdentifier"].astype(str) == pid
+    ].copy()
+
+    weekday_wakeup, weekend_wakeup = _infer_wakeup_from_gif(gif_participant)
+    weekday_bedtime, weekend_bedtime = _infer_bedtime_from_end(end_participant)
+
+    # if one of weekday/weekend is unavailable, borrow from the other side first
+    if pd.isna(weekday_wakeup) and not pd.isna(weekend_wakeup):
+        weekday_wakeup = weekend_wakeup
+    if pd.isna(weekend_wakeup) and not pd.isna(weekday_wakeup):
+        weekend_wakeup = weekday_wakeup
+    if pd.isna(weekday_bedtime) and not pd.isna(weekend_bedtime):
+        weekday_bedtime = weekend_bedtime
+    if pd.isna(weekend_bedtime) and not pd.isna(weekday_bedtime):
+        weekend_bedtime = weekday_bedtime
+
+    inferred_any = any(
+        not pd.isna(v)
+        for v in [weekday_wakeup, weekend_wakeup, weekday_bedtime, weekend_bedtime]
+    )
+    row = {
+        "ParticipantIdentifier": pid,
+        "QuestionEndDate": pd.NaT,
+        "WeekdayWakeup": weekday_wakeup if not pd.isna(weekday_wakeup) else cohort_fallback["WeekdayWakeup"],
+        "WeekendWakeup": weekend_wakeup if not pd.isna(weekend_wakeup) else cohort_fallback["WeekendWakeup"],
+        "WeekdayBedtime": weekday_bedtime if not pd.isna(weekday_bedtime) else cohort_fallback["WeekdayBedtime"],
+        "WeekendBedtime": weekend_bedtime if not pd.isna(weekend_bedtime) else cohort_fallback["WeekendBedtime"],
+    }
+
+    if inferred_any:
+        recovered_from_delivery.append(pid)
+    elif all(not pd.isna(row[col]) for col in required_cols):
+        fallback_used.append(pid)
     else:
-        row = {"ParticipantIdentifier": pid, "QuestionEndDate": pd.NaT}
-        for k, v in cols.items():
-            row[k] = _to_time(v)
+        still_missing.append(pid)
+
+    existing_mask = df_wakeup_bedtime["ParticipantIdentifier"].astype(str) == pid
+    if existing_mask.any():
+        idx = df_wakeup_bedtime.index[existing_mask][0]
+        for col in ["QuestionEndDate"] + required_cols:
+            df_wakeup_bedtime.loc[idx, col] = row[col]
+    else:
         df_wakeup_bedtime = pd.concat(
             [df_wakeup_bedtime, pd.DataFrame([row])],
             ignore_index=True,
         )
+
+# Manual bedtime override for participants with clearly implausible inferred bedtime from push timing.
+manual_bedtime_override_ids = {"118", "138", "143", "151"}
+manual_bedtime = pd.to_datetime("23:00:00").time()
+override_mask = df_wakeup_bedtime["ParticipantIdentifier"].astype(str).isin(manual_bedtime_override_ids)
+df_wakeup_bedtime.loc[override_mask, "WeekdayBedtime"] = manual_bedtime
+df_wakeup_bedtime.loc[override_mask, "WeekendBedtime"] = manual_bedtime
+
+print("Recovered from gif/endOfDay delivery timing:", recovered_from_delivery)
+print("Used cohort fallback wake/bed medians:", fallback_used)
+print("Still missing after recovery:", still_missing)
 print(df_wakeup_bedtime)
 
 

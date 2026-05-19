@@ -1,15 +1,15 @@
 # %%
+from __future__ import annotations
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
-%matplotlib inline
 from matplotlib.ticker import MaxNLocator
 import matplotlib.dates as mdates
 import datetime
 import json
-from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable
@@ -21,7 +21,7 @@ OUT_DIR = ROOT_DIR / "_combined"   # where combined JSON/CSV will go
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DATE_START = "2025-09-13"
-DATE_END = "2026-03-14"
+DATE_END = "2026-05-16"
 FOLDER_FMT = "%Y-%m-%d"
 
 # Combine only files that end with _YYYYMMDD.json or _YYYYMMDD-YYYYMMDD.json
@@ -29,8 +29,8 @@ DATE_SUFFIX_RE = re.compile(r"_(\d{8}(?:-\d{8})?)\.json$", re.IGNORECASE)
 
 # Non-dated JSONs that appear inside each date folder and should be combined
 FIXED_NAME_DATASETS = {
-    # "ProjectDeviceData_cleaned.json",
-    # "filtered_activities-steps.json",
+    "ProjectDeviceData_cleaned.json",
+    "filtered_activities-steps.json",
     # "filtered_hrv.json",
     "filtered_activities-heart.json"
     # add more if needed, e.g. "Manifest.json"
@@ -89,6 +89,14 @@ def iter_json_records(path: Path) -> Iterable[dict[str, Any]]:
                                 yield r
                         return
                     if isinstance(obj, dict):
+                        # Common export shape: {"data":[...]} or similar list container.
+                        for key in LIST_KEYS_CANDIDATES:
+                            maybe_rows = obj.get(key)
+                            if isinstance(maybe_rows, list):
+                                for r in maybe_rows:
+                                    if isinstance(r, dict):
+                                        yield r
+                                return
                         yield obj
                         return
                 except json.JSONDecodeError:
@@ -239,7 +247,7 @@ def list_types_from_one_file() -> set[str]:
     return types
 
 # --- Run ---
-types = list_types_from_one_file()
+# types = list_types_from_one_file()
 
 # %%
 TARGET_TYPES = {
@@ -400,9 +408,6 @@ def extract_types_per_date_folder() -> None:
                 h.close()
 
 
-if __name__ == "__main__":
-    extract_types_per_date_folder()
-
 # %%
 # ---------- MAIN ----------
 def main() -> None:
@@ -434,9 +439,6 @@ def main() -> None:
 
     for dataset, paths in sorted(groups.items()):
         combine_dataset_streaming(dataset, sorted(paths))
-
-if __name__ == "__main__":
-    main()
 
 # %%
 # Extract data from ProjectDeviceData_clean
@@ -483,15 +485,6 @@ def load_json_flex(path: Path) -> pd.DataFrame:
     if not rows:
         raise ValueError("Could not parse JSON file as array/object or line-delimited JSON.")
     return pd.DataFrame(rows)
-df = load_json_flex(json_path)
-print(df.shape)
-df.head(2)
-
-
-
-
-# %%
-# 3) Helper to safely parse Value
 def parse_value(v):
     if isinstance(v, dict):
         return v
@@ -502,57 +495,53 @@ def parse_value(v):
             return {}
     return {}
 
-# 4) Build extracted rows
-rows = []
-for _, r in df.iterrows():
-    value_obj = parse_value(r.get("Value"))
+def extract_project_device_fields() -> pd.DataFrame:
+    df = load_json_flex(json_path)
+    print(df.shape)
 
-    user = value_obj.get("user", {}) if isinstance(value_obj.get("user"), dict) else {}
-    demographics = user.get("demographics", {}) if isinstance(user.get("demographics"), dict) else {}
-    custom_fields = user.get("customFields", {}) if isinstance(user.get("customFields"), dict) else {}
+    rows = []
+    for _, r in df.iterrows():
+        value_obj = parse_value(r.get("Value"))
 
-    # timestamp under Value (fallback: Value.event.timestamp)
-    timestamp = value_obj.get("timestamp")
-    if timestamp is None and isinstance(value_obj.get("event"), dict):
-        timestamp = value_obj["event"].get("timestamp")
+        user = value_obj.get("user", {}) if isinstance(value_obj.get("user"), dict) else {}
+        demographics = user.get("demographics", {}) if isinstance(user.get("demographics"), dict) else {}
+        custom_fields = user.get("customFields", {}) if isinstance(user.get("customFields"), dict) else {}
 
-    participantidentifier = r.get("ParticipantIdentifier")
-    if pd.isna(participantidentifier) or participantidentifier is None:
-        participantidentifier = user.get("participantIdentifier")
+        # timestamp under Value (fallback: Value.event.timestamp)
+        timestamp = value_obj.get("timestamp")
+        if timestamp is None and isinstance(value_obj.get("event"), dict):
+            timestamp = value_obj["event"].get("timestamp")
 
-    rows.append({
-        "timeZone": demographics.get("timeZone"),
-        "phase": custom_fields.get("Phase"),
-        "participantidentifier": participantidentifier,
-        "utcOffset": demographics.get("utcOffset"),
-        "timestamp": timestamp,
-    })
+        participantidentifier = r.get("ParticipantIdentifier")
+        if pd.isna(participantidentifier) or participantidentifier is None:
+            participantidentifier = user.get("participantIdentifier")
 
-# 5) Save final CSV
-out = pd.DataFrame(rows, columns=[
-    "timeZone", "phase", "participantidentifier", "utcOffset", "timestamp"
-])
+        rows.append({
+            "timeZone": demographics.get("timeZone"),
+            "phase": custom_fields.get("Phase"),
+            "participantidentifier": participantidentifier,
+            "utcOffset": demographics.get("utcOffset"),
+            "timestamp": timestamp,
+        })
 
-# out.to_csv("ProjectDeviceData_selected_fields_combined.csv", index=False)
-print(out.shape)
-out.head()
+    out = pd.DataFrame(rows, columns=[
+        "timeZone", "phase", "participantidentifier", "utcOffset", "timestamp"
+    ])
+    print(out.shape)
 
-# %%
-# add a date column to the dataframe and remove duplicate rows
-# convert timestamp string -> datetime
-out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce", utc=True)
+    # convert timestamp string -> datetime
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce", utc=True)
+    out["date"] = out["timestamp"].dt.date
+    out = out.drop(columns=["timestamp"])
+    out = out.drop_duplicates()
 
-# add date column
-out["date"] = out["timestamp"].dt.date
+    out.to_csv(OUT_DIR / "ProjectDeviceData_selected_fields_combined.csv", index=False)
+    return out
 
-# remove timestamp column
-out = out.drop(columns=["timestamp"])
 
-# optional: remove exact duplicate rows
-out = out.drop_duplicates()
-
-# save
-out.to_csv(OUT_DIR / "ProjectDeviceData_selected_fields_combined.csv", index=False)
-out.head()
+if __name__ == "__main__":
+    extract_types_per_date_folder()
+    main()
+    extract_project_device_fields()
 
 

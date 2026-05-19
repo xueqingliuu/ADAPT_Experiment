@@ -88,6 +88,23 @@ def merge_json_file(path, new_values):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(existing, f, allow_nan=False)
 
+
+def fill_nan_with_mean(x, default=0.0):
+    """Fill NaNs with the user's mean; use default if the whole vector is missing."""
+    x = np.asarray(x, dtype=float)
+    if np.all(np.isnan(x)):
+        return np.full_like(x, default, dtype=float)
+    return np.where(np.isnan(x), np.nanmean(x), x)
+
+
+def safe_nanmean(x, default=0.0):
+    """Mean that stays finite when all values are missing."""
+    x = np.asarray(x, dtype=float)
+    if np.all(np.isnan(x)):
+        return default
+    return np.nanmean(x)
+
+
 THETA_PRIOR2HOUR_STEP_COUNT_NAMES = [
     "intercept",
     "prior2hour_step_count_lag1",
@@ -293,27 +310,27 @@ for i, userid in enumerate(userid_all):
     
 
     # fill in missing values (NAN) with mean for predictors except for FourSC and Intercept
-    fourSC_lag1 = np.where(np.isnan(fourSC_lag1), np.nanmean(fourSC_lag1), fourSC_lag1)
-    today_step_count = np.where(np.isnan(today_step_count), np.nanmean(today_step_count), today_step_count)
-    yesterday_step_count = np.where(np.isnan(yesterday_step_count), np.nanmean(yesterday_step_count), yesterday_step_count)
-    seven_day_step_count_avg = np.where(np.isnan(seven_day_step_count_avg), np.nanmean(seven_day_step_count_avg), seven_day_step_count_avg)
-    prior2hour_step_count_filled = np.where(np.isnan(prior2hour_step_count), np.nanmean(prior2hour_step_count), prior2hour_step_count)
-    prior2hour_step_count_lag1 = np.where(np.isnan(prior2hour_step_count_lag1), np.nanmean(prior2hour_step_count_lag1), prior2hour_step_count_lag1)
-    Previous7DaysRPA = np.where(np.isnan(Previous7DaysRPA), np.nanmean(Previous7DaysRPA), Previous7DaysRPA)
-    recorded_physical_activity_lag1 = np.where(np.isnan(recorded_physical_activity_lag1), np.nanmean(recorded_physical_activity_lag1), recorded_physical_activity_lag1)
+    fourSC_lag1 = fill_nan_with_mean(fourSC_lag1)
+    today_step_count = fill_nan_with_mean(today_step_count)
+    yesterday_step_count = fill_nan_with_mean(yesterday_step_count)
+    seven_day_step_count_avg = fill_nan_with_mean(seven_day_step_count_avg)
+    prior2hour_step_count_filled = fill_nan_with_mean(prior2hour_step_count)
+    prior2hour_step_count_lag1 = fill_nan_with_mean(prior2hour_step_count_lag1)
+    Previous7DaysRPA = fill_nan_with_mean(Previous7DaysRPA)
+    recorded_physical_activity_lag1 = fill_nan_with_mean(recorded_physical_activity_lag1)
 
-    recent_burden = np.where(np.isnan(recent_burden), np.nanmean(recent_burden), recent_burden)
+    recent_burden = fill_nan_with_mean(recent_burden)
     
-    seven_day_pageview_count = np.where(np.isnan(seven_day_pageview_count), np.nanmean(seven_day_pageview_count), seven_day_pageview_count)
-    past7days_hourly_pageview_count = np.where(np.isnan(past7days_hourly_pageview_count), np.nanmean(past7days_hourly_pageview_count), past7days_hourly_pageview_count)
-    past7days_morning_wearing = np.where(np.isnan(past7days_morning_wearing), np.nanmean(past7days_morning_wearing), past7days_morning_wearing)
+    seven_day_pageview_count = fill_nan_with_mean(seven_day_pageview_count)
+    past7days_hourly_pageview_count = fill_nan_with_mean(past7days_hourly_pageview_count)
+    past7days_morning_wearing = fill_nan_with_mean(past7days_morning_wearing)
 
-    Interacted_7d_walk = np.where(np.isnan(Interacted_7d_walk), np.nanmean(Interacted_7d_walk), Interacted_7d_walk)
-    Interacted_7d_salience = np.where(np.isnan(Interacted_7d_salience), np.nanmean(Interacted_7d_salience), Interacted_7d_salience)
+    Interacted_7d_walk = fill_nan_with_mean(Interacted_7d_walk)
+    Interacted_7d_salience = fill_nan_with_mean(Interacted_7d_salience)
     # anticipated_affect = np.where(np.isnan(anticipated_affect), np.nanmean(anticipated_affect), anticipated_affect)
-    anticipated_affect_yesterday = np.where(np.isnan(anticipated_affect_yesterday), np.nanmean(anticipated_affect_yesterday), anticipated_affect_yesterday)
+    anticipated_affect_yesterday = fill_nan_with_mean(anticipated_affect_yesterday)
     
-    CAE_avg_lastweek = np.where(np.isnan(CAE_avg_lastweek), np.nanmean(CAE_avg_lastweek), CAE_avg_lastweek)
+    CAE_avg_lastweek = fill_nan_with_mean(CAE_avg_lastweek)
 
     ws_morning = WalkingSuggestion * (1.0 - decision_time)
     ws_afternoon = WalkingSuggestion * decision_time
@@ -634,7 +651,7 @@ for i, userid in enumerate(userid_all):
     #### Model 6: Anticipated affect model #### 
     # Daily outcome: one row per calendar day (morning row). Predictors from that row except treatment,
     # which enters as both ws_morning_day and ws_afternoon_day for that day.
-    recorded_physical_activity_filled = np.where(np.isnan(recorded_physical_activity), np.nanmean(recorded_physical_activity), recorded_physical_activity)
+    recorded_physical_activity_filled = fill_nan_with_mean(recorded_physical_activity)
     # planning_prompt_filled = np.where(np.isnan(planning_prompt), 0, planning_prompt)
     _am = idx_morning
     anticipated_affect_cond_day = np.stack([
@@ -664,30 +681,60 @@ for i, userid in enumerate(userid_all):
 
     y_antic_day = anticipated_affect[_am]
     idx_daily_antic = ~np.isnan(y_antic_day)
-    cv_anticipated_affect = min(5, int(idx_daily_antic.sum()))
+    n_obs_anticipated_affect = int(idx_daily_antic.sum())
 
-    model_anticipated_affect = RidgeCV(
-        alphas=alpha_l2_list,
-        fit_intercept=False,
-        cv=cv_anticipated_affect,
-        scoring="neg_mean_squared_error",
-    )
-    model_anticipated_affect.fit(
-        anticipated_affect_cond_day[idx_daily_antic],
-        y_antic_day[idx_daily_antic],
-    )
-    alpha_anticipated_affect_l2 = model_anticipated_affect.alpha_
-    theta_anticipated_affect_mean = model_anticipated_affect.coef_
-    pred_anticipated_affect = model_anticipated_affect.predict(
-        anticipated_affect_cond_day
-    )
-    resid_obs_anticipated_affect = (
-        y_antic_day[idx_daily_antic]
-        - pred_anticipated_affect[idx_daily_antic]
-    )
-    resid_anticipated_affect = np.full_like(y_antic_day, np.nan, dtype=float)
-    resid_anticipated_affect[idx_daily_antic] = resid_obs_anticipated_affect
-    sigma2_anticipated_affect_mean = np.var(resid_obs_anticipated_affect)
+    if n_obs_anticipated_affect >= 2:
+        cv_anticipated_affect = min(5, n_obs_anticipated_affect)
+        model_anticipated_affect = RidgeCV(
+            alphas=alpha_l2_list,
+            fit_intercept=False,
+            cv=cv_anticipated_affect,
+            scoring="neg_mean_squared_error",
+        )
+        model_anticipated_affect.fit(
+            anticipated_affect_cond_day[idx_daily_antic],
+            y_antic_day[idx_daily_antic],
+        )
+        alpha_anticipated_affect_l2 = model_anticipated_affect.alpha_
+        theta_anticipated_affect_mean = model_anticipated_affect.coef_
+        pred_anticipated_affect = model_anticipated_affect.predict(
+            anticipated_affect_cond_day
+        )
+        resid_obs_anticipated_affect = (
+            y_antic_day[idx_daily_antic]
+            - pred_anticipated_affect[idx_daily_antic]
+        )
+        resid_anticipated_affect = np.full_like(y_antic_day, np.nan, dtype=float)
+        resid_anticipated_affect[idx_daily_antic] = resid_obs_anticipated_affect
+        sigma2_anticipated_affect_mean = np.var(resid_obs_anticipated_affect)
+    elif n_obs_anticipated_affect == 1:
+        print(f"fallback to fixed alpha for anticipated_affect model for user {userid}")
+
+        alpha_anticipated_affect_l2 = 1.0
+        model_anticipated_affect = Ridge(alpha=alpha_anticipated_affect_l2, fit_intercept=False)
+        model_anticipated_affect.fit(
+            anticipated_affect_cond_day[idx_daily_antic],
+            y_antic_day[idx_daily_antic],
+        )
+        theta_anticipated_affect_mean = model_anticipated_affect.coef_
+        pred_anticipated_affect = model_anticipated_affect.predict(
+            anticipated_affect_cond_day
+        )
+        resid_obs_anticipated_affect = (
+            y_antic_day[idx_daily_antic]
+            - pred_anticipated_affect[idx_daily_antic]
+        )
+        resid_anticipated_affect = np.full_like(y_antic_day, np.nan, dtype=float)
+        resid_anticipated_affect[idx_daily_antic] = resid_obs_anticipated_affect
+        sigma2_anticipated_affect_mean = np.var(resid_obs_anticipated_affect)
+    else:
+        print(f"no observed anticipated_affect values for user {userid}; using zero fallback")
+
+        alpha_anticipated_affect_l2 = 1.0
+        theta_anticipated_affect_mean = np.zeros(anticipated_affect_cond_day.shape[1], dtype=float)
+        pred_anticipated_affect = np.zeros(len(y_antic_day), dtype=float)
+        resid_anticipated_affect = np.full_like(y_antic_day, np.nan, dtype=float)
+        sigma2_anticipated_affect_mean = 0.0
 
     print(f"The fit of anticipated_affect is good for user {userid}")
 
@@ -703,8 +750,8 @@ for i, userid in enumerate(userid_all):
     
     # FourSC: 14 decision slots/week. Anticipated affect is daily (repeated across 2 decisions/day) → 7 columns/week
     foursc_wk = fourSC.reshape(-1, K)
-    _mu_foursc = np.nanmean(fourSC)
-    _mu_antic = np.nanmean(anticipated_affect)
+    _mu_foursc = safe_nanmean(fourSC)
+    _mu_antic = safe_nanmean(anticipated_affect)
     foursc_wk = np.where(np.isnan(foursc_wk), _mu_foursc, foursc_wk)
     _af = anticipated_affect.reshape(-1, K)
     _af = np.where(np.isnan(_af), _mu_antic, _af)
@@ -778,7 +825,7 @@ for i, userid in enumerate(userid_all):
 
     # if j = 1, then the emission is 3 questions from CAE
     CAE_short_avg_sw = CAE_short_avg.reshape(-1, K)[:, 0]
-    CAE_avg_sw_filled = np.where(np.isnan(CAE_avg_sw), np.nanmean(CAE_avg_sw), CAE_avg_sw)
+    CAE_avg_sw_filled = fill_nan_with_mean(CAE_avg_sw)
     idx_obs_CAE_short_avg = ~np.isnan(CAE_short_avg_sw)
     CAE_short_avg_sw_obs = CAE_short_avg_sw[idx_obs_CAE_short_avg]
     
