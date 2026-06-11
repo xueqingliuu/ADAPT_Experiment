@@ -1,0 +1,34 @@
+{
+  "nweek": 36,
+  "n_users": 100,
+  "n_experiments": 1,
+  "n_experiments_configured": 100,
+  "seeds": [
+    83
+  ],
+  "algorithms": [
+    "micro_g0",
+    "micro_g05",
+    "mtd_g0",
+    "mtd_g05",
+    "rs_g0",
+    "rs_g05",
+    "rs_mtd_g0",
+    "rs_mtd_g05"
+  ],
+  "labels": {
+    "micro_g0": "Micro-query (\u03b3\u0304=0)",
+    "micro_g05": "Micro-query (\u03b3\u0304=0.5)",
+    "mtd_g0": "Micro-query + MTD (\u03b3\u0304=0)",
+    "mtd_g05": "Micro-query + MTD (\u03b3\u0304=0.5)",
+    "rs_g0": "Micro-query + RS (\u03b3\u0304=0)",
+    "rs_g05": "Micro-query + RS (\u03b3\u0304=0.5)",
+    "rs_mtd_g0": "Micro-query + RS + MTD (\u03b3\u0304=0)",
+    "rs_mtd_g05": "Micro-query + RS + MTD (\u03b3\u0304=0.5)"
+  },
+  "gamma_bar": 0.5,
+  "epsilon_0": 0.05,
+  "J_particles": 50,
+  "B_ensembles": 50,
+  "target_update_C": 2
+}

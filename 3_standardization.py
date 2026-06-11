@@ -1,270 +1,252 @@
+# %% [markdown]
+# # Standardize `df_merged` → `df_fit.csv` + `std_params.json`
+#
+# Reads `df_merged.csv` from `2_combine_data_frame.py`.
+#
+# ## Pipeline
+# 1. Select analysis columns
+# 2. Calendar covariates → `*_norm` in [-1, 1]
+# 3. Log-transform count outcomes / pageviews
+# 4. Z-score continuous features; Likert → [0, 1]
+# 5. Write `std_params.json` (shifts, scales, limits) to `env_para_vanilla/`
+# 6. Add decision-slot lags; save `df_fit.csv`
+
+# %% [markdown]
+# ## 0. Setup
+
 # %%
-# 0. import libraries
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import os
-import matplotlib.pyplot as plt
-plt.ion()
-from matplotlib.ticker import MaxNLocator
-import matplotlib.dates as mdates
-import datetime
 import json
-import statsmodels.api as sm
-from patsy import dmatrix
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 
-# %%
-# read data — paths do not depend on os.getcwd()
 PROJECT_ROOT = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed")
 COMBINED_DIR = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined")
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-df_merged = pd.read_csv(COMBINED_DIR / "df_merged.csv")
-
-print("COMBINED_DIR:", COMBINED_DIR.resolve())
-print("WORK_DIR:   ", WORK_DIR.resolve(), "| exists:", WORK_DIR.is_dir())
-
-# Aliases for later cells that use `folder` / `work_folder` (Path so `/` joins work)
 folder = COMBINED_DIR
-work_folder = Path(WORK_DIR)
+work_folder = WORK_DIR
+DIGITS = 3
+
+DAY_RANGE = 84
+WEEK_RANGE = 12
+
+# Columns expected in df_merged (missing cols are skipped with a warning)
+FIT_COLUMNS = [
+    "ParticipantIdentifier",
+    "Date",
+    "DecisionTime",
+    "week",
+    "day",
+    "dow",
+    "is_weekend",
+    # interventions
+    "WalkingSuggestion",
+    "Interacted_walk",
+    "Interacted_7d_walk",
+    "SalienceMessage",
+    "Interacted_salience",
+    "yesterday_SalienceMessage",
+    "planning_prompt",
+    "yesterday_planning_prompt",
+    "recent_burden",
+    # step counts
+    "4hour_step",
+    "EMA_StepCount",
+    "TodayStepCount",
+    "YesterdayStepCount",
+    "prior2hour_step",
+    "EMA_Prior2HourStepCount",
+    # wearables / activity
+    "RecordedPhysicalActivity",
+    "Previous7DaysRPA",
+    "morning_wearing",
+    "nextday_wearing",
+    "past7days_morning_wearing",
+    # pageviews
+    "DailyPageviewCount",
+    "Past7DaysPageviewEMA",
+    "HourlyPageviewCount",
+    "Past7DaysHourlyPageviewEMA",
+    # surveys
+    "week_present",
+    "week_present_lastweek",
+    "daily_present",
+    "daily_present_yesterday",
+    "affective_reflection",
+    "affective_reflection_yesterday",
+    "anticipated_affect",
+    "anticipated_affect_yesterday",
+    "active_status",
+    "active_status_yesterday",
+    "active_status_fraction_7days",
+    "active_status_fraction_7days_yesterday",
+    # weekly CAE / tools
+    "CAE_avg",
+    "CAE_avg_lastweek",
+    "CAE_short_avg",
+    "Exp-tool-1",
+    "Exp-tool-2",
+]
+
+LOG_COLUMNS = [
+    "4hour_step",
+    "TodayStepCount",
+    "YesterdayStepCount",
+    "prior2hour_step",
+    "DailyPageviewCount",
+    "Past7DaysPageviewEMA",
+    "HourlyPageviewCount",
+    "Past7DaysHourlyPageviewEMA",
+]
+
+ZSCORE_SPECS = [
+    # (source_col, norm_col, json_shift_key, json_scale_key, json_limit_key)
+    ("4hour_step", "4hour_step_norm", "4hour_step_count_shift", "4hour_step_count_scale", "4hour_step_count_limit"),
+    ("TodayStepCount", "TodayStepCount_norm", "today_step_count_shift", "today_step_count_scale", "TodayStepCount_limit"),
+    ("YesterdayStepCount", "YesterdayStepCount_norm", "yesterday_step_count_shift", "yesterday_step_count_scale", "YesterdayStepCount_limit"),
+    ("prior2hour_step", "prior2hour_step_norm", "prior2hour_step_count_shift", "prior2hour_step_count_scale", "prior2hour_step_count_limit"),
+    ("EMA_StepCount", "EMA_StepCount_norm", "EMA_step_count_shift", "EMA_step_count_scale", "EMA_StepCount_limit"),
+    ("EMA_Prior2HourStepCount", "EMA_Prior2HourStepCount_norm", "EMA_prior2hour_step_count_shift", "EMA_prior2hour_step_count_scale", "EMA_Prior2HourStepCount_limit"),
+    ("DailyPageviewCount", "DailyPageviewCount_norm", "DailyPageviewCount_shift", "DailyPageviewCount_scale", "DailyPageviewCount_limit"),
+    ("Past7DaysPageviewEMA", "Past7DaysPageviewEMA_norm", "Past7DaysPageviewEMA_shift", "Past7DaysPageviewEMA_scale", "Past7DaysPageviewEMA_limit"),
+    ("HourlyPageviewCount", "HourlyPageviewCount_norm", "HourlyPageviewCount_shift", "HourlyPageviewCount_scale", "HourlyPageviewCount_limit"),
+    ("Past7DaysHourlyPageviewEMA", "Past7DaysHourlyPageviewEMA_norm", "Past7DaysHourlyPageviewEMA_shift", "Past7DaysHourlyPageviewEMA_scale", "Past7DaysHourlyPageviewEMA_limit"),
+    ("CAE_avg", "CAE_avg_norm", "CAE_avg_shift", "CAE_avg_scale", "CAE_avg_limit"),
+    ("CAE_avg_lastweek", "CAE_avg_lastweek_norm", "CAE_avg_lastweek_shift", "CAE_avg_lastweek_scale", "CAE_avg_lastweek_limit"),
+    ("CAE_short_avg", "CAE_short_avg_norm", "CAE_short_avg_shift", "CAE_short_avg_scale", "CAE_short_avg_limit"),
+    ("recent_burden", "recent_burden_norm", "recent_burden_shift", "recent_burden_scale", "recent_burden_limit"),
+]
+
+# Fractions in [0, 1] — kept raw (no z-score / Likert); only limits for env clipping.
+# Binary {0, 1} columns (e.g. active_status, morning_wearing) are left alone.
+RAW_UNIT_INTERVAL_COLS = [
+    # ActivityCheck rolling fractions
+    ("active_status_fraction_7days", "active_status_fraction_7days_limit"),
+    ("active_status_fraction_7days_yesterday", "active_status_fraction_7days_yesterday_limit"),
+    # Rolling interaction / wear / RPA fractions
+    ("Interacted_7d_walk", "Interacted_7d_walk_limit"),
+    ("Previous7DaysRPA", "Previous7DaysRPA_limit"),
+    ("past7days_morning_wearing", "past7days_morning_wearing_limit"),
+]
+
+LIKERT_SPECS = [
+    ("affective_reflection", "affective_reflection_norm", "affective_reflection_limit"),
+    ("anticipated_affect", "anticipated_affect_norm", "anticipated_affect_limit"),
+    ("affective_reflection_yesterday", "affective_reflection_yesterday_norm", "affective_reflection_yesterday_limit"),
+    ("anticipated_affect_yesterday", "anticipated_affect_yesterday_norm", "anticipated_affect_yesterday_limit"),
+    ("Exp-tool-1", "Exp-tool-1_norm", "exp1_limit"),
+    ("Exp-tool-2", "Exp-tool-2_norm", "exp2_limit"),
+]
+
+
+def _zscore(series, digits=DIGITS):
+    shift = np.round(np.mean(series), digits)
+    scale = np.round(np.std(series), digits)
+    if scale == 0:
+        scale = 1.0
+    norm = (series - shift) / scale
+    limit = [np.round(norm.min(), digits), np.round(norm.max(), digits)]
+    return norm, shift, scale, limit
+
+
+def _likert_norm(series, digits=DIGITS):
+    norm = (series + 1) / 8
+    limit = [np.round(norm.min(), digits), np.round(norm.max(), digits)]
+    return norm, limit
+
+
+# %% [markdown]
+# ## 1. Load merged panel
 
 # %%
-# display all columns
-print(df_merged.columns)
+df_merged = pd.read_csv(COMBINED_DIR / "df_merged.csv")
+print("COMBINED_DIR:", COMBINED_DIR.resolve())
+print("WORK_DIR:   ", WORK_DIR.resolve())
+print("df_merged columns:", len(df_merged.columns))
+
+missing = [c for c in FIT_COLUMNS if c not in df_merged.columns]
+if missing:
+    print("Warning: missing columns (skipped):", missing)
+
+use_cols = [c for c in FIT_COLUMNS if c in df_merged.columns]
+df_fit = df_merged[use_cols].copy()
+print(df_fit.shape)
+
+# %% [markdown]
+# ## 2. Calendar normalization
 
 # %%
-# select columns
-df_fit = df_merged[['ParticipantIdentifier', 'Date', 'DecisionTime', 'week', 'day', 'dow', 'is_weekend',
-                    'WalkingSuggestion', 'Interacted_walk', 'Interacted_7d_walk',
-                    'SalienceMessage', 'Interacted_salience', 'Interacted_7d_salience', 
-                    'yesterday_SalienceMessage', 
-                    'planning_prompt', 'yesterday_planning_prompt',
-                    '4hour_step', 'EMA_StepCount', 
-                    'TodayStepCount', 'YesterdayStepCount', 'prior2hour_step', 
-                    'RecordedPhysicalActivity','Previous7DaysRPA', 
-                    'morning_wearing', 'nextday_wearing', 'past7days_morning_wearing', 
-                    'DailyPageviewCount', 'Past7DaysPageviewEMA', 'HourlyPageviewCount', 'Past7DaysHourlyPageviewEMA',
-                    'week_present', 'week_present_lastweek', 'daily_present', 'daily_present_yesterday',
-                    'affective_reflection', 'affective_reflection_yesterday', 
-                    'anticipated_affect', 'anticipated_affect_yesterday',
-                    'CAE_avg', 'CAE_avg_lastweek', 'CAE_short_avg', 
-                    'recent_burden',
-                    'Exp-tool-1', 'Exp-tool-2',
-                  ]]
+df_fit["day_norm"] = (df_fit["day"] - (1 + DAY_RANGE) / 2) / ((DAY_RANGE - 1) / 2)
+df_fit["week_norm"] = (df_fit["week"] - (1 + WEEK_RANGE) / 2) / ((WEEK_RANGE - 1) / 2)
+df_fit["dow_norm"] = (df_fit["dow"] - (1 + 7) / 2) / ((7 - 1) / 2)
 
-print(df_fit)
+# %% [markdown]
+# ## 3. Log transforms (counts / pageviews)
 
 # %%
-# normalize day and week to be within [-1,1] 
-# TODO: based on the expected range of RCT
-# TODO: I'll use the MRT range for now, 84 and 12
-df_fit = df_fit.copy()
-df_fit['day_norm'] = (df_fit['day'] - (1+84)/2) / ((84-1)/2)
-df_fit['week_norm'] = (df_fit['week'] - (1+12)/2) / ((12-1)/2)
-df_fit['dow_norm'] = (df_fit['dow'] - (1+7)/2) / ((7-1)/2)
+for col in LOG_COLUMNS:
+    if col in df_fit.columns:
+        df_fit[col] = np.log(df_fit[col] + 1)
 
-print(df_fit)
-
-# remove the first day of data for each participant
-
+# %% [markdown]
+# ## 4. Z-score + Likert normalization
 
 # %%
-# log transform the step count data
-df_fit['4hour_step'] = np.log(df_fit['4hour_step'] + 1)
-df_fit['TodayStepCount'] = np.log(df_fit['TodayStepCount'] + 1)
-df_fit['YesterdayStepCount'] = np.log(df_fit['YesterdayStepCount'] + 1)
-df_fit['prior2hour_step'] = np.log(df_fit['prior2hour_step'] + 1)
+std_params = {}
 
-# log transform the pageview count data
-df_fit['DailyPageviewCount'] = np.log(df_fit['DailyPageviewCount'] + 1)
-df_fit['Past7DaysPageviewEMA'] = np.log(df_fit['Past7DaysPageviewEMA'] + 1)
-df_fit['HourlyPageviewCount'] = np.log(df_fit['HourlyPageviewCount'] + 1)
-df_fit['Past7DaysHourlyPageviewEMA'] = np.log(df_fit['Past7DaysHourlyPageviewEMA'] + 1)
+for src, norm, shift_key, scale_key, limit_key in ZSCORE_SPECS:
+    if src not in df_fit.columns:
+        continue
+    df_fit[norm], shift, scale, limit = _zscore(df_fit[src])
+    std_params[shift_key] = shift
+    std_params[scale_key] = scale
+    std_params[limit_key] = limit
+
+for src, norm, limit_key in LIKERT_SPECS:
+    if src not in df_fit.columns:
+        continue
+    df_fit[norm], limit = _likert_norm(df_fit[src])
+    std_params[limit_key] = limit
+
+for col, limit_key in RAW_UNIT_INTERVAL_COLS:
+    if col in df_fit.columns:
+        std_params[limit_key] = [
+            np.round(df_fit[col].min(), DIGITS),
+            np.round(df_fit[col].max(), DIGITS),
+        ]
+
+# %% [markdown]
+# ## 5. Save `std_params.json`
 
 # %%
-# standardize the rest of the data
-digits = 3
-df_fit = df_fit.copy()
-step_count_shift = np.round(np.mean(df_fit['4hour_step']), digits)
-step_count_scale = np.round(np.std(df_fit['4hour_step']), digits)
-df_fit['4hour_step_norm'] = (df_fit['4hour_step'] - step_count_shift) / step_count_scale
-
-today_step_count_shift = np.round(np.mean(df_fit['TodayStepCount']), digits)
-today_step_count_scale = np.round(np.std(df_fit['TodayStepCount']), digits)
-df_fit['TodayStepCount_norm'] = (df_fit['TodayStepCount'] - today_step_count_shift) / today_step_count_scale
-
-yesterday_step_count_shift = np.round(np.mean(df_fit['YesterdayStepCount']), digits)
-yesterday_step_count_scale = np.round(np.std(df_fit['YesterdayStepCount']), digits)
-df_fit['YesterdayStepCount_norm'] = (df_fit['YesterdayStepCount'] - yesterday_step_count_shift) / yesterday_step_count_scale
-
-prior2hour_step_count_shift = np.round(np.mean(df_fit['prior2hour_step']), digits)
-prior2hour_step_count_scale = np.round(np.std(df_fit['prior2hour_step']), digits)
-df_fit['prior2hour_step_norm'] = (df_fit['prior2hour_step'] - prior2hour_step_count_shift) / prior2hour_step_count_scale
-
-EMA_StepCount_shift = np.round(np.mean(df_fit['EMA_StepCount']), digits)
-EMA_StepCount_scale = np.round(np.std(df_fit['EMA_StepCount']), digits)
-df_fit['EMA_StepCount_norm'] = (df_fit['EMA_StepCount'] - EMA_StepCount_shift) / EMA_StepCount_scale
-
-DailyPageviewCount_shift = np.round(np.mean(df_fit['DailyPageviewCount']), digits)
-DailyPageviewCount_scale = np.round(np.std(df_fit['DailyPageviewCount']), digits)
-df_fit['DailyPageviewCount_norm'] = (df_fit['DailyPageviewCount'] - DailyPageviewCount_shift) / DailyPageviewCount_scale
-
-Past7DaysPageviewEMA_shift = np.round(np.mean(df_fit['Past7DaysPageviewEMA']), digits)
-Past7DaysPageviewEMA_scale = np.round(np.std(df_fit['Past7DaysPageviewEMA']), digits)
-df_fit['Past7DaysPageviewEMA_norm'] = (df_fit['Past7DaysPageviewEMA'] - Past7DaysPageviewEMA_shift) / Past7DaysPageviewEMA_scale
-
-HourlyPageviewCount_shift = np.round(np.mean(df_fit['HourlyPageviewCount']), digits)
-HourlyPageviewCount_scale = np.round(np.std(df_fit['HourlyPageviewCount']), digits)
-df_fit['HourlyPageviewCount_norm'] = (df_fit['HourlyPageviewCount'] - HourlyPageviewCount_shift) / HourlyPageviewCount_scale
-
-Past7DaysHourlyPageviewEMA_shift = np.round(np.mean(df_fit['Past7DaysHourlyPageviewEMA']), digits)
-Past7DaysHourlyPageviewEMA_scale = np.round(np.std(df_fit['Past7DaysHourlyPageviewEMA']), digits)
-df_fit['Past7DaysHourlyPageviewEMA_norm'] = (df_fit['Past7DaysHourlyPageviewEMA'] - Past7DaysHourlyPageviewEMA_shift) / Past7DaysHourlyPageviewEMA_scale
-
-
-df_fit['affective_reflection_norm'] = (df_fit['affective_reflection'] + 1) / 8
-
-df_fit['anticipated_affect_norm'] = (df_fit['anticipated_affect'] + 1) / 8
-
-df_fit['affective_reflection_yesterday_norm'] = (df_fit['affective_reflection_yesterday'] + 1) / 8
-
-df_fit['anticipated_affect_yesterday_norm'] = (df_fit['anticipated_affect_yesterday'] + 1) / 8
-
-CAE_avg_shift = np.round(np.mean(df_fit['CAE_avg']), digits)
-CAE_avg_scale = np.round(np.std(df_fit['CAE_avg']), digits)
-df_fit['CAE_avg_norm'] = (df_fit['CAE_avg'] - CAE_avg_shift) / CAE_avg_scale
-
-CAE_avg_lastweek_shift = np.round(np.mean(df_fit['CAE_avg_lastweek']), digits)
-CAE_avg_lastweek_scale = np.round(np.std(df_fit['CAE_avg_lastweek']), digits)
-df_fit['CAE_avg_lastweek_norm'] = (df_fit['CAE_avg_lastweek'] - CAE_avg_lastweek_shift) / CAE_avg_lastweek_scale
-
-CAE_short_avg_shift = np.round(np.mean(df_fit['CAE_short_avg']), digits)
-CAE_short_avg_scale = np.round(np.std(df_fit['CAE_short_avg']), digits)
-df_fit['CAE_short_avg_norm'] = (df_fit['CAE_short_avg'] - CAE_short_avg_shift) / CAE_short_avg_scale
-
-
-recent_burden_shift = np.round(np.mean(df_fit['recent_burden']), digits)
-recent_burden_scale = np.round(np.std(df_fit['recent_burden']), digits)
-df_fit['recent_burden_norm'] = (df_fit['recent_burden'] - recent_burden_shift) / recent_burden_scale
-
-df_fit['Exp-tool-1_norm'] = (df_fit['Exp-tool-1'] + 1) / 8
-df_fit['Exp-tool-2_norm'] = (df_fit['Exp-tool-2'] + 1) / 8
-
-# perceived utility need to be normalized later because we will tune it (what is true vs what we use in the algorithm)
-
-
-# check the range of the normalized data
-hour4_step_count_limit = [np.round(np.min(df_fit['4hour_step_norm']), digits), np.round(np.max(df_fit['4hour_step_norm']), digits)]
-today_step_count_limit = [np.round(np.min(df_fit['TodayStepCount_norm']), digits), np.round(np.max(df_fit['TodayStepCount_norm']), digits)]
-yesterday_step_count_limit = [np.round(np.min(df_fit['YesterdayStepCount_norm']), digits), np.round(np.max(df_fit['YesterdayStepCount_norm']), digits)]
-prior2hour_step_count_limit = [np.round(np.min(df_fit['prior2hour_step_norm']), digits), np.round(np.max(df_fit['prior2hour_step_norm']), digits)]
-EMA_step_count_limit = [np.round(np.min(df_fit['EMA_StepCount_norm']), digits), np.round(np.max(df_fit['EMA_StepCount_norm']), digits)]
-daily_pageview_count_limit = [np.round(np.min(df_fit['DailyPageviewCount_norm']), digits), np.round(np.max(df_fit['DailyPageviewCount_norm']), digits)]
-past7days_pageview_count_limit = [np.round(np.min(df_fit['Past7DaysPageviewEMA_norm']), digits), np.round(np.max(df_fit['Past7DaysPageviewEMA_norm']), digits)]
-hourly_pageview_count_limit = [np.round(np.min(df_fit['HourlyPageviewCount_norm']), digits), np.round(np.max(df_fit['HourlyPageviewCount_norm']), digits)]
-past7days_hourly_pageview_count_limit = [np.round(np.min(df_fit['Past7DaysHourlyPageviewEMA_norm']), digits), np.round(np.max(df_fit['Past7DaysHourlyPageviewEMA_norm']), digits)]
-affective_reflection_limit = [np.round(np.min(df_fit['affective_reflection_norm']), digits), np.round(np.max(df_fit['affective_reflection_norm']), digits)]
-anticipated_affect_limit = [np.round(np.min(df_fit['anticipated_affect_norm']), digits), np.round(np.max(df_fit['anticipated_affect_norm']), digits)]
-affective_reflection_yesterday_limit = [np.round(np.min(df_fit['affective_reflection_yesterday_norm']), digits), np.round(np.max(df_fit['affective_reflection_yesterday_norm']), digits)]
-anticipated_affect_yesterday_limit = [np.round(np.min(df_fit['anticipated_affect_yesterday_norm']), digits), np.round(np.max(df_fit['anticipated_affect_yesterday_norm']), digits)]
-CAE_avg_limit = [np.round(np.min(df_fit['CAE_avg_norm']), digits), np.round(np.max(df_fit['CAE_avg_norm']), digits)]
-CAE_avg_lastweek_limit = [np.round(np.min(df_fit['CAE_avg_lastweek_norm']), digits), np.round(np.max(df_fit['CAE_avg_lastweek_norm']), digits)]
-CAE_short_avg_limit = [np.round(np.min(df_fit['CAE_short_avg_norm']), digits), np.round(np.max(df_fit['CAE_short_avg_norm']), digits)]
-recent_burden_limit = [np.round(np.min(df_fit['recent_burden_norm']), digits), np.round(np.max(df_fit['recent_burden_norm']), digits)]
-exp1_limit = [np.round(np.min(df_fit['Exp-tool-1_norm']), digits), np.round(np.max(df_fit['Exp-tool-1_norm']), digits)]
-exp2_limit = [np.round(np.min(df_fit['Exp-tool-2_norm']), digits), np.round(np.max(df_fit['Exp-tool-2_norm']), digits)]
-
-# save the shift and scales into a json file
-std_params = {
-    '4hour_step_count_shift': step_count_shift,
-    '4hour_step_count_scale': step_count_scale,
-    'today_step_count_shift': today_step_count_shift,
-    'today_step_count_scale': today_step_count_scale,
-    'yesterday_step_count_shift': yesterday_step_count_shift,
-    'yesterday_step_count_scale': yesterday_step_count_scale,
-    'prior2hour_step_count_shift': prior2hour_step_count_shift,
-    'prior2hour_step_count_scale': prior2hour_step_count_scale,
-    'EMA_step_count_shift': EMA_StepCount_shift,
-    'EMA_step_count_scale': EMA_StepCount_scale,
-    'DailyPageviewCount_shift': DailyPageviewCount_shift,
-    'DailyPageviewCount_scale': DailyPageviewCount_scale,
-    'Past7DaysPageviewEMA_shift': Past7DaysPageviewEMA_shift,
-    'Past7DaysPageviewEMA_scale': Past7DaysPageviewEMA_scale,
-    'HourlyPageviewCount_shift': HourlyPageviewCount_shift,
-    'HourlyPageviewCount_scale': HourlyPageviewCount_scale,
-    'Past7DaysHourlyPageviewEMA_shift': Past7DaysHourlyPageviewEMA_shift,
-    'Past7DaysHourlyPageviewEMA_scale': Past7DaysHourlyPageviewEMA_scale,
-    'CAE_avg_shift': CAE_avg_shift,
-    'CAE_avg_scale': CAE_avg_scale,
-    'CAE_avg_lastweek_shift': CAE_avg_lastweek_shift,
-    'CAE_avg_lastweek_scale': CAE_avg_lastweek_scale,
-    'CAE_short_avg_shift': CAE_short_avg_shift,
-    'CAE_short_avg_scale': CAE_short_avg_scale,
-    'recent_burden_shift': recent_burden_shift,
-    'recent_burden_scale': recent_burden_scale,
-    '4hour_step_count_limit': hour4_step_count_limit,   
-    'TodayStepCount_limit': today_step_count_limit,
-    'YesterdayStepCount_limit': yesterday_step_count_limit,
-    'prior2hour_step_count_limit': prior2hour_step_count_limit,
-    'EMA_StepCount_limit': EMA_step_count_limit,
-    'DailyPageviewCount_limit': daily_pageview_count_limit,
-    'Past7DaysPageviewEMA_limit': past7days_pageview_count_limit,
-    'HourlyPageviewCount_limit': hourly_pageview_count_limit,
-    'affective_reflection_limit': affective_reflection_limit,
-    'anticipated_affect_limit': anticipated_affect_limit,
-    'affective_reflection_yesterday_limit': affective_reflection_yesterday_limit,
-    'anticipated_affect_yesterday_limit': anticipated_affect_yesterday_limit,
-    'CAE_avg_limit': CAE_avg_limit,
-    'CAE_avg_lastweek_limit': CAE_avg_lastweek_limit,
-    'CAE_short_avg_limit': CAE_short_avg_limit,
-    'recent_burden_limit': recent_burden_limit,
-    'exp1_limit': exp1_limit,
-    'exp2_limit': exp2_limit,
-}
-
-_work_dir = Path(work_folder)
-output_path = _work_dir / "std_params.json"
-os.makedirs(_work_dir, exist_ok=True)
-with open(output_path, 'w') as f:
+std_params_path = work_folder / "std_params.json"
+with open(std_params_path, "w") as f:
     json.dump(std_params, f)
+print(f"Wrote {std_params_path}")
 
-
-
-
+# %% [markdown]
+# ## 6. Decision-slot lags + save `df_fit.csv`
 
 # %%
-# only save the normalized data
-# remove the unnormalized data
-# df_fit = df_fit.drop(columns=['day', 'week',
-#                               'step_count', 'yesterday_step_count', 'prior30_step_count',
-#                               'yesterday_pageview_count', 
-#                               'AA_avg', 'perceived_utility',
-#                               'affective_valuation',
-#                               'perceived_utility_lastweek', 'AA_avg_lastweek',
-#                               '7day_step_count_avg', '7day_step_count_std',
-#                               'week_step_count_avg', 'week_walking_suggestion', 'week_view_status'])
-
-# Shifts are row-based: expect two rows per calendar day (DecisionTime 0 then 1), chronological.
 df_fit = df_fit.sort_values(
-    ['ParticipantIdentifier', 'Date', 'DecisionTime'],
-    kind='mergesort',
+    ["ParticipantIdentifier", "Date", "DecisionTime"],
+    kind="mergesort",
 ).reset_index(drop=True)
 
-# shift(1) = previous decision slot; shift(2) = one calendar day back if day-level vars repeat on AM/PM.
-df_fit['FourSC_lag1'] = df_fit.groupby('ParticipantIdentifier', sort=False)['4hour_step_norm'].shift(1)
-df_fit['prior2hour_step_count_lag1'] = df_fit.groupby('ParticipantIdentifier', sort=False)['prior2hour_step_norm'].shift(1)
-df_fit['hourly_pageview_count_lag1'] = df_fit.groupby('ParticipantIdentifier', sort=False)['HourlyPageviewCount_norm'].shift(1)
-df_fit['recorded_physical_activity_lag1'] = df_fit.groupby('ParticipantIdentifier', sort=False)['RecordedPhysicalActivity'].shift(2)
+# shift(1) = previous decision slot; shift(2) ≈ prior calendar day for day-level vars
+lag_specs = [
+    ("4hour_step_norm", "FourSC_lag1", 1),
+    ("prior2hour_step_norm", "prior2hour_step_count_lag1", 1),
+    ("HourlyPageviewCount_norm", "hourly_pageview_count_lag1", 1),
+    ("RecordedPhysicalActivity", "recorded_physical_activity_lag1", 2),
+]
+for src, out, n in lag_specs:
+    if src in df_fit.columns:
+        df_fit[out] = df_fit.groupby("ParticipantIdentifier", sort=False)[src].shift(n)
 
-
-df_fit.to_csv(folder / 'df_fit.csv', index=False)
-
-
-# %%
-# print(df_fit.loc[df_fit['ParticipantIdentifier'] == 219, '4hour_step_norm'])
-
-
+df_fit_path = folder / "df_fit.csv"
+df_fit.to_csv(df_fit_path, index=False)
+print(f"Wrote {df_fit_path} ({len(df_fit)} rows)")

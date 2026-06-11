@@ -52,7 +52,7 @@ import numpy as np
 import experiment
 from experiment import OnlineEnv, FOURSC_SLOTS_PER_WEEK
 from vani_env import PARAMS_DIR, EnvConfig, Env
-from algorithm import MicroQueryAgent
+from agents import MicroQueryAgent
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ from algorithm import MicroQueryAgent
 # total wall is ~quadratic in ``nweek``. To size the production weekly batch
 # we want the *peak* per-week cost (= week ``nweek-1``), not the average.
 #
-# Timed window breakdown:
+# Timed windayOfWeekNorm breakdayOfWeekNormn:
 #
 #   get_week_packet(k)                 ← t0_week
 #   ▼   packet returned                ← t_after_pkt
@@ -88,7 +88,7 @@ from algorithm import MicroQueryAgent
 _ORIG_RUN_EPISODE     = OnlineEnv.run_episode
 _ORIG_GET_WEEK_PACKET = OnlineEnv.get_week_packet
 _ORIG_START_WEEK      = OnlineEnv.start_week
-_ORIG_GET_STATE       = OnlineEnv.get_state
+_ORIG_GET_CONTEXT     = OnlineEnv.get_context
 _ORIG_STEP_ACTION     = OnlineEnv.step_action
 _ORIG_FINALIZE_WEEK   = OnlineEnv._finalize_week
 
@@ -108,19 +108,18 @@ def _truncated_oenv(oenv, k):
         "U2_all":             oenv.U2_all[:n_wk].copy(),
         "E_known_all":        oenv.E_known_all[:n_wk].copy(),
         # daily
-        "antic_all":              oenv.antic_all[:n_day].copy(),
-        "antic_obs_all":          oenv.antic_obs_all[:n_day].copy(),
-        "fitbit_all":             oenv.fitbit_all[:n_day].copy(),
-        "daily_all":              oenv.daily_all[:n_day].copy(),
-        "recorded_physical_activity_all": oenv.recorded_physical_activity_all[:n_day].copy(),
-        "Previous7DaysRPA_all":   oenv.Previous7DaysRPA_all[:n_day].copy(),
+        "dailyAnticipatedAffectAll":              oenv.dailyAnticipatedAffectAll[:n_day].copy(),
+        "dailyAnticipatedAffectObsAll":          oenv.dailyAnticipatedAffectObsAll[:n_day].copy(),
+        "morningFitbitWearAll":             oenv.morningFitbitWearAll[:n_day].copy(),
+        "dailySurveyCompleteAll":              oenv.dailySurveyCompleteAll[:n_day].copy(),
+        "activityCompletedLast7DaysAll": oenv.activityCompletedLast7DaysAll[:n_day].copy(),
+        "activityCompletedLast7DaysAll":   oenv.activityCompletedLast7DaysAll[:n_day].copy(),
         # slot-level
-        "fourSC_all":             oenv.fourSC_all[:n_slot].copy(),
-        "pageview_all":           oenv.pageview_all[:n_slot].copy(),
+        "stepCountFourHourAll":             oenv.stepCountFourHourAll[:n_slot].copy(),
+        "pageViewFourHourAll":           oenv.pageViewFourHourAll[:n_slot].copy(),
         "action_all":             oenv.action_all[:n_slot].copy(),
-        "prior2hour_step_all":    oenv.prior2hour_step_all[:n_slot].copy(),
+        "prior2HourStepCountAll":    oenv.prior2HourStepCountAll[:n_slot].copy(),
         "ws_interaction_all":     oenv.ws_interaction_all[:n_slot].copy(),
-        "salience_interaction_all": oenv.salience_interaction_all[:n_slot].copy(),
     }
 
 
@@ -138,7 +137,7 @@ def _agent_state(agent):
     return out
 
 
-def _timed_run_episode(self, agent):
+def _timed_run_episode(self, agent, dataset):
     nw = self.nweek
     self._current_agent           = agent
     self._per_week_wall           = np.zeros(nw)
@@ -148,7 +147,7 @@ def _timed_run_episode(self, agent):
     self._t0_week     = 0.0
     self._t_after_pkt = 0.0
     self._t0_decision = 0.0
-    return _ORIG_RUN_EPISODE(self, agent)
+    return _ORIG_RUN_EPISODE(self, agent, dataset)
 
 
 def _timed_get_week_packet(self, k):
@@ -165,9 +164,9 @@ def _timed_start_week(self, k, I_w):
     return _ORIG_START_WEEK(self, k, I_w)
 
 
-def _timed_get_state(self, k, d, t):
+def _timed_get_context(self, k, d, t):
     self._t0_decision = time.perf_counter()
-    return _ORIG_GET_STATE(self, k, d, t)
+    return _ORIG_GET_CONTEXT(self, k, d, t)
 
 
 def _timed_step_action(self, k, d, t, A_wdt, I_w):
@@ -202,7 +201,7 @@ def _timed_finalize_week(self, sim_w):
 OnlineEnv.run_episode     = _timed_run_episode
 OnlineEnv.get_week_packet = _timed_get_week_packet
 OnlineEnv.start_week      = _timed_start_week
-OnlineEnv.get_state       = _timed_get_state
+OnlineEnv.get_context     = _timed_get_context
 OnlineEnv.step_action     = _timed_step_action
 OnlineEnv._finalize_week  = _timed_finalize_week
 
@@ -283,13 +282,12 @@ def _run_micro_query(uid, seed, snapshot_dir=None, save_agent_state=True):
         nu_0_tilde_Y=experiment.nu_0_tilde_Y,
         Gamma_0_tilde_Y=experiment.Gamma_0_tilde_Y,
         sigma2_tilde_Y=experiment.sigma2_tilde_Y,
-        Y_1=experiment._initial_cae_from_env(uid),
-        get_state=oenv.get_state,
-        reward_fn=oenv.reward_fn,
+        Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
     )
 
-    result = oenv.run_episode(agent)
+    dataset = experiment.EpisodeDataset(nweek)
+    result = oenv.run_episode(agent, dataset)
     return result, oenv
 
 

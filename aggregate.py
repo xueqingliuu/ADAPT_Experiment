@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -6,17 +7,24 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-RESULTS_ROOT = Path("results")
+# Must match experiment.py's RESULTS_ROOT (env-overridable, same default).
+RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_mtd_joint"))
 OUT = RESULTS_ROOT / f"aggregated_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 OUT.mkdir(parents=True, exist_ok=True)
 
 # Find folders that contain config.json and at least one .npz
+# (skip our own aggregated_* output folders, which have no config.json).
 run_dirs = sorted(
     p for p in RESULTS_ROOT.iterdir()
     if p.is_dir() and (p / "config.json").exists()
 )
 
-print(f"Found {len(run_dirs)} run folders")
+print(f"Found {len(run_dirs)} run folders under {RESULTS_ROOT}")
+if not run_dirs:
+    raise SystemExit(
+        f"No run folders with config.json under {RESULTS_ROOT.resolve()}. "
+        "Set RESULTS_ROOT=<dir> to point at your experiment output."
+    )
 
 # Use first config as reference
 cfg = json.loads((run_dirs[0] / "config.json").read_text())
@@ -44,10 +52,16 @@ for name in ALGORITHMS:
         cae_parts.append(data["cae_runs"])   # usually (1, n_users, NWEEK+1)
         piA_parts.append(data["piA_runs"])   # usually (1, n_users, W, 6, 2)
 
+    if not cae_parts:
+        print(f"No {name}.npz found in any run folder; skipping {name}")
+        continue
     all_cae_full[name] = np.concatenate(cae_parts, axis=0)
     all_piA[name] = np.concatenate(piA_parts, axis=0)
 
     print(name, "CAE shape:", all_cae_full[name].shape)
+
+# Only keep algorithms that actually had data across the run folders.
+ALGORITHMS = [name for name in ALGORITHMS if name in all_cae_full]
 
 # Drop baseline week 0
 all_cae = {name: arr[..., 1:] for name, arr in all_cae_full.items()}
@@ -86,6 +100,9 @@ markers = {
     "rs_g05":     "s-",
     "rs_mtd_g0":  "d:",
     "rs_mtd_g05": "d-",
+    "never_send":  "x-",
+    "always_send": "*-",
+    "random_send": "+-",
 }
 
 fig, axes = plt.subplots(2, 2, figsize=(15, 9))

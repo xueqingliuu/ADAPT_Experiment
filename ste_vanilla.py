@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import numpy.random as rd
 
-from algorithm import _mask_mediators_for_slot
+from algorithm_helpers import _mask_mediators_for_slot, make_state
 from experiment import OnlineEnv
 from vani_env import PARAMS_DIR, Env, EnvConfig
 
@@ -57,7 +57,7 @@ def _dqn_fit_device() -> str:
 
 def build_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int, b_hat: float = 0.0) -> np.ndarray:
     """Flat state for tabular/vector DQN (no action cross-terms; belief fixed at ``b_hat``)."""
-    st = oenv.get_state(k, d, t)
+    st = make_state(oenv.get_context(k, d, t))
     e_w = float(st["E_w"])
     m_y, m_e = _mask_mediators_for_slot(st["M_Y"], st["M_E"], d, t)
     c_dt = np.asarray(st["C"], dtype=np.float64).ravel()
@@ -95,8 +95,10 @@ def collect_mdp_episode(
     Roll one episode under Bernoulli(``walk_prob``) walking suggestions; build
     dense MDP tuples with weekly CAE as reward on the last weekday slot of each week.
     """
-    oenv._hist_instant_burden.clear()
-    oenv.s["recent_burden"] = oenv._recent_burden_initial
+    oenv._hist_daily_suggestions.clear()
+    oenv.s["activitySuggestionsSentLast7Days"] = (
+        oenv._activitySuggestionsSentLast7Days_initial
+    )
 
     states, actions, rewards = [], [], []
     next_states, terminals, timeouts = [], [], []
@@ -256,8 +258,10 @@ def rollout_total_cae(
     oenv = OnlineEnv(env, nweek=nweek, seed=seed)
     rng = np.random.default_rng(seed)
 
-    oenv._hist_instant_burden.clear()
-    oenv.s["recent_burden"] = oenv._recent_burden_initial
+    oenv._hist_daily_suggestions.clear()
+    oenv.s["activitySuggestionsSentLast7Days"] = (
+        oenv._activitySuggestionsSentLast7Days_initial
+    )
 
     for k in range(oenv.nweek):
         packet = oenv.get_week_packet(k)
@@ -267,7 +271,7 @@ def rollout_total_cae(
 
         for d in range(1, 7):
             for t_slot in range(1, 3):
-                st_dict = oenv.get_state(k, d, t_slot)
+                st_dict = make_state(oenv.get_context(k, d, t_slot))
                 if policy == "zero":
                     a = 0
                 elif policy == "bernoulli":

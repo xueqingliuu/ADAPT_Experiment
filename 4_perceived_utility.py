@@ -1674,14 +1674,47 @@ def neg_loglik_blocks(theta, blocks, grid, weights, e1_known, lam=1e-2):
     except FloatingPointError:
         return 1e100
 
+def neg_loglik_unpenalized_blocks(theta, blocks, grid, weights, e1_known):
+    try:
+        out = quadrature_loglik(blocks, theta, grid, weights, e1_known=e1_known)
+        if not np.isfinite(out["loglik"]):
+            return 1e100
+        return -out["loglik"]
+    except FloatingPointError:
+        return 1e100
+
+
 def neg_loglik_all_users(theta, user_blocks, grid, weights, e1_known, lam=1e-2):
-    total = 0.0
+    total_nll = 0.0
+
     for uid, blocks in user_blocks.items():
-        val = neg_loglik_blocks(theta, blocks, grid, weights, e1_known, lam=lam)
+        val = neg_loglik_unpenalized_blocks(
+            theta, blocks, grid, weights, e1_known
+        )
         if not np.isfinite(val):
             return 1e100
-        total += val
-    return total
+        total_nll += val
+
+    # Apply ridge penalty once, not once per participant
+    penalty = lam * np.sum(theta ** 2)
+    return total_nll + penalty
+
+def make_bounds(*, e1_known: bool):
+    bounds = [(None, None)] * theta_dim(e1_known=e1_known)
+
+    # State AR coefficient a1
+    bounds[1] = (-0.98, 0.98)
+
+    # log sigma parameters:
+    # 5: sigma_E, 10: sigma_U1, 13: sigma_U2, 21: sigma_PV
+    for idx in [5, 10, 13, 21]:
+        bounds[idx] = (np.log(0.03), np.log(10.0))
+
+    # If E1 prior is estimated, bound log sigma0 too
+    if not e1_known:
+        bounds[42] = (np.log(0.03), np.log(10.0))
+
+    return bounds
 
 def fit_pooled_model(
     df_fit,
@@ -1743,10 +1776,13 @@ def fit_pooled_model(
         x0,
         args=(user_blocks, grid, weights, e1_known, lam),
         method="L-BFGS-B",
+        bounds=make_bounds(e1_known=(e1_known is not None)),
         options={
             "maxiter": maxiter,
-            "maxfun": 10000,
+            "maxfun": 1_500_000,
             "maxls": 50,
+            "ftol": 1e-7,
+            "gtol": 1e-4,
         },
     )
 
@@ -1816,6 +1852,7 @@ def fit_one_user(
         x0,
         args=(blocks, grid, weights, e1_known, lam),
         method="L-BFGS-B",
+        bounds=make_bounds(e1_known=e1_fixed),
         options={
             "maxiter": maxiter,
             "maxfun": 300000,
@@ -2243,6 +2280,21 @@ if __name__ == "__main__":
     )
 
     pooled_x0 = pooled_res.x.copy()
+
+    print("pooled success:", pooled_res.success)
+    print("pooled message:", pooled_res.message)
+    print("pooled nfev:", pooled_res.nfev)
+    print("pooled njev:", getattr(pooled_res, "njev", None))
+    print("pooled nit:", pooled_res.nit)
+    print("pooled grad inf-norm:", np.linalg.norm(pooled_res.jac, ord=np.inf))
+    print("pooled nll:", pooled_res.fun)
+
+    if pooled_res.success:
+        print("Pooled fit converged.")
+    elif np.linalg.norm(pooled_res.jac, ord=np.inf) < 1e-3:
+        print("Probably close enough as a warm start, but not as a final pooled MLE.")
+    else:
+        print("Pooled fit did not converge; consider adjusting bounds / maxfun / ftol.")
 
     # Stage 2: user-specific fits initialized at pooled estimate
     _e1_known = 2.0

@@ -2,22 +2,22 @@
 """
 Generative environment for the vanilla testbed.
 
-**Vanilla mediators** (``2_fit_vanilla_testbed.py``): Ridge / L2 logistic with
+**Vanilla mediators** (``5_fit_vanilla_testbed.py``): Ridge / L2 logistic with
 ``Intercept`` in the design matrix and ``fit_intercept=False`` — the leading
 column of ones is part of ``theta_*``, not sklearn's intercept.
 
-**Perceived-utility stack** (``perceived_utility.py``): parameters are merged into
+**Perceived-utility stack** (``perceivedUtility.py``): parameters are merged into
 the same ``params_env_<userid>.json`` as ``theta_ml_*`` / ``resid_ml_*``.
 Within-week outcomes (hourly PV, daily FW/PJ) and weekly ``week_present`` use
 those coefficients conditional on latent ``E_w`` carried in
-``state[\"perceived_utility_lastweek\"]``.
+``state[\"perceivedUtilityLastWeek\"]``.
 
 Weekly AR transition for ``E_w``::
 
     E_{w+1} = a0 + a1 E_w + a2 \\bar{PV}_w + a3 \\bar{FW}_w + a4 \\bar{PJ}_w + \\varepsilon,
 
 with :math:`\\varepsilon \\sim N(0, \\sigma_E^2)` (``sigma_E`` from ``theta_ml_Ew``).
-Means match ``perceived_utility.transition_matrix`` / ``est_Ew_weights`` conventions:
+Means match ``perceivedUtility.transition_matrix`` / ``est_Ew_weights`` conventions:
 ``\\bar{PV}_w = (1/14)\\sum`` hourly pageviews, ``\\bar{FW}_w`` and ``\\bar{PJ}_w``
 are :math:`(1/7)\\sum` over calendar days (one value per day).
 """
@@ -37,9 +37,17 @@ PROJECT_ROOT = Path(
 ).expanduser().resolve()
 PARAMS_DIR = PROJECT_ROOT / "env_para_vanilla"
 
-# Design sizes (``2_fit_vanilla_testbed.py``)
-P_FOURSC = 31
-P_ANTIC = 22
+# Design sizes (``5_fit_vanilla_testbed.py``); no 7-day salience-interaction covariate.
+# The environment uses the full fitted fourSC model, including the
+# ``seven_day_pageview_count`` and ``anticipated_affect_yesterday`` predictors
+# (and their WalkingSuggestion interactions) — these are NOT trimmed away.
+P_FOURSC = 30
+_LEGACY_INTERACT_DROP = (2,)  # removed legacy salience-history covariate
+P_ANTIC = 25
+P_ACTIVE_STATUS = 3
+P_PRIOR2HOUR = 4
+P_RPA = 3
+_LEGACY_RPA_DROP = (3,)  # decisionTimeSlot in legacy 4-dim RPA fits
 PV_ML_BASE = 9
 PV_ML_QUERY = 5
 FW_ML_BASE = 9
@@ -58,6 +66,40 @@ def _json_float_list(key: str, d: dict, n: int | None = None) -> np.ndarray:
     if n is not None and out.shape[0] != n:
         raise ValueError(f"{key}: expected length {n}, got {out.shape[0]}")
     return out
+
+
+def trim_theta_interaction(theta, *, name: str = "theta") -> np.ndarray:
+    """Accept 4-dim interaction fits or legacy 5-dim (with salience 7d row)."""
+    a = np.asarray(theta, dtype=float).ravel()
+    if a.size == 4:
+        return a
+    if a.size == 5:
+        return np.delete(a, _LEGACY_INTERACT_DROP)
+    raise ValueError(f"{name} length {a.size}; expected 4 or legacy 5")
+
+
+def trim_theta_rpa(theta) -> np.ndarray:
+    """Accept current 3-dim RPA fits or legacy 4-dim (with decisionTimeSlot)."""
+    a = np.asarray(theta, dtype=float).ravel()
+    if a.size == P_RPA:
+        return a
+    if a.size == 4:
+        return np.delete(a, _LEGACY_RPA_DROP)
+    raise ValueError(
+        f"theta_recorded_physical_activity length {a.size}; expected {P_RPA} or legacy 4"
+    )
+
+
+def trim_theta_foursc(theta) -> np.ndarray:
+    """Accept the full fitted ``P_FOURSC`` (=30) fourSC coefficients.
+
+    The pageview and anticipated-affect predictors are kept in the environment
+    generative model, so the fitted vector is used as-is with no trimming.
+    """
+    a = np.asarray(theta, dtype=float).ravel()
+    if a.size == P_FOURSC:
+        return a
+    raise ValueError(f"theta_fourSC length {a.size}; expected {P_FOURSC}")
 
 
 def _json_resid_list(key: str, d: dict) -> np.ndarray:
@@ -124,12 +166,12 @@ class EnvConfig:
         self.limits_antic = std["anticipated_affect_yesterday_limit"]
         self.limits_fitbitwearing = [0.0, 1.0]
         self.limits_dailysurvey = [0.0, 1.0]
-        self.limits_perceived_utility = [-2.0, 2.0]
+        self.limits_perceivedUtility = [-2.0, 2.0]
         self.limits_week_present = [0.0, 1.0]
         self.limits_prior2hour_step_count = std["prior2hour_step_count_limit"]
         self.limits_recorded_physical_activity = [0.0, 1.0]
+        self.limits_active_status = [0.0, 1.0]
         self.limits_ws_interaction = [0.0, 1.0]
-        self.limits_salience_interaction = [0.0, 1.0]
         # Tool surveys live on the [(0+1)/8, (7+1)/8] = [0.375, 1.0] normalized scale
         # (from ``1.5_standardization``: Exp-tool-i_norm = (Exp-tool-i + 1) / 8).
         # self.limits_exp1 = std["exp1_limit"]
@@ -140,18 +182,25 @@ class EnvConfig:
             p = json.load(f)
 
         self.theta_prior2hour_step_count = _json_float_list("theta_prior2hour_step_count", p)
-        self.theta_recorded_physical_activity = _json_float_list("theta_recorded_physical_activity", p)
-        self.theta_ws_interaction = _json_float_list("theta_ws_interaction", p)
-        self.theta_salience_interaction = _json_float_list("theta_salience_interaction", p)
-        self.theta_fourSC = _json_float_list("theta_fourSC", p)
+        self.theta_recorded_physical_activity = trim_theta_rpa(
+            _json_float_list("theta_recorded_physical_activity", p)
+        )
+        if p.get("theta_active_status"):
+            self.theta_active_status = _json_float_list("theta_active_status", p)
+        else:
+            self.theta_active_status = np.zeros(P_ACTIVE_STATUS, dtype=float)
+        self.theta_ws_interaction = trim_theta_interaction(
+            _json_float_list("theta_ws_interaction", p), name="theta_ws_interaction"
+        )
+        self.theta_fourSC = trim_theta_foursc(_json_float_list("theta_fourSC", p))
         self.theta_antic = _json_float_list("theta_antic", p)
         self.theta_CAE = _json_float_list("theta_CAE", p)
         self.theta_CAE_short = _json_float_list("theta_CAE_short_avg", p)
 
         self.resid_prior2hour_step_count = _json_resid_list("resid_prior2hour_step_count", p)
         self.resid_recorded_physical_activity = _json_resid_list("resid_recorded_physical_activity", p)
+        self.resid_active_status = _json_resid_list("resid_active_status", p)
         self.resid_ws_interaction = _json_resid_list("resid_ws_interaction", p)
-        self.resid_salience_interaction = _json_resid_list("resid_salience_interaction", p)
         self.resid_fourSC = _json_resid_list("resid_fourSC", p)
         self.resid_antic = _json_resid_list("resid_antic", p)
         self.resid_CAE = _json_resid_list("resid_CAE", p)
@@ -186,10 +235,10 @@ class EnvConfig:
 
     def _validate_shapes(self) -> None:
         expected = {
-            "theta_prior2hour_step_count": 4,
-            "theta_recorded_physical_activity": 4,
-            "theta_ws_interaction": 5,
-            "theta_salience_interaction": 5,
+            "theta_prior2hour_step_count": P_PRIOR2HOUR,
+            "theta_recorded_physical_activity": P_RPA,
+            "theta_active_status": P_ACTIVE_STATUS,
+            "theta_ws_interaction": 4,
             "theta_fourSC": P_FOURSC,
             "theta_antic": P_ANTIC,
             "theta_CAE": 24,
@@ -198,6 +247,8 @@ class EnvConfig:
 
         for name, n in expected.items():
             arr = getattr(self, name)
+            if arr.shape[0] == 0:
+                continue
             if arr.shape[0] != n:
                 raise ValueError(
                     f"{name} length {arr.shape[0]} != {n}; "
@@ -246,13 +297,13 @@ class Env:
     # ----- decision-level (K=2) -----
 
     def gen_prior2hour_step_count_mean(self, s):
-        """[1, lag1, dow, decision_time]."""
+        """[1, EMA_Prior2HourStepCount, dayOfWeekNorm, decisionTimeSlot]."""
         X = np.array(
             [
                 1.0,
-                s["prior2hour_step_count_lag1"],
-                s["dow"],
-                s["decision_time"],
+                s["prior2HourStepCountEma7d"],
+                s["dayOfWeekNorm"],
+                s["decisionTimeSlot"],
             ],
             dtype=float,
         )
@@ -264,12 +315,12 @@ class Env:
         return float(np.clip(mean + noise, *self.cfg.limits_prior2hour_step_count))
 
     def gen_recorded_physical_activity_mean(self, s, return_logit=False):
+        """Daily morning model: [1, recordedPhysicalActivityLag1, dayOfWeekNorm]."""
         X = np.array(
             [
                 1.0,
-                s["recorded_physical_activity_lag1"],
-                s["dow"],
-                s["decision_time"],
+                s["recordedPhysicalActivityLag1"],
+                s["dayOfWeekNorm"],
             ],
             dtype=float,
         )
@@ -288,15 +339,34 @@ class Env:
         )
         return float(rd.binomial(1, p))
 
-    def gen_ws_interaction_mean(self, s, return_logit=False):
-        """[1, Interacted_7d_walk, Interacted_7d_salience, dow, decision_time]."""
+    def gen_active_status_mean(self, s, return_logit=False):
+        """Daily morning model: [1, activeDaysLast7Days, dayOfWeekNorm]."""
         X = np.array(
             [
                 1.0,
-                s["Interacted_7d_walk"],
-                s["Interacted_7d_salience"],
-                s["dow"],
-                s["decision_time"],
+                s["activeDaysLast7Days"],
+                s["dayOfWeekNorm"],
+            ],
+            dtype=float,
+        )
+        eta = float(self.cfg.theta_active_status @ X)
+        return eta if return_logit else self._sigmoid(eta)
+
+    def gen_active_status(self, s, day_idx):
+        eta = self.gen_active_status_mean(s, return_logit=True)
+        base_p = self._sigmoid(eta)
+        noise = self._sample_noise(self.cfg.resid_active_status, day_idx)
+        p = float(np.clip(base_p + noise, *self.cfg.limits_active_status))
+        return float(rd.binomial(1, p))
+
+    def gen_ws_interaction_mean(self, s, return_logit=False):
+        """[1, activitySuggestionInteractLast7Days, dayOfWeekNorm, decisionTimeSlot]."""
+        X = np.array(
+            [
+                1.0,
+                s["activitySuggestionInteractLast7Days"],
+                s["dayOfWeekNorm"],
+                s["decisionTimeSlot"],
             ],
             dtype=float,
         )
@@ -310,70 +380,47 @@ class Env:
         p = float(np.clip(base_p + noise, *self.cfg.limits_ws_interaction))
         return float(rd.binomial(1, p))
 
-    def gen_salience_interaction_mean(self, s, return_logit=False):
-        X = np.array(
-            [
-                1.0,
-                s["Interacted_7d_walk"],
-                s["Interacted_7d_salience"],
-                s["dow"],
-                s["decision_time"],
-            ],
-            dtype=float,
-        )
-        eta = float(self.cfg.theta_salience_interaction @ X)
-        return eta if return_logit else self._sigmoid(eta)
-
-    def gen_salience_interaction(self, s, step_idx):
-        eta = self.gen_salience_interaction_mean(s, return_logit=True)
-        base_p = self._sigmoid(eta)
-        noise = self._sample_noise(self.cfg.resid_salience_interaction, step_idx)
-        p = float(
-            np.clip(base_p + noise, *self.cfg.limits_salience_interaction)
-        )
-        return float(rd.binomial(1, p))
-
     def gen_fourSC_mean(self, s, Ah):
         """
-        31 predictors — matches ``2_fit_vanilla_testbed`` fourSC_cond (no ``is_weekend``;
-        ``past7days_morning_wearing``, ``yesterday_SalienceMessage``;
-        includes ``perceived_utility_lastweek`` and its action interaction).
+        ``P_FOURSC`` predictors — matches ``5_fit_vanilla_testbed`` fourSC_cond.
+        ``yesterdayStepCount`` is the sum of the prior day's two 4-hour slots.
         """
-        wear7 = float(s.get("past7days_morning_wearing", s["past7days_daywearing"]))
-        y_sal = float(s["yesterday_salience_message"])
-        pu = float(s["perceived_utility_lastweek"])
-        cae = float(s["CAE_avg_lastweek"])
+        wear7 = float(s.get("morningFitbitWearLast7Days", s["morningFitbitWearLast7DaysAlt"]))
+        y_sal = float(s["salienceMessageSentYesterday"])
+        pv7 = float(s["pageViewLast7DaysEma"])
+        antic_y = float(s["dailyAnticipatedAffectYesterday"])
+        pu = float(s["perceivedUtilityLastWeek"])
+        cae = float(s["caeAverageLastWeek"])
         X = np.array(
             [
                 1.0,
-                s["fourSC_lag1"],
-                s["yesterday_step"],
-                s["seven_day_step_count_avg"],
-                s["prior2hour_step"],
-                s["Previous7DaysRPA"],
-                s["recent_burden"],
-                s["seven_day_pageview"],
+                s["stepCountNext4HourLag1"],
+                s["yesterdayStepCount"],
+                s["stepCountLast7DaysEma"],
+                s["prior2HourStepCount"],
+                s["activityCompletedLast7Days"],
+                s["activitySuggestionsSentLast7Days"],
+                pv7,
                 wear7,
                 y_sal,
-                s["Interacted_7d_walk"],
-                s["Interacted_7d_salience"],
-                s["anticipated_affect_yesterday"],
-                s["dow"],
-                s["decision_time"],
+                s["activitySuggestionInteractLast7Days"],
+                antic_y,
+                s["activeDaysLast7Days"],
+                s["dayOfWeekNorm"],
+                s["decisionTimeSlot"],
                 pu,
                 cae,
                 Ah,
-                Ah * s["yesterday_step"],
-                Ah * s["prior2hour_step"],
-                Ah * s["recent_burden"],
-                Ah * s["seven_day_pageview"],
+                Ah * s["yesterdayStepCount"],
+                Ah * s["prior2HourStepCount"],
+                Ah * s["activitySuggestionsSentLast7Days"],
+                Ah * pv7,
                 Ah * wear7,
                 Ah * y_sal,
-                Ah * s["Interacted_7d_walk"],
-                Ah * s["Interacted_7d_salience"],
-                Ah * s["anticipated_affect_yesterday"],
-                Ah * s["dow"],
-                Ah * s["decision_time"],
+                Ah * s["activitySuggestionInteractLast7Days"],
+                Ah * antic_y,
+                Ah * s["dayOfWeekNorm"],
+                Ah * s["decisionTimeSlot"],
                 Ah * pu,
                 Ah * cae,
             ],
@@ -389,12 +436,12 @@ class Env:
     def _ml_pv_mean(self, s, Ah: float, Iw: int) -> float:
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
-        Ew = float(s["perceived_utility_lastweek"])
+        Ew = float(s["perceivedUtilityLastWeek"])
         base, q = _split_ml_pv_full(self.cfg.theta_ml_PV)
         (
             alpha0,
             alpha1,
-            a2_dow,
+            a2_dayOfWeekNorm,
             a2_dt,
             a2_rb,
             alpha_ar1,
@@ -402,18 +449,18 @@ class Env:
             alpha4,
             _sigma_pv,
         ) = base
-        lag1 = float(s["hourly_pageview_lag1"])
+        lag1 = float(s["pageViewNext4HourLag1"])
         mu = (
             alpha0
             + alpha1 * Ew
-            + a2_dow * float(s["dow"])
-            + a2_dt * float(s["decision_time"])
-            + a2_rb * float(s["recent_burden"])
+            + a2_dayOfWeekNorm * float(s["dayOfWeekNorm"])
+            + a2_dt * float(s["decisionTimeSlot"])
+            + a2_rb * float(s["activitySuggestionsSentLast7Days"])
             + alpha_ar1 * lag1
             + Ah * (alpha3 + alpha4 * Ew)
         )
         if Iw != 0:
-            xq = np.array([1.0, Ew, float(s["dow"]), float(s["decision_time"]), float(s["recent_burden"])])
+            xq = np.array([1.0, Ew, float(s["dayOfWeekNorm"]), float(s["decisionTimeSlot"]), float(s["activitySuggestionsSentLast7Days"])])
             mu += float(Iw * (q @ xq))
         return float(mu)
 
@@ -434,25 +481,27 @@ class Env:
 
     def gen_antic_mean(self, s, ws_morning, ws_afternoon):
         """
-        Daily ridge design (morning row): 22 columns — matches
-        ``2_fit_vanilla_testbed`` ``anticipated_affect_cond_day``
-        (no ``planning_prompt``; includes ``perceived_utility_lastweek`` main and
+        Daily ridge design (morning row): 25 columns — matches
+        ``5_fit_vanilla_testbed`` ``anticipated_affect_cond_day``
+        (no ``planning_prompt``; includes ``perceivedUtilityLastWeek`` main and
         AM/PM interactions).
         """
-        ys = float(s["today_step"])
-        rpa = float(s["recorded_physical_activity"])
-        sal = float(s["salience_message"])
-        dow = float(s["dow"])
-        pu = float(s["perceived_utility_lastweek"])
-        cae = float(s["CAE_avg_lastweek"])
+        ys = float(s["todayStepCount"])
+        rpa = float(s["recordedPhysicalActivityToday"])
+        act = float(s["activityStatusToday"])
+        sal = float(s["salienceMessageSentToday"])
+        dayOfWeekNorm = float(s["dayOfWeekNorm"])
+        pu = float(s["perceivedUtilityLastWeek"])
+        cae = float(s["caeAverageLastWeek"])
         X = np.array(
             [
                 1.0,
-                float(s["anticipated_affect"]),
+                float(s["dailyAnticipatedAffectYesterday"]),
                 ys,
                 rpa,
+                act,
                 sal,
-                dow,
+                dayOfWeekNorm,
                 pu,
                 cae,
                 ws_morning,
@@ -461,10 +510,12 @@ class Env:
                 ws_afternoon * ys,
                 ws_morning * rpa,
                 ws_afternoon * rpa,
+                ws_morning * act,
+                ws_afternoon * act,
                 ws_morning * sal,
                 ws_afternoon * sal,
-                ws_morning * dow,
-                ws_afternoon * dow,
+                ws_morning * dayOfWeekNorm,
+                ws_afternoon * dayOfWeekNorm,
                 ws_morning * pu,
                 ws_afternoon * pu,
                 ws_morning * cae,
@@ -482,23 +533,23 @@ class Env:
     def _ml_fw_eta(self, s, ws_morning, ws_afternoon, Iw: int, return_logit: bool):
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
-        Ew = float(s["perceived_utility_lastweek"])
+        Ew = float(s["perceivedUtilityLastWeek"])
         base, q = _split_ml_fw(self.cfg.theta_ml_FW)
-        beta0, beta1, b2_dow, b2_rb, beta_ar1, beta3, beta4, beta5, beta6 = base
-        dow = float(s["dow"])
-        rb = float(s["recent_burden"])
-        y_lag = float(s["yesterday_fitbitwearing_morning"])
+        beta0, beta1, b2_dayOfWeekNorm, b2_rb, beta_ar1, beta3, beta4, beta5, beta6 = base
+        dayOfWeekNorm = float(s["dayOfWeekNorm"])
+        rb = float(s["activitySuggestionsSentLast7Days"])
+        y_lag = float(s["morningFitbitWearYesterday"])
         eta = (
             beta0
             + beta1 * Ew
-            + b2_dow * dow
+            + b2_dayOfWeekNorm * dayOfWeekNorm
             + b2_rb * rb
             + beta_ar1 * y_lag
             + ws_morning * (beta3 + beta4 * Ew)
             + ws_afternoon * (beta5 + beta6 * Ew)
         )
         if Iw != 0:
-            xq = np.array([1.0, Ew, dow, rb])
+            xq = np.array([1.0, Ew, dayOfWeekNorm, rb])
             eta += float(Iw * (q @ xq))
         return eta if return_logit else self._sigmoid(eta)
 
@@ -517,23 +568,23 @@ class Env:
     def _ml_pj_eta(self, s, ws_morning, ws_afternoon, Iw: int, return_logit: bool):
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
-        Ew = float(s["perceived_utility_lastweek"])
+        Ew = float(s["perceivedUtilityLastWeek"])
         base, q = _split_ml_pj(self.cfg.theta_ml_PJ)
-        t0, t1, t2_dow, t2_rb, t_ar1, t3, t4, t5, t6 = base
-        dow = float(s["dow"])
-        rb = float(s["recent_burden"])
-        y_lag = float(s["yesterday_present"])
+        t0, t1, t2_dayOfWeekNorm, t2_rb, t_ar1, t3, t4, t5, t6 = base
+        dayOfWeekNorm = float(s["dayOfWeekNorm"])
+        rb = float(s["activitySuggestionsSentLast7Days"])
+        y_lag = float(s["dailySurveyCompleteYesterday"])
         eta = (
             t0
             + t1 * Ew
-            + t2_dow * dow
+            + t2_dayOfWeekNorm * dayOfWeekNorm
             + t2_rb * rb
             + t_ar1 * y_lag
             + ws_morning * (t3 + t4 * Ew)
             + ws_afternoon * (t5 + t6 * Ew)
         )
         if Iw != 0:
-            xq = np.array([1.0, Ew, dow, rb])
+            xq = np.array([1.0, Ew, dayOfWeekNorm, rb])
             eta += float(Iw * (q @ xq))
         return eta if return_logit else self._sigmoid(eta)
 
@@ -579,7 +630,7 @@ class Env:
         pj_m = float(np.nansum(pj) / 7.0) if pj.size else 0.0
         return pv_m, fw_m, pj_m
 
-    def gen_perceived_utility_mean(self, Ew_carry, week_norm, pw_wk, dw_wk, dp_wk):
+    def gen_perceivedUtility_mean(self, Ew_carry, week_norm, pw_wk, dw_wk, dp_wk):
         """Gaussian AR on ``E_w``; ``week_norm`` kept for API compatibility (unused)."""
         del week_norm
         if self.cfg.theta_ml_Ew.size < 6:
@@ -588,22 +639,22 @@ class Env:
         pv_m, fw_m, pj_m = self._week_means_from_arrays(pw_wk, dw_wk, dp_wk)
         return float(a0 + a1 * float(Ew_carry) + a2 * pv_m + a3 * fw_m + a4 * pj_m)
 
-    def gen_perceived_utility(self, Ew_carry, week_norm, pw_wk, dw_wk, dp_wk, week_idx):
+    def gen_perceivedUtility(self, Ew_carry, week_norm, pw_wk, dw_wk, dp_wk, week_idx):
         del week_idx
-        mean = self.gen_perceived_utility_mean(Ew_carry, week_norm, pw_wk, dw_wk, dp_wk)
+        mean = self.gen_perceivedUtility_mean(Ew_carry, week_norm, pw_wk, dw_wk, dp_wk)
         sigma_e = float(self.cfg.theta_ml_Ew[5]) if self.cfg.theta_ml_Ew.size > 5 else 0.1
         noise = float(rd.normal(0.0, sigma_e))
-        return float(np.clip(mean + noise, *self.cfg.limits_perceived_utility))
+        return float(np.clip(mean + noise, *self.cfg.limits_perceivedUtility))
 
-    def gen_week_present_mean(self, perceived_utility, return_logit=False):
+    def gen_week_present_mean(self, perceivedUtility, return_logit=False):
         if self.cfg.theta_ml_J.size < 2:
             raise RuntimeError("theta_ml_J required for week_present (J_week)")
         b0, b1 = float(self.cfg.theta_ml_J[0]), float(self.cfg.theta_ml_J[1])
-        eta = b0 + b1 * float(perceived_utility)
+        eta = b0 + b1 * float(perceivedUtility)
         return eta if return_logit else self._sigmoid(eta)
 
-    def gen_week_present(self, perceived_utility, week_idx):
-        eta = self.gen_week_present_mean(perceived_utility, return_logit=True)
+    def gen_week_present(self, perceivedUtility, week_idx):
+        eta = self.gen_week_present_mean(perceivedUtility, return_logit=True)
         base_p = self._sigmoid(eta)
         noise = self._sample_noise(self.cfg.resid_ml_J_week, week_idx)
         if not np.isfinite(noise):
@@ -612,11 +663,11 @@ class Env:
         p = float(np.clip(base_p + noise, *lim))
         return float(rd.binomial(1, p))
 
-    def gen_CAE_short_mean(self, CAE_avg):
-        return float(self.cfg.theta_CAE_short @ np.array([1.0, CAE_avg], dtype=float))
+    def gen_CAE_short_mean(self, caeAverage):
+        return float(self.cfg.theta_CAE_short @ np.array([1.0, caeAverage], dtype=float))
 
-    def gen_CAE_short(self, CAE_avg, week_idx):
-        mean = self.gen_CAE_short_mean(CAE_avg)
+    def gen_CAE_short(self, caeAverage, week_idx):
+        mean = self.gen_CAE_short_mean(caeAverage)
         noise = self._sample_noise(self.cfg.resid_CAE_short, week_idx)
         return float(np.clip(mean + noise, *self.cfg.limits_CAE_short))
 
@@ -751,29 +802,69 @@ def _read_first_csv_row_for_participant(path, participant_id):
     return None
 
 
+def _read_last_csv_row_for_participant(path, participant_id):
+    if participant_id is None:
+        return None
+    path = Path(path)
+    if not path.is_file():
+        return None
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rdr = csv.DictReader(f)
+        fieldnames = list(rdr.fieldnames or [])
+        rows = list(rdr)
+    if not rows:
+        return None
+    id_key = _participant_id_column(fieldnames)
+    if not id_key:
+        return None
+    try:
+        want = int(participant_id)
+    except (TypeError, ValueError):
+        want = str(participant_id).strip()
+    last_match = None
+    for row in rows:
+        raw = row.get(id_key)
+        if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+            continue
+        try:
+            if int(float(str(raw).strip())) == int(want):
+                last_match = row
+        except (TypeError, ValueError):
+            if str(raw).strip() == str(want):
+                last_match = row
+    return last_match
+
+
 _STATE_FROM_DF_FIT_ROW = (
-    ("fourSC_lag1", ("FourSC_lag1",)),
-    ("hourly_pageview_lag1", ("hourly_pageview_count_lag1",)),
-    ("prior2hour_step_count_lag1", ("prior2hour_step_count_lag1",)),
-    ("prior2hour_step", ("prior2hour_step_norm", "prior2hour_step")),
-    ("yesterday_step", ("YesterdayStepCount_norm", "YesterdayStepCount")),
-    ("seven_day_step_count_avg", ("EMA_StepCount_norm", "EMA_StepCount")),
-    ("seven_day_pageview", ("Past7DaysPageviewEMA_norm", "Past7DaysPageviewEMA")),
-    ("past7days_daywearing", ("past7days_morning_wearing", )),
-    ("past7days_morning_wearing", ("past7days_morning_wearing",)),
-    ("daily_present", ("daily_present",)),
-    ("Previous7DaysRPA", ("Previous7DaysRPA",)),
-    ("recent_burden", ("recent_burden_norm", "recent_burden")),
-    ("Interacted_7d_walk", ("Interacted_7d_walk",)),
-    ("Interacted_7d_salience", ("Interacted_7d_salience",)),
-    ("anticipated_affect_yesterday", ("anticipated_affect_yesterday_norm", "anticipated_affect_yesterday")),
-    ("anticipated_affect", ("anticipated_affect_norm", "anticipated_affect")),
-    ("CAE_avg_lastweek", ("CAE_avg_lastweek_norm", "CAE_avg_lastweek")),
-    ("yesterday_fitbitwearing_morning", ("morning_wearing",)),
-    ("yesterday_present", ("daily_present_yesterday",)),
-    ("yesterday_salience_message", ("yesterday_SalienceMessage",)),
-    ("recorded_physical_activity", ("RecordedPhysicalActivity",)),
-    ("recorded_physical_activity_lag1", ("recorded_physical_activity_lag1",)),
+    ("stepCountNext4HourLag1", ("FourSC_lag1",)),
+    ("pageViewNext4HourLag1", ("hourly_pageview_count_lag1",)),
+    ("prior2HourStepCountEma7d", ("EMA_Prior2HourStepCount_norm", "EMA_Prior2HourStepCount")),
+    ("prior2HourStepCountLag1", ("prior2HourStepCountLag1",)),
+    ("prior2HourStepCount", ("prior2HourStepCount_norm", "prior2HourStepCount")),
+    ("yesterdayStepCount", ("YesterdayStepCount_norm", "YesterdayStepCount")),
+    ("stepCountLast7DaysEma", ("EMA_StepCount_norm", "EMA_StepCount")),
+    ("pageViewLast7DaysEma", ("Past7DaysPageviewEMA_norm", "Past7DaysPageviewEMA")),
+    ("morningFitbitWearLast7DaysAlt", ("morningFitbitWearLast7Days", )),
+    ("morningFitbitWearLast7Days", ("morningFitbitWearLast7Days",)),
+    ("dailySurveyComplete", ("dailySurveyComplete",)),
+    ("activityCompletedLast7Days", ("Previous7DaysRPA", "activityCompletedLast7Days")),
+    ("activeDaysLast7Days", ("active_status_fraction_7days", "activeDaysLast7Days")),
+    ("activitySuggestionsSentLast7Days", (
+        "recent_burden_norm",
+        "recentBurdenEma_norm",
+        "recentBurdenEma",
+        "activitySuggestionsSentLast7Days",
+    )),
+    ("activitySuggestionInteractLast7Days", ("activitySuggestionInteractLast7Days",)),
+    ("dailyAnticipatedAffectYesterday", ("dailyAnticipatedAffectYesterday_norm", "dailyAnticipatedAffectYesterday")),
+    ("dailyAnticipatedAffect", ("dailyAnticipatedAffect_norm", "dailyAnticipatedAffect")),
+    ("caeAverageLastWeek", ("caeAverageLastWeek_norm", "caeAverageLastWeek")),
+    ("morningFitbitWearYesterday", ("morning_wearing",)),
+    ("dailySurveyCompleteYesterday", ("dailySurveyComplete_yesterday",)),
+    ("salienceMessageSentYesterday", ("yesterday_SalienceMessage",)),
+    ("recordedPhysicalActivityToday", ("RecordedPhysicalActivity",)),
+    ("recordedPhysicalActivityLag1", ("recordedPhysicalActivityLag1",)),
+    ("activityStatusToday", ("active_status",)),
 )
 
 
@@ -783,8 +874,8 @@ def _state_updates_from_df_fit_row(row):
     out = {}
     for skey, csv_keys in _STATE_FROM_DF_FIT_ROW:
         out[skey] = _float_csv_cell(row, *csv_keys, default=0.0)
-    if "past7days_morning_wearing" not in out or out.get("past7days_morning_wearing", 0) == 0:
-        out["past7days_morning_wearing"] = out.get("past7days_daywearing", 0.0)
+    if "morningFitbitWearLast7Days" not in out or out.get("morningFitbitWearLast7Days", 0) == 0:
+        out["morningFitbitWearLast7Days"] = out.get("morningFitbitWearLast7DaysAlt", 0.0)
     yh = _float_csv_cell(
         row,
         "yesterday_hourly_pageview_count_norm",
@@ -792,15 +883,15 @@ def _state_updates_from_df_fit_row(row):
         default=float("nan"),
     )
     if math.isfinite(yh):
-        out["yesterday_pageview_morning"] = yh
-        out["yesterday_pageview_afternoon"] = yh
+        out["pageViewMorningYesterday"] = yh
+        out["pageViewAfternoonYesterday"] = yh
     else:
-        hm = _float_csv_cell(row, "yesterday_pageview_morning", default=float("nan"))
-        ha = _float_csv_cell(row, "yesterday_pageview_afternoon", default=float("nan"))
+        hm = _float_csv_cell(row, "pageViewMorningYesterday", default=float("nan"))
+        ha = _float_csv_cell(row, "pageViewAfternoonYesterday", default=float("nan"))
         if math.isfinite(hm):
-            out["yesterday_pageview_morning"] = hm
+            out["pageViewMorningYesterday"] = hm
         if math.isfinite(ha):
-            out["yesterday_pageview_afternoon"] = ha
+            out["pageViewAfternoonYesterday"] = ha
     return out
 
 
@@ -817,43 +908,50 @@ def _resolve_df_fit_11week_path(explicit_path=None):
 
 def make_initial_state(df_fit_11week_csv=None, participant_id=None):
     s = {
-        "fourSC_lag1": 0.0,
-        "hourly_pageview_lag1": 0.0,
-        "prior2hour_step": 0.0,
-        "prior2hour_step_count_lag1": 0.0,
-        "yesterday_step": 0.0,
-        "today_step": 0.0,
-        "yesterday_fitbitwearing_morning": 0.0,
-        "yesterday_present": 0.0,
-        "yesterday_pageview_morning": 0.0,
-        "yesterday_pageview_afternoon": 0.0,
-        "today_pageview_morning": 0.0,
-        "today_pageview_afternoon": 0.0,
-        "seven_day_step_count_avg": 0.0,
-        "seven_day_pageview": 0.0,
-        "past7days_daywearing": 0.0,
-        "past7days_morning_wearing": 0.0,
-        "fitbitwearing_morning": 0.0,
-        "daily_present": 0.0,
-        "CAE_avg_lastweek": 0.0,
-        "perceived_utility_lastweek": 2.0,
-        "anticipated_affect": 0.0,
-        "anticipated_affect_yesterday": 0.0,
-        "Previous7DaysRPA": 0.0,
-        "recent_burden": 0.0,
-        "recorded_physical_activity": 0.0,
-        "recorded_physical_activity_lag1": 0.0,
-        "salience_message": 0.0,
-        "yesterday_salience_message": 0.0,
-        "Interacted_7d_walk": 0.0,
-        "Interacted_7d_salience": 0.0,
-        "is_weekend": 0.0,
-        "dow": 0.0,
-        "dow_lag1": 0.0,
-        "decision_time": 0.0,
+        "stepCountNext4HourLag1": 0.0,
+        "pageViewNext4HourLag1": 0.0,
+        "prior2HourStepCount": 0.0,
+        "prior2HourStepCountEma7d": 0.0,
+        "prior2HourStepCountLag1": 0.0,
+        "yesterdayStepCount": 0.0,
+        "todayStepCount": 0.0,
+        "morningFitbitWearYesterday": 0.0,
+        "dailySurveyCompleteYesterday": 0.0,
+        "pageViewMorningYesterday": 0.0,
+        "pageViewAfternoonYesterday": 0.0,
+        "pageViewMorningToday": 0.0,
+        "pageViewAfternoonToday": 0.0,
+        "stepCountLast7DaysEma": 0.0,
+        "pageViewLast7DaysEma": 0.0,
+        "morningFitbitWearLast7DaysAlt": 0.0,
+        "morningFitbitWearLast7Days": 0.0,
+        "morningFitbitWear": 0.0,
+        "dailySurveyComplete": 0.0,
+        "caeAverageLastWeek": 0.0,
+        "perceivedUtilityLastWeek": 2.0,
+        "dailyAnticipatedAffect": 0.0,
+        "dailyAnticipatedAffectYesterday": 0.0,
+        "activityCompletedLast7Days": 0.0,
+        "activeDaysLast7Days": 0.0,
+        "activitySuggestionsSentLast7Days": 0.0,
+        "recordedPhysicalActivityToday": 0.0,
+        "activityStatusToday": 0.0,
+        "recordedPhysicalActivityLag1": 0.0,
+        "salienceMessageSentToday": 0.0,
+        "salienceMessageSentYesterday": 0.0,
+        "activitySuggestionInteractLast7Days": 0.0,
+        "expTool1": float("nan"),
+        "expTool2": float("nan"),
+        "isWeekend": 0.0,
+        "dayOfWeekNorm": 0.0,
+        "dayOfWeekNormLag1": 0.0,
+        "decisionTimeSlot": 0.0,
     }
-    row = _read_first_csv_row_for_participant(
-        _resolve_df_fit_11week_path(df_fit_11week_csv), participant_id
-    )
+    df_path = _resolve_df_fit_11week_path(df_fit_11week_csv)
+    row = _read_first_csv_row_for_participant(df_path, participant_id)
     s.update(_state_updates_from_df_fit_row(row))
+    last_row = _read_last_csv_row_for_participant(df_path, participant_id)
+    if last_row is not None:
+        s["expTool1"] = _float_csv_cell(last_row, "Exp-tool-1", default=float("nan"))
+        s["expTool2"] = _float_csv_cell(last_row, "Exp-tool-2", default=float("nan"))
     return s

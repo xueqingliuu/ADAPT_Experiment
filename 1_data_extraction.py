@@ -1,33 +1,56 @@
 # %% [markdown]
-# # Extract variables from ADAPTS MRT dataset
+# # ADAPTS MRT — data extraction
+#
+# Notebook-style script (`# %%` cells). Outputs CSVs under `DATA_FOLDER`.
+#
+# ## Pipeline
+# 1. Setup — imports, paths, timezone lookup
+# 2. Cohort — testers removed; ≥83-day active span; manual exclusions
+# 3. Surveys — weekly (12) and daily (85) filled panels
+# 4. Schedule — wakeup/bedtime (+ push-timing imputation)
+# 5. Engagement — page views
+# 6. Interventions — walking suggestions, salience, planning prompts
+# 7. Wearables — HR/steps, wear flags, step features
+# 8. Fitbit activity log — recorded physical activity
+
+# %% [markdown]
+# ## 0. Setup
 
 # %%
-# 0. import libraries
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import os
-import matplotlib.pyplot as plt
-plt.ion()
-from matplotlib.ticker import MaxNLocator
-import matplotlib.dates as mdates
 import datetime
 import json
-from pathlib import Path
+import os
 import re
+from itertools import zip_longest
+from pathlib import Path
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from matplotlib.ticker import MaxNLocator
+
+plt.ion()
+
+DATA_FOLDER = Path(
+    "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined"
+)
+folder = DATA_FOLDER
+
+MIN_ACTIVE_SPAN_DAYS = 83
+EXCLUDED_PARTICIPANT_IDS = ("112", "117", "219")
+EXTRA_TESTER_IDS = ("test-Yuxuan",)
 
 # %%
-# read ProjectDeviceData_selected_fields_combined.csv
-folder = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined")
+# Device metadata (timezone lookup source)
 
 project_device_data = pd.read_csv(folder / "ProjectDeviceData_selected_fields_combined.csv")
 
-# %%
+# %% [markdown]
+# ## 1a. Timezone lookup (UTC → participant local)
 
-# -----------------------------
-# 1) Build participant-date -> timezone lookup
-# -----------------------------
+# %%
 # project_device_data should already contain:
 # ParticipantIdentifier (or participantidentifier), date, timeZone, utcOffset
 
@@ -122,8 +145,10 @@ def convert_utc_columns_to_user_local(
     return out
 
 
+# %% [markdown]
+# ## 1b. Participant cohort
+
 # %%
-# remove testers from all data
 testers = pd.read_csv(
     folder / "Testers.csv"
 )
@@ -131,7 +156,7 @@ testers = pd.read_csv(
 testers_id = testers.ParticipantIdentifier.values
 
 # add 'test-Yuxuan' to the testers_id
-testers_id = np.concatenate([testers_id, ['test-Yuxuan']])
+testers_id = np.concatenate([testers_id, list(EXTRA_TESTER_IDS)])
 
 all_participant_ids = project_device_data.participantidentifier.unique()
 
@@ -143,8 +168,10 @@ print(real_participant_ids)
 
 
 
-# %%
+# %% [markdown]
+# ## 2. Survey tasks & results
 
+# %%
 # survey task and survey question are linked by surveykey (surveytask.surveykey = surveyquestion.surveykey)
 # but this does not distinguish between different days and different participants and different questions
 # participantidentifier
@@ -197,10 +224,10 @@ surveytask = surveytask[~surveytask.ParticipantIdentifier.isin(testers_id)]
 surveyquestionresults = surveyquestionresults[~surveyquestionresults.ParticipantIdentifier.isin(testers_id)]
 
 print(surveyquestionresults.head())
-# check whether the record of step count start date is the same as the baseline survey date
+# %% [markdown]
+# ## 1c. Active-phase span (daily EOD survey tasks)
 
 # %%
-# check whether the record of step count start date is the same as the baseline survey date
 surveytask['date'] = pd.to_datetime(surveytask['InsertedDate']).dt.date
 # survey_task_active = surveytask[surveytask.surveyname == 'MRT - Salience - Message Display']
 survey_task_active = surveytask[surveytask.SurveyName == 'MRT - Daily End of day survey and Planning Exercise']
@@ -226,13 +253,15 @@ summary_surveytask.rename(columns={'ParticipantIdentifier': 'ParticipantIdentifi
 print(summary_surveytask)
 
 # filter out participants who have span_days longer than 84 days
-complete_participant_ids = summary_surveytask[summary_surveytask['span_days'] >= 83]['ParticipantIdentifier'].unique()
+complete_participant_ids = summary_surveytask[
+    summary_surveytask['span_days'] >= MIN_ACTIVE_SPAN_DAYS
+]['ParticipantIdentifier'].unique()
 print(complete_participant_ids, len(complete_participant_ids))
 
 # remove participants with clearly problematic wearable quality
 # remove 117 because the step count/heart rate data is not correct
 # remove 219 because the step count/heart rate data is very sparse
-complete_participant_ids = np.setdiff1d(complete_participant_ids, ['112', '117', '219'])
+complete_participant_ids = np.setdiff1d(complete_participant_ids, list(EXCLUDED_PARTICIPANT_IDS))
 print(complete_participant_ids, len(complete_participant_ids))
 
 # filter out incomplete participants from surveytask and surveyquestionresults
@@ -263,6 +292,9 @@ surveyquestionresults = surveyquestionresults.sort_values(by=['ParticipantIdenti
 # 
 # 
 # - time zone issue: since it's daily 6pm, even though due to the use of UTC, it will be around 10pm. This will not flow to the next day, so it's fine for now!!!!!!!!
+
+# %% [markdown]
+# ### 3a. Flatten nested SurveyResults JSON
 
 # %%
 
@@ -346,7 +378,7 @@ tmp = (
 )
 
 # Keep parsed datetime for ordering/debug (UTC-normalized)
-tmp["datetime"] = pd.to_datetime(tmp["QuestionEndDate"], errors="coerce", utc=True)
+tmp["datetime"] = pd.to_datetime(tmp["QuestionStartDate"], errors="coerce", utc=True)
 
 print(tmp["datetime"].dtype)
 
@@ -355,7 +387,7 @@ tmp["value"] = pd.to_numeric(tmp["AnswerFirst"], errors="coerce")
 
 # Local date from original offset timestamp string (YYYY-MM-DD part)
 tmp["date"] = pd.to_datetime(
-    tmp["QuestionEndDate"].astype(str).str.slice(0, 10),
+    tmp["QuestionStartDate"].astype(str).str.slice(0, 10),
     errors="coerce"
 ).dt.date
 
@@ -532,7 +564,7 @@ df_weekly_filled.to_csv(folder / "df_weekly_filled.csv", index=False)
 # - ignore winter time or other time zones in addition to eastern time.
 
 # %%
-questions = ["AffectiveReflection", "AnticipatedAffect"]
+questions = ["AffectiveReflection", "AnticipatedAffect", "ActivityCheck"]    
 
 tmp = (
     survey_results_flat
@@ -541,10 +573,19 @@ tmp = (
 )
 
 # Same pattern as weekly block
-tmp["datetime"] = pd.to_datetime(tmp["QuestionEndDate"], errors="coerce", utc=True)
+tmp["datetime"] = pd.to_datetime(tmp["QuestionStartDate"], errors="coerce", utc=True)
 tmp["value"] = pd.to_numeric(tmp["AnswerFirst"], errors="coerce")
+# ActivityCheck: "wasActive" -> 1, any other response -> 0
+activity_mask = tmp["ResultIdentifier"] == "ActivityCheck"
+tmp.loc[activity_mask, "value"] = (
+    tmp.loc[activity_mask, "AnswerFirst"]
+    .astype(str)
+    .str.strip()
+    .eq("wasActive")
+    .astype(float)
+)
 tmp["date"] = pd.to_datetime(
-    tmp["QuestionEndDate"].astype(str).str.slice(0, 10),
+    tmp["QuestionStartDate"].astype(str).str.slice(0, 10),
     errors="coerce"
 ).dt.date
 
@@ -563,10 +604,11 @@ df_daily_survey = (
 rename_map = {
     "AffectiveReflection": "affective_reflection",
     "AnticipatedAffect": "anticipated_affect",
+    "ActivityCheck": "active_status",
 }
 df_daily_survey = df_daily_survey.rename(columns=rename_map)
 
-desired_cols = ["ParticipantIdentifier", "date", "affective_reflection", "anticipated_affect"]
+desired_cols = ["ParticipantIdentifier", "date", "affective_reflection", "anticipated_affect", "active_status"]
 for c in desired_cols:
     if c not in df_daily_survey.columns:
         df_daily_survey[c] = np.nan
@@ -665,6 +707,63 @@ def fill_daily_85(df1, id_col="ParticipantIdentifier", date_col="date", days=85)
 df_daily_filled = fill_daily_85(df_daily_survey)
 # , survey_task_eod)
 
+
+def _mean_prior_rows(series, window=7, min_periods=1):
+    """Mean over prior `window` calendar rows; excludes the current row."""
+    return series.shift(1).rolling(window=window, min_periods=min_periods).mean()
+
+
+def _ewm_prior_rows(series, gamma=6/7, window=7, min_periods=1):
+    """
+    Exponentially weighted average over at most the prior `window` rows only.
+    Excludes the current row.
+
+    Computes:
+        sum_{j=1}^k gamma^{j-1} x_{t-j}
+        ---------------------------------
+        sum_{j=1}^k gamma^{j-1}
+
+    where j=1 is the most recent prior row.
+    """
+    alpha = 1 - gamma
+
+    def _ewm_last(window_values):
+        w = pd.Series(window_values, dtype=float).dropna()
+        if w.empty:
+            return np.nan
+
+        return w.ewm(alpha=alpha, adjust=True).mean().iloc[-1]
+
+    return (
+        series.shift(1)
+        .rolling(window=window, min_periods=min_periods)
+        .apply(_ewm_last, raw=True)
+    )
+
+
+# Fraction wasActive among prior ≤7 days with ActivityCheck answered (excludes today)
+def _active_frac_last7_answered(g):
+    g = g.sort_values("date")
+    hist = []
+    out = np.full(len(g), np.nan)
+    for i, status in enumerate(g["active_status"]):
+        if hist:
+            out[i] = np.mean(hist[-7:])
+        if pd.notna(status):
+            hist.append(float(status))
+    return pd.Series(out, index=g.index)
+
+
+df_daily_filled = df_daily_filled.sort_values(
+    ["ParticipantIdentifier", "date"], kind="mergesort"
+)
+df_daily_filled["active_status_fraction_7days"] = (
+    df_daily_filled.groupby("ParticipantIdentifier", sort=False)
+    .apply(_active_frac_last7_answered)
+    .reset_index(level=0, drop=True)
+)
+
+
 # add day numbers as well:
 df_daily_filled["day"] = (
     df_daily_filled.groupby("ParticipantIdentifier").cumcount() + 1
@@ -688,7 +787,7 @@ df_daily_filled.to_csv(folder / "df_daily_filled.csv", index=False)
 
 
 # %% [markdown]
-# ## Extract wakeup and bedtime for each participant
+# ## 4. Wakeup and bedtime schedule
 # - this is useful for filling in the walking suggestions delivery time!
 
 # %%
@@ -697,9 +796,6 @@ df_daily_filled.to_csv(folder / "df_daily_filled.csv", index=False)
 
 # get wakeup and bedtime for each user
 # key fields: resultidentifier: Wakeday Wakeup, Wakeday Bedtime, Weekend Wakeup, Weekend Bedtime
-from typing import Any
-
-
 weekday_wakeup_all = []
 weekday_bedtime_all = []
 weekend_wakeup_all = []
@@ -718,7 +814,7 @@ for participant_id in complete_participant_ids:
     weekday_wakeup_all.append(wake_weekday.dt.time.to_list())
 
     question_enddate = pd.to_datetime(
-        subset.loc[subset["ResultIdentifier"] == "Weekday Wakeup", "QuestionEndDate"],
+        subset.loc[subset["ResultIdentifier"] == "Weekday Wakeup", "QuestionStartDate"],
         errors="coerce",
         utc=True
     )
@@ -746,8 +842,6 @@ for participant_id in complete_participant_ids:
     )
     weekend_bedtime_all.append(bed_weekend.dt.time.to_list())       
 
-from itertools import zip_longest
-
 rows = []
 for pid, time1s, time2s, time3s, time4s, dates in zip(
     complete_participant_ids,
@@ -766,7 +860,7 @@ for pid, time1s, time2s, time3s, time4s, dates in zip(
             "WeekdayBedtime": time2,
             "WeekendWakeup": time3,
             "WeekendBedtime": time4,
-            "QuestionEndDate": date,
+            "QuestionStartDate": date,
         })
 
 df_wakeup_bedtime = pd.DataFrame(rows)
@@ -928,7 +1022,7 @@ for pid in participant_without_wakeup_bedtime:
     )
     row = {
         "ParticipantIdentifier": pid,
-        "QuestionEndDate": pd.NaT,
+        "QuestionStartDate": pd.NaT,
         "WeekdayWakeup": weekday_wakeup if not pd.isna(weekday_wakeup) else cohort_fallback["WeekdayWakeup"],
         "WeekendWakeup": weekend_wakeup if not pd.isna(weekend_wakeup) else cohort_fallback["WeekendWakeup"],
         "WeekdayBedtime": weekday_bedtime if not pd.isna(weekday_bedtime) else cohort_fallback["WeekdayBedtime"],
@@ -945,7 +1039,7 @@ for pid in participant_without_wakeup_bedtime:
     existing_mask = df_wakeup_bedtime["ParticipantIdentifier"].astype(str) == pid
     if existing_mask.any():
         idx = df_wakeup_bedtime.index[existing_mask][0]
-        for col in ["QuestionEndDate"] + required_cols:
+        for col in ["QuestionStartDate"] + required_cols:
             df_wakeup_bedtime.loc[idx, col] = row[col]
     else:
         df_wakeup_bedtime = pd.concat(
@@ -966,8 +1060,49 @@ print("Still missing after recovery:", still_missing)
 print(df_wakeup_bedtime)
 
 
+def resolve_schedule_for_date(df_wb_participant, date):
+    """Weekday/weekend wake and bed times effective on `date` → (wakeup_time, bedtime_time)."""
+    wb = df_wb_participant
+    if wb.shape[0] == 1:
+        weekday_wakeup = wb["WeekdayWakeup"].iloc[0]
+        weekend_wakeup = wb["WeekendWakeup"].iloc[0]
+        weekday_bedtime = wb["WeekdayBedtime"].iloc[0]
+        weekend_bedtime = wb["WeekendBedtime"].iloc[0]
+    else:
+        weekday_wakeup = wb["WeekdayWakeup"].iloc[0]
+        weekend_wakeup = wb["WeekendWakeup"].iloc[0]
+        weekday_bedtime = wb["WeekdayBedtime"].iloc[0]
+        weekend_bedtime = wb["WeekendBedtime"].iloc[0]
+        for j in range(len(wb)):
+            change_date = wb["QuestionStartDate"].iloc[j]
+            if j < len(wb) - 1:
+                next_change_date = wb["QuestionStartDate"].iloc[j + 1]
+                if change_date <= date < next_change_date:
+                    weekday_wakeup = wb["WeekdayWakeup"].iloc[j]
+                    weekend_wakeup = wb["WeekendWakeup"].iloc[j]
+                    weekday_bedtime = wb["WeekdayBedtime"].iloc[j]
+                    weekend_bedtime = wb["WeekendBedtime"].iloc[j]
+                    break
+            elif change_date <= date:
+                weekday_wakeup = wb["WeekdayWakeup"].iloc[j]
+                weekend_wakeup = wb["WeekendWakeup"].iloc[j]
+                weekday_bedtime = wb["WeekdayBedtime"].iloc[j]
+                weekend_bedtime = wb["WeekendBedtime"].iloc[j]
+                break
+    is_weekday = pd.Timestamp(date).weekday() < 5
+    wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
+    bedtime_time = weekday_bedtime if is_weekday else weekend_bedtime
+    return wakeup_time, bedtime_time
+
+
+def resolve_wakeup_for_date(df_wb_participant, date):
+    """Wakeup time only (walking-suggestion default timing)."""
+    wakeup_time, _ = resolve_schedule_for_date(df_wb_participant, date)
+    return wakeup_time
+
+
 # %% [markdown]
-# ## Extract daily engagement(number of view viewed) data
+# ## 5. Daily engagement (page views)
 # 
 # - for engagement, we may have yesterday's engagement data for day 1
 # - this is different from survey variables...
@@ -1015,43 +1150,7 @@ for participant_id in complete_participant_ids:
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
         # print(date)
-        if df_wakeup_bedtime_participant.shape[0] == 1:
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-        else:
-            change_date = df_wakeup_bedtime_participant['QuestionEndDate']
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-            
-            for j in range(len(df_wakeup_bedtime_participant)):
-                change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j]
-                
-                # Check if this is the applicable period
-                if j < len(df_wakeup_bedtime_participant) - 1:
-                    next_change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j + 1]
-                    if change_date <= date < next_change_date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-                else:
-                    # Last entry - applies from change_date onwards
-                    if change_date <= date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-        
-        # Determine wakeup time based on weekday/weekend
-        is_weekday = date.weekday() < 5
-        wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
-        bedtime_time = weekday_bedtime if is_weekday else weekend_bedtime
+        wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
 
 
         # filter out the days with less than 8 hours of wearing fitbit (more than 8 hours of heart rate =0 or nan
@@ -1087,12 +1186,12 @@ df_daily_pageview['YesterdayPageviewCount'] = (
     .astype(int)
 )
 
-# get past 7 days pageview exponential moving average (per participant, chronological by Date)
+# EWM (gamma=6/7) over prior ≤7 calendar days of pageviews (excludes today)
 df_daily_pageview['Past7DaysPageviewEMA'] = (
     df_daily_pageview
     .sort_values(['ParticipantIdentifier', 'Date'], kind='mergesort')
     .groupby('ParticipantIdentifier', sort=False)['DailyPageviewCount']
-    .transform(lambda s: s.ewm(span=7, adjust=False).mean())
+    .transform(lambda s: _ewm_prior_rows(s, gamma=6/7))
 )
 
 # get tomorrow's pageview count
@@ -1131,43 +1230,7 @@ for participant_id in complete_participant_ids:
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
         
-        if df_wakeup_bedtime_participant.shape[0] == 1:
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-        else:
-            change_date = df_wakeup_bedtime_participant['QuestionEndDate']
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-            
-            for j in range(len(df_wakeup_bedtime_participant)):
-                change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j]
-                
-                # Check if this is the applicable period
-                if j < len(df_wakeup_bedtime_participant) - 1:
-                    next_change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j + 1]
-                    if change_date <= date < next_change_date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-                else:
-                    # Last entry - applies from change_date onwards
-                    if change_date <= date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-        
-        # Determine wakeup time based on weekday/weekend
-        is_weekday = date.weekday() < 5
-        wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
-        bedtime_time = weekday_bedtime if is_weekday else weekend_bedtime
+        wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
 
         # Get all heart rate data for this date
         pageview_participant_date = pageview_participant[pageview_participant.Timestamp.dt.date == date]
@@ -1213,12 +1276,12 @@ for participant_id in complete_participant_ids:
 df_hourly_pageview = pd.DataFrame(hourly_pageview_list)
 
 
-# past 7 days pageview exponential moving average (per participant, per decision time, chronological by Date)
+# EWM (gamma=6/7) over prior ≤7 same-slot pageviews (excludes current slot)
 df_hourly_pageview['Past7DaysHourlyPageviewEMA'] = (
     df_hourly_pageview
     .sort_values(['ParticipantIdentifier', 'Date', 'DecisionTime'], kind='mergesort')
     .groupby(['ParticipantIdentifier', 'DecisionTime'], sort=False)['HourlyPageviewCount']
-    .transform(lambda s: s.ewm(span=7, adjust=False).mean())
+    .transform(lambda s: _ewm_prior_rows(s, gamma=6/7))
 )
 
 # save the dataframe
@@ -1226,7 +1289,7 @@ df_hourly_pageview.to_csv(folder / 'hourly_pageview.csv', index=False)
 
 
 # %% [markdown]
-# ## Extract all actions data and click data at the same time
+# ## 6. Interventions (push notifications & survey display)
 # - twice daily walking suggestions map to hourly, twice-daily, daily, and weekly
 # - daily planning prompts map to hourly, twice-daily, daily, and weekly
 # - daily salience message map to hourly, twice-daily, daily, and weekly
@@ -1423,8 +1486,8 @@ tmp = (
 )
 
 
-tmp["datetime"] = pd.to_datetime(tmp["QuestionEndDate"], errors="coerce", utc=True)
-s = tmp["QuestionEndDate"].astype(str).str.replace(
+tmp["datetime"] = pd.to_datetime(tmp["QuestionStartDate"], errors="coerce", utc=True)
+s = tmp["QuestionStartDate"].astype(str).str.replace(
     r"([+-]\d{2}:\d{2}|Z)$", "", regex=True
 )
 tmp["datetime_local"] = pd.to_datetime(s, errors="coerce")
@@ -1469,34 +1532,7 @@ for n in range(len(complete_participant_ids)):
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
         # print(date)
-        if df_wakeup_bedtime_participant.shape[0] == 1:
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-        else:
-            change_date = df_wakeup_bedtime_participant['QuestionEndDate']
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            
-            for j in range(len(df_wakeup_bedtime_participant)):
-                change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j]
-                
-                # Check if this is the applicable period
-                if j < len(df_wakeup_bedtime_participant) - 1:
-                    next_change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j + 1]
-                    if change_date <= date < next_change_date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        break
-                else:
-                    # Last entry - applies from change_date onwards
-                    if change_date <= date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        break
-        
-        # Determine wakeup time based on weekday/weekend
-        is_weekday = date.weekday() < 5
-        wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
+        wakeup_time = resolve_wakeup_for_date(df_wakeup_bedtime_participant, date)
 
         wake_td = pd.Timedelta(hours=wakeup_time.hour, minutes=wakeup_time.minute, seconds=wakeup_time.second)
         m_time = wake_td + pd.Timedelta(minutes=60)   # Morning: 1 hour after wake
@@ -1661,8 +1697,30 @@ for n in range(len(complete_participant_ids)):
 
 df_gif_all = pd.DataFrame(df_gif_all)
 
-# add a column for the fraction of interacted=1 for the past 7 days
-df_gif_all['Interacted_7d'] = df_gif_all.groupby('ParticipantIdentifier')['Interacted'].transform(lambda x: x.rolling(window=14, min_periods=14).mean())
+# Fraction interacted over prior 14 walking-suggestion slots (~7 days × 2); excludes current slot
+df_gif_all = df_gif_all.sort_values(['ParticipantIdentifier', 'Date', 'DecisionTime'], kind='mergesort')
+df_gif_all['Interacted_7d'] = (
+    df_gif_all.groupby('ParticipantIdentifier', sort=False)['Interacted']
+    .transform(lambda s: _mean_prior_rows(s, window=14, min_periods=7))
+)
+
+# recent_burden: X_d = daily walking-suggestion count (sum over AM/PM slots), then
+#   _ewm_prior_rows on the daily series (gamma=6/7, window=7):
+#   (X_{d-1} + r X_{d-2} + ... + r^6 X_{d-7}) / (1 + r + ... + r^6),  r = 6/7
+_daily_panel = (
+    df_gif_all.groupby(['ParticipantIdentifier', 'Date'], sort=False)['WalkingSuggestion']
+    .sum()
+    .reset_index(name='_daily_suggestions')
+)
+_daily_panel['recent_burden'] = (
+    _daily_panel.groupby('ParticipantIdentifier', sort=False)['_daily_suggestions']
+    .transform(lambda s: _ewm_prior_rows(s, gamma=6 / 7, window=7, min_periods=1))
+)
+df_gif_all = df_gif_all.merge(
+    _daily_panel[['ParticipantIdentifier', 'Date', 'recent_burden']],
+    on=['ParticipantIdentifier', 'Date'],
+    how='left',
+)
 
 print(df_gif_all)
 print(df_gif_all.Interacted.value_counts())
@@ -1682,8 +1740,8 @@ tmp = (
 )
 
 
-tmp["datetime"] = pd.to_datetime(tmp["QuestionEndDate"], errors="coerce", utc=True)
-s = tmp["QuestionEndDate"].astype(str).str.replace(
+tmp["datetime"] = pd.to_datetime(tmp["QuestionStartDate"], errors="coerce", utc=True)
+s = tmp["QuestionStartDate"].astype(str).str.replace(
     r"([+-]\d{2}:\d{2}|Z)$", "", regex=True
 )
 tmp["datetime_local"] = pd.to_datetime(s, errors="coerce")
@@ -1757,8 +1815,12 @@ df_salience_all = pd.DataFrame(df_salience_all)
 print(df_salience_all)
 print(df_salience_all.Interacted.value_counts())
 
-# add a column for the fraction of interacted=1 for the  7 days
-df_salience_all['Interacted_7d'] = df_salience_all.groupby('ParticipantIdentifier')['Interacted'].transform(lambda x: x.rolling(window=7, min_periods=7).mean())
+# Fraction interacted over prior 7 calendar days; excludes today
+df_salience_all = df_salience_all.sort_values(['ParticipantIdentifier', 'Date'], kind='mergesort')
+df_salience_all['Interacted_7d'] = (
+    df_salience_all.groupby('ParticipantIdentifier', sort=False)['Interacted']
+    .transform(lambda s: _mean_prior_rows(s, window=7, min_periods=7))
+)
 
 # print(df_salience_all.head(85))
 # print(df_salience_all.open.value_counts())
@@ -1768,7 +1830,7 @@ df_salience_all.to_csv(os.path.join(folder, 'df_salience_all.csv'), index=False)
 
 
 # %% [markdown]
-# ## Check missing data in step counts (not wearing fitbit for greater than 8 hours)
+# ## 7. Wearables — heart rate, steps, wear flags
 # - case 1- missing hours: user receive walking suggestions at 9am, but only started wearing fitbit until 10 am 
 #   treatment: 
 # - case 2- missing days: user didn't wear fitbit for most hours between the wakeup and bedtime
@@ -1916,43 +1978,7 @@ for participant_id in complete_participant_ids:
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
         # print(date)
-        if df_wakeup_bedtime_participant.shape[0] == 1:
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-        else:
-            change_date = df_wakeup_bedtime_participant['QuestionEndDate']
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-            
-            for j in range(len(df_wakeup_bedtime_participant)):
-                change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j]
-                
-                # Check if this is the applicable period
-                if j < len(df_wakeup_bedtime_participant) - 1:
-                    next_change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j + 1]
-                    if change_date <= date < next_change_date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-                else:
-                    # Last entry - applies from change_date onwards
-                    if change_date <= date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-        
-        # Determine wakeup time based on weekday/weekend
-        is_weekday = date.weekday() < 5
-        wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
-        bedtime_time = weekday_bedtime if is_weekday else weekend_bedtime
+        wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
 
 
         # filter out the days with less than 8 hours of wearing fitbit (more than 8 hours of heart rate =0 or nan
@@ -2001,12 +2027,12 @@ for participant_id in complete_participant_ids:
 
 df_missing_days = pd.DataFrame(missing_days_list)
 
-# Proportion of days with sufficient wear in the last ≤7 days (binary mean), per participant.
+# Proportion of prior ≤7 calendar days with sufficient wear (excludes today)
 df_missing_days['past7days_daywearing'] = (
     df_missing_days
     .sort_values(['ParticipantIdentifier', 'Date'], kind='mergesort')
     .groupby('ParticipantIdentifier', sort=False)['DayWearing']
-    .transform(lambda s: s.rolling(window=7, min_periods=1).mean())
+    .transform(lambda s: _mean_prior_rows(s, window=7, min_periods=1))
 )
 
 # add a column of next day wearing
@@ -2041,43 +2067,7 @@ for participant_id in complete_participant_ids:
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
         
-        if df_wakeup_bedtime_participant.shape[0] == 1:
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-        else:
-            change_date = df_wakeup_bedtime_participant['QuestionEndDate']
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-            
-            for j in range(len(df_wakeup_bedtime_participant)):
-                change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j]
-                
-                # Check if this is the applicable period
-                if j < len(df_wakeup_bedtime_participant) - 1:
-                    next_change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j + 1]
-                    if change_date <= date < next_change_date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-                else:
-                    # Last entry - applies from change_date onwards
-                    if change_date <= date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-        
-        # Determine wakeup time based on weekday/weekend
-        is_weekday = date.weekday() < 5
-        wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
-        bedtime_time = weekday_bedtime if is_weekday else weekend_bedtime
+        wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
 
         # Get all heart rate data for this date
         heartratebymin_participant_date = heartratebymin_participant[heartratebymin_participant.Date == date]
@@ -2187,43 +2177,7 @@ for participant_id in complete_participant_ids:
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
         
-        if df_wakeup_bedtime_participant.shape[0] == 1:
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-        else:
-            change_date = df_wakeup_bedtime_participant['QuestionEndDate']
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-            
-            for j in range(len(df_wakeup_bedtime_participant)):
-                change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j]
-                
-                # Check if this is the applicable period
-                if j < len(df_wakeup_bedtime_participant) - 1:
-                    next_change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j + 1]
-                    if change_date <= date < next_change_date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-                else:
-                    # Last entry - applies from change_date onwards
-                    if change_date <= date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-        
-        # Determine wakeup time based on weekday/weekend
-        is_weekday = date.weekday() < 5
-        wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
-        bedtime_time = weekday_bedtime if is_weekday else weekend_bedtime
+        wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
 
         # Get all heart rate data for this date
         heartratebymin_participant_date = heartratebymin_participant[heartratebymin_participant.Date == date]
@@ -2322,48 +2276,10 @@ def _to_time(x):
 def _get_wakeup_bedtime(df_wb_participant, date):
     if df_wb_participant.empty:
         return None, None
-
-    wb = df_wb_participant.copy()
-    wb['QuestionEndDate'] = pd.to_datetime(wb['QuestionEndDate'], errors='coerce').dt.normalize()
-
-    for col in ['WeekdayWakeup', 'WeekendWakeup', 'WeekdayBedtime', 'WeekendBedtime']:
-        wb[col] = wb[col].apply(_to_time)
-
-    wb = wb.sort_values('QuestionEndDate', na_position='last').reset_index(drop=True)
-
-    # Start from first available schedule values
-    weekday_wakeup = wb['WeekdayWakeup'].dropna().iloc[0] if wb['WeekdayWakeup'].notna().any() else None
-    weekend_wakeup = wb['WeekendWakeup'].dropna().iloc[0] if wb['WeekendWakeup'].notna().any() else None
-    weekday_bedtime = wb['WeekdayBedtime'].dropna().iloc[0] if wb['WeekdayBedtime'].notna().any() else None
-    weekend_bedtime = wb['WeekendBedtime'].dropna().iloc[0] if wb['WeekendBedtime'].notna().any() else None
-
-    if any(t is None for t in [weekday_wakeup, weekend_wakeup, weekday_bedtime, weekend_bedtime]):
+    try:
+        return resolve_schedule_for_date(df_wb_participant, date)
+    except Exception:
         return None, None
-
-    wb_dated = wb.dropna(subset=['QuestionEndDate']).reset_index(drop=True)
-
-    for j in range(len(wb_dated)):
-        change_date = wb_dated['QuestionEndDate'].iloc[j]
-        if j < len(wb_dated) - 1:
-            next_change_date = wb_dated['QuestionEndDate'].iloc[j + 1]
-            if change_date <= date < next_change_date:
-                weekday_wakeup = wb_dated['WeekdayWakeup'].iloc[j] or weekday_wakeup
-                weekend_wakeup = wb_dated['WeekendWakeup'].iloc[j] or weekend_wakeup
-                weekday_bedtime = wb_dated['WeekdayBedtime'].iloc[j] or weekday_bedtime
-                weekend_bedtime = wb_dated['WeekendBedtime'].iloc[j] or weekend_bedtime
-                break
-        else:
-            if change_date <= date:
-                weekday_wakeup = wb_dated['WeekdayWakeup'].iloc[j] or weekday_wakeup
-                weekend_wakeup = wb_dated['WeekendWakeup'].iloc[j] or weekend_wakeup
-                weekday_bedtime = wb_dated['WeekdayBedtime'].iloc[j] or weekday_bedtime
-                weekend_bedtime = wb_dated['WeekendBedtime'].iloc[j] or weekend_bedtime
-                break
-
-    is_weekday = date.weekday() < 5
-    wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
-    bedtime_time = weekday_bedtime if is_weekday else weekend_bedtime
-    return wakeup_time, bedtime_time
 
 
 def _valid_minutes(hr_df, step_df):
@@ -2491,12 +2407,12 @@ wear_day['nextday_wearing'] = (
     .shift(-1)
 )
 
-# Proportion of mornings with wear in the last ≤7 days (binary mean), per participant.
+# Proportion of prior ≤7 calendar mornings with wear (excludes today)
 wear_day['past7days_morning_wearing'] = (
     wear_day
     .sort_values(['ParticipantIdentifier', 'Date'], kind='mergesort')
     .groupby('ParticipantIdentifier', sort=False)['morning_wearing']
-    .transform(lambda s: s.rolling(window=7, min_periods=1).mean())
+    .transform(lambda s: _mean_prior_rows(s, window=7, min_periods=1))
 )
 
 # save the next morning wearing data
@@ -2520,43 +2436,7 @@ for participant_id in complete_participant_ids:
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
         
-        if df_wakeup_bedtime_participant.shape[0] == 1:
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-        else:
-            change_date = df_wakeup_bedtime_participant['QuestionEndDate']
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-            
-            for j in range(len(df_wakeup_bedtime_participant)):
-                change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j]
-                
-                # Check if this is the applicable period
-                if j < len(df_wakeup_bedtime_participant) - 1:
-                    next_change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j + 1]
-                    if change_date <= date < next_change_date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-                else:
-                    # Last entry - applies from change_date onwards
-                    if change_date <= date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-        
-        # Determine wakeup time based on weekday/weekend
-        is_weekday = date.weekday() < 5
-        wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
-        bedtime_time = weekday_bedtime if is_weekday else weekend_bedtime
+        wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
 
         # print(participant_id)
         # print(date, wakeup_time, bedtime_time)
@@ -2641,8 +2521,7 @@ for participant_id in complete_participant_ids:
 
 df_hourly_step_counts = pd.DataFrame(hourly_step_counts)
 
-# Exponential moving average (span=7) of StepCount at the *same* decision slot (morning vs afternoon), per person.
-# Chronological within each (ParticipantIdentifier, DecisionTime); does not mix participants or slots.
+# EWM (gamma=6/7) over prior ≤7 same-slot step counts (excludes current slot)
 df_hourly_step_counts = df_hourly_step_counts.sort_values(
     ["ParticipantIdentifier", "DecisionTime", "Date"],
     kind="mergesort",
@@ -2650,7 +2529,7 @@ df_hourly_step_counts = df_hourly_step_counts.sort_values(
 df_hourly_step_counts["EMA_StepCount"] = (
     df_hourly_step_counts.groupby(["ParticipantIdentifier", "DecisionTime"], sort=False)[
         "StepCount"
-    ].transform(lambda s: s.ewm(span=7, adjust=False).mean())
+    ].transform(lambda s: _ewm_prior_rows(s, gamma=6/7))
 )
 
 # print(df_hourly_step_counts[df_hourly_step_counts['participantidentifier'] == 22])
@@ -2684,43 +2563,7 @@ for participant_id in complete_participant_ids:
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
         
-        if df_wakeup_bedtime_participant.shape[0] == 1:
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-        else:
-            change_date = df_wakeup_bedtime_participant['QuestionEndDate']
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-            
-            for j in range(len(df_wakeup_bedtime_participant)):
-                change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j]
-                
-                # Check if this is the applicable period
-                if j < len(df_wakeup_bedtime_participant) - 1:
-                    next_change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j + 1]
-                    if change_date <= date < next_change_date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-                else:
-                    # Last entry - applies from change_date onwards
-                    if change_date <= date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-        
-        # Determine wakeup time based on weekday/weekend
-        is_weekday = date.weekday() < 5
-        wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
-        bedtime_time = weekday_bedtime if is_weekday else weekend_bedtime
+        wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
 
 
         # Get all heart rate data for this date
@@ -2804,43 +2647,7 @@ for participant_id in complete_participant_ids:
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
         
-        if df_wakeup_bedtime_participant.shape[0] == 1:
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-        else:
-            change_date = df_wakeup_bedtime_participant['QuestionEndDate']
-            weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[0]
-            weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[0]
-            weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[0]
-            weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[0]
-            
-            for j in range(len(df_wakeup_bedtime_participant)):
-                change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j]
-                
-                # Check if this is the applicable period
-                if j < len(df_wakeup_bedtime_participant) - 1:
-                    next_change_date = df_wakeup_bedtime_participant['QuestionEndDate'].iloc[j + 1]
-                    if change_date <= date < next_change_date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-                else:
-                    # Last entry - applies from change_date onwards
-                    if change_date <= date:
-                        weekday_wakeup = df_wakeup_bedtime_participant['WeekdayWakeup'].iloc[j]
-                        weekend_wakeup = df_wakeup_bedtime_participant['WeekendWakeup'].iloc[j]
-                        weekday_bedtime = df_wakeup_bedtime_participant['WeekdayBedtime'].iloc[j]
-                        weekend_bedtime = df_wakeup_bedtime_participant['WeekendBedtime'].iloc[j]
-                        break
-        
-        # Determine wakeup time based on weekday/weekend
-        is_weekday = date.weekday() < 5
-        wakeup_time = weekday_wakeup if is_weekday else weekend_wakeup
-        bedtime_time = weekday_bedtime if is_weekday else weekend_bedtime
+        wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
 
 
         # Get all heart rate data for this date
@@ -2908,6 +2715,16 @@ for participant_id in complete_participant_ids:
 
 df_prior_2hours_step_counts = pd.DataFrame(prior_2hours_step_counts)
 
+# EWM (gamma=6/7) over prior ≤7 same-slot prior-2h step counts (excludes current slot)
+df_prior_2hours_step_counts = df_prior_2hours_step_counts.sort_values(
+    ["ParticipantIdentifier", "DecisionTime", "Date"],
+    kind="mergesort",
+).reset_index(drop=True)
+df_prior_2hours_step_counts["EMA_Prior2HourStepCount"] = (
+    df_prior_2hours_step_counts.groupby(["ParticipantIdentifier", "DecisionTime"], sort=False)[
+        "StepCount"
+    ].transform(lambda s: _ewm_prior_rows(s, gamma=6 / 7))
+)
 
 # print(df_hourly_step_counts[df_hourly_step_counts['participantidentifier'] == 22])
 print((df_prior_2hours_step_counts[df_prior_2hours_step_counts['ParticipantIdentifier'] == 31]))
@@ -2926,8 +2743,10 @@ df_today_step_counts.to_csv(os.path.join(folder, 'today_step_counts.csv'), index
 df_hourly_step_counts.to_csv(os.path.join(folder, 'hourly_step_counts.csv'), index=False)
 df_prior_2hours_step_counts.to_csv(os.path.join(folder, 'prior_2hours_step_counts.csv'), index=False)
 
+# %% [markdown]
+# ## 8. Fitbit recorded physical activity
+
 # %%
-# Recorded physical activity data
 fitbit_log_data = pd.read_csv(folder / 'FitbitActivityLogs.csv')
 fitbit_log_data['Date'] = pd.to_datetime(fitbit_log_data['EndDate']).dt.date
 recorded_physical_activity = []
@@ -2958,11 +2777,14 @@ for participant_id in complete_participant_ids:
 
 df_recorded_physical_activity = pd.DataFrame(recorded_physical_activity)
 
-# Fraction of prior 7 calendar days with RPA logged (binary mean); excludes today's RPA (shift then roll).
+# Fraction of prior 7 calendar days with non-walk RPA logged (excludes today)
+df_recorded_physical_activity = df_recorded_physical_activity.sort_values(
+    ['ParticipantIdentifier', 'Date'], kind='mergesort'
+)
 df_recorded_physical_activity['Previous7DaysRPA'] = (
     df_recorded_physical_activity
     .groupby('ParticipantIdentifier', sort=False)['RecordedPhysicalActivity']
-    .transform(lambda x: x.shift(1).rolling(window=7).mean())
+    .transform(lambda s: _mean_prior_rows(s, window=7, min_periods=1))
 )
 
 print(df_recorded_physical_activity)
