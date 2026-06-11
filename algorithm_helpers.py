@@ -14,6 +14,52 @@ TERMINAL_D = N_RL_DAYS - 1
 TERMINAL_T = N_RL_SLOTS - 1
 
 
+def spd_inverse(A):
+    """Symmetric positive-definite inverse that is robust to ill-conditioning.
+
+    Posterior precision matrices of the form ``Gamma_0^{-1} + X^T X / sigma^2``
+    can become numerically singular when ``sigma^2`` is small (so the data term
+    dominates) and the cumulative design ``X`` is rank-deficient -- e.g. in
+    early weeks when the number of observation rows is below the parameter
+    dimension. A plain ``np.linalg.inv`` then raises ``LinAlgError: Singular
+    matrix`` and a slightly non-symmetric inverse triggers the
+    "covariance is not symmetric positive-semidefinite" warnings downstream.
+
+    This helper symmetrizes the input, inverts via Cholesky, and on failure
+    adds increasing diagonal jitter (scaled to the matrix magnitude) before
+    falling back to the pseudo-inverse. The returned matrix is always
+    symmetric.
+    """
+    A = np.asarray(A, dtype=float)
+    A = 0.5 * (A + A.T)
+    n = A.shape[0]
+    try:
+        L = np.linalg.cholesky(A)
+        Linv = np.linalg.inv(L)
+        out = Linv.T @ Linv
+        return 0.5 * (out + out.T)
+    except np.linalg.LinAlgError:
+        pass
+
+    diag = np.diagonal(A)
+    base = float(np.mean(np.abs(diag))) if diag.size else 1.0
+    if not np.isfinite(base) or base <= 0.0:
+        base = 1.0
+    jitter = base * 1e-10
+    I = np.eye(n)
+    for _ in range(10):
+        try:
+            L = np.linalg.cholesky(A + jitter * I)
+            Linv = np.linalg.inv(L)
+            out = Linv.T @ Linv
+            return 0.5 * (out + out.T)
+        except np.linalg.LinAlgError:
+            jitter *= 10.0
+
+    out = np.linalg.pinv(A)
+    return 0.5 * (out + out.T)
+
+
 def bayesian_posterior_update(nu_0, Gamma_0, X_cumul, y_cumul, sigma2):
     """
     Compute the Bayesian posterior for a normal linear regression model,
@@ -74,7 +120,7 @@ def bayesian_posterior_update(nu_0, Gamma_0, X_cumul, y_cumul, sigma2):
 
     Gamma_0_inv = np.linalg.inv(Gamma_0)
     Gamma_post_inv = Gamma_0_inv + (1.0 / sigma2) * (X.T @ X)
-    Gamma_post = np.linalg.inv(Gamma_post_inv)
+    Gamma_post = spd_inverse(Gamma_post_inv)
     nu_post = Gamma_post @ (Gamma_0_inv @ nu_0 + (1.0 / sigma2) * (X.T @ y))
 
     return nu_post, Gamma_post
@@ -636,8 +682,10 @@ def _stack_param_store(store, W):
 # Online empirical-Bayes scalar-variance update (Monday-night refit)
 # ──────────────────────────────────────────────────────────────────
 
-EB_SIGMA2_MIN = 1e-6        # floor to keep 1/sigma2 finite/conditioned
-EB_SIGMA2_LOG_HALFWIDTH = 20.0   # search +/- this in log-space around the data scale
+EB_SIGMA2_MIN = 1e-4        # floor to keep 1/sigma2 bounded and posteriors well-conditioned
+EB_SIGMA2_LOG_HALFWIDTH = 8.0    # search +/- this in log-space around the data scale
+                                 # (~3.5 decades each way); keeps sigma2 near the data
+                                 # scale so 1/sigma2 cannot collapse the posterior precision
 
 
 def _eb_neg_marginal_loglik(log_s2, XtX, Xty, yty, n, Sigma0_inv, Sigma0_inv_mu0):
@@ -708,8 +756,10 @@ def empirical_bayes_sigma2(X, y, mu_0, Sigma_0, fallback=1.0):
     resid0 = y - X @ mu_0
     scale = max(float(np.mean(resid0 ** 2)), 1e-12)
     log_c = np.log(scale)
-    lo = log_c - EB_SIGMA2_LOG_HALFWIDTH
+    lo = max(log_c - EB_SIGMA2_LOG_HALFWIDTH, np.log(EB_SIGMA2_MIN))
     hi = log_c + EB_SIGMA2_LOG_HALFWIDTH
+    if hi <= lo:
+        hi = lo + EB_SIGMA2_LOG_HALFWIDTH
 
     res = minimize_scalar(
         _eb_neg_marginal_loglik,
@@ -785,7 +835,7 @@ def compute_rlsvi_betas(Phi, targets_per_b, mu_0, Sigma_0, sigma2,
     if Phi.shape[0] == 0:
         Sigma_post = Sigma_0.copy()
     else:
-        Sigma_post = np.linalg.inv(
+        Sigma_post = spd_inverse(
             Sigma_0_inv + (1.0 / sigma2) * (Phi.T @ Phi))
 
     noise_cov = (1.0 - gamma_bar ** 2) * Sigma_post
@@ -1012,7 +1062,7 @@ def compute_rlsvi_betas_with_alphas(
             + (1.0 / sigma2)            * XtX_B
             + (1.0 / sigma2_T)          * XtX_C
         )
-        Sigma_post = np.linalg.inv(Sigma_post_inv)
+        Sigma_post = spd_inverse(Sigma_post_inv)
 
         if n_TD == 0:
             Xty_B = np.zeros(p)
@@ -1122,7 +1172,7 @@ def compute_reward_shaping_eta(Phi, b_hat_hist, mu_0, Sigma_0, sigma2):
     if Phi.shape[0] == 0:
         Sigma_post = Sigma_0.copy()
     else:
-        Sigma_post = np.linalg.inv(
+        Sigma_post = spd_inverse(
             Sigma_0_inv + (1.0 / sigma2) * (Phi.T @ Phi))
     precomp = Sigma_0_inv @ mu_0
     mu_post = Sigma_post @ (precomp + (1.0 / sigma2) * (Phi.T @ b_hat_hist))
