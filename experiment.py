@@ -1422,6 +1422,7 @@ def run_micro_query(uid, seed=42, gamma_bar=0.5):
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
     )
+    agent.update_sigma2_online = False
 
     result = oenv.run_episode(agent, dataset)
     return result, oenv
@@ -1447,8 +1448,8 @@ def run_micro_query_rs(uid, seed=42, gamma_bar=0.5):
         sigma2_reward=sigma2_reward,
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
-    )
-
+    )       
+    agent.update_sigma2_online = False
     dataset = EpisodeDataset(nweek)
     result = oenv.run_episode(agent, dataset)
     return result, oenv
@@ -1477,7 +1478,7 @@ def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5):
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
     )
-
+    agent.update_sigma2_online = False
     dataset = EpisodeDataset(nweek)
     result = oenv.run_episode(agent, dataset)
     return result, oenv
@@ -1508,7 +1509,7 @@ def run_micro_query_rs_mtd(uid, seed=42, gamma_bar=0.5):
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
     )
-
+    agent.update_sigma2_online = False
     dataset = EpisodeDataset(nweek)
     result = oenv.run_episode(agent, dataset)
     return result, oenv
@@ -1538,7 +1539,6 @@ def _run_fixed_policy(agent_cls, uid, seed=42):
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
     )
-
     dataset = EpisodeDataset(nweek)
     result = oenv.run_episode(agent, dataset)
     return result, oenv
