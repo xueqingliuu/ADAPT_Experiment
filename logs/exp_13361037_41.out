@@ -1,0 +1,123 @@
+fourSC features dim: 31 (expect 31)
+CAE features dim:    24
+CAE_short feat dim:  2
+OnlineEnv defined.
+PF mediator dims: P_MY_FOURSC=31, P_MY_ANTIC=22, P_CAE=24, P_TY=2
+Priors ready:  p_rl(micro)=81, p_rs=62, p_b=4
+Runner functions defined.
+Running a single seed from index 41: seed=40 (N_EXPERIMENTS=100)
+  Experiment 0, draw 1/100, user 204, seed 40 ... CAE means: micro_g0=-1.850, micro_g05=-1.848, mtd_g0=-1.849, mtd_g05=-1.849, rs_g0=-1.849, rs_g05=-1.848, rs_mtd_g0=-1.850, rs_mtd_g05=-1.849
+  Experiment 0, draw 2/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 3/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 4/100, user 143, seed 40 ... CAE means: micro_g0=0.142, micro_g05=0.155, mtd_g0=0.121, mtd_g05=0.128, rs_g0=0.162, rs_g05=0.243, rs_mtd_g0=0.276, rs_mtd_g05=0.202
+  Experiment 0, draw 5/100, user 151, seed 40 ... CAE means: micro_g0=0.585, micro_g05=0.583, mtd_g0=0.591, mtd_g05=0.587, rs_g0=0.586, rs_g05=0.587, rs_mtd_g0=0.597, rs_mtd_g05=0.595
+  Experiment 0, draw 6/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 7/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 8/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 9/100, user 141, seed 40 ... CAE means: micro_g0=0.660, micro_g05=0.651, mtd_g0=0.653, mtd_g05=0.652, rs_g0=0.649, rs_g05=0.647, rs_mtd_g0=0.649, rs_mtd_g05=0.644
+  Experiment 0, draw 10/100, user 195, seed 40 ... CAE means: micro_g0=-0.225, micro_g05=-0.225, mtd_g0=-0.225, mtd_g05=-0.225, rs_g0=-0.225, rs_g05=-0.225, rs_mtd_g0=-0.225, rs_mtd_g05=-0.225
+  Experiment 0, draw 11/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 12/100, user 225, seed 40 ... CAE means: micro_g0=0.472, micro_g05=0.471, mtd_g0=0.472, mtd_g05=0.472, rs_g0=0.469, rs_g05=0.474, rs_mtd_g0=0.475, rs_mtd_g05=0.473
+  Experiment 0, draw 13/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 14/100, user 184, seed 40 ... CAE means: micro_g0=-2.566, micro_g05=-2.564, mtd_g0=-2.563, mtd_g05=-2.565, rs_g0=-2.564, rs_g05=-2.563, rs_mtd_g0=-2.564, rs_mtd_g05=-2.565
+  Experiment 0, draw 15/100, user 225, seed 40 ... CAE means: micro_g0=0.472, micro_g05=0.471, mtd_g0=0.472, mtd_g05=0.472, rs_g0=0.469, rs_g05=0.474, rs_mtd_g0=0.475, rs_mtd_g05=0.473
+  Experiment 0, draw 16/100, user 195, seed 40 ... CAE means: micro_g0=-0.225, micro_g05=-0.225, mtd_g0=-0.225, mtd_g05=-0.225, rs_g0=-0.225, rs_g05=-0.225, rs_mtd_g0=-0.225, rs_mtd_g05=-0.225
+  Experiment 0, draw 17/100, user 184, seed 40 ... CAE means: micro_g0=-2.566, micro_g05=-2.564, mtd_g0=-2.563, mtd_g05=-2.565, rs_g0=-2.564, rs_g05=-2.563, rs_mtd_g0=-2.564, rs_mtd_g05=-2.565
+  Experiment 0, draw 18/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 19/100, user 184, seed 40 ... CAE means: micro_g0=-2.566, micro_g05=-2.564, mtd_g0=-2.563, mtd_g05=-2.565, rs_g0=-2.564, rs_g05=-2.563, rs_mtd_g0=-2.564, rs_mtd_g05=-2.565
+  Experiment 0, draw 20/100, user 225, seed 40 ... CAE means: micro_g0=0.472, micro_g05=0.471, mtd_g0=0.472, mtd_g05=0.472, rs_g0=0.469, rs_g05=0.474, rs_mtd_g0=0.475, rs_mtd_g05=0.473
+  Experiment 0, draw 21/100, user 151, seed 40 ... CAE means: micro_g0=0.585, micro_g05=0.583, mtd_g0=0.591, mtd_g05=0.587, rs_g0=0.586, rs_g05=0.587, rs_mtd_g0=0.597, rs_mtd_g05=0.595
+  Experiment 0, draw 22/100, user 195, seed 40 ... CAE means: micro_g0=-0.225, micro_g05=-0.225, mtd_g0=-0.225, mtd_g05=-0.225, rs_g0=-0.225, rs_g05=-0.225, rs_mtd_g0=-0.225, rs_mtd_g05=-0.225
+  Experiment 0, draw 23/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 24/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 25/100, user 160, seed 40 ... CAE means: micro_g0=0.312, micro_g05=0.323, mtd_g0=0.317, mtd_g05=0.303, rs_g0=0.280, rs_g05=0.314, rs_mtd_g0=0.300, rs_mtd_g05=0.309
+  Experiment 0, draw 26/100, user 204, seed 40 ... CAE means: micro_g0=-1.850, micro_g05=-1.848, mtd_g0=-1.849, mtd_g05=-1.849, rs_g0=-1.849, rs_g05=-1.848, rs_mtd_g0=-1.850, rs_mtd_g05=-1.849
+  Experiment 0, draw 27/100, user 184, seed 40 ... CAE means: micro_g0=-2.566, micro_g05=-2.564, mtd_g0=-2.563, mtd_g05=-2.565, rs_g0=-2.564, rs_g05=-2.563, rs_mtd_g0=-2.564, rs_mtd_g05=-2.565
+  Experiment 0, draw 28/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 29/100, user 195, seed 40 ... CAE means: micro_g0=-0.225, micro_g05=-0.225, mtd_g0=-0.225, mtd_g05=-0.225, rs_g0=-0.225, rs_g05=-0.225, rs_mtd_g0=-0.225, rs_mtd_g05=-0.225
+  Experiment 0, draw 30/100, user 195, seed 40 ... CAE means: micro_g0=-0.225, micro_g05=-0.225, mtd_g0=-0.225, mtd_g05=-0.225, rs_g0=-0.225, rs_g05=-0.225, rs_mtd_g0=-0.225, rs_mtd_g05=-0.225
+  Experiment 0, draw 31/100, user 204, seed 40 ... CAE means: micro_g0=-1.850, micro_g05=-1.848, mtd_g0=-1.849, mtd_g05=-1.849, rs_g0=-1.849, rs_g05=-1.848, rs_mtd_g0=-1.850, rs_mtd_g05=-1.849
+  Experiment 0, draw 32/100, user 141, seed 40 ... CAE means: micro_g0=0.660, micro_g05=0.651, mtd_g0=0.653, mtd_g05=0.652, rs_g0=0.649, rs_g05=0.647, rs_mtd_g0=0.649, rs_mtd_g05=0.644
+  Experiment 0, draw 33/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 34/100, user 204, seed 40 ... CAE means: micro_g0=-1.850, micro_g05=-1.848, mtd_g0=-1.849, mtd_g05=-1.849, rs_g0=-1.849, rs_g05=-1.848, rs_mtd_g0=-1.850, rs_mtd_g05=-1.849
+  Experiment 0, draw 35/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 36/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 37/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 38/100, user 151, seed 40 ... CAE means: micro_g0=0.585, micro_g05=0.583, mtd_g0=0.591, mtd_g05=0.587, rs_g0=0.586, rs_g05=0.587, rs_mtd_g0=0.597, rs_mtd_g05=0.595
+  Experiment 0, draw 39/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 40/100, user 160, seed 40 ... CAE means: micro_g0=0.312, micro_g05=0.323, mtd_g0=0.317, mtd_g05=0.303, rs_g0=0.280, rs_g05=0.314, rs_mtd_g0=0.300, rs_mtd_g05=0.309
+  Experiment 0, draw 41/100, user 160, seed 40 ... CAE means: micro_g0=0.312, micro_g05=0.323, mtd_g0=0.317, mtd_g05=0.303, rs_g0=0.280, rs_g05=0.314, rs_mtd_g0=0.300, rs_mtd_g05=0.309
+  Experiment 0, draw 42/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 43/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 44/100, user 141, seed 40 ... CAE means: micro_g0=0.660, micro_g05=0.651, mtd_g0=0.653, mtd_g05=0.652, rs_g0=0.649, rs_g05=0.647, rs_mtd_g0=0.649, rs_mtd_g05=0.644
+  Experiment 0, draw 45/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 46/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 47/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 48/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 49/100, user 143, seed 40 ... CAE means: micro_g0=0.142, micro_g05=0.155, mtd_g0=0.121, mtd_g05=0.128, rs_g0=0.162, rs_g05=0.243, rs_mtd_g0=0.276, rs_mtd_g05=0.202
+  Experiment 0, draw 50/100, user 184, seed 40 ... CAE means: micro_g0=-2.566, micro_g05=-2.564, mtd_g0=-2.563, mtd_g05=-2.565, rs_g0=-2.564, rs_g05=-2.563, rs_mtd_g0=-2.564, rs_mtd_g05=-2.565
+  Experiment 0, draw 51/100, user 195, seed 40 ... CAE means: micro_g0=-0.225, micro_g05=-0.225, mtd_g0=-0.225, mtd_g05=-0.225, rs_g0=-0.225, rs_g05=-0.225, rs_mtd_g0=-0.225, rs_mtd_g05=-0.225
+  Experiment 0, draw 52/100, user 160, seed 40 ... CAE means: micro_g0=0.312, micro_g05=0.323, mtd_g0=0.317, mtd_g05=0.303, rs_g0=0.280, rs_g05=0.314, rs_mtd_g0=0.300, rs_mtd_g05=0.309
+  Experiment 0, draw 53/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 54/100, user 225, seed 40 ... CAE means: micro_g0=0.472, micro_g05=0.471, mtd_g0=0.472, mtd_g05=0.472, rs_g0=0.469, rs_g05=0.474, rs_mtd_g0=0.475, rs_mtd_g05=0.473
+  Experiment 0, draw 55/100, user 195, seed 40 ... CAE means: micro_g0=-0.225, micro_g05=-0.225, mtd_g0=-0.225, mtd_g05=-0.225, rs_g0=-0.225, rs_g05=-0.225, rs_mtd_g0=-0.225, rs_mtd_g05=-0.225
+  Experiment 0, draw 56/100, user 225, seed 40 ... CAE means: micro_g0=0.472, micro_g05=0.471, mtd_g0=0.472, mtd_g05=0.472, rs_g0=0.469, rs_g05=0.474, rs_mtd_g0=0.475, rs_mtd_g05=0.473
+  Experiment 0, draw 57/100, user 160, seed 40 ... CAE means: micro_g0=0.312, micro_g05=0.323, mtd_g0=0.317, mtd_g05=0.303, rs_g0=0.280, rs_g05=0.314, rs_mtd_g0=0.300, rs_mtd_g05=0.309
+  Experiment 0, draw 58/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 59/100, user 225, seed 40 ... CAE means: micro_g0=0.472, micro_g05=0.471, mtd_g0=0.472, mtd_g05=0.472, rs_g0=0.469, rs_g05=0.474, rs_mtd_g0=0.475, rs_mtd_g05=0.473
+  Experiment 0, draw 60/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 61/100, user 204, seed 40 ... CAE means: micro_g0=-1.850, micro_g05=-1.848, mtd_g0=-1.849, mtd_g05=-1.849, rs_g0=-1.849, rs_g05=-1.848, rs_mtd_g0=-1.850, rs_mtd_g05=-1.849
+  Experiment 0, draw 62/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 63/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 64/100, user 160, seed 40 ... CAE means: micro_g0=0.312, micro_g05=0.323, mtd_g0=0.317, mtd_g05=0.303, rs_g0=0.280, rs_g05=0.314, rs_mtd_g0=0.300, rs_mtd_g05=0.309
+  Experiment 0, draw 65/100, user 204, seed 40 ... CAE means: micro_g0=-1.850, micro_g05=-1.848, mtd_g0=-1.849, mtd_g05=-1.849, rs_g0=-1.849, rs_g05=-1.848, rs_mtd_g0=-1.850, rs_mtd_g05=-1.849
+  Experiment 0, draw 66/100, user 141, seed 40 ... CAE means: micro_g0=0.660, micro_g05=0.651, mtd_g0=0.653, mtd_g05=0.652, rs_g0=0.649, rs_g05=0.647, rs_mtd_g0=0.649, rs_mtd_g05=0.644
+  Experiment 0, draw 67/100, user 184, seed 40 ... CAE means: micro_g0=-2.566, micro_g05=-2.564, mtd_g0=-2.563, mtd_g05=-2.565, rs_g0=-2.564, rs_g05=-2.563, rs_mtd_g0=-2.564, rs_mtd_g05=-2.565
+  Experiment 0, draw 68/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 69/100, user 204, seed 40 ... CAE means: micro_g0=-1.850, micro_g05=-1.848, mtd_g0=-1.849, mtd_g05=-1.849, rs_g0=-1.849, rs_g05=-1.848, rs_mtd_g0=-1.850, rs_mtd_g05=-1.849
+  Experiment 0, draw 70/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 71/100, user 160, seed 40 ... CAE means: micro_g0=0.312, micro_g05=0.323, mtd_g0=0.317, mtd_g05=0.303, rs_g0=0.280, rs_g05=0.314, rs_mtd_g0=0.300, rs_mtd_g05=0.309
+  Experiment 0, draw 72/100, user 151, seed 40 ... CAE means: micro_g0=0.585, micro_g05=0.583, mtd_g0=0.591, mtd_g05=0.587, rs_g0=0.586, rs_g05=0.587, rs_mtd_g0=0.597, rs_mtd_g05=0.595
+  Experiment 0, draw 73/100, user 160, seed 40 ... CAE means: micro_g0=0.312, micro_g05=0.323, mtd_g0=0.317, mtd_g05=0.303, rs_g0=0.280, rs_g05=0.314, rs_mtd_g0=0.300, rs_mtd_g05=0.309
+  Experiment 0, draw 74/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 75/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 76/100, user 204, seed 40 ... CAE means: micro_g0=-1.850, micro_g05=-1.848, mtd_g0=-1.849, mtd_g05=-1.849, rs_g0=-1.849, rs_g05=-1.848, rs_mtd_g0=-1.850, rs_mtd_g05=-1.849
+  Experiment 0, draw 77/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 78/100, user 225, seed 40 ... CAE means: micro_g0=0.472, micro_g05=0.471, mtd_g0=0.472, mtd_g05=0.472, rs_g0=0.469, rs_g05=0.474, rs_mtd_g0=0.475, rs_mtd_g05=0.473
+  Experiment 0, draw 79/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 80/100, user 151, seed 40 ... CAE means: micro_g0=0.585, micro_g05=0.583, mtd_g0=0.591, mtd_g05=0.587, rs_g0=0.586, rs_g05=0.587, rs_mtd_g0=0.597, rs_mtd_g05=0.595
+  Experiment 0, draw 81/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 82/100, user 184, seed 40 ... CAE means: micro_g0=-2.566, micro_g05=-2.564, mtd_g0=-2.563, mtd_g05=-2.565, rs_g0=-2.564, rs_g05=-2.563, rs_mtd_g0=-2.564, rs_mtd_g05=-2.565
+  Experiment 0, draw 83/100, user 143, seed 40 ... CAE means: micro_g0=0.142, micro_g05=0.155, mtd_g0=0.121, mtd_g05=0.128, rs_g0=0.162, rs_g05=0.243, rs_mtd_g0=0.276, rs_mtd_g05=0.202
+  Experiment 0, draw 84/100, user 151, seed 40 ... CAE means: micro_g0=0.585, micro_g05=0.583, mtd_g0=0.591, mtd_g05=0.587, rs_g0=0.586, rs_g05=0.587, rs_mtd_g0=0.597, rs_mtd_g05=0.595
+  Experiment 0, draw 85/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 86/100, user 184, seed 40 ... CAE means: micro_g0=-2.566, micro_g05=-2.564, mtd_g0=-2.563, mtd_g05=-2.565, rs_g0=-2.564, rs_g05=-2.563, rs_mtd_g0=-2.564, rs_mtd_g05=-2.565
+  Experiment 0, draw 87/100, user 170, seed 40 ... CAE means: micro_g0=0.303, micro_g05=0.309, mtd_g0=0.302, mtd_g05=0.292, rs_g0=0.306, rs_g05=0.320, rs_mtd_g0=0.292, rs_mtd_g05=0.292
+  Experiment 0, draw 88/100, user 151, seed 40 ... CAE means: micro_g0=0.585, micro_g05=0.583, mtd_g0=0.591, mtd_g05=0.587, rs_g0=0.586, rs_g05=0.587, rs_mtd_g0=0.597, rs_mtd_g05=0.595
+  Experiment 0, draw 89/100, user 195, seed 40 ... CAE means: micro_g0=-0.225, micro_g05=-0.225, mtd_g0=-0.225, mtd_g05=-0.225, rs_g0=-0.225, rs_g05=-0.225, rs_mtd_g0=-0.225, rs_mtd_g05=-0.225
+  Experiment 0, draw 90/100, user 160, seed 40 ... CAE means: micro_g0=0.312, micro_g05=0.323, mtd_g0=0.317, mtd_g05=0.303, rs_g0=0.280, rs_g05=0.314, rs_mtd_g0=0.300, rs_mtd_g05=0.309
+  Experiment 0, draw 91/100, user 151, seed 40 ... CAE means: micro_g0=0.585, micro_g05=0.583, mtd_g0=0.591, mtd_g05=0.587, rs_g0=0.586, rs_g05=0.587, rs_mtd_g0=0.597, rs_mtd_g05=0.595
+  Experiment 0, draw 92/100, user 204, seed 40 ... CAE means: micro_g0=-1.850, micro_g05=-1.848, mtd_g0=-1.849, mtd_g05=-1.849, rs_g0=-1.849, rs_g05=-1.848, rs_mtd_g0=-1.850, rs_mtd_g05=-1.849
+  Experiment 0, draw 93/100, user 143, seed 40 ... CAE means: micro_g0=0.142, micro_g05=0.155, mtd_g0=0.121, mtd_g05=0.128, rs_g0=0.162, rs_g05=0.243, rs_mtd_g0=0.276, rs_mtd_g05=0.202
+  Experiment 0, draw 94/100, user 143, seed 40 ... CAE means: micro_g0=0.142, micro_g05=0.155, mtd_g0=0.121, mtd_g05=0.128, rs_g0=0.162, rs_g05=0.243, rs_mtd_g0=0.276, rs_mtd_g05=0.202
+  Experiment 0, draw 95/100, user 188, seed 40 ... CAE means: micro_g0=1.228, micro_g05=1.215, mtd_g0=1.220, mtd_g05=1.212, rs_g0=1.215, rs_g05=1.209, rs_mtd_g0=1.218, rs_mtd_g05=1.216
+  Experiment 0, draw 96/100, user 184, seed 40 ... CAE means: micro_g0=-2.566, micro_g05=-2.564, mtd_g0=-2.563, mtd_g05=-2.565, rs_g0=-2.564, rs_g05=-2.563, rs_mtd_g0=-2.564, rs_mtd_g05=-2.565
+  Experiment 0, draw 97/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 98/100, user 118, seed 40 ... CAE means: micro_g0=0.619, micro_g05=0.614, mtd_g0=0.611, mtd_g05=0.610, rs_g0=0.617, rs_g05=0.618, rs_mtd_g0=0.617, rs_mtd_g05=0.612
+  Experiment 0, draw 99/100, user 160, seed 40 ... CAE means: micro_g0=0.312, micro_g05=0.323, mtd_g0=0.317, mtd_g05=0.303, rs_g0=0.280, rs_g05=0.314, rs_mtd_g0=0.300, rs_mtd_g05=0.309
+  Experiment 0, draw 100/100, user 204, seed 40 ... CAE means: micro_g0=-1.850, micro_g05=-1.848, mtd_g0=-1.849, mtd_g05=-1.849, rs_g0=-1.849, rs_g05=-1.848, rs_mtd_g0=-1.850, rs_mtd_g05=-1.849
+
+Experiment complete.
+Saving results to /n/home09/xliu08/ADAPT_RCT_Experiment/results/20260517-070054-528555_seed40_job13441144_task41
+
+==================================================================================================================================================================
+            Metric          micro_g0         micro_g05            mtd_g0           mtd_g05             rs_g0            rs_g05         rs_mtd_g0        rs_mtd_g05
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Mean CAE (all weeks)            0.0025            0.0021            0.0002           -0.0040           -0.0019            0.0071            0.0060            0.0017
+Mean CAE (week 3+)            0.0129            0.0120            0.0109            0.0067            0.0083            0.0172            0.0170            0.0126
+Median CAE (all wks)            0.3785            0.3923            0.3906            0.3860            0.3887            0.3913            0.3920            0.3826
+      25th pct CAE           -0.2140           -0.2140           -0.2161           -0.2070           -0.2140           -0.2074           -0.2140           -0.2125
+Cumulative CAE (total)            0.0897            0.0756            0.0075           -0.1425           -0.0669            0.2542            0.2165            0.0602
+==================================================================================================================================================================
+
+Results saved to /n/home09/xliu08/ADAPT_RCT_Experiment/results/20260517-070054-528555_seed40_job13441144_task41

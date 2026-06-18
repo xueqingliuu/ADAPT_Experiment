@@ -1,0 +1,9 @@
+Host: holy7c18103.rc.fas.harvard.edu
+Job ID: 22051994  Task ID: 71
+RESULTS_ROOT=/n/home09/xliu08/ADAPT_RCT_Experiment/results_mtd_joint
+OnlineEnv defined.
+[priors] using default zero/identity priors (USE_ESTIMATED_PRIORS=0 -> defaults)
+Priors ready:  p_rl(micro)=79, p_rs=61, p_b=4, p_mtd_joint=83
+Runner functions defined.
+Running a single seed from index 71: seed=70 (N_EXPERIMENTS=100)
+  Experiment 0, draw 1/100, user 251, exp_seed 70, draw_seed 2524312431 ... 

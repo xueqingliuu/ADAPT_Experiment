@@ -1,0 +1,21 @@
+Traceback (most recent call last):
+  File "/n/home09/xliu08/ADAPT_RCT_Experiment/experiment.py", line 403, in __init__
+    self._ew_coefs = load_pooled_coefs()
+                     ^^^^^^^^^^^^^^^^^^^
+  File "/n/home09/xliu08/ADAPT_RCT_Experiment/6_est_Ew_weights.py", line 166, in load_pooled_coefs
+    with open(p, encoding="utf-8") as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed/env_para_vanilla/Ew_pooled_linear_coefs.json'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/n/home09/xliu08/ADAPT_RCT_Experiment/experiment.py", line 1358, in <module>
+    res, oenv = runner(uid, seed=seed)
+                ^^^^^^^^^^^^^^^^^^^^^^
+  File "/n/home09/xliu08/ADAPT_RCT_Experiment/experiment.py", line 1116, in run_micro_query
+    oenv = OnlineEnv(env, nweek=nweek, seed=seed)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/n/home09/xliu08/ADAPT_RCT_Experiment/experiment.py", line 405, in __init__
+    raise RuntimeError(
+RuntimeError: Ew_pooled_linear_coefs.json missing; run est_Ew_weights.py first.

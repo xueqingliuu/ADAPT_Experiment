@@ -1,0 +1,25 @@
+Host: holy7c18104.rc.fas.harvard.edu
+Job ID: 22043221  Task ID: 52
+RESULTS_ROOT=/n/home09/xliu08/ADAPT_RCT_Experiment/results_mtd_joint
+OnlineEnv defined.
+[priors] using default zero/identity priors (USE_ESTIMATED_PRIORS=0 -> defaults)
+Priors ready:  p_rl(micro)=79, p_rs=61, p_b=4, p_mtd_joint=83
+Runner functions defined.
+Running a single seed from index 52: seed=51 (N_EXPERIMENTS=100)
+  Experiment 0, draw 1/100, user 251, exp_seed 51, draw_seed 2193224722 ... CAE means: micro_g0=0.000, micro_g05=0.000, mtd_g0=0.000, mtd_g05=0.000, rs_g0=0.000, rs_g05=0.000, rs_mtd_g0=0.000, rs_mtd_g05=0.000, never_send=0.000, always_send=0.000, random_send=0.000
+  Experiment 0, draw 2/100, user 204, exp_seed 51, draw_seed 1107985938 ... CAE means: micro_g0=-0.360, micro_g05=-0.364, mtd_g0=-0.358, mtd_g05=-0.383, rs_g0=-0.363, rs_g05=-0.362, rs_mtd_g0=-0.364, rs_mtd_g05=-0.358, never_send=-0.353, always_send=-0.376, random_send=-0.353
+  Experiment 0, draw 3/100, user 188, exp_seed 51, draw_seed 3858890576 ... CAE means: micro_g0=0.948, micro_g05=0.942, mtd_g0=0.951, mtd_g05=0.969, rs_g0=0.945, rs_g05=0.946, rs_mtd_g0=0.954, rs_mtd_g05=0.954, never_send=0.858, always_send=0.929, random_send=0.854
+  Experiment 0, draw 4/100, user 151, exp_seed 51, draw_seed 285944125 ... CAE means: micro_g0=0.709, micro_g05=0.722, mtd_g0=0.696, mtd_g05=0.687, rs_g0=0.683, rs_g05=0.698, rs_mtd_g0=0.675, rs_mtd_g05=0.692, never_send=0.607, always_send=0.803, random_send=0.698
+  Experiment 0, draw 5/100, user 151, exp_seed 51, draw_seed 1881009500 ... CAE means: micro_g0=0.705, micro_g05=0.707, mtd_g0=0.717, mtd_g05=0.736, rs_g0=0.714, rs_g05=0.729, rs_mtd_g0=0.707, rs_mtd_g05=0.713, never_send=0.617, always_send=0.822, random_send=0.694
+  Experiment 0, draw 6/100, user 118, exp_seed 51, draw_seed 360266434 ... CAE means: micro_g0=-0.156, micro_g05=-0.155, mtd_g0=-0.154, mtd_g05=-0.155, rs_g0=-0.153, rs_g05=-0.153, rs_mtd_g0=-0.155, rs_mtd_g05=-0.154, never_send=-0.158, always_send=-0.148, random_send=-0.157
+  Experiment 0, draw 7/100, user 138, exp_seed 51, draw_seed 2098679063 ... CAE means: micro_g0=-0.732, micro_g05=-0.700, mtd_g0=-0.701, mtd_g05=-0.730, rs_g0=-0.811, rs_g05=-0.735, rs_mtd_g0=-0.727, rs_mtd_g05=-0.626, never_send=-0.732, always_send=-0.718, random_send=-0.708
+  Experiment 0, draw 8/100, user 118, exp_seed 51, draw_seed 4107059982 ... CAE means: micro_g0=-0.144, micro_g05=-0.145, mtd_g0=-0.146, mtd_g05=-0.144, rs_g0=-0.145, rs_g05=-0.146, rs_mtd_g0=-0.145, rs_mtd_g05=-0.145, never_send=-0.147, always_send=-0.142, random_send=-0.146
+  Experiment 0, draw 9/100, user 141, exp_seed 51, draw_seed 4009823524 ... CAE means: micro_g0=0.610, micro_g05=0.605, mtd_g0=0.624, mtd_g05=0.616, rs_g0=0.592, rs_g05=0.614, rs_mtd_g0=0.595, rs_mtd_g05=0.626, never_send=0.681, always_send=0.552, random_send=0.607
+  Experiment 0, draw 10/100, user 251, exp_seed 51, draw_seed 2849281749 ... CAE means: micro_g0=0.000, micro_g05=0.000, mtd_g0=0.000, mtd_g05=0.000, rs_g0=0.000, rs_g05=0.000, rs_mtd_g0=0.000, rs_mtd_g05=0.000, never_send=0.000, always_send=0.000, random_send=0.000
+  Experiment 0, draw 11/100, user 204, exp_seed 51, draw_seed 170238468 ... CAE means: micro_g0=-0.361, micro_g05=-0.356, mtd_g0=-0.346, mtd_g05=-0.379, rs_g0=-0.356, rs_g05=-0.372, rs_mtd_g0=-0.380, rs_mtd_g05=-0.364, never_send=-0.349, always_send=-0.374, random_send=-0.353
+  Experiment 0, draw 12/100, user 252, exp_seed 51, draw_seed 1345529268 ... CAE means: micro_g0=0.198, micro_g05=0.202, mtd_g0=0.205, mtd_g05=0.207, rs_g0=0.210, rs_g05=0.203, rs_mtd_g0=0.212, rs_mtd_g05=0.214, never_send=0.208, always_send=0.187, random_send=0.195
+  Experiment 0, draw 13/100, user 188, exp_seed 51, draw_seed 1218945564 ... CAE means: micro_g0=0.939, micro_g05=0.950, mtd_g0=0.859, mtd_g05=0.937, rs_g0=0.926, rs_g05=0.948, rs_mtd_g0=0.903, rs_mtd_g05=0.928, never_send=0.881, always_send=0.932, random_send=0.890
+  Experiment 0, draw 14/100, user 195, exp_seed 51, draw_seed 2463885376 ... CAE means: micro_g0=0.260, micro_g05=0.263, mtd_g0=0.264, mtd_g05=0.260, rs_g0=0.273, rs_g05=0.265, rs_mtd_g0=0.264, rs_mtd_g05=0.263, never_send=0.253, always_send=0.261, random_send=0.262
+  Experiment 0, draw 15/100, user 257, exp_seed 51, draw_seed 524267630 ... CAE means: micro_g0=0.000, micro_g05=0.000, mtd_g0=0.000, mtd_g05=0.000, rs_g0=0.000, rs_g05=0.000, rs_mtd_g0=0.000, rs_mtd_g05=0.000, never_send=0.000, always_send=0.000, random_send=0.000
+  Experiment 0, draw 16/100, user 225, exp_seed 51, draw_seed 2881419030 ... CAE means: micro_g0=0.536, micro_g05=0.531, mtd_g0=0.518, mtd_g05=0.516, rs_g0=0.519, rs_g05=0.523, rs_mtd_g0=0.508, rs_mtd_g05=0.526, never_send=0.487, always_send=0.553, random_send=0.508
+  Experiment 0, draw 17/100, user 204, exp_seed 51, draw_seed 757137802 ... 

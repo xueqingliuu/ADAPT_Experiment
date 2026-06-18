@@ -1,0 +1,13 @@
+fourSC features dim: 31 (expect 31)
+CAE features dim:    24
+CAE_short feat dim:  2
+OnlineEnv defined.
+PF mediator dims: P_MY_FOURSC=31, P_MY_ANTIC=22, P_CAE=24, P_TY=2
+Priors ready:  p_rl(micro)=81, p_rs=62, p_b=4
+Runner functions defined.
+Running a single seed from index 8: seed=7 (N_EXPERIMENTS=100)
+  Experiment 0, draw 1/100, user 204, seed 7 ... CAE means: micro_g0=-1.852, micro_g05=-1.853, mtd_g0=-1.851, mtd_g05=-1.851, rs_g0=-1.852, rs_g05=-1.851, rs_mtd_g0=-1.851, rs_mtd_g05=-1.853
+  Experiment 0, draw 2/100, user 188, seed 7 ... CAE means: micro_g0=1.189, micro_g05=1.175, mtd_g0=1.195, mtd_g05=1.207, rs_g0=1.195, rs_g05=1.178, rs_mtd_g0=1.200, rs_mtd_g05=1.208
+  Experiment 0, draw 3/100, user 170, seed 7 ... CAE means: micro_g0=0.311, micro_g05=0.317, mtd_g0=0.311, mtd_g05=0.306, rs_g0=0.317, rs_g05=0.318, rs_mtd_g0=0.308, rs_mtd_g05=0.313
+  Experiment 0, draw 4/100, user 143, seed 7 ... CAE means: micro_g0=-0.150, micro_g05=-0.255, mtd_g0=-0.114, mtd_g05=-0.232, rs_g0=-0.055, rs_g05=-0.007, rs_mtd_g0=-0.144, rs_mtd_g05=0.095
+  Experiment 0, draw 5/100, user 151, seed 7 ... 

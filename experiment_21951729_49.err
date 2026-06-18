@@ -1,0 +1,16 @@
+/n/home09/xliu08/.conda/envs/budgeted/lib/python3.12/site-packages/scipy/optimize/_optimize.py:2358: RuntimeWarning: invalid value encountered in scalar subtract
+  p = (xf - fulc) * q - (xf - nfc) * r
+/n/home09/xliu08/.conda/envs/budgeted/lib/python3.12/site-packages/scipy/optimize/_optimize.py:2359: RuntimeWarning: invalid value encountered in scalar subtract
+  q = 2.0 * (q - r)
+/n/home09/xliu08/.conda/envs/budgeted/lib/python3.12/site-packages/scipy/optimize/_optimize.py:2358: RuntimeWarning: invalid value encountered in scalar subtract
+  p = (xf - fulc) * q - (xf - nfc) * r
+/n/home09/xliu08/.conda/envs/budgeted/lib/python3.12/site-packages/scipy/optimize/_optimize.py:2359: RuntimeWarning: invalid value encountered in scalar subtract
+  q = 2.0 * (q - r)
+/n/home09/xliu08/.conda/envs/budgeted/lib/python3.12/site-packages/scipy/optimize/_optimize.py:2358: RuntimeWarning: invalid value encountered in scalar subtract
+  p = (xf - fulc) * q - (xf - nfc) * r
+/n/home09/xliu08/.conda/envs/budgeted/lib/python3.12/site-packages/scipy/optimize/_optimize.py:2359: RuntimeWarning: invalid value encountered in scalar subtract
+  q = 2.0 * (q - r)
+/n/home09/xliu08/.conda/envs/budgeted/lib/python3.12/site-packages/scipy/optimize/_optimize.py:2358: RuntimeWarning: invalid value encountered in scalar subtract
+  p = (xf - fulc) * q - (xf - nfc) * r
+/n/home09/xliu08/.conda/envs/budgeted/lib/python3.12/site-packages/scipy/optimize/_optimize.py:2359: RuntimeWarning: invalid value encountered in scalar subtract
+  q = 2.0 * (q - r)

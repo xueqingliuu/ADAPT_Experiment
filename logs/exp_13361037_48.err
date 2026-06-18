@@ -1,0 +1,28 @@
+/n/home09/xliu08/ADAPT_RCT_Experiment/algorithm.py:265: RuntimeWarning: covariance is not symmetric positive-semidefinite.
+  theta_MY_j = [rng.multivariate_normal(nu_MY_j[m], Gamma_MY_j[m])
+/n/home09/xliu08/ADAPT_RCT_Experiment/algorithm.py:265: RuntimeWarning: covariance is not symmetric positive-semidefinite.
+  theta_MY_j = [rng.multivariate_normal(nu_MY_j[m], Gamma_MY_j[m])
+/n/home09/xliu08/ADAPT_RCT_Experiment/algorithm.py:265: RuntimeWarning: covariance is not symmetric positive-semidefinite.
+  theta_MY_j = [rng.multivariate_normal(nu_MY_j[m], Gamma_MY_j[m])
+Traceback (most recent call last):
+  File "/n/home09/xliu08/ADAPT_RCT_Experiment/experiment.py", line 1348, in <module>
+    res, oenv = runner(uid, seed=seed)
+                ^^^^^^^^^^^^^^^^^^^^^^
+  File "/n/home09/xliu08/ADAPT_RCT_Experiment/experiment.py", line 1209, in run_micro_query_rs_mtd
+    result = oenv.run_episode(agent)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/n/home09/xliu08/ADAPT_RCT_Experiment/experiment.py", line 486, in run_episode
+    I_w = agent.begin_week(k, packet)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/n/home09/xliu08/ADAPT_RCT_Experiment/algorithm.py", line 2218, in begin_week
+    eta_k, _ = compute_reward_shaping_eta(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/n/home09/xliu08/ADAPT_RCT_Experiment/algorithm.py", line 793, in compute_reward_shaping_eta
+    Sigma_post = np.linalg.inv(
+                 ^^^^^^^^^^^^^^
+  File "/n/home09/xliu08/.conda/envs/budgeted/lib/python3.12/site-packages/numpy/linalg/_linalg.py", line 669, in inv
+    ainv = _umath_linalg.inv(a, signature=signature)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/n/home09/xliu08/.conda/envs/budgeted/lib/python3.12/site-packages/numpy/linalg/_linalg.py", line 163, in _raise_linalgerror_singular
+    raise LinAlgError("Singular matrix")
+numpy.linalg.LinAlgError: Singular matrix

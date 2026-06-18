@@ -4,3 +4,11 @@ __pycache__/
 .env
 .venv/
 venv/
+results/
+
+results/
+*.npz
+*.npy
+*.pkl
+*.png
+*.pdf
