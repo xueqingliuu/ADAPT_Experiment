@@ -26,7 +26,7 @@ export MPLBACKEND=Agg
 export MPLCONFIGDIR="${SLURM_SUBMIT_DIR}/.matplotlib"
 
 # results parent dir shared by all array tasks (aggregate.py reads the same)
-export RESULTS_ROOT="${SLURM_SUBMIT_DIR}/results_mtd_joint"
+export RESULTS_ROOT="${SLURM_SUBMIT_DIR}/results_vanilla"
 
 echo "Host: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID:-local}  Task ID: ${SLURM_ARRAY_TASK_ID:-none}"

@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 
 
 # Must match experiment.py's RESULTS_ROOT (env-overridable, same default).
-RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_mtd_joint"))
+RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla"))
 OUT = RESULTS_ROOT / f"aggregated_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 OUT.mkdir(parents=True, exist_ok=True)
 

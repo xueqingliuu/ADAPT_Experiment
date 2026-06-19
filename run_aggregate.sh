@@ -12,6 +12,9 @@ cd "$SLURM_SUBMIT_DIR"
 module load python
 mamba activate budgeted
 
-echo "Running aggregate_results.py on $(hostname)"
+export RESULTS_ROOT="${SLURM_SUBMIT_DIR}/results_vanilla"
+
+echo "Running aggregate.py on $(hostname)"
+echo "RESULTS_ROOT=${RESULTS_ROOT}"
 
 python aggregate.py

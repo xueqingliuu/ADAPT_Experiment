@@ -1777,11 +1777,9 @@ if __name__ == "__main__":
     # ──────────────────────────────────────────────────────────────────
     # Persist results to disk (timestamped folder under the parent dir)
     #
-    # Default parent is ./results_mtd_joint/ so the discount-corrected
-    # joint-MTD runs do NOT overwrite or commingle with the older
-    # ./results/ tree. Override with RESULTS_ROOT=<path> if you want a
-    # different folder, e.g.
-    #     RESULTS_ROOT=results_experiments_v3 python experiment.py
+    # Default parent is ./results_vanilla/. Override with RESULTS_ROOT=<path>
+    # if you want a different folder, e.g.
+    #     RESULTS_ROOT=results_mtd_joint python experiment.py
     # ──────────────────────────────────────────────────────────────────
     ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     run_tag = f"seed{SEEDS[0]}" if len(SEEDS) == 1 else f"all{len(SEEDS)}"
@@ -1792,7 +1790,7 @@ if __name__ == "__main__":
         slurm_suffix = f"_job{slurm_job_id}"
         if slurm_task_id:
             slurm_suffix += f"_task{slurm_task_id}"
-    RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_mtd_joint"))
+    RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla"))
     OUTPUT_DIR = RESULTS_ROOT / f"{ts}_{run_tag}{slurm_suffix}"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Saving results to {OUTPUT_DIR.resolve()}")

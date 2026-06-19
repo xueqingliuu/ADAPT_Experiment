@@ -1,12 +1,29 @@
+# Python
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .env
 .venv/
 venv/
-results/
 
+# macOS
+.DS_Store
+
+# Experiment outputs (see RESULTS_ROOT in experiment.py / aggregate.py)
 results/
+results_*/
+
+# SLURM job logs
+experiment_*.out
+experiment_*.err
+aggregate_*.out
+aggregate_*.err
+
+# Runtime caches
+.matplotlib/
+d3rlpy_logs/
+
+# Data artifacts
 *.npz
 *.npy
 *.pkl
