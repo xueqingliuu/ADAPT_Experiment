@@ -115,6 +115,11 @@ class EpisodeDataset:
         self.b_tilde_hist = np.full(W, np.nan)
         self.pf_result = {}
         self.state_hist = {}
+        # Full realized per-week mediator matrices (M_Y, M_E), recorded once a
+        # week is finalized. Reward shaping reads these so its feature map can
+        # access post-action decision-time / daily mediators (the per-slot
+        # ``state_hist`` snapshots are pre-action and zero those out).
+        self.med_full_hist = {}
 
     def bootstrap_week0(self, A_grid, rng):
         self.A_hist[0] = np.asarray(A_grid, dtype=int)
@@ -157,6 +162,17 @@ class EpisodeDataset:
             "M_E": snap["M_E"],
             "C": snap["C"],
         }
+
+    def record_full_week_mediators(self, k, M_Y, M_E):
+        """Store the full realized mediator matrices for completed RL week ``k``."""
+        self.med_full_hist[k] = (
+            np.asarray(M_Y, dtype=float),
+            np.asarray(M_E, dtype=float),
+        )
+
+    def get_full_week_mediators(self, k):
+        """Full realized ``(M_Y, M_E)`` for week ``k`` or ``None`` if unrecorded."""
+        return self.med_full_hist.get(k)
 
 
 # %%
@@ -659,6 +675,14 @@ class OnlineEnv:
                     self.step_action(k, d, t, A_wdt, I_w)
 
             self._finalize_week(k)
+
+            # Record the full realized weekly mediators for reward shaping
+            # (post-action decision-time/daily mediators). Skipped for
+            # fixed-policy baselines, which do no learning.
+            if needs_belief:
+                full_ctx = self.get_context(k, N_RL_DAYS, 0)
+                dataset.record_full_week_mediators(
+                    k, full_ctx["M_Y"], full_ctx["M_E"])
 
         return agent.results(dataset)
 
@@ -1422,7 +1446,7 @@ def run_micro_query(uid, seed=42, gamma_bar=0.5):
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
     )
-    agent.update_sigma2_online = False
+    # agent.update_sigma2_online = False
 
     result = oenv.run_episode(agent, dataset)
     return result, oenv
@@ -1449,7 +1473,7 @@ def run_micro_query_rs(uid, seed=42, gamma_bar=0.5):
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
     )       
-    agent.update_sigma2_online = False
+    # agent.update_sigma2_online = False
     dataset = EpisodeDataset(nweek)
     result = oenv.run_episode(agent, dataset)
     return result, oenv
@@ -1478,7 +1502,7 @@ def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5):
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
     )
-    agent.update_sigma2_online = False
+    # agent.update_sigma2_online = False
     dataset = EpisodeDataset(nweek)
     result = oenv.run_episode(agent, dataset)
     return result, oenv
@@ -1509,7 +1533,7 @@ def run_micro_query_rs_mtd(uid, seed=42, gamma_bar=0.5):
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
     )
-    agent.update_sigma2_online = False
+    # agent.update_sigma2_online = False
     dataset = EpisodeDataset(nweek)
     result = oenv.run_episode(agent, dataset)
     return result, oenv
@@ -1669,8 +1693,15 @@ if __name__ == "__main__":
     else:
         SEEDS = all_seeds
         print(f"Running all seeds: {len(SEEDS)} experiments")
-    uid_draw_rng = np.random.default_rng(0)
     n_users = 100
+    # Pre-draw the participant sample for ALL experiments so that array-mode
+    # (one seed per task) and full-run mode see identical populations:
+    # experiment with seed s always uses row s, regardless of which seeds
+    # this process actually runs.
+    uid_draw_rng = np.random.default_rng(0)
+    all_sampled_uids = uid_draw_rng.choice(
+        user_ids, size=(N_EXPERIMENTS, n_users), replace=True
+    )
 
     # Per-algorithm stores nested by experiment:
     #   run_uids[exp_idx]                 → array of n_users uids for that exp
@@ -1687,7 +1718,7 @@ if __name__ == "__main__":
     cae_by_uid = {name: {} for name in ALGORITHMS}   # keyed by uid (flat across exps)
 
     for exp_idx, seed in enumerate(SEEDS):
-        sampled_uids = uid_draw_rng.choice(user_ids, size=n_users, replace=True)
+        sampled_uids = all_sampled_uids[seed]
         run_uids.append(np.asarray(sampled_uids, dtype=int))
         # Per-experiment sub-list, one entry per participant draw.
         for name in ALGORITHMS:

@@ -98,6 +98,7 @@ class MicroQueryAgent_rewardshaping_modifiedTD:
     def reset(self, dataset):
         self.dataset = dataset
         self.get_state = dataset.get_state
+        self.get_full_mediators = getattr(dataset, "get_full_week_mediators", None)
         p = self.mu_0_joint.size
         p_eta = self.p_eta
 
@@ -150,7 +151,8 @@ class MicroQueryAgent_rewardshaping_modifiedTD:
             return
         Phi_rewardshaping, Delta_terminal = build_reward_shaping_training_data(
             k, self.b_hat_hist, self.b_tilde_hist,
-            self.get_state, self.gamma_dt, build_phi_action_rewardshaping)
+            self.get_state, self.gamma_dt, build_phi_action_rewardshaping,
+            get_full_mediators=self.get_full_mediators)
         y_rewardshaping = Delta_terminal * self.b_hat_hist[1:(k + 1)]
         # Monday-night empirical-Bayes refit of the reward-shaping pseudo-noise
         # variance sigma_sh^2 before drawing the shaping potential.
@@ -185,6 +187,7 @@ class MicroQueryAgent_rewardshaping_modifiedTD:
                 self.get_state,
                 eta_k,
                 p_eta=self.p_eta, p_beta=self.p_beta,
+                get_full_mediators=self.get_full_mediators,
             )
 
         z_prev = self.z_store.get(k - 1, self.z_store[0])

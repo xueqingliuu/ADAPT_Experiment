@@ -349,6 +349,16 @@ class ParticleFilterRuntime:
         v_in = self.v_hat.copy()
         y_in = self.y_hat
 
+        # Empirical-Bayes refit of the PF noise variances FIRST (Alg.
+        # "Estimating Belief State", step 1: UpdateEBVariancesPF(H_{w-1})).
+        # The refit uses only the pre-update cumulative history (pf_data,
+        # sim_w_prev) and the incoming belief-weighted-mean CAE trajectory, so
+        # the updated sigma^2 are then consumed by this week's posterior draws,
+        # mediator likelihoods, and latent propagation below.
+        if has_cumul and getattr(self.agent, "update_sigma2_online", True):
+            ybar = (v_in @ y_in).ravel()
+            self._update_sigma2_eb(pf_data, sim_w_prev, ybar)
+
         y_w = np.zeros(self.J)
         log_med_lik = np.zeros(self.J)
         mu_Y_arr = np.zeros(self.J)
@@ -467,9 +477,6 @@ class ParticleFilterRuntime:
         self.b_hat_hist[k] = b_hat_w
         self.b_tilde_hist[k] = b_tilde_w
         self._record_standard_week(k)
-        if has_cumul and getattr(self.agent, "update_sigma2_online", True):
-            ybar = (v_in @ y_in).ravel()
-            self._update_sigma2_eb(pf_data, sim_w_prev, ybar)
         self.dataset.pf_result = self.export()
 
     def _update_sigma2_eb(self, pf_data, sim_w_prev, ybar):
@@ -1760,6 +1767,40 @@ def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
     return np.concatenate([base, med_ctx])
 
 
+def _rewardshaping_state(state_dt, full_mediators):
+    """State dict for the reward-shaping feature map at a decision slot.
+
+    The Q-function snapshot ``state_dt`` (from ``dataset.get_state``) is the
+    *pre-action* context: its ``M_Y`` / ``M_E`` zero out the current slot's
+    decision-time mediator and the current day's daily mediator, because those
+    are only observed *after* the action. Reward shaping, however, assigns
+    within-week credit using exactly that post-action mediator information
+    (availability sets ``V^{sh}_{d,t} = V_{d,t} ∪ {(d,t)}`` and, for the second
+    slot, ``D^{sh}_{d,t} = D_d ∪ {d+1}``).
+
+    Since masking can only zero entries (never restore them), feeding the
+    pre-action snapshot to :func:`build_phi_action_rewardshaping` would never
+    expose the post-action mediators. We therefore swap in the *full realized*
+    weekly mediator matrices (``full_mediators = (M_Y_full, M_E_full)``) while
+    keeping the slot-specific ``E_w`` and context ``C`` from ``state_dt``;
+    ``build_phi_action_rewardshaping`` then masks for the *next* slot, which
+    trims the full matrices down to exactly ``V^{sh}`` / ``D^{sh}`` (including
+    the terminal slot, whose next-slot sentinel reveals the whole week).
+
+    ``full_mediators`` may be ``None`` (e.g. when no full-week record exists),
+    in which case the original pre-action snapshot is returned unchanged.
+    """
+    if full_mediators is None:
+        return state_dt
+    M_Y_full, M_E_full = full_mediators
+    if M_Y_full is None or M_E_full is None:
+        return state_dt
+    rs = dict(state_dt)
+    rs["M_Y"] = np.asarray(M_Y_full, dtype=float)
+    rs["M_E"] = np.asarray(M_E_full, dtype=float)
+    return rs
+
+
 def build_phi_bottleneck(b_hat, b_tilde, state):
     """
     Feature map  phi(S_{w,0}) for the bottleneck value V_alpha.
@@ -1942,7 +1983,7 @@ def build_rl_training_data_with_rewardshaping(k_cur, A_hist, b_hat_hist, b_tilde
                            get_state, eta, phi_fn=None, phi_rewardshaping_fn=None,
                            include_query=False, I_hist=None,
                            b_hat_query_hist=None, b_tilde_query_hist=None,
-                           gamma_query=None):
+                           gamma_query=None, get_full_mediators=None):
     """
     Build the RLSVI feature matrix and per-ensemble TD targets.
 
@@ -2045,6 +2086,7 @@ def build_rl_training_data_with_rewardshaping(k_cur, A_hist, b_hat_hist, b_tilde
         #         = Delta_{5,1} * Y_w
         #     <=>   R_{w,add} = Y_w - (1/Delta_{5,1}) sum_{d,t} Delta_{d,t} r_{d,t}.
         R_dt_disc_cumul = 0.0
+        full_med = get_full_mediators(kp) if get_full_mediators is not None else None
         for d, t in _iter_slots():
             state_dt = get_state(kp, d, t)
             a_dt = A_hist[kp, d, t]
@@ -2053,9 +2095,13 @@ def build_rl_training_data_with_rewardshaping(k_cur, A_hist, b_hat_hist, b_tilde
 
             nxt = _next_slot(d, t)
 
-            # per-slot shaped reward r_{d,t} = psi^T eta
+            # per-slot shaped reward r_{d,t} = psi^T eta. The reward-shaping
+            # feature uses post-action mediators, so it reads the full realized
+            # weekly mediators (the Q-feature above keeps the pre-action state).
             R_dt = float(
-                phi_rewardshaping_fn(bh_wp, bt_wp, state_dt, d, t) @ eta)
+                phi_rewardshaping_fn(
+                    bh_wp, bt_wp,
+                    _rewardshaping_state(state_dt, full_med), d, t) @ eta)
             R_dt_disc_cumul += Delta[d, t] * R_dt
             if nxt is not None:
                 # non-terminal: bootstrap from same-week successor
@@ -2105,7 +2151,8 @@ def build_rl_training_data_with_rewardshaping(k_cur, A_hist, b_hat_hist, b_tilde
     return Phi, targets_per_b
 
 def build_reward_shaping_training_data(k_cur, b_hat_hist, b_tilde_hist,
-                           get_state, gamma_dt, phi_fn=None):
+                           get_state, gamma_dt, phi_fn=None,
+                           get_full_mediators=None):
     """
     Build the (discount-weighted) reward-shaping feature matrix.
 
@@ -2155,11 +2202,12 @@ def build_reward_shaping_training_data(k_cur, b_hat_hist, b_tilde_hist,
     for kp in range(k_cur):
         bh_wp = b_hat_hist[kp]
         bt_wp = b_tilde_hist[kp]
+        full_med = get_full_mediators(kp) if get_full_mediators is not None else None
 
         # ── discount-weighted sum of 12 slot-level psis ──
         phi_week = None
         for d, t in _iter_slots():
-            state_dt = get_state(kp, d, t)
+            state_dt = _rewardshaping_state(get_state(kp, d, t), full_med)
             psi_dt = np.asarray(
                 phi_fn(bh_wp, bt_wp, state_dt, d, t), dtype=float)
             term = Delta[d, t] * psi_dt
@@ -2338,7 +2386,7 @@ def build_rl_training_data_with_rewardshaping_bottleneck(
     get_state,
     eta,
     phi_fn=None, phi_rewardshaping_fn=None,
-    p_eta=None, p_beta=None,
+    p_eta=None, p_beta=None, get_full_mediators=None,
 ):
     """
     Same structure as :func:`build_rl_training_data_with_bottleneck`, with the
@@ -2424,12 +2472,17 @@ def build_rl_training_data_with_rewardshaping_bottleneck(
         # We accumulate that non-terminal discounted sum below as
         # ``R_dt_nonterminal_disc``.
         R_dt_nonterminal_disc = 0.0
+        full_med = get_full_mediators(kp) if get_full_mediators is not None else None
         for d, t in _iter_slots():
             state_dt = get_state(kp, d, t)
             a_dt = A_hist[kp, d, t]
             phi_dt = phi_fn(bh_wp, bt_wp, state_dt, d, t, a_dt)
+            # Reward-shaping feature uses post-action mediators (full realized
+            # week); the Q-feature ``phi_dt`` above keeps the pre-action state.
             R_dt = float(
-                phi_rewardshaping_fn(bh_wp, bt_wp, state_dt, d, t) @ eta)
+                phi_rewardshaping_fn(
+                    bh_wp, bt_wp,
+                    _rewardshaping_state(state_dt, full_med), d, t) @ eta)
             nxt = _next_slot(d, t)
 
             if nxt is not None:

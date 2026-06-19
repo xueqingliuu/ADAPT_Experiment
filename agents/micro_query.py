@@ -53,6 +53,7 @@ class MicroQueryAgent:
     def reset(self, dataset):
         self.dataset = dataset
         self.get_state = dataset.get_state
+        self.get_full_mediators = getattr(dataset, "get_full_week_mediators", None)
         p_rl = self.mu_0_rl.shape[0]
 
         self.b_hat_hist = dataset.b_hat_hist
