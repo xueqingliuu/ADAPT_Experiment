@@ -27,10 +27,13 @@ export MPLCONFIGDIR="${SLURM_SUBMIT_DIR}/.matplotlib"
 
 # results parent dir shared by all array tasks (aggregate.py reads the same)
 export RESULTS_ROOT="${SLURM_SUBMIT_DIR}/results_vanilla"
+# compact: skip pf.pkl; full trajectory arrays only for random_send (see experiment.py)
+export SAVE_MODE="${SAVE_MODE:-compact}"
 
 echo "Host: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID:-local}  Task ID: ${SLURM_ARRAY_TASK_ID:-none}"
 echo "RESULTS_ROOT=${RESULTS_ROOT}"
+echo "SAVE_MODE=${SAVE_MODE}"
 
 # sanity check before a long run
 test -f env_para_vanilla/user_ids.txt

@@ -1253,6 +1253,33 @@ J_PARTICLES  = 50
 B_ENSEMBLES  = 50
 NWEEK        = 36
 
+# Result persistence: ``full`` (default) writes pf.pkl and trajectories for every
+# algorithm; ``compact`` skips pf.pkl and writes trajectory arrays in .npz only
+# for TRAJECTORY_REFERENCE_ALGO (for downstream replay / debugging).
+SAVE_MODE_FULL = "full"
+SAVE_MODE_COMPACT = "compact"
+TRAJECTORY_REFERENCE_ALGO = "random_send"
+
+
+def _parse_save_mode(raw):
+    mode = (raw or SAVE_MODE_FULL).strip().lower()
+    if mode in (SAVE_MODE_FULL, SAVE_MODE_COMPACT):
+        return mode
+    raise ValueError(
+        f"SAVE_MODE must be {SAVE_MODE_FULL!r} or {SAVE_MODE_COMPACT!r}, got {raw!r}"
+    )
+
+
+def _save_pf_pkl(save_mode):
+    return save_mode == SAVE_MODE_FULL
+
+
+def _save_trajectories_for_algo(save_mode, algo_name):
+    return (
+        save_mode == SAVE_MODE_FULL
+        or algo_name == TRAJECTORY_REFERENCE_ALGO
+    )
+
 
 # ──────────────────────────────────────────────────────────────────
 # Load priors estimated from df_fit (env_para_vanilla/rl_priors.json).
@@ -1670,7 +1697,30 @@ if __name__ == "__main__":
             "SLURM_ARRAY_TASK_ID is set, that value is used."
         ),
     )
+    parser.add_argument(
+        "--save-mode",
+        choices=[SAVE_MODE_FULL, SAVE_MODE_COMPACT],
+        default=None,
+        help=(
+            f"{SAVE_MODE_FULL}: save pf.pkl and full trajectories for all "
+            f"algorithms; {SAVE_MODE_COMPACT}: skip pf.pkl and save trajectory "
+            f"arrays only for {TRAJECTORY_REFERENCE_ALGO}. "
+            "Override with SAVE_MODE=<mode>."
+        ),
+    )
     args = parser.parse_args()
+
+    save_mode = _parse_save_mode(args.save_mode or os.getenv("SAVE_MODE"))
+    save_pf = _save_pf_pkl(save_mode)
+    traj_msg = (
+        "trajectories=all algos"
+        if save_mode == SAVE_MODE_FULL
+        else f"trajectories={TRAJECTORY_REFERENCE_ALGO} only"
+    )
+    print(
+        f"SAVE_MODE={save_mode} "
+        f"(pf.pkl={'yes' if save_pf else 'no'}, {traj_msg})"
+    )
 
     user_ids = np.loadtxt(PARAMS_DIR / "user_ids.txt", dtype=int)
     N_EXPERIMENTS = 100
@@ -1740,11 +1790,13 @@ if __name__ == "__main__":
             for name, (runner, _label) in ALGORITHMS.items():
                 res, oenv = runner(uid, seed=draw_seed)
                 snap = _snapshot_oenv(oenv)
-                oenv_runs[name][exp_idx].append(snap)
+                if _save_trajectories_for_algo(save_mode, name):
+                    oenv_runs[name][exp_idx].append(snap)
                 cae_full = snap["CAE_all"]
                 cae_runs[name][exp_idx].append(cae_full)
                 piA_runs[name][exp_idx].append(res["pi_A"].copy())
-                pf_runs[name][exp_idx].append(res["pf"])
+                if save_pf:
+                    pf_runs[name][exp_idx].append(res["pf"])
                 cae_by_uid[name].setdefault(uid, []).append(cae_full)
                 summary_parts.append(
                     f"{name}={np.nanmean(cae_full[1:]):.3f}"
@@ -1771,7 +1823,8 @@ if __name__ == "__main__":
             for field in oenv_runs[name][0][0].keys()
         }
         for name in ALGORITHMS
-        if oenv_runs[name] and oenv_runs[name][0]
+        if _save_trajectories_for_algo(save_mode, name)
+        and oenv_runs[name] and oenv_runs[name][0]
     }
 
     # ──────────────────────────────────────────────────────────────────
@@ -1810,6 +1863,8 @@ if __name__ == "__main__":
             "J_particles":    J_PARTICLES,
             "B_ensembles":    B_ENSEMBLES,
             "target_update_C": TARGET_C,
+            "save_mode":      save_mode,
+            "trajectory_reference_algo": TRAJECTORY_REFERENCE_ALGO,
         }, f, indent=2)
 
     np.save(OUTPUT_DIR / "run_uids.npy", run_uids_arr)
@@ -1819,14 +1874,16 @@ if __name__ == "__main__":
         cae_arr = np.stack([np.stack(per_exp) for per_exp in cae_runs[name]])
         piA_arr = np.stack([np.stack(per_exp) for per_exp in piA_runs[name]])
 
-        # Single compressed npz per algorithm: cae, piA, run_uids, every snapshot field.
-        np.savez_compressed(
-            OUTPUT_DIR / f"{name}.npz",
-            cae_runs=cae_arr,
-            piA_runs=piA_arr,
-            run_uids=run_uids_arr,
-            **trajectories[name],
-        )
+        # Single compressed npz per algorithm: cae, piA, run_uids; trajectory
+        # snapshot fields only when save_mode is full or name is the reference algo.
+        npz_payload = {
+            "cae_runs": cae_arr,
+            "piA_runs": piA_arr,
+            "run_uids": run_uids_arr,
+        }
+        if name in trajectories:
+            npz_payload.update(trajectories[name])
+        np.savez_compressed(OUTPUT_DIR / f"{name}.npz", **npz_payload)
 
         # cae_by_uid is heterogeneous (per-uid list lengths differ when a uid
         # is sampled different numbers of times across experiments). Pickle it
@@ -1837,8 +1894,9 @@ if __name__ == "__main__":
         }
         with open(OUTPUT_DIR / f"{name}_cae_by_uid.pkl", "wb") as f:
             pickle.dump(cae_by_uid_stacked, f)
-        with open(OUTPUT_DIR / f"{name}_pf.pkl", "wb") as f:
-            pickle.dump(pf_runs[name], f)
+        if save_pf:
+            with open(OUTPUT_DIR / f"{name}_pf.pkl", "wb") as f:
+                pickle.dump(pf_runs[name], f)
 
     # %%
     # ──────────────────────────────────────────────────────────────────
