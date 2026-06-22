@@ -40,6 +40,12 @@ COMBINED_DIR = Path(
 ).expanduser().resolve()
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
 EW_POOLED_COEF_JSON = WORK_DIR / "Ew_pooled_linear_coefs.json"
+COEF_DECIMALS = 3
+
+
+def _truncate_decimals(x: float, digits: int = COEF_DECIMALS) -> float:
+    factor = 10.0 ** digits
+    return float(np.trunc(float(x) * factor) / factor)
 
 
 def _week_fix_and_filter(df: pd.DataFrame) -> pd.DataFrame:
@@ -185,7 +191,7 @@ def fit_pooled_linear_Ew(
     reg.fit(X, y)
     names = feature_cols
     coefs = reg.coef_.ravel()
-    out = {k: float(c) for k, c in zip(names, coefs)}
+    out = {k: _truncate_decimals(c, COEF_DECIMALS) for k, c in zip(names, coefs)}
     r2 = reg.score(X, y)
     return {"coefficients": out, "r2": r2, "n": len(m), "frame": m}
 
@@ -194,7 +200,7 @@ if __name__ == "__main__":
     result = fit_pooled_linear_Ew()
     print(f'n = {result["n"]}, R^2 = {result["r2"]:.4f}')
     for k, v in result["coefficients"].items():
-        print(f'  {k}: {v:.6f}')
+        print(f"  {k}: {v:.3f}")
     EW_POOLED_COEF_JSON.parent.mkdir(parents=True, exist_ok=True)
     with open(EW_POOLED_COEF_JSON, "w", encoding="utf-8") as f:
         json.dump(result["coefficients"], f, indent=2)

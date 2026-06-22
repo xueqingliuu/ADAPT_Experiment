@@ -1263,7 +1263,7 @@ try:
     from vani_env import P_FOURSC, P_ANTIC, make_initial_state
 except ImportError:  # pragma: no cover
     P_FOURSC = 30
-    P_ANTIC = 25
+    P_ANTIC = 19
 
     def make_initial_state(participant_id=118):  # type: ignore[misc]
         raise ImportError("vani_env required for make_initial_state")
@@ -1361,8 +1361,8 @@ _FOURSC_AH_CAE_COL = 24
 _ANTIC_CAE_COL = 7
 _ANTIC_WS_M_COL = 8
 _ANTIC_WS_A_COL = 9
-_ANTIC_CAE_WS_M_COL = 20
-_ANTIC_CAE_WS_A_COL = 21
+_ANTIC_CAE_WS_M_COL = 17
+_ANTIC_CAE_WS_A_COL = 18
 _CAE_AR1_COL = 1
 
 
@@ -1413,9 +1413,6 @@ def build_antic_features(
     return np.array([
         1.0, float(dailyAnticipatedAffectYesterday), ys, rpa, act, sal, dayOfWeekNorm_n, _pu, _cae,
         ws_morning, ws_afternoon,
-        ws_morning * ys, ws_afternoon * ys,
-        ws_morning * rpa, ws_afternoon * rpa,
-        ws_morning * act, ws_afternoon * act,
         ws_morning * sal, ws_afternoon * sal,
         ws_morning * dayOfWeekNorm, ws_afternoon * dayOfWeekNorm,
         ws_morning * _pu, ws_afternoon * _pu,

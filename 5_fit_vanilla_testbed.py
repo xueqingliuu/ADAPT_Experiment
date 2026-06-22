@@ -193,12 +193,6 @@ THETA_ANTIC_NAMES = [
     "CAE_avg_lastweek",
     "A0_morning",
     "A1_afternoon",
-    "A0_morning_by_today_step_count",
-    "A1_afternoon_by_today_step_count",
-    "A0_morning_by_recorded_physical_activity",
-    "A1_afternoon_by_recorded_physical_activity",
-    "A0_morning_by_active_status",
-    "A1_afternoon_by_active_status",
     "A0_morning_by_salience_message",
     "A1_afternoon_by_salience_message",
     "A0_morning_by_dow",
@@ -405,7 +399,8 @@ for i, userid in enumerate(userid_all):
     recorded_physical_activity_cond_obs = recorded_physical_activity_cond[idx_obs_recorded_physical_activity, :]
     recorded_physical_activity_obs = recorded_physical_activity[idx_obs_recorded_physical_activity]
 
-    if np.var(recorded_physical_activity_obs.astype(float)) > 0:
+    has_recorded_physical_activity_obs = recorded_physical_activity_obs.size > 0
+    if has_recorded_physical_activity_obs and np.var(recorded_physical_activity_obs.astype(float)) > 0:
         n0, n1 = int(np.sum(recorded_physical_activity_obs == 0)), int(np.sum(recorded_physical_activity_obs == 1))
         min_class = min(n0, n1)
         cv_rpa = min(cv_recorded_physical_activity, min_class)
@@ -451,10 +446,15 @@ for i, userid in enumerate(userid_all):
         sigma2_recorded_physical_activity_mean = np.var(resid_obs_recorded_physical_activity)
     else:
         print(f"the variance of recorded_physical_activity is 0 for user {userid}")
-        const = float(np.nanmean(recorded_physical_activity_obs.astype(float)))
+        const = float(
+            safe_nanmean(recorded_physical_activity_obs.astype(float), default=np.nan)
+        )
         alpha_recorded_physical_activity_l2 = float(alpha_l2_list[0])
         theta_recorded_physical_activity_mean = np.zeros(recorded_physical_activity_cond.shape[1])
-        if const <= 0.0:
+        if not np.isfinite(const):
+            const = 0.5
+            theta_recorded_physical_activity_mean[0] = 0.0
+        elif const <= 0.0:
             theta_recorded_physical_activity_mean[0] = -25.0
         elif const >= 1.0:
             theta_recorded_physical_activity_mean[0] = 25.0
@@ -481,7 +481,8 @@ for i, userid in enumerate(userid_all):
     active_status_cond_obs = active_status_cond[idx_obs_active_status, :]
     active_status_obs = active_status[idx_obs_active_status]
 
-    if np.var(active_status_obs.astype(float)) > 0:
+    has_active_status_obs = active_status_obs.size > 0
+    if has_active_status_obs and np.var(active_status_obs.astype(float)) > 0:
         n0, n1 = int(np.sum(active_status_obs == 0)), int(np.sum(active_status_obs == 1))
         min_class = min(n0, n1)
         cv_as = min(cv_active_status, min_class)
@@ -521,7 +522,7 @@ for i, userid in enumerate(userid_all):
         sigma2_active_status_mean = np.var(resid_obs_active_status)
     else:
         print(f"the variance of active_status is 0 for user {userid}")
-        const = float(np.nanmean(active_status_obs.astype(float)))
+        const = float(safe_nanmean(active_status_obs.astype(float), default=np.nan))
         alpha_active_status_l2 = float(alpha_l2_list[0])
         theta_active_status_mean = np.zeros(active_status_cond.shape[1])
         if not np.isfinite(const):
@@ -557,7 +558,8 @@ for i, userid in enumerate(userid_all):
     ws_interaction_obs =  ws_interaction[idx_obs_ws_interaction]
 
 
-    if np.var(ws_interaction_obs.astype(float)) > 0:
+    has_ws_interaction_obs = ws_interaction_obs.size > 0
+    if has_ws_interaction_obs and np.var(ws_interaction_obs.astype(float)) > 0:
         n0, n1 = int(np.sum(ws_interaction_obs == 0)), int(np.sum(ws_interaction_obs == 1))
         min_class = min(n0, n1)
         cv_ws = min(cv_ws_interaction, min_class)
@@ -594,10 +596,13 @@ for i, userid in enumerate(userid_all):
         sigma2_ws_interaction_mean = np.var(resid_obs_ws_interaction)
     else:
         print(f"the variance of Interacted_walk is 0 for user {userid}")
-        const = float(np.nanmean(ws_interaction_obs.astype(float)))
+        const = float(safe_nanmean(ws_interaction_obs.astype(float), default=np.nan))
         alpha_ws_interaction_l2 = float(alpha_l2_list[0])
         theta_ws_interaction_mean = np.zeros(ws_interaction_cond.shape[1])
-        if const <= 0.0:
+        if not np.isfinite(const):
+            const = 0.5
+            theta_ws_interaction_mean[0] = 0.0
+        elif const <= 0.0:
             theta_ws_interaction_mean[0] = -25.0
         elif const >= 1.0:
             theta_ws_interaction_mean[0] = 25.0
@@ -691,12 +696,6 @@ for i, userid in enumerate(userid_all):
         CAE_avg_lastweek[_am],
         ws_morning_day,
         ws_afternoon_day,
-        ws_morning_day * today_step_count[_am],
-        ws_afternoon_day * today_step_count[_am],
-        ws_morning_day * recorded_physical_activity_filled[_am],
-        ws_afternoon_day * recorded_physical_activity_filled[_am],
-        ws_morning_day * active_status_filled[_am],
-        ws_afternoon_day * active_status_filled[_am],
         ws_morning_day * salience_message[_am],
         ws_afternoon_day * salience_message[_am],
         ws_morning_day * dow[_am],

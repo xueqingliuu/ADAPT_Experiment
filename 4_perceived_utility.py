@@ -359,7 +359,7 @@ def build_user_blocks(
       - The within-week likelihood uses only actually observed rows:
             pv_y, FW_daily, PJ_daily
         plus ``day_dow`` and ``day_burden`` (aligned with each calendar day, from the
-        morning row) for FW/PJ logit covariates.
+        afternoon row) for FW/PJ logit covariates.
         AR coefficients multiply precomputed lag columns: ``PV_lag1_col`` per hour,
         ``FW_lag_col`` / ``PJ_lag_col`` per day (NaNs treated as 0 in the likelihood).
         Missing weeks keep these as empty arrays.
@@ -450,10 +450,10 @@ def build_user_blocks(
 
 
             day_dow_list.append(
-                float(row_morning[dow_col]) if not pd.isna(row_morning[dow_col]) else np.nan
+                float(row_afternoon[dow_col]) if not pd.isna(row_afternoon[dow_col]) else np.nan
             )
             day_burden_list.append(
-                float(row_morning[burden_col]) if not pd.isna(row_morning[burden_col]) else np.nan
+                float(row_afternoon[burden_col]) if not pd.isna(row_afternoon[burden_col]) else np.nan
             )
 
             if FW_lag_col is not None:
@@ -1566,20 +1566,6 @@ def quadrature_loglik(
             raise FloatingPointError("invalid week-1 log-likelihood at fixed E_1")
         loglik += log_ell1
         c_list.append(float(np.exp(log_ell1)))
-
-        mu2 = (
-            par["a0"]
-            + par["a1"] * e1
-            + par["a2"] * blocks[0]["PV_sum_trans"]
-            + par["a3"] * blocks[0]["FW_sum_trans"]
-            + par["a4"] * blocks[0]["PJ_sum_trans"]
-        )
-        q = normal_pdf(grid, mu2, par["sigma_E"])
-        denq = np.sum(q * weights)
-        if denq <= 0 or not np.isfinite(denq):
-            raise FloatingPointError("invalid predictive density for E_2")
-        q /= denq
-
         pred_mean[0] = np.nan
         filt_mean[0] = e1
 
@@ -1594,6 +1580,21 @@ def quadrature_loglik(
                 "params": par,
                 "e1_known": e1_known,
             }
+
+        # Predictive density for week 2, obtained by propagating the fixed week-1
+        # latent through the Gaussian transition.
+        mu2 = (
+            par["a0"]
+            + par["a1"] * e1
+            + par["a2"] * blocks[0]["PV_sum_trans"]
+            + par["a3"] * blocks[0]["FW_sum_trans"]
+            + par["a4"] * blocks[0]["PJ_sum_trans"]
+        )
+        q = normal_pdf(grid, mu2, par["sigma_E"])
+        denq = np.sum(q * weights)
+        if denq <= 0 or not np.isfinite(denq):
+            raise FloatingPointError("invalid predictive density for E_2")
+        q /= denq
 
         for t in range(1, T):
             q_list.append(q.copy())
@@ -1623,17 +1624,7 @@ def quadrature_loglik(
     else:
         q = normal_pdf(grid, par["m0"], par["sigma0"])
         q /= np.sum(q * weights)
-        q_list.append(q.copy())
-        pred_mean[0] = np.sum(grid * q * weights)
-
         for t in range(T):
-            if t > 0:
-                F = transition_matrix(grid, blocks[t - 1], par)
-                q = F @ (p * weights)
-                denq = np.sum(q * weights)
-                if denq <= 0 or not np.isfinite(denq):
-                    raise FloatingPointError(f"invalid predictive density week {t+1}")
-                q /= denq
             q_list.append(q.copy())
             pred_mean[t] = np.sum(grid * q * weights)
 
@@ -1650,6 +1641,14 @@ def quadrature_loglik(
             c_list.append(c)
             filt_mean[t] = np.sum(grid * p * weights)
             loglik += np.log(c)
+
+            if t < T - 1:
+                F = transition_matrix(grid, blocks[t], par)
+                q = F @ (p * weights)
+                denq = np.sum(q * weights)
+                if denq <= 0 or not np.isfinite(denq):
+                    raise FloatingPointError(f"invalid predictive density week {t+2}")
+                q /= denq
 
     return {
         "loglik": float(loglik),

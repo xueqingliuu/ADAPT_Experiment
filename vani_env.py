@@ -43,7 +43,8 @@ PARAMS_DIR = PROJECT_ROOT / "env_para_vanilla"
 # (and their WalkingSuggestion interactions) — these are NOT trimmed away.
 P_FOURSC = 30
 _LEGACY_INTERACT_DROP = (2,)  # removed legacy salience-history covariate
-P_ANTIC = 25
+_LEGACY_ANTIC_DROP = (11, 12, 13, 14, 15, 16)  # removed WS×(step, RPA, active) terms
+P_ANTIC = 19
 P_ACTIVE_STATUS = 3
 P_PRIOR2HOUR = 4
 P_RPA = 3
@@ -100,6 +101,16 @@ def trim_theta_foursc(theta) -> np.ndarray:
     if a.size == P_FOURSC:
         return a
     raise ValueError(f"theta_fourSC length {a.size}; expected {P_FOURSC}")
+
+
+def trim_theta_antic(theta) -> np.ndarray:
+    """Accept current 19-dim antic fits or legacy 25-dim with extra WS terms."""
+    a = np.asarray(theta, dtype=float).ravel()
+    if a.size == P_ANTIC:
+        return a
+    if a.size == 25:
+        return np.delete(a, _LEGACY_ANTIC_DROP)
+    raise ValueError(f"theta_antic length {a.size}; expected {P_ANTIC} or legacy 25")
 
 
 def _json_resid_list(key: str, d: dict) -> np.ndarray:
@@ -193,7 +204,7 @@ class EnvConfig:
             _json_float_list("theta_ws_interaction", p), name="theta_ws_interaction"
         )
         self.theta_fourSC = trim_theta_foursc(_json_float_list("theta_fourSC", p))
-        self.theta_antic = _json_float_list("theta_antic", p)
+        self.theta_antic = trim_theta_antic(_json_float_list("theta_antic", p))
         self.theta_CAE = _json_float_list("theta_CAE", p)
         self.theta_CAE_short = _json_float_list("theta_CAE_short_avg", p)
 
@@ -481,7 +492,7 @@ class Env:
 
     def gen_antic_mean(self, s, ws_morning, ws_afternoon):
         """
-        Daily ridge design (morning row): 25 columns — matches
+        Daily ridge design (morning row): 19 columns — matches
         ``5_fit_vanilla_testbed`` ``anticipated_affect_cond_day``
         (no ``planning_prompt``; includes ``perceivedUtilityLastWeek`` main and
         AM/PM interactions).
@@ -506,12 +517,6 @@ class Env:
                 cae,
                 ws_morning,
                 ws_afternoon,
-                ws_morning * ys,
-                ws_afternoon * ys,
-                ws_morning * rpa,
-                ws_afternoon * rpa,
-                ws_morning * act,
-                ws_afternoon * act,
                 ws_morning * sal,
                 ws_afternoon * sal,
                 ws_morning * dayOfWeekNorm,

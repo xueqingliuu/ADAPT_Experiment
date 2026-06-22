@@ -1216,6 +1216,8 @@ P_MY_FOURSC = int(
         Ah=0.0,
     ).shape[0]
 )
+# Antic PF design mirrors the trimmed treatment-effect spec in 5_fit/vani_env
+# (no WS × {todayStepCount, recordedPhysicalActivityToday, activityStatusToday}).
 P_MY_ANTIC  = P_ANTIC
 P_CAE = int(build_CAE_features(0.0, 0.0, np.zeros(FOURSC_SLOTS_PER_WEEK), np.zeros(7)).shape[0])
 P_TY  = int(build_CAE_short_features(0.0).shape[0])

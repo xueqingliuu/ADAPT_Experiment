@@ -7,7 +7,7 @@
 # 1. Select analysis columns
 # 2. Calendar covariates → `*_norm` in [-1, 1]
 # 3. Log-transform count outcomes / pageviews
-# 4. Z-score continuous features; Likert → [0, 1]
+# 4. Z-score continuous features; ordinal 0–7 surveys → [-1, 1]
 # 5. Write `std_params.json` (shifts, scales, limits) to `env_para_vanilla/`
 # 6. Add decision-slot lags; save `df_fit.csv`
 
@@ -153,7 +153,10 @@ def _zscore(series, digits=DIGITS):
 
 
 def _likert_norm(series, digits=DIGITS):
-    norm = (series + 1) / 8
+    # Fixed-scale normalization for ordinal survey items coded on 0..7.
+    # Maps scale midpoint to 0 and keeps outputs comparable to other
+    # standardized predictors on approximately [-1, 1].
+    norm = 2 * series / 7 - 1
     limit = [np.round(norm.min(), digits), np.round(norm.max(), digits)]
     return norm, limit
 
@@ -192,7 +195,7 @@ for col in LOG_COLUMNS:
         df_fit[col] = np.log(df_fit[col] + 1)
 
 # %% [markdown]
-# ## 4. Z-score + Likert normalization
+# ## 4. Z-score + fixed-scale ordinal normalization
 
 # %%
 std_params = {}
