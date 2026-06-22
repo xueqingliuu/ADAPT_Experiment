@@ -878,8 +878,8 @@ def compute_rlsvi_betas_with_alphas(
     Phi_terminal, Phi_bottleneck_next, Y_terminal, gamma_terminal,
     # ── JOINT prior on theta = (eta, beta) (full covariance) ──
     mu_0, Sigma_0,
-    # ── three noise variances ──
-    sigma2_bottleneck, sigma2, sigma2_T,
+    # ── single modified-TD loss noise variance ──
+    sigma2_Q,
     # ── joint AR(1) noise ──
     gamma_bar, z_prev, rng,
 ):
@@ -895,16 +895,16 @@ def compute_rlsvi_betas_with_alphas(
     Per-ensemble loss (math)
     ------------------------
         L^{(b)}(eta, beta) =
-            (1 / sigma_0^2) * sum_{w'=0..k-1} (
+            (1 / sigma_Q^2) * sum_{w'=0..k-1} (
                 phi(tilde S_{w',0,0}, a^{(b)})^T beta
               - phi_bottleneck(S_{w',0})^T eta
             )^2
-          + (1 / sigma_TD^2) * sum_{w'=0..k-1}
+          + (1 / sigma_Q^2) * sum_{w'=0..k-1}
                 sum_{(0,0) <= (d,t) < (5,1)} (
                 y^{(b)}_{w',d,t}
               - phi(tilde S_{w',d,t}, A_{w',d,t})^T beta
             )^2
-          + (1 / sigma_T^2)  * sum_{w'=0..k-1} (
+          + (1 / sigma_Q^2) * sum_{w'=0..k-1} (
                 Y_{w'+1}
               + gamma_{5,1} * phi_bottleneck(S_{w'+1,0})^T eta
               - phi(tilde S_{w',5,1}, A_{w',5,1})^T beta
@@ -918,9 +918,7 @@ def compute_rlsvi_betas_with_alphas(
 
     Code ↔ math
     -----------
-    ``sigma2_bottleneck``  ↔  sigma_0^2 (bottleneck regression noise).
-    ``sigma2``             ↔  sigma_TD^2 (non-terminal TD noise).
-    ``sigma2_T``           ↔  sigma_T^2 (terminal TD noise).
+    ``sigma2_Q``           ↔  sigma_Q^2 (shared joint-loss noise).
     ``gamma_terminal``     ↔  gamma_{5,1}.
 
     Note on the single ``z_prev`` (no ``z_prev_bottleneck``)
@@ -947,14 +945,18 @@ def compute_rlsvi_betas_with_alphas(
     Then
         Sigma_post^{(b),-1} =
             Sigma_0^{-1}
-          + (1 / sigma2_bottleneck) * X_A^{(b),T} X_A^{(b)}
-          + (1 / sigma2)            * X_B^T       X_B
-          + (1 / sigma2_T)          * X_C^T       X_C
+          + (1 / sigma2_Q) * (
+                X_A^{(b),T} X_A^{(b)}
+              + X_B^T       X_B
+              + X_C^T       X_C
+            )
 
         mu_post^{(b)} = Sigma_post^{(b)} (
               Sigma_0^{-1} mu_0
-            + (1 / sigma2)   * X_B^T targets_per_b[b]
-            + (1 / sigma2_T) * X_C^T Y_terminal
+            + (1 / sigma2_Q) * (
+                  X_B^T targets_per_b[b]
+                + X_C^T Y_terminal
+              )
         )
     (the block-A target is zero, so no X_A^T y_A term).
 
@@ -984,12 +986,9 @@ def compute_rlsvi_betas_with_alphas(
         Joint prior mean for theta = (eta, beta), p = p_eta + p_beta.
     Sigma_0 : (p, p) array
         Joint prior covariance (full, not block-diagonal).
-    sigma2_bottleneck : float
-        Block-A (bottleneck regression) noise variance.
-    sigma2 : float
-        Block-B (non-terminal TD) noise variance == sigma_TD^2.
-    sigma2_T : float
-        Block-C (terminal TD) noise variance.
+    sigma2_Q : float
+        Shared noise variance for all three blocks in the bottleneck-state TD
+        loss.
     gamma_bar : float
         AR(1) coefficient for the joint noise discount.
     z_prev : list of B (p,) arrays
@@ -1065,9 +1064,7 @@ def compute_rlsvi_betas_with_alphas(
 
         Sigma_post_inv = (
             Sigma_0_inv
-            + (1.0 / sigma2_bottleneck) * XtX_A
-            + (1.0 / sigma2)            * XtX_B
-            + (1.0 / sigma2_T)          * XtX_C
+            + (1.0 / sigma2_Q) * (XtX_A + XtX_B + XtX_C)
         )
         Sigma_post = spd_inverse(Sigma_post_inv)
 
@@ -1077,8 +1074,7 @@ def compute_rlsvi_betas_with_alphas(
             Xty_B = X_B.T @ np.asarray(targets_per_b[b], dtype=float).ravel()
         rhs = (
             precomp_prior
-            + (1.0 / sigma2)   * Xty_B
-            + (1.0 / sigma2_T) * Xty_C
+            + (1.0 / sigma2_Q) * (Xty_B + Xty_C)
         )
         mu_b_joint = Sigma_post @ rhs
 

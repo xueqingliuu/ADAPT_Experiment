@@ -1311,13 +1311,13 @@ def _default_rl_priors(p_rl):
 def _default_rl_joint_priors(p_eta, p_beta):
     """Fallback joint prior for the modified-TD-loss RLSVI agents.
 
-    Returns ``(mu_0, Sigma_0, p_eta, sigma2_bottleneck, sigma2_TD, sigma2_T)``
+    Returns ``(mu_0, Sigma_0, p_eta, sigma2_Q)``
     with mean 0, covariance ``10 * I_{p_eta+p_beta}`` (block-diagonal only
     because we have no informative prior; the agents will then learn the
-    cross-terms from data), and unit noise variances.
+    cross-terms from data), and unit joint-loss noise variance.
     """
     p = p_eta + p_beta
-    return (np.zeros(p), np.eye(p), int(p_eta), 1.0, 1.0, 1.0)
+    return (np.zeros(p), np.eye(p), int(p_eta), 1.0)
 
 
 def _load_priors():
@@ -1347,13 +1347,10 @@ if _priors is None:
     Gamma_0_tilde_Y= _pf["Gamma_0_tilde_Y"]
     sigma2_tilde_Y = _pf["sigma2_tilde_Y"]
     mu_0_micro,     Sigma_0_micro,     sigma2_rl_micro     = _default_rl_priors(P_RL_MICRO)
-    mu_0_micro_mtd, Sigma_0_micro_mtd, sigma2_rl_micro_mtd = _default_rl_priors(P_RL_MICRO)
     mu_0_reward,    Sigma_0_reward,    sigma2_reward      = _default_rl_priors(P_RL_REWARDSHAPING)
-    mu_0_bottleneck,Sigma_0_bottleneck,sigma2_bottleneck  = _default_rl_priors(P_RL_BOTTLENECK)
     # Joint (alpha, beta) prior for the modified-TD-loss RLSVI agents.
     (mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint,
-     sigma2_bottleneck_mtd_joint, sigma2_TD_mtd_joint,
-     sigma2_T_mtd_joint) = _default_rl_joint_priors(
+     sigma2_Q_mtd_joint) = _default_rl_joint_priors(
         P_RL_BOTTLENECK, P_RL_MICRO)
 else:
     _setup_log(f"[priors] loaded estimated priors from {_priors_src}")
@@ -1371,18 +1368,9 @@ else:
     mu_0_micro      = _priors["mu_0_micro"]
     Sigma_0_micro   = _priors["Sigma_0_micro"]
     sigma2_rl_micro = _priors["sigma2_rl_micro"]
-    # Separate Q prior used by the two TD-modify variants
-    # (MicroQueryAgent_ModifiedTDLoss and MicroQueryAgent_rewardshaping_modifiedTD)
-    # whose FQI target bootstraps from V_alpha at the terminal slot.
-    mu_0_micro_mtd      = _priors["mu_0_micro_mtd"]
-    Sigma_0_micro_mtd   = _priors["Sigma_0_micro_mtd"]
-    sigma2_rl_micro_mtd = _priors["sigma2_rl_micro_mtd"]
     mu_0_reward     = _priors["mu_0_reward"]
     Sigma_0_reward  = _priors["Sigma_0_reward"]
     sigma2_reward   = _priors["sigma2_reward"]
-    mu_0_bottleneck = _priors["mu_0_bottleneck"]
-    Sigma_0_bottleneck = _priors["Sigma_0_bottleneck"]
-    sigma2_bottleneck  = _priors["sigma2_bottleneck"]
     # Joint (alpha, beta) prior for the modified-TD-loss RLSVI agents.
     # Sigma_0 is the FULL joint covariance across users (not block-diagonal).
     # Falls back to the block-diagonal default if the older rl_priors.json
@@ -1391,16 +1379,16 @@ else:
         mu_0_mtd_joint              = _priors["mu_0_micro_mtd_joint"]
         Sigma_0_mtd_joint           = _priors["Sigma_0_micro_mtd_joint"]
         p_eta_mtd_joint             = int(_priors["p_eta_micro_mtd_joint"])
-        sigma2_bottleneck_mtd_joint = float(_priors["sigma2_bottleneck_mtd_joint"])
-        sigma2_TD_mtd_joint         = float(_priors["sigma2_TD_mtd_joint"])
-        sigma2_T_mtd_joint          = float(_priors["sigma2_T_mtd_joint"])
+        sigma2_Q_mtd_joint          = float(_priors.get(
+            "sigma2_Q_mtd_joint",
+            _priors.get("sigma2_TD_mtd_joint", 1.0),
+        ))
     else:
         _setup_log("[priors] q_td_modify_joint missing from rl_priors.json -> "
                    "falling back to default joint prior (rerun est_prior.py "
                    "to regenerate).")
         (mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint,
-         sigma2_bottleneck_mtd_joint, sigma2_TD_mtd_joint,
-         sigma2_T_mtd_joint) = _default_rl_joint_priors(
+         sigma2_Q_mtd_joint) = _default_rl_joint_priors(
             P_RL_BOTTLENECK, P_RL_MICRO)
 
 # Sanity check: every loaded prior must agree with the phi-builder dims.
@@ -1409,9 +1397,7 @@ assert nu_0_MY[1].shape == (P_MY_ANTIC,),  f"antic dim {nu_0_MY[1].shape} != {P_
 assert nu_0_Y.shape       == (P_CAE,),     f"CAE dim {nu_0_Y.shape} != {P_CAE}"
 assert nu_0_tilde_Y.shape == (P_TY,),      f"CAE_short dim {nu_0_tilde_Y.shape} != {P_TY}"
 assert mu_0_micro.shape       == (P_RL_MICRO,)
-assert mu_0_micro_mtd.shape   == (P_RL_MICRO,)
 assert mu_0_reward.shape      == (P_RL_REWARDSHAPING,)
-assert mu_0_bottleneck.shape  == (P_RL_BOTTLENECK,)
 _P_MTD_JOINT = P_RL_BOTTLENECK + P_RL_MICRO
 assert mu_0_mtd_joint.shape    == (_P_MTD_JOINT,), \
     f"joint mu_0 dim {mu_0_mtd_joint.shape} != ({_P_MTD_JOINT},)"
@@ -1519,9 +1505,7 @@ def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5):
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
         mu_0_joint=mu_0_mtd_joint, Sigma_0_joint=Sigma_0_mtd_joint,
         p_eta=p_eta_mtd_joint,
-        sigma2_bottleneck=sigma2_bottleneck_mtd_joint,
-        sigma2_TD=sigma2_TD_mtd_joint,
-        sigma2_T=sigma2_T_mtd_joint,
+        sigma2_Q=sigma2_Q_mtd_joint,
         gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
         target_update_C=TARGET_C,
         nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
@@ -1548,9 +1532,7 @@ def run_micro_query_rs_mtd(uid, seed=42, gamma_bar=0.5):
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
         mu_0_joint=mu_0_mtd_joint, Sigma_0_joint=Sigma_0_mtd_joint,
         p_eta=p_eta_mtd_joint,
-        sigma2_bottleneck=sigma2_bottleneck_mtd_joint,
-        sigma2_TD=sigma2_TD_mtd_joint,
-        sigma2_T=sigma2_T_mtd_joint,
+        sigma2_Q=sigma2_Q_mtd_joint,
         gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
         target_update_C=TARGET_C,
         nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,

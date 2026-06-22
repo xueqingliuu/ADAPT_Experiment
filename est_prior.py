@@ -3,11 +3,11 @@
 For every model below we use a two-stage empirical-Bayes scheme:
 
   1. **Pooled fit.** Stack all users' rows of ``df_fit`` into one design
-     and fit a single ridge regression. This gives ``theta_pool`` and a
-     pooled residual variance ``sigma2_pool``.
+     and fit a single ridge regression. This gives ``theta_pool``.
   2. **Per-user fits.** Fit a separate ridge regression on each user's
-     rows to obtain ``theta_u``. The across-user spread of these
-     ``theta_u`` characterises population heterogeneity.
+     rows to obtain ``theta_u`` and a per-user residual variance
+     ``sigma2_u``. The across-user spread of ``theta_u`` characterises
+     population heterogeneity.
 
 Pool into:
 
@@ -15,7 +15,8 @@ Pool into:
          prior cov     = diag( var_u(theta_u) )       (across-user variance
                                                        of per-user theta_u,
                                                        one number per coefficient)
-         sigma2        = sigma2_pool                  (pooled residual variance)
+         sigma2        = mean_u( sigma2_u )         (average per-user
+                                                       residual variance)
 
 For the joint ``(eta, beta)`` Q-prior, the same scheme applies coordinate-wise
 but the covariance is the **full** sample covariance of per-user
@@ -40,33 +41,30 @@ PF features differ from the env generative model in three respects (see
      belief / agent E_w. This is a feature-substitution mechanism and does
      not change the population parameter being estimated, so the
      regressions here use the actual observed values from df_fit.
-RL bottleneck V_alpha (eta)     -> mu_0_bottleneck, Sigma_0_bottleneck,
-   (build_phi_bottleneck)          sigma2_bottleneck
 RL reward shaping               -> mu_0_reward, Sigma_0_reward, sigma2_reward
    (build_phi_action_rewardshaping;
     sum_{d,t} Delta_{d,t} psi on
     Delta_{6,2} * Y_w)
 RL Q (no TD modify, beta)       -> mu_0_micro, Sigma_0_micro, sigma2_rl_micro
    (build_phi_action, fitted Q
-    bootstrapping next-week Q)
-RL Q (with TD modify, beta)     -> mu_0_micro_mtd, Sigma_0_micro_mtd,
-   (build_phi_action, fitted Q     sigma2_rl_micro_mtd
-    bootstrapping next-week V_alpha)
+    bootstrapping next-week Q;
+    used by micro_g0 / micro_g05 / rs_g0 / rs_g05)
+
 RL Q joint (eta, beta) for      -> mu_0_micro_mtd_joint,
    modified-TD-loss RLSVI          Sigma_0_micro_mtd_joint (FULL cov),
-   (mu = (alpha_pool, beta_pool)    p_eta_micro_mtd_joint,
-    from pooled bottleneck + TD-    sigma2_bottleneck_mtd_joint,
-    modify FQI; Sigma = full cov    sigma2_TD_mtd_joint,
-    of per-user (alpha_u, beta_u);  sigma2_T_mtd_joint
-    pooled-FQI residuals split into
-    non-terminal (TD) / terminal
-    (T) blocks)
+   (direct joint fit of the         p_eta_micro_mtd_joint,
+    stacked bottleneck-state        sigma2_Q_mtd_joint
+    TD loss; Sigma = full cov
+    of per-user theta=(eta,beta))
+   Used by mtd_g0 / mtd_g05 / rs_mtd_g0 / rs_mtd_g05 in experiment.py.
 
-The Q-function priors are fit by fitted-Q iteration (FQI):
+The no-TD-modify Q prior is fit by fitted-Q iteration (FQI):
 
     target_{k,d,t} = gamma_{d,t} * max_a Q(s_{next}, a)            (non-terminal)
-    target_{k,6,2} = R_{k+1} + gamma_{6,2} * max_a Q(s_{1,1}^{k+1}, a)  (no TD-mod)
-                   = R_{k+1} + gamma_{6,2} * V_alpha(s_0^{k+1})         (with TD-mod)
+    target_{k,6,2} = R_{k+1} + gamma_{6,2} * max_a Q(s_{1,1}^{k+1}, a)
+
+The modified-TD prior is fit by direct joint FQI on the stacked
+bottleneck-state TD loss for ``theta=(eta,beta)``.
 
 with ``R_{k+1} = caeAverage_norm`` of week k and
 ``s_{1,1}^{k+1}`` the start-of-week state in df_fit week k+1.  The last
@@ -131,7 +129,7 @@ RL_ME_SHAPE = (6, 4)
 
 # Numerical hyperparameters
 RIDGE_ALPHA_PF = 1.0     # ridge prior precision for PF mediator / Y / tY fits
-RIDGE_ALPHA_RL = 1.0     # ridge prior precision for RL Q / reward / bottleneck fits
+RIDGE_ALPHA_RL = 1.0     # ridge prior precision for RL Q / reward / joint fits
 MIN_SIGMA2 = 1e-6
 N_FQI_ITERS = 25         # fitted-Q iterations per user
 
@@ -150,9 +148,28 @@ def _week_fix_and_filter(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[df["week"] < 13].copy()
 
 
+def _filter_users_with_cae_obs(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop users with no observed weekly CAE values after the week filter."""
+    has_cae_obs = (
+        df.groupby("ParticipantIdentifier", sort=False)["CAE_avg_norm"]
+        .apply(lambda s: np.isfinite(s.to_numpy(dtype=float)).any())
+    )
+    keep_ids = has_cae_obs[has_cae_obs].index
+    drop_ids = has_cae_obs[~has_cae_obs].index
+    if len(drop_ids) > 0:
+        print(
+            "Excluding users with no CAE observations: "
+            + ", ".join(str(int(uid)) for uid in drop_ids)
+        )
+    if len(keep_ids) == 0:
+        raise ValueError("No users with observed CAE values remain after filtering.")
+    return df.loc[df["ParticipantIdentifier"].isin(keep_ids)].copy()
+
+
 def load_df_fit(path: Optional[Path] = None) -> pd.DataFrame:
     p = path or (COMBINED_DIR / "df_fit.csv")
-    return _week_fix_and_filter(pd.read_csv(p))
+    return _filter_users_with_cae_obs(_week_fix_and_filter(pd.read_csv(p)))
+
 
 
 def _fill_nan(x: np.ndarray, default: float = 0.0) -> np.ndarray:
@@ -196,10 +213,22 @@ def _ridge_fit(
     return theta, sigma2
 
 
+def _mean_user_sigma2(user_sigma2s: List[Optional[float]]) -> float:
+    """Average finite per-user residual variances."""
+    vals = [
+        float(s)
+        for s in user_sigma2s
+        if s is not None and np.isfinite(s)
+    ]
+    if not vals:
+        return 1.0
+    return max(float(np.mean(vals)), MIN_SIGMA2)
+
+
 def _pool_user_fits(
     pooled_theta: Optional[np.ndarray],
-    pooled_sigma2: Optional[float],
     user_thetas: List[Optional[np.ndarray]],
+    user_sigma2s: List[Optional[float]],
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
     """Build a (prior mean, diag cov, sigma2) tuple under empirical-Bayes pooling.
 
@@ -207,13 +236,15 @@ def _pool_user_fits(
     ------
     pooled_theta   coefficient vector from a single ridge regression on all
                    users' rows stacked together; becomes the prior mean.
-    pooled_sigma2  residual variance of the same pooled fit; becomes sigma2.
     user_thetas    list of per-user theta_u (None for users that could not
                    be fit). Their across-user variance is the diagonal of
                    the prior covariance.
+    user_sigma2s   list of per-user residual variances aligned with
+                   ``user_thetas``; their average becomes sigma2.
 
-    The prior mean / sigma2 come entirely from the pooled fit; the per-user
-    fits are used only to characterise across-user heterogeneity.
+    The prior mean comes from the pooled fit; sigma2 is the average of
+    per-user residual variances; the per-user thetas characterise
+    across-user heterogeneity.
     """
     if pooled_theta is None:
         return None, None, None
@@ -229,7 +260,7 @@ def _pool_user_fits(
         var = np.ones(p)
     var = np.maximum(var, MIN_SIGMA2)
     cov = np.diag(var)
-    sigma2 = float(pooled_sigma2) if pooled_sigma2 is not None else 1.0
+    sigma2 = _mean_user_sigma2(user_sigma2s)
     return pooled_theta, cov, sigma2
 
 
@@ -433,10 +464,10 @@ def fit_pf_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
 
     For each of fourSC, antic, CAE, CAE_short:
       * stack all users' design rows and fit one ridge regression
-        -> ``theta_pool`` (prior mean) and ``sigma2_pool`` (prior sigma^2);
+        -> ``theta_pool`` (prior mean);
       * fit a ridge regression on each user separately
-        -> ``theta_u`` collection, used only for the diagonal across-user
-        variance of the prior covariance.
+        -> ``theta_u`` collection for the diagonal across-user prior
+           covariance, and ``sigma2_u`` for the average residual variance.
     """
     by_user = df_fit.groupby("ParticipantIdentifier", sort=False)
 
@@ -445,48 +476,56 @@ def fit_pf_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
     X_ant_all, y_ant_all = [], []
     X_Y_all,   y_Y_all   = [], []
     X_tY_all,  y_tY_all  = [], []
-    # Per-user theta collections for the across-user variance.
+    # Per-user theta / sigma2 collections for across-user pooling.
     fSC_thetas: List[Optional[np.ndarray]] = []
+    fSC_sigma2s: List[Optional[float]] = []
     ant_thetas: List[Optional[np.ndarray]] = []
+    ant_sigma2s: List[Optional[float]] = []
     Y_thetas:   List[Optional[np.ndarray]] = []
+    Y_sigma2s:  List[Optional[float]] = []
     tY_thetas:  List[Optional[np.ndarray]] = []
+    tY_sigma2s: List[Optional[float]] = []
 
     for _uid, dat in by_user:
         dat = dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True)
 
         Xf, yf = _build_fourSC_design(dat)
         X_fSC_all.append(Xf); y_fSC_all.append(yf)
-        th, _ = _ridge_fit(Xf, yf, alpha=RIDGE_ALPHA_PF)
+        th, s2 = _ridge_fit(Xf, yf, alpha=RIDGE_ALPHA_PF)
         fSC_thetas.append(th)
+        fSC_sigma2s.append(s2)
 
         Xa, ya = _build_antic_design(dat)
         X_ant_all.append(Xa); y_ant_all.append(ya)
-        th, _ = _ridge_fit(Xa, ya, alpha=RIDGE_ALPHA_PF)
+        th, s2 = _ridge_fit(Xa, ya, alpha=RIDGE_ALPHA_PF)
         ant_thetas.append(th)
+        ant_sigma2s.append(s2)
 
         XC, yC = _build_CAE_design(dat)
         X_Y_all.append(XC); y_Y_all.append(yC)
-        th, _ = _ridge_fit(XC, yC, alpha=RIDGE_ALPHA_PF)
+        th, s2 = _ridge_fit(XC, yC, alpha=RIDGE_ALPHA_PF)
         Y_thetas.append(th)
+        Y_sigma2s.append(s2)
 
         Xs, ys = _build_CAE_short_design(dat)
         X_tY_all.append(Xs); y_tY_all.append(ys)
-        th, _ = _ridge_fit(Xs, ys, alpha=RIDGE_ALPHA_PF)
+        th, s2 = _ridge_fit(Xs, ys, alpha=RIDGE_ALPHA_PF)
         tY_thetas.append(th)
+        tY_sigma2s.append(s2)
 
-    th_fSC_pool, s2_fSC_pool = _ridge_fit(
+    th_fSC_pool, _ = _ridge_fit(
         np.vstack(X_fSC_all), np.concatenate(y_fSC_all), alpha=RIDGE_ALPHA_PF)
-    th_ant_pool, s2_ant_pool = _ridge_fit(
+    th_ant_pool, _ = _ridge_fit(
         np.vstack(X_ant_all), np.concatenate(y_ant_all), alpha=RIDGE_ALPHA_PF)
-    th_Y_pool,   s2_Y_pool   = _ridge_fit(
+    th_Y_pool, _ = _ridge_fit(
         np.vstack(X_Y_all),   np.concatenate(y_Y_all),   alpha=RIDGE_ALPHA_PF)
-    th_tY_pool,  s2_tY_pool  = _ridge_fit(
+    th_tY_pool, _ = _ridge_fit(
         np.vstack(X_tY_all),  np.concatenate(y_tY_all),  alpha=RIDGE_ALPHA_PF)
 
-    nu_fSC, G_fSC, s2_fSC = _pool_user_fits(th_fSC_pool, s2_fSC_pool, fSC_thetas)
-    nu_ant, G_ant, s2_ant = _pool_user_fits(th_ant_pool, s2_ant_pool, ant_thetas)
-    nu_Y,   G_Y,   s2_Y   = _pool_user_fits(th_Y_pool,   s2_Y_pool,   Y_thetas)
-    nu_tY,  G_tY,  s2_tY  = _pool_user_fits(th_tY_pool,  s2_tY_pool,  tY_thetas)
+    nu_fSC, G_fSC, s2_fSC = _pool_user_fits(th_fSC_pool, fSC_thetas, fSC_sigma2s)
+    nu_ant, G_ant, s2_ant = _pool_user_fits(th_ant_pool, ant_thetas, ant_sigma2s)
+    nu_Y,   G_Y,   s2_Y   = _pool_user_fits(th_Y_pool,   Y_thetas,   Y_sigma2s)
+    nu_tY,  G_tY,  s2_tY  = _pool_user_fits(th_tY_pool,  tY_thetas,  tY_sigma2s)
 
     return {
         "fourSC":    {"nu_0": nu_fSC, "Gamma_0": G_fSC, "sigma2": s2_fSC,
@@ -669,50 +708,7 @@ def _phi_bottleneck_start(t_dict, k) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────
-# 3. V_alpha bottleneck prior
-# ──────────────────────────────────────────────────────────────────
-def fit_bottleneck_prior(
-    df_fit: pd.DataFrame,
-) -> Tuple[Dict[str, Any], Dict[int, np.ndarray]]:
-    """Bottleneck V_alpha prior: regress weekly CAE on phi_bottleneck(S_{k,0}).
-
-    Prior mean comes from a pooled regression that stacks every user's
-    weeks together; the diagonal prior covariance comes from the across-user
-    variance of per-user alpha_u. The per-user alphas are also returned for
-    dayOfWeekNormnstream use as the V_alpha bootstrap when fitting the TD-modify
-    Q prior.
-    """
-    thetas: List[Optional[np.ndarray]] = []
-    alpha_by_user: Dict[int, np.ndarray] = {}
-    Phi_all, y_all = [], []
-    for uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False):
-        dat = dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True)
-        td = _user_weekly_tensors(dat)
-        n_w = td["n_w"]
-        if n_w < 2:
-            thetas.append(None); continue
-        Phi = np.stack([_phi_bottleneck_start(td, k) for k in range(n_w)])
-        y = td["R_week"]
-        Phi_all.append(Phi); y_all.append(y)
-        theta, _ = _ridge_fit(Phi, y, alpha=RIDGE_ALPHA_RL)
-        thetas.append(theta)
-        if theta is not None:
-            alpha_by_user[int(uid)] = theta
-
-    if Phi_all:
-        pooled_theta, pooled_s2 = _ridge_fit(
-            np.vstack(Phi_all), np.concatenate(y_all), alpha=RIDGE_ALPHA_RL)
-    else:
-        pooled_theta, pooled_s2 = None, None
-
-    mu, Sigma, sigma2 = _pool_user_fits(pooled_theta, pooled_s2, thetas)
-    return ({"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2,
-             "names": ["intercept", "E_w", "b_hat", "b_tilde"]},
-            alpha_by_user)
-
-
-# ──────────────────────────────────────────────────────────────────
-# 4. Reward-shaping eta prior
+# 3. Reward-shaping eta prior
 # ──────────────────────────────────────────────────────────────────
 def fit_reward_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
     """Reward-shaping prior under the discount-corrected regression.
@@ -730,26 +726,30 @@ def fit_reward_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
     covariance comes from per-user fits.
     """
     thetas: List[Optional[np.ndarray]] = []
+    sigma2s: List[Optional[float]] = []
     Phi_all, y_all = [], []
     for _uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False):
         dat = dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True)
         td = _user_weekly_tensors(dat)
         n_w = td["n_w"]
         if n_w < 2:
-            thetas.append(None); continue
+            thetas.append(None)
+            sigma2s.append(None)
+            continue
         Phi = np.stack([_phi_rs_week_discounted(td, k) for k in range(n_w)])
         y = DELTA_TERMINAL * td["R_week"]
         Phi_all.append(Phi); y_all.append(y)
-        theta, _ = _ridge_fit(Phi, y, alpha=RIDGE_ALPHA_RL)
+        theta, s2 = _ridge_fit(Phi, y, alpha=RIDGE_ALPHA_RL)
         thetas.append(theta)
+        sigma2s.append(s2)
 
     if Phi_all:
-        pooled_theta, pooled_s2 = _ridge_fit(
+        pooled_theta, _ = _ridge_fit(
             np.vstack(Phi_all), np.concatenate(y_all), alpha=RIDGE_ALPHA_RL)
     else:
-        pooled_theta, pooled_s2 = None, None
+        pooled_theta = None
 
-    mu, Sigma, sigma2 = _pool_user_fits(pooled_theta, pooled_s2, thetas)
+    mu, Sigma, sigma2 = _pool_user_fits(pooled_theta, thetas, sigma2s)
     return {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
 
 
@@ -758,16 +758,13 @@ def fit_reward_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────
 def _precompute_q_features(
     td: Dict[str, np.ndarray],
-    alpha_bottleneck: Optional[np.ndarray],
     use_td_modify: bool,
 ) -> Optional[Dict[str, Any]]:
     """Per-user phi tensors for FQI; ``None`` if the user has < 2 weeks.
 
     The same precompute is used for per-user FQI (one entry per user) and
-    for pooled FQI (one entry per user, then stacked). ``alpha_bottleneck``
-    is only used to size / fill ``phi_next_bot``; for pooled FQI the caller
-    should pass the same pooled alpha consistently so the bootstrap target
-    matches across users.
+    for pooled FQI (one entry per user, then stacked). The direct joint
+    modified-TD fit builds bottleneck features without a staged alpha estimate.
     """
     n_w = td["n_w"]
     if n_w < 2:
@@ -795,9 +792,14 @@ def _precompute_q_features(
         phi_next_a1[k] = _phi_action(td, k + 1, 0, 1)
 
     phi_next_bot = None
-    if use_td_modify and alpha_bottleneck is not None:
-        phi_next_bot = np.zeros((n_train, np.asarray(alpha_bottleneck).size))
+    phi_bot = None
+    p_eta = None
+    if use_td_modify:
+        p_eta = _phi_bottleneck_start(td, 0).size
+        phi_bot = np.zeros((n_train, p_eta))
+        phi_next_bot = np.zeros((n_train, p_eta))
         for k in range(n_train):
+            phi_bot[k] = _phi_bottleneck_start(td, k)
             phi_next_bot[k] = _phi_bottleneck_start(td, k + 1)
 
     return {
@@ -806,10 +808,12 @@ def _precompute_q_features(
         "phi_a1":      phi_a1,
         "phi_next_a0": phi_next_a0,
         "phi_next_a1": phi_next_a1,
+        "phi_bot":      phi_bot,
         "phi_next_bot": phi_next_bot,
         "R":           td["R_week"][:n_train],
         "n_train":     n_train,
         "p_phi":       p_phi,
+        "p_eta":       p_eta,
     }
 
 
@@ -818,7 +822,6 @@ def _fqi_iterate(
     alpha_for_boot: Optional[np.ndarray],
     use_td_modify: bool,
     n_iters: int = N_FQI_ITERS,
-    split_residuals: bool = False,
 ) -> Tuple[Optional[np.ndarray], Optional[float], Optional[float]]:
     """Run FQI on one or more users' precomputed features.
 
@@ -827,12 +830,8 @@ def _fqi_iterate(
     rebuilds targets per (user, week, slot) using the current ``theta`` and
     refits a ridge regression on the stacked rows.
 
-    Returns ``(theta, sigma2_a, sigma2_b)``:
-      * If ``split_residuals`` is False, ``sigma2_a`` is the residual
-        variance over all training rows and ``sigma2_b`` is None.
-      * If True, ``sigma2_a`` is the non-terminal (TD) residual variance and
-        ``sigma2_b`` is the terminal (T) residual variance (used by the
-        joint modified-TD-loss prior).
+    Returns ``(theta, sigma2, None)``, where ``sigma2`` is the residual
+    variance over the fitted-Q rows.
     """
     if not feats_list:
         return None, None, None
@@ -873,100 +872,129 @@ def _fqi_iterate(
             break
         theta = theta_new
 
-    if not split_residuals:
-        resid = y_all - X_all @ theta
-        sigma2 = (max(float(np.var(resid, ddof=1)), MIN_SIGMA2)
-                  if resid.size > 1 else 1.0)
-        return theta, sigma2, None
-
-    # Split residuals into non-terminal (TD) vs terminal (T) blocks, pooled
-    # across users.
-    resid_nt_chunks, resid_t_chunks = [], []
-    offset = 0
-    for f in feats_list:
-        n_train = f["n_train"]
-        n_rows = n_train * N_RL_SLOTS_WEEK
-        X_u = f["phi_obs"].reshape(n_rows, p_phi)
-        y_u = y_all[offset:offset + n_rows]
-        resid_u = (y_u - X_u @ theta).reshape(n_train, N_RL_SLOTS_WEEK)
-        resid_nt_chunks.append(resid_u[:, : N_RL_SLOTS_WEEK - 1].reshape(-1))
-        resid_t_chunks.append(resid_u[:, N_RL_SLOTS_WEEK - 1])
-        offset += n_rows
-    resid_nt = np.concatenate(resid_nt_chunks)
-    resid_t  = np.concatenate(resid_t_chunks)
-    sigma2_TD = (max(float(np.var(resid_nt, ddof=1)), MIN_SIGMA2)
-                 if resid_nt.size > 1 else 1.0)
-    sigma2_T  = (max(float(np.var(resid_t,  ddof=1)), MIN_SIGMA2)
-                 if resid_t.size  > 1 else 1.0)
-    return theta, sigma2_TD, sigma2_T
+    resid = y_all - X_all @ theta
+    sigma2 = (max(float(np.var(resid, ddof=1)), MIN_SIGMA2)
+              if resid.size > 1 else 1.0)
+    return theta, sigma2, None
 
 
-def fit_q_priors(
-    df_fit: pd.DataFrame,
-    alpha_by_user: Dict[int, np.ndarray],
-    alpha_pool: Optional[np.ndarray] = None,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Q-function priors (no TD-modify, with TD-modify) under pooled-mean +
-    per-user-variance pooling.
+def _mtd_joint_design(
+    feats_list: List[Dict[str, Any]],
+    beta_for_targets: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Stack the three bottleneck-state TD loss blocks for theta=(alpha,beta)."""
+    if not feats_list:
+        return np.empty((0, 0)), np.empty((0,)), 0
+
+    p_eta = int(feats_list[0]["p_eta"])
+    p_beta = int(feats_list[0]["p_phi"])
+    p = p_eta + p_beta
+    beta_for_targets = np.asarray(beta_for_targets, dtype=float).ravel()
+
+    X_chunks, y_chunks = [], []
+    for feats in feats_list:
+        n_train = feats["n_train"]
+
+        # Block A: Q(S_{w,1,1}, a*) - V(S_{w,0}) = 0.
+        q0_first = feats["phi_a0"][:, 0, :] @ beta_for_targets
+        q1_first = feats["phi_a1"][:, 0, :] @ beta_for_targets
+        phi_first = np.where(
+            (q1_first >= q0_first)[:, None],
+            feats["phi_a1"][:, 0, :],
+            feats["phi_a0"][:, 0, :],
+        )
+        X_A = np.zeros((n_train, p))
+        X_A[:, :p_eta] = -feats["phi_bot"]
+        X_A[:, p_eta:] = phi_first
+        y_A = np.zeros(n_train)
+
+        # Block B: non-terminal TD rows.
+        n_nt = n_train * (N_RL_SLOTS_WEEK - 1)
+        X_B = np.zeros((n_nt, p))
+        y_B = np.zeros(n_nt)
+        row = 0
+        for k in range(n_train):
+            for idx in range(N_RL_SLOTS_WEEK - 1):
+                X_B[row, p_eta:] = feats["phi_obs"][k, idx]
+                q0_next = feats["phi_a0"][k, idx + 1] @ beta_for_targets
+                q1_next = feats["phi_a1"][k, idx + 1] @ beta_for_targets
+                y_B[row] = GAMMA_DT_SCALAR * max(q0_next, q1_next)
+                row += 1
+
+        # Block C: terminal row with next-week bottleneck bootstrap in design.
+        X_C = np.zeros((n_train, p))
+        X_C[:, :p_eta] = -GAMMA_DT_SCALAR * feats["phi_next_bot"]
+        X_C[:, p_eta:] = feats["phi_obs"][:, N_RL_SLOTS_WEEK - 1, :]
+        y_C = feats["R"]
+
+        X_chunks.extend([X_A, X_B, X_C])
+        y_chunks.extend([y_A, y_B, y_C])
+
+    return np.vstack(X_chunks), np.concatenate(y_chunks), p_eta
+
+
+def _joint_fqi_iterate(
+    feats_list: List[Dict[str, Any]],
+    n_iters: int = N_FQI_ITERS,
+) -> Tuple[Optional[np.ndarray], Optional[float], Optional[int]]:
+    """Directly fit theta=(alpha,beta) under the bottleneck-state TD loss."""
+    if not feats_list:
+        return None, None, None
+
+    p_eta = int(feats_list[0]["p_eta"])
+    p_beta = int(feats_list[0]["p_phi"])
+    theta = np.zeros(p_eta + p_beta)
+    sigma2 = None
+
+    for _ in range(n_iters):
+        X, y, p_eta = _mtd_joint_design(feats_list, theta[p_eta:])
+        theta_new, sigma2 = _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)
+        if theta_new is None:
+            return None, None, None
+        if np.linalg.norm(theta_new - theta) < 1e-6 * (
+            np.linalg.norm(theta) + 1e-12
+        ):
+            theta = theta_new
+            break
+        theta = theta_new
+
+    X, y, _ = _mtd_joint_design(feats_list, theta[p_eta:])
+    resid = y - X @ theta
+    sigma2 = (max(float(np.var(resid, ddof=1)), MIN_SIGMA2)
+              if resid.size > 1 else 1.0)
+    return theta, sigma2, p_eta
+
+
+def fit_q_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
+    """Q-function prior (no TD-modify) under pooled-mean + per-user-variance pooling.
 
     Prior mean comes from a single FQI run on every user's rows stacked
     together; the diagonal prior covariance comes from the across-user
-    variance of per-user FQI thetas. For the TD-modify variant, the
-    V_alpha bootstrap target uses ``alpha_pool`` in the pooled fit and the
-    user's own ``alpha_u`` in per-user fits (so each user's FQI is
-    self-consistent with their bottleneck fit).
+    variance of per-user FQI thetas.
     """
     th_nomod_users: List[Optional[np.ndarray]] = []
-    th_mod_users:   List[Optional[np.ndarray]] = []
+    s2_nomod_users: List[Optional[float]] = []
     feats_nomod_pool: List[Dict[str, Any]] = []
-    feats_mod_pool:   List[Dict[str, Any]] = []
 
-    for uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False):
+    for _uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False):
         dat = dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True)
         td = _user_weekly_tensors(dat)
-        alpha_u = alpha_by_user.get(int(uid))
 
-        feats_u_no = _precompute_q_features(td, None, use_td_modify=False)
+        feats_u_no = _precompute_q_features(td, use_td_modify=False)
         if feats_u_no is None:
             th_nomod_users.append(None)
+            s2_nomod_users.append(None)
         else:
-            th, _, _ = _fqi_iterate([feats_u_no], None, use_td_modify=False)
+            th, s2_u, _ = _fqi_iterate([feats_u_no], None, use_td_modify=False)
             th_nomod_users.append(th)
+            s2_nomod_users.append(s2_u)
             feats_nomod_pool.append(feats_u_no)
 
-        if alpha_u is None:
-            th_mod_users.append(None)
-        else:
-            feats_u_m = _precompute_q_features(td, alpha_u, use_td_modify=True)
-            if feats_u_m is None:
-                th_mod_users.append(None)
-            else:
-                th, _, _ = _fqi_iterate([feats_u_m], alpha_u, use_td_modify=True)
-                th_mod_users.append(th)
-
-        # Pooled FQI features must use alpha_pool consistently across users.
-        if alpha_pool is not None:
-            feats_pool_m = _precompute_q_features(
-                td, alpha_pool, use_td_modify=True)
-            if feats_pool_m is not None:
-                feats_mod_pool.append(feats_pool_m)
-
-    th_nomod_pool, s2_nomod_pool, _ = _fqi_iterate(
+    th_nomod_pool, _, _ = _fqi_iterate(
         feats_nomod_pool, None, use_td_modify=False)
-    if alpha_pool is not None and feats_mod_pool:
-        th_mod_pool, s2_mod_pool, _ = _fqi_iterate(
-            feats_mod_pool, alpha_pool, use_td_modify=True)
-    else:
-        th_mod_pool, s2_mod_pool = None, None
-
-    mu_n, Sigma_n, sigma2_n = _pool_user_fits(
-        th_nomod_pool, s2_nomod_pool, th_nomod_users)
-    mu_m, Sigma_m, sigma2_m = _pool_user_fits(
-        th_mod_pool,   s2_mod_pool,   th_mod_users)
-    return (
-        {"mu_0": mu_n, "Sigma_0": Sigma_n, "sigma2": sigma2_n},
-        {"mu_0": mu_m, "Sigma_0": Sigma_m, "sigma2": sigma2_m},
-    )
+    mu, Sigma, sigma2 = _pool_user_fits(
+        th_nomod_pool, th_nomod_users, s2_nomod_users)
+    return {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1007,31 +1035,14 @@ def _pool_joint_user_fits(
     return pooled_theta, Sigma, n_used
 
 
-def fit_q_td_modify_joint_prior(
-    df_fit: pd.DataFrame,
-    alpha_by_user: Dict[int, np.ndarray],
-    alpha_pool: Optional[np.ndarray],
-    sigma2_bottleneck: float,
-) -> Dict[str, Any]:
-    """Joint pooled-mean / per-user-variance prior on theta = (eta, beta).
+def fit_q_td_modify_joint_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
+    """Joint prior on theta=(eta,beta) from the bottleneck-state TD loss.
 
-    The two stages mirror the other priors but use the joint vector
-    ``(eta, beta)`` and a full (non-diagonal) covariance:
-
-      * **Pooled mean.** ``alpha_pool`` (from the pooled bottleneck fit) and
-        ``beta_pool`` (from a single FQI on all users' rows under the
-        TD-modify bootstrap with ``alpha_pool`` as the V_alpha target) are
-        concatenated to give ``mu_0 = (alpha_pool, beta_pool)``.
-      * **Per-user covariance.** For each user we form
-        ``theta_u = (alpha_u, beta_u)`` from their own bottleneck and
-        TD-modify FQI fits. The full sample covariance across users gives
-        ``Sigma_0`` (cross-block terms preserved).
-
-    Residual variances ``sigma2_TD`` (non-terminal slots) and ``sigma2_T``
-    (terminal slot) come from the pooled FQI fit, split by slot type.
-    ``sigma2_bottleneck`` (block-A noise variance) is echoed from the
-    bottleneck-regression prior so callers can read the full triple from
-    one place.
+    The pooled prior mean is fit by running the direct joint FQI objective on
+    all users' rows stacked together. The prior covariance is the full sample
+    covariance across per-user joint fits, preserving eta-beta cross terms.
+    ``sigma2_Q`` is the average of per-user residual variances from the same
+    stacked loss.
 
     Returns
     -------
@@ -1039,59 +1050,38 @@ def fit_q_td_modify_joint_prior(
         ``mu_0``                joint mean,    shape ``(p_eta + p_beta,)``
         ``Sigma_0``             joint cov,     shape ``(p, p)`` (FULL)
         ``p_eta``               int            number of eta coordinates
-        ``sigma2_bottleneck``   float          block-A noise variance
-        ``sigma2_TD``           float          block-B noise variance
-        ``sigma2_T``            float          block-C noise variance
+        ``sigma2_Q``            float          shared joint-loss noise variance
         ``n_users``             int            number of users contributing
     """
     user_thetas: List[Optional[np.ndarray]] = []
+    s2_Q_users: List[Optional[float]] = []
     feats_pool: List[Dict[str, Any]] = []
     p_eta: Optional[int] = None
 
-    for uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False):
-        alpha_u = alpha_by_user.get(int(uid))
-        if alpha_u is None:
-            user_thetas.append(None); continue
-        if p_eta is None:
-            p_eta = int(np.asarray(alpha_u).ravel().size)
-
+    for _uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False):
         dat = dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True)
         td = _user_weekly_tensors(dat)
 
-        feats_u = _precompute_q_features(td, alpha_u, use_td_modify=True)
+        feats_u = _precompute_q_features(td, use_td_modify=True)
         if feats_u is None:
-            user_thetas.append(None); continue
-        beta_u, _, _ = _fqi_iterate(
-            [feats_u], alpha_u, use_td_modify=True)
-        if beta_u is None:
-            user_thetas.append(None); continue
-        theta_u = np.concatenate([
-            np.asarray(alpha_u, dtype=float).ravel(),
-            np.asarray(beta_u, dtype=float).ravel(),
-        ])
+            user_thetas.append(None)
+            s2_Q_users.append(None)
+            continue
+
+        theta_u, s2_u, p_eta_u = _joint_fqi_iterate([feats_u])
+        if theta_u is None:
+            user_thetas.append(None)
+            s2_Q_users.append(None)
+            continue
+        if p_eta is None:
+            p_eta = int(p_eta_u)
         user_thetas.append(theta_u)
+        s2_Q_users.append(s2_u)
+        feats_pool.append(feats_u)
 
-        # Pooled FQI uses alpha_pool (not alpha_u) for the V_alpha bootstrap
-        # so the bootstrap target is consistent across stacked rows.
-        if alpha_pool is not None:
-            feats_pool_u = _precompute_q_features(
-                td, alpha_pool, use_td_modify=True)
-            if feats_pool_u is not None:
-                feats_pool.append(feats_pool_u)
-
-    if alpha_pool is not None and feats_pool:
-        beta_pool, sigma2_TD, sigma2_T = _fqi_iterate(
-            feats_pool, alpha_pool, use_td_modify=True, split_residuals=True)
-    else:
-        beta_pool, sigma2_TD, sigma2_T = None, None, None
-
-    if alpha_pool is not None and beta_pool is not None:
-        theta_pool = np.concatenate([
-            np.asarray(alpha_pool, dtype=float).ravel(),
-            np.asarray(beta_pool, dtype=float).ravel(),
-        ])
-    else:
-        theta_pool = None
+    theta_pool, _, p_eta_pool = _joint_fqi_iterate(feats_pool)
+    if p_eta is None and p_eta_pool is not None:
+        p_eta = int(p_eta_pool)
 
     mu_0, Sigma_0, n_used = _pool_joint_user_fits(theta_pool, user_thetas)
 
@@ -1099,9 +1089,7 @@ def fit_q_td_modify_joint_prior(
         "mu_0":              mu_0,
         "Sigma_0":           Sigma_0,
         "p_eta":             int(p_eta) if p_eta is not None else None,
-        "sigma2_bottleneck": float(sigma2_bottleneck),
-        "sigma2_TD":         float(sigma2_TD) if sigma2_TD is not None else 1.0,
-        "sigma2_T":          float(sigma2_T)  if sigma2_T  is not None else 1.0,
+        "sigma2_Q":          _mean_user_sigma2(s2_Q_users),
         "n_users":           int(n_used),
     }
 
@@ -1142,10 +1130,8 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
         return None if x is None else np.asarray(x, dtype=float)
 
     pf = raw["pf"]
-    bn = raw["bottleneck"]
     rw = raw["reward"]
     qn = raw["q_no_td_modify"]
-    qm = raw["q_td_modify"]
     qj = raw.get("q_td_modify_joint")
 
     out = {
@@ -1158,18 +1144,12 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
         "nu_0_tilde_Y":     arr(pf["CAE_short"]["nu_0"]),
         "Gamma_0_tilde_Y":  arr(pf["CAE_short"]["Gamma_0"]),
         "sigma2_tilde_Y":   float(pf["CAE_short"]["sigma2"]),
-        "mu_0_bottleneck":     arr(bn["mu_0"]),
-        "Sigma_0_bottleneck":  arr(bn["Sigma_0"]),
-        "sigma2_bottleneck":   float(bn["sigma2"]),
         "mu_0_reward":     arr(rw["mu_0"]),
         "Sigma_0_reward":  arr(rw["Sigma_0"]),
         "sigma2_reward":   float(rw["sigma2"]),
         "mu_0_micro":         arr(qn["mu_0"]),
         "Sigma_0_micro":      arr(qn["Sigma_0"]),
         "sigma2_rl_micro":    float(qn["sigma2"]),
-        "mu_0_micro_mtd":         arr(qm["mu_0"]),
-        "Sigma_0_micro_mtd":      arr(qm["Sigma_0"]),
-        "sigma2_rl_micro_mtd":    float(qm["sigma2"]),
     }
 
     if qj is not None:
@@ -1180,10 +1160,10 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
             "Sigma_0_micro_mtd_joint":    arr(qj["Sigma_0"]),
             "p_eta_micro_mtd_joint":      (None if qj.get("p_eta") is None
                                            else int(qj["p_eta"])),
-            "sigma2_bottleneck_mtd_joint":
-                float(qj.get("sigma2_bottleneck", bn["sigma2"])),
-            "sigma2_TD_mtd_joint":        float(qj["sigma2_TD"]),
-            "sigma2_T_mtd_joint":         float(qj["sigma2_T"]),
+            "sigma2_Q_mtd_joint":         float(qj.get(
+                "sigma2_Q",
+                qj.get("sigma2_TD", 1.0),
+            )),
         })
 
     return out
@@ -1200,45 +1180,29 @@ def main() -> Dict[str, Any]:
         n = None if d["nu_0"] is None else len(d["nu_0"])
         print(f"  {name:9s}: p={n}, sigma2={d['sigma2']:.4f}")
 
-    print("Fitting bottleneck V_alpha prior ...")
-    bottleneck, alpha_by_user = fit_bottleneck_prior(df_fit)
-    print(f"  bottleneck: p={len(bottleneck['mu_0'])}, "
-          f"sigma2={bottleneck['sigma2']:.4f}, "
-          f"users={len(alpha_by_user)}")
-
     print("Fitting reward-shaping eta prior ...")
     reward = fit_reward_prior(df_fit)
     print(f"  reward: p={len(reward['mu_0'])}, sigma2={reward['sigma2']:.4f}")
 
-    print("Fitting Q-function priors (no TD-modify, with TD-modify) ...")
-    q_no_mod, q_mod = fit_q_priors(
-        df_fit, alpha_by_user, alpha_pool=bottleneck["mu_0"])
+    print("Fitting Q-function prior (no TD-modify) ...")
+    q_no_mod = fit_q_prior(df_fit)
     print(f"  Q (no TD-modify): p={len(q_no_mod['mu_0'])}, "
           f"sigma2={q_no_mod['sigma2']:.4f}")
-    print(f"  Q (with TD-modify): p={len(q_mod['mu_0'])}, "
-          f"sigma2={q_mod['sigma2']:.4f}")
 
     print("Fitting joint (alpha, beta) prior for modified-TD-loss RLSVI ...")
-    q_mod_joint = fit_q_td_modify_joint_prior(
-        df_fit, alpha_by_user,
-        alpha_pool=bottleneck["mu_0"],
-        sigma2_bottleneck=bottleneck["sigma2"])
+    q_mod_joint = fit_q_td_modify_joint_prior(df_fit)
     if q_mod_joint["mu_0"] is not None:
         print(f"  Q joint: p={len(q_mod_joint['mu_0'])}, "
               f"p_eta={q_mod_joint['p_eta']}, "
               f"n_users={q_mod_joint['n_users']}, "
-              f"sigma2_bottleneck={q_mod_joint['sigma2_bottleneck']:.4f}, "
-              f"sigma2_TD={q_mod_joint['sigma2_TD']:.4f}, "
-              f"sigma2_T={q_mod_joint['sigma2_T']:.4f}")
+              f"sigma2_Q={q_mod_joint['sigma2_Q']:.4f}")
     else:
         print("  Q joint: no users contributed (skipped)")
 
     priors = {
         "pf":           pf,
-        "bottleneck":   bottleneck,
         "reward":       reward,
         "q_no_td_modify":      q_no_mod,
-        "q_td_modify":         q_mod,
         "q_td_modify_joint":   q_mod_joint,
     }
     path = save_priors(priors)

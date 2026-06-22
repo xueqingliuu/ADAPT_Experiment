@@ -326,11 +326,11 @@ class Env:
         return float(np.clip(mean + noise, *self.cfg.limits_prior2hour_step_count))
 
     def gen_recorded_physical_activity_mean(self, s, return_logit=False):
-        """Daily morning model: [1, recordedPhysicalActivityLag1, dayOfWeekNorm]."""
+        """Daily morning model: [1, activityCompletedLast7Days, dayOfWeekNorm]."""
         X = np.array(
             [
                 1.0,
-                s["recordedPhysicalActivityLag1"],
+                s["activityCompletedLast7Days"],
                 s["dayOfWeekNorm"],
             ],
             dtype=float,

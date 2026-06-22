@@ -129,7 +129,7 @@ THETA_PRIOR2HOUR_STEP_COUNT_NAMES = [
 
 THETA_RECORDED_PHYSICAL_ACTIVITY_NAMES = [
     "intercept",
-    "recorded_physical_activity_lag1",
+    "Previous7DaysRPA",
     "dow",
 ]
 
@@ -221,7 +221,30 @@ seed = 2026
 
 dat_user_all = []
 
-userid_all = df_fit['ParticipantIdentifier'].unique()
+# Keep only users with at least one observed CAE value.
+# Users with no CAE observations lead to fallback-zero CAE models, which can
+# create unrealistic downstream trajectories.
+_all_userids = df_fit['ParticipantIdentifier'].unique()
+_has_cae_obs = (
+    df_fit.groupby('ParticipantIdentifier', sort=False)['CAE_avg_norm']
+    .apply(lambda s: np.any(~np.isnan(s.to_numpy(dtype=float))))
+)
+userid_all = np.array(
+    [uid for uid in _all_userids if bool(_has_cae_obs.get(uid, False))],
+    dtype=int,
+)
+excluded_userids = np.array(
+    [uid for uid in _all_userids if not bool(_has_cae_obs.get(uid, False))],
+    dtype=int,
+)
+if excluded_userids.size > 0:
+    print(
+        "Excluding users with no CAE observations: "
+        + ", ".join(str(int(u)) for u in excluded_userids)
+    )
+if userid_all.size == 0:
+    raise ValueError("No users with observed CAE values remain after filtering.")
+
 theta_pageview_list = []
 theta_fitbitwearing_list = []
 theta_eodcomplete_list = []
@@ -286,7 +309,6 @@ for i, userid in enumerate(userid_all):
     recent_burden = dat_user['recent_burden_norm'].to_numpy()
 
     recorded_physical_activity = dat_user['RecordedPhysicalActivity'].to_numpy()
-    recorded_physical_activity_lag1 = dat_user['recorded_physical_activity_lag1'].to_numpy()
     active_status = dat_user['active_status'].to_numpy()
     active_status_fraction_7days = dat_user['active_status_fraction_7days'].to_numpy()
     Previous7DaysRPA = dat_user['Previous7DaysRPA'].to_numpy()
@@ -326,7 +348,6 @@ for i, userid in enumerate(userid_all):
     prior2hour_step_count_filled = fill_nan_with_mean(prior2hour_step_count)
     ema_prior2hour_step_count = fill_nan_with_mean(ema_prior2hour_step_count)
     Previous7DaysRPA = fill_nan_with_mean(Previous7DaysRPA)
-    recorded_physical_activity_lag1 = fill_nan_with_mean(recorded_physical_activity_lag1)
     active_status_fraction_7days = fill_nan_with_mean(active_status_fraction_7days)
 
     recent_burden = fill_nan_with_mean(recent_burden)
@@ -386,10 +407,10 @@ for i, userid in enumerate(userid_all):
     print(f"The fit of prior2hour_step_count is good for user {userid}")
 
     #### Model 2: Recorded physical activity model #### 
-    # Recorded PA
+    # P(RecordedPhysicalActivity = 1 | prior 7-day RPA fraction, dow); morning rows
     recorded_physical_activity_cond = np.stack([
         Intercept,
-        recorded_physical_activity_lag1,
+        Previous7DaysRPA,
         dow
     ], axis=1)
     Cs_recorded_physical_activity = np.sort(1.0 / np.asarray(alpha_l2_list, dtype=float))

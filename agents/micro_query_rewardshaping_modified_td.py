@@ -38,7 +38,7 @@ class MicroQueryAgent_rewardshaping_modifiedTD:
         self,
         W, J, B, epsilon_0,
         mu_0_joint, Sigma_0_joint, p_eta,
-        sigma2_bottleneck, sigma2_TD, sigma2_T,
+        sigma2_Q,
         gamma_dt, gamma_bar, target_update_C,
         nu_0_MY, Gamma_0_MY, sigma2_MY,
         nu_0_Y, Gamma_0_Y, sigma2_Y,
@@ -67,9 +67,7 @@ class MicroQueryAgent_rewardshaping_modifiedTD:
                 f"with mu_0_joint.size={self.mu_0_joint.size}"
             )
 
-        self.sigma2_bottleneck = float(sigma2_bottleneck)
-        self.sigma2_TD = float(sigma2_TD)
-        self.sigma2_T = float(sigma2_T)
+        self.sigma2_Q = float(sigma2_Q)
 
         self.gamma_dt = gamma_dt
         self.gamma_bar = gamma_bar
@@ -192,26 +190,23 @@ class MicroQueryAgent_rewardshaping_modifiedTD:
 
         z_prev = self.z_store.get(k - 1, self.z_store[0])
 
-        # Monday-night empirical-Bayes refit of the (single) TD pseudo-noise
-        # variance sigma_Q^2 for the joint bottleneck loss (stacked blocks,
-        # per ensemble member, averaged), shared across the three block vars.
+        # Monday-night empirical-Bayes refit of the single TD pseudo-noise
+        # variance sigma_Q^2 for the stacked bottleneck-state TD loss.
         sigma2_Q = empirical_bayes_sigma2_bottleneck_td(
             Phi_rl, targets_rl,
             Phi_bottleneck, Phi_TD_at_bottleneck_per_b,
             Phi_terminal, Phi_bottleneck_next, Y_terminal, self.gamma_terminal,
             self.mu_0_joint, self.Sigma_0_joint, self.p_eta,
-            fallback=self.sigma2_TD,
+            fallback=self.sigma2_Q,
         )
-        self.sigma2_bottleneck = sigma2_Q
-        self.sigma2_TD = sigma2_Q
-        self.sigma2_T = sigma2_Q
+        self.sigma2_Q = sigma2_Q
 
         betas_k, alphas_k, z_k = compute_rlsvi_betas_with_alphas(
             Phi_rl, targets_rl,
             Phi_bottleneck, Phi_TD_at_bottleneck_per_b,
             Phi_terminal, Phi_bottleneck_next, Y_terminal, self.gamma_terminal,
             self.mu_0_joint, self.Sigma_0_joint,
-            self.sigma2_bottleneck, self.sigma2_TD, self.sigma2_T,
+            self.sigma2_Q,
             self.gamma_bar, z_prev, self.rng,
         )
         self.betas_store[k]  = betas_k

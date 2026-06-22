@@ -71,6 +71,18 @@ mean_cae = {
     for name, arr in all_cae.items()
 }
 
+def rolling_mean(x, window=3):
+    x = np.asarray(x, dtype=float)
+    if window <= 1:
+        return x.copy()
+    out = np.empty_like(x, dtype=float)
+    half = window // 2
+    for i in range(len(x)):
+        lo = max(0, i - half)
+        hi = min(len(x), i + half + 1)
+        out[i] = np.nanmean(x[lo:hi])
+    return out
+
 se_cae = {
     name: np.nanstd(arr, axis=(0, 1)) / np.sqrt(arr.shape[0] * arr.shape[1])
     for name, arr in all_cae.items()
@@ -113,10 +125,19 @@ for name in ALGORITHMS:
     m = mean_cae[name]
     s = se_cae[name]
     ax.plot(weeks, m, markers.get(name, "o-"), label=LABELS.get(name, name))
+    ax.plot(
+        weeks,
+        rolling_mean(m, window=3),
+        linestyle="--",
+        linewidth=2.0,
+        color=ax.lines[-1].get_color(),
+        alpha=0.9,
+        label=None,
+    )
     ax.fill_between(weeks, m - s, m + s, alpha=0.15)
 ax.set_xlabel("Week")
 ax.set_ylabel("CAE")
-ax.set_title("Mean weekly CAE (± SE), aggregated over seeds")
+ax.set_title("Mean weekly CAE (± SE) with 3-week rolling mean")
 ax.legend(fontsize=8)
 ax.grid(True, alpha=0.3)
 
