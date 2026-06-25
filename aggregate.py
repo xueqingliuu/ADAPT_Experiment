@@ -6,11 +6,44 @@ from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 
+from vani_env import denormalize_CAE
 
 # Must match experiment.py's RESULTS_ROOT (env-overridable, same default).
 RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla"))
 OUT = RESULTS_ROOT / f"aggregated_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 OUT.mkdir(parents=True, exist_ok=True)
+
+# ── CAE reporting conventions ────────────────────────────────────────────
+# We build the 4-panel overview for BOTH weekly-CAE variants, on the *raw*
+# (pre-normalization) scale via ``denormalize_CAE`` (raw = shift + scale*norm):
+#   • latent (no noise) — E[CAE_w | realized history], stored as
+#     ``cae_mean_runs`` by experiment.py.
+#   • noisy (realized)  — the drawn CAE incl. residual noise + clipping,
+#     stored as ``cae_runs``.
+# Older result folders that predate ``cae_mean_runs`` only get the noisy plot.
+LATENT_FIELD = "cae_mean_runs"   # latent (noise-free)
+NOISY_FIELD = "cae_runs"         # realized (with noise)
+
+markers = {
+    "micro_g0":   "o:",
+    "micro_g05":  "o-",
+    "mtd_g0":     "^:",
+    "mtd_g05":    "^-",
+    "rs_g0":      "s:",
+    "rs_g05":     "s-",
+    "rs_mtd_g0":  "d:",
+    "rs_mtd_g05": "d-",
+    "never_send":  "x-",
+    "always_send": "*-",
+    "random_send": "+-",
+}
+
+
+def cumulative_average(x):
+    """Running mean up to each week ('average over time')."""
+    x = np.asarray(x, dtype=float)
+    return np.cumsum(x) / np.arange(1, len(x) + 1)
+
 
 # Find folders that contain config.json and at least one .npz
 # (skip our own aggregated_* output folders, which have no config.json).
@@ -35,11 +68,14 @@ NWEEK = cfg["nweek"]
 weeks = np.arange(1, NWEEK + 1)
 rl_weeks = np.arange(2, NWEEK + 1)
 
-all_cae_full = {}
+all_cae_latent_full = {}   # raw-scale latent CAE incl. baseline
+all_cae_noisy_full = {}    # raw-scale realized CAE incl. baseline
 all_piA = {}
+_latent_available = True    # set False if any run lacks the latent field
 
 for name in ALGORITHMS:
-    cae_parts = []
+    latent_parts = []
+    noisy_parts = []
     piA_parts = []
 
     for d in run_dirs:
@@ -49,192 +85,169 @@ for name in ALGORITHMS:
             continue
 
         data = np.load(f)
-        cae_parts.append(data["cae_runs"])   # usually (1, n_users, NWEEK+1)
-        piA_parts.append(data["piA_runs"])   # usually (1, n_users, W, 6, 2)
+        # Realized (noisy) CAE is always present.
+        noisy_parts.append(denormalize_CAE(data[NOISY_FIELD]))   # (1, n_users, NWEEK+1)
+        # Latent (noise-free) CAE only if recorded by experiment.py.
+        if LATENT_FIELD in data:
+            latent_parts.append(denormalize_CAE(data[LATENT_FIELD]))
+        else:
+            _latent_available = False
+        piA_parts.append(data["piA_runs"])                       # (1, n_users, W, 6, 2)
 
-    if not cae_parts:
+    if not noisy_parts:
         print(f"No {name}.npz found in any run folder; skipping {name}")
         continue
-    all_cae_full[name] = np.concatenate(cae_parts, axis=0)
+    all_cae_noisy_full[name] = np.concatenate(noisy_parts, axis=0)
     all_piA[name] = np.concatenate(piA_parts, axis=0)
+    if _latent_available and latent_parts:
+        all_cae_latent_full[name] = np.concatenate(latent_parts, axis=0)
 
-    print(name, "CAE shape:", all_cae_full[name].shape)
+    print(name, "CAE shape:", all_cae_noisy_full[name].shape)
 
 # Only keep algorithms that actually had data across the run folders.
-ALGORITHMS = [name for name in ALGORITHMS if name in all_cae_full]
+ALGORITHMS = [name for name in ALGORITHMS if name in all_cae_noisy_full]
 
-# Drop baseline week 0
-all_cae = {name: arr[..., 1:] for name, arr in all_cae_full.items()}
-
-mean_cae = {
-    name: np.nanmean(arr, axis=(0, 1))
-    for name, arr in all_cae.items()
-}
-
-def rolling_mean(x, window=3):
-    x = np.asarray(x, dtype=float)
-    if window <= 1:
-        return x.copy()
-    out = np.empty_like(x, dtype=float)
-    half = window // 2
-    for i in range(len(x)):
-        lo = max(0, i - half)
-        hi = min(len(x), i + half + 1)
-        out[i] = np.nanmean(x[lo:hi])
-    return out
-
-se_cae = {
-    name: np.nanstd(arr, axis=(0, 1)) / np.sqrt(arr.shape[0] * arr.shape[1])
-    for name, arr in all_cae.items()
-}
-
-median_cae = {
-    name: np.nanmedian(arr, axis=(0, 1))
-    for name, arr in all_cae.items()
-}
-
-p25_cae = {
-    name: np.nanpercentile(arr, 25, axis=(0, 1))
-    for name, arr in all_cae.items()
-}
-
-p75_cae = {
-    name: np.nanpercentile(arr, 75, axis=(0, 1))
-    for name, arr in all_cae.items()
-}
-
-markers = {
-    "micro_g0":   "o:",
-    "micro_g05":  "o-",
-    "mtd_g0":     "^:",
-    "mtd_g05":    "^-",
-    "rs_g0":      "s:",
-    "rs_g05":     "s-",
-    "rs_mtd_g0":  "d:",
-    "rs_mtd_g05": "d-",
-    "never_send":  "x-",
-    "always_send": "*-",
-    "random_send": "+-",
-}
-
-fig, axes = plt.subplots(2, 2, figsize=(15, 9))
-
-# Mean weekly CAE
-ax = axes[0, 0]
-for name in ALGORITHMS:
-    m = mean_cae[name]
-    s = se_cae[name]
-    ax.plot(weeks, m, markers.get(name, "o-"), label=LABELS.get(name, name))
-    ax.plot(
-        weeks,
-        rolling_mean(m, window=3),
-        linestyle="--",
-        linewidth=2.0,
-        color=ax.lines[-1].get_color(),
-        alpha=0.9,
-        label=None,
+if not _latent_available:
+    all_cae_latent_full = {}
+    print(
+        f"\nWARNING: some runs lacked '{LATENT_FIELD}' (latent/no-noise CAE); "
+        "only the noisy (realized) overview will be produced. "
+        "Re-run experiment.py to record latent CAE."
     )
-    ax.fill_between(weeks, m - s, m + s, alpha=0.15)
-ax.set_xlabel("Week")
-ax.set_ylabel("CAE")
-ax.set_title("Mean weekly CAE (± SE) with 3-week rolling mean")
-ax.legend(fontsize=8)
-ax.grid(True, alpha=0.3)
 
-# Median weekly CAE
-ax = axes[0, 1]
+
+def compute_stats(all_cae_full):
+    """Per-week aggregate stats over (experiments × participants), raw scale."""
+    all_cae = {name: arr[..., 1:] for name, arr in all_cae_full.items()}  # drop week 0
+    mean_cae = {n: np.nanmean(a, axis=(0, 1)) for n, a in all_cae.items()}
+    se_cae = {
+        n: np.nanstd(a, axis=(0, 1)) / np.sqrt(a.shape[0] * a.shape[1])
+        for n, a in all_cae.items()
+    }
+    median_cae = {n: np.nanmedian(a, axis=(0, 1)) for n, a in all_cae.items()}
+    p25_cae = {n: np.nanpercentile(a, 25, axis=(0, 1)) for n, a in all_cae.items()}
+    p75_cae = {n: np.nanpercentile(a, 75, axis=(0, 1)) for n, a in all_cae.items()}
+    cumavg_cae = {n: cumulative_average(mean_cae[n]) for n in all_cae}
+    return {
+        "all_cae": all_cae,
+        "mean": mean_cae,
+        "se": se_cae,
+        "median": median_cae,
+        "p25": p25_cae,
+        "p75": p75_cae,
+        "cumavg": cumavg_cae,
+    }
+
+
+def make_overview(stats, kind, suffix):
+    """4-panel overview figure for one CAE variant; saved with ``suffix``."""
+    names = list(stats["all_cae"].keys())
+    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+
+    # (0,0) Mean weekly CAE ± SE
+    ax = axes[0, 0]
+    for name in names:
+        m = stats["mean"][name]
+        s = stats["se"][name]
+        ax.plot(weeks, m, markers.get(name, "o-"), label=LABELS.get(name, name))
+        ax.fill_between(weeks, m - s, m + s, alpha=0.15)
+    ax.set_xlabel("Week")
+    ax.set_ylabel("CAE (raw scale)")
+    ax.set_title(f"Mean weekly CAE (± SE) — {kind}, raw scale")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # (0,1) Median weekly CAE with IQR band
+    ax = axes[0, 1]
+    for name in names:
+        med = stats["median"][name]
+        p25 = stats["p25"][name]
+        p75 = stats["p75"][name]
+        line, = ax.plot(weeks, med, markers.get(name, "o-"), label=LABELS.get(name, name))
+        ax.fill_between(weeks, p25, p75, color=line.get_color(), alpha=0.12)
+    ax.set_xlabel("Week")
+    ax.set_ylabel("CAE (raw scale)")
+    ax.set_title(f"Median weekly CAE (band = IQR) — {kind}, raw scale")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # (1,0) Average-over-time CAE: running cumulative mean
+    ax = axes[1, 0]
+    for name in names:
+        ax.plot(weeks, stats["cumavg"][name], markers.get(name, "o-"),
+                label=LABELS.get(name, name))
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Cumulative-average CAE (raw scale)")
+    ax.set_title(f"Average-over-time CAE — {kind}, raw scale")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # (1,1) Action probability (identical across CAE variants)
+    ax = axes[1, 1]
+    for name in names:
+        piA_all = all_piA[name]
+        piA_mean = np.nanmean(piA_all[:, :, 1:, :, :], axis=(0, 1, 3, 4))
+        ax.plot(rl_weeks, piA_mean, markers.get(name, "o-"), label=LABELS.get(name, name))
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Mean P(walking suggestion = 1)")
+    ax.set_title("Action probability over time, aggregated")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(OUT / f"overview_{suffix}.png", dpi=150, bbox_inches="tight")
+    fig.savefig(OUT / f"overview_{suffix}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_summary(stats, kind, suffix):
+    """Raw-scale summary table for one CAE variant."""
+    names = list(stats["all_cae"].keys())
+    all_cae = stats["all_cae"]
+    headers = ["Metric"] + names
+    col_w = 18
+    sep_w = col_w * len(headers)
+
+    lines = []
+    lines.append(f"CAE source: {kind}; scale: raw (pre-normalization)")
+    lines.append("=" * sep_w)
+    lines.append("".join(f"{h:>{col_w}}" for h in headers))
+    lines.append("-" * sep_w)
+    lines.append("".join([f"{'Mean CAE (all weeks)':>{col_w}}"] +
+                 [f"{np.nanmean(all_cae[n]):>{col_w}.4f}" for n in names]))
+    lines.append("".join([f"{'Mean CAE (week 3+)':>{col_w}}"] +
+                 [f"{np.nanmean(all_cae[n][..., 2:]):>{col_w}.4f}" for n in names]))
+    lines.append("".join([f"{'Median CAE (all wks)':>{col_w}}"] +
+                 [f"{np.nanmedian(all_cae[n]):>{col_w}.4f}" for n in names]))
+    lines.append("".join([f"{'25th pct CAE':>{col_w}}"] +
+                 [f"{np.nanpercentile(all_cae[n], 25):>{col_w}.4f}" for n in names]))
+    lines.append("".join([f"{'Final cum-avg CAE':>{col_w}}"] +
+                 [f"{stats['cumavg'][n][-1]:>{col_w}.4f}" for n in names]))
+    lines.append("=" * sep_w)
+
+    text = "\n".join(lines)
+    print("\n" + text)
+    (OUT / f"summary_{suffix}.txt").write_text(text + "\n")
+
+
+# ── Build both overviews (latent / no-noise and noisy / realized) ─────────
+variants = [("noisy (realized)", "noisy", all_cae_noisy_full)]
+if all_cae_latent_full:
+    variants.insert(0, ("latent (no noise)", "latent", all_cae_latent_full))
+
+for kind, suffix, all_cae_full in variants:
+    stats = compute_stats(all_cae_full)
+    make_overview(stats, kind, suffix)
+    write_summary(stats, kind, suffix)
+
+# Save aggregated arrays too (raw scale).
 for name in ALGORITHMS:
-    med = median_cae[name]
-    p25 = p25_cae[name]
-    p75 = p75_cae[name]
-    line, = ax.plot(weeks, med, markers.get(name, "o-"), label=LABELS.get(name, name))
-    ax.plot(
-        weeks, p25, markers.get(name, "o-")[0] + "--",
-        color=line.get_color(), alpha=0.6, linewidth=1.0,
-    )
-    ax.fill_between(weeks, p25, p75, color=line.get_color(), alpha=0.12)
-ax.set_xlabel("Week")
-ax.set_ylabel("CAE")
-ax.set_title("Median weekly CAE, aggregated")
-ax.legend(fontsize=8)
-ax.grid(True, alpha=0.3)
-
-# Cumulative mean CAE
-ax = axes[1, 0]
-cum_cae = {name: np.cumsum(mean_cae[name]) for name in ALGORITHMS}
-for name in ALGORITHMS:
-    ax.plot(weeks, cum_cae[name], markers.get(name, "o-"), label=LABELS.get(name, name))
-ax.set_xlabel("Week")
-ax.set_ylabel("Cumulative CAE")
-ax.set_title("Cumulative CAE over time, aggregated")
-ax.legend(fontsize=8)
-ax.grid(True, alpha=0.3)
-
-# Action probability
-ax = axes[1, 1]
-for name in ALGORITHMS:
-    piA_all = all_piA[name]
-    piA_mean = np.nanmean(piA_all[:, :, 1:, :, :], axis=(0, 1, 3, 4))
-    ax.plot(rl_weeks, piA_mean, markers.get(name, "o-"), label=LABELS.get(name, name))
-ax.set_xlabel("Week")
-ax.set_ylabel("Mean P(walking suggestion = 1)")
-ax.set_title("Action probability over time, aggregated")
-ax.legend(fontsize=8)
-ax.grid(True, alpha=0.3)
-
-fig.tight_layout()
-fig.savefig(OUT / "overview_aggregated.png", dpi=150, bbox_inches="tight")
-fig.savefig(OUT / "overview_aggregated.pdf", bbox_inches="tight")
-plt.close(fig)
-
-# Summary table
-headers = ["Metric"] + ALGORITHMS
-col_w = 18
-sep_w = col_w * len(headers)
-
-summary_lines = []
-summary_lines.append("=" * sep_w)
-summary_lines.append("".join(f"{h:>{col_w}}" for h in headers))
-summary_lines.append("-" * sep_w)
-
-summary_lines.append(
-    "".join([f"{'Mean CAE (all weeks)':>{col_w}}"] +
-    [f"{np.nanmean(all_cae[n]):>{col_w}.4f}" for n in ALGORITHMS])
-)
-
-summary_lines.append(
-    "".join([f"{'Mean CAE (week 3+)':>{col_w}}"] +
-    [f"{np.nanmean(all_cae[n][..., 2:]):>{col_w}.4f}" for n in ALGORITHMS])
-)
-
-summary_lines.append(
-    "".join([f"{'Median CAE (all wks)':>{col_w}}"] +
-    [f"{np.nanmedian(all_cae[n]):>{col_w}.4f}" for n in ALGORITHMS])
-)
-
-summary_lines.append(
-    "".join([f"{'25th pct CAE':>{col_w}}"] +
-    [f"{np.nanpercentile(all_cae[n], 25):>{col_w}.4f}" for n in ALGORITHMS])
-)
-
-summary_lines.append(
-    "".join([f"{'Cumulative CAE total':>{col_w}}"] +
-    [f"{cum_cae[n][-1]:>{col_w}.4f}" for n in ALGORITHMS])
-)
-
-summary_lines.append("=" * sep_w)
-
-summary_text = "\n".join(summary_lines)
-print(summary_text)
-
-(OUT / "summary_aggregated.txt").write_text(summary_text + "\n")
-
-# Save aggregated arrays too
-for name in ALGORITHMS:
-    np.savez_compressed(
-        OUT / f"{name}_aggregated.npz",
-        cae_runs=all_cae_full[name],
-        piA_runs=all_piA[name],
-    )
+    payload = {
+        "cae_noisy_runs": all_cae_noisy_full[name],
+        "piA_runs": all_piA[name],
+    }
+    if name in all_cae_latent_full:
+        payload["cae_latent_runs"] = all_cae_latent_full[name]
+    np.savez_compressed(OUT / f"{name}_aggregated.npz", **payload)
 
 print(f"\nAggregated results saved to: {OUT.resolve()}")

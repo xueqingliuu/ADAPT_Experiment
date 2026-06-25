@@ -37,6 +37,24 @@ PROJECT_ROOT = Path(
 ).expanduser().resolve()
 PARAMS_DIR = PROJECT_ROOT / "env_para_vanilla"
 
+
+def load_CAE_norm_params(params_dir=PARAMS_DIR):
+    """Return ``(shift, scale)`` used to z-score raw weekly CAE into ``CAE_avg_norm``.
+
+    Standardization (``3_standardization.py``):
+        ``CAE_avg_norm = (CAE_avg - shift) / scale``.
+    Inverse (raw level): ``CAE_avg = shift + scale * CAE_avg_norm``.
+    """
+    with open(Path(params_dir) / "std_params.json", encoding="utf-8") as f:
+        std = json.load(f)
+    return float(std["CAE_avg_shift"]), float(std["CAE_avg_scale"])
+
+
+def denormalize_CAE(cae_norm, params_dir=PARAMS_DIR):
+    """Map normalized weekly CAE back to the raw (pre-normalization) scale."""
+    shift, scale = load_CAE_norm_params(params_dir)
+    return shift + scale * np.asarray(cae_norm, dtype=float)
+
 # Design sizes (``5_fit_vanilla_testbed.py``); no 7-day salience-interaction covariate.
 # The environment uses the full fitted fourSC model, including the
 # ``seven_day_pageview_count`` and ``anticipated_affect_yesterday`` predictors
@@ -174,6 +192,10 @@ class EnvConfig:
         self.limits_pageview = std["HourlyPageviewCount_limit"]
         self.limits_CAE = std["CAE_avg_limit"]
         self.limits_CAE_short = std["CAE_short_avg_limit"]
+        # Affine map back to the raw (pre-normalization) CAE level:
+        #   raw_CAE = CAE_shift + CAE_scale * CAE_avg_norm
+        self.CAE_shift = float(std["CAE_avg_shift"])
+        self.CAE_scale = float(std["CAE_avg_scale"])
         self.limits_antic = std["anticipated_affect_yesterday_limit"]
         self.limits_fitbitwearing = [0.0, 1.0]
         self.limits_dailysurvey = [0.0, 1.0]
