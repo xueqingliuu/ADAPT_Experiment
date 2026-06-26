@@ -1633,6 +1633,33 @@ def _normalize_dt(d, t):
     return d_feat, t_feat
 
 
+def build_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0):
+    """
+    State-only features shared by RLSVI and DQN (no action cross-terms).
+
+    phi_state = [1, d, t, E_w, d*E_w, t*E_w, b_hat, d*b_hat, t*b_hat, b_tilde]
+              ⌢ [tilde_M^Y, tilde_M^E, C_{w,d,t}]
+
+    ``d`` / ``t`` are zero-based walking indices; day/slot enter via
+    :func:`_normalize_dt`. For STE DQN with ``I_w = 1``, pass the known
+    lagged weekly CAE as ``b_hat`` and ``b_tilde = 0``.
+    """
+    E_w = state["E_w"]
+    d_feat, t_feat = _normalize_dt(d, t)
+
+    M_Y_m, M_E_m = _mask_mediators_for_slot(state["M_Y"], state["M_E"], d, t)
+    C_dt = np.asarray(state["C"]).ravel()
+
+    base = np.array([
+        1.0, d_feat, t_feat, E_w,
+        d_feat * E_w, t_feat * E_w,
+        b_hat, d_feat * b_hat, t_feat * b_hat,
+        b_tilde,
+    ])
+    med_ctx = np.concatenate([M_Y_m.ravel(), M_E_m.ravel(), C_dt])
+    return np.concatenate([base, med_ctx])
+
+
 def build_phi_action(b_hat, b_tilde, state, d, t, action):
     """
     Feature map  phi(tilde_S_{w,d,t}, A_{w,d,t}).
@@ -1670,25 +1697,8 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
     b_w = b_hat
 
     d_feat, t_feat = _normalize_dt(d, t)
-
-    M_Y_m, M_E_m = _mask_mediators_for_slot(state['M_Y'], state['M_E'], d, t)
-    M_Y_tilde = M_Y_m.ravel()
-    M_E_tilde = M_E_m.ravel()
-
-    # ── state for current decision point ──
-    C_dt = np.asarray(state['C']).ravel()              # (n_c,)
-
-    # ── part 1: base features ── 
-    # TODO: need to include b_tilde
-    base = np.array([
-        1.0, d_feat, t_feat, E_w,
-        d_feat * E_w, t_feat * E_w,
-        b_w, d_feat * b_w, t_feat * b_w,
-        b_tilde,
-    ])
-
-    # ── part 2: masked mediators + state ──
-    med_ctx = np.concatenate([M_Y_tilde, M_E_tilde, C_dt])
+    C_dt = np.asarray(state['C']).ravel()
+    state_part = build_phi_state(state, d, t, b_hat=b_hat, b_tilde=b_tilde)
 
     # ── part 3: shared action-interacted block with time effects ──
     interact_vec = np.concatenate([
@@ -1699,7 +1709,7 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
     ])
     action_block = float(action) * interact_vec
 
-    return np.concatenate([base, med_ctx, action_block])
+    return np.concatenate([state_part, action_block])
 
 def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
     """

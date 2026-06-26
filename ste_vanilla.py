@@ -7,6 +7,11 @@ simulator, following the STE6 archive pattern (``opt_policy.py`` / ``eval_ste.py
     random walking policy (Bernoulli ``P0``) with ``I_w = 1`` (full CAE query).
   * Evaluate total per-episode reward ``sum_w CAE_w`` under the zero policy vs.
     greedy DQN actions.
+  * Aggregate population STE as ``mean_i(Delta_i) / sqrt(mean_i(sigma_i^2))`` over
+    fitted participant types (not the mean of per-type standardized effects).
+  * DQN observations match the RLSVI state features (:func:`build_phi_state`):
+    ``E_w`` is agent-visible perceived utility; the ``b_hat`` slot carries the
+    known lagged weekly CAE (``I_w = 1``); ``b_tilde = 0``.
   * One job per user: ``jobid`` indexes ``user_ids.txt``. Different DGP variants
     should use separate env modules / param dirs or ``--exp`` names, not a
     generative scale knob.
@@ -23,7 +28,14 @@ from pathlib import Path
 import numpy as np
 import numpy.random as rd
 
-from algorithm_helpers import _mask_mediators_for_slot, make_state
+from algorithm_helpers import (
+    N_RL_DAYS,
+    N_RL_SLOTS,
+    TERMINAL_D,
+    TERMINAL_T,
+    build_phi_state,
+    make_state,
+)
 from experiment import OnlineEnv
 from vani_env import PARAMS_DIR, Env, EnvConfig
 
@@ -55,34 +67,24 @@ def _dqn_fit_device() -> str:
     return "cpu"
 
 
-def build_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int, b_hat: float = 0.0) -> np.ndarray:
-    """Flat state for tabular/vector DQN (no action cross-terms; belief fixed at ``b_hat``)."""
+def known_weekly_cae(oenv: OnlineEnv, k: int) -> float:
+    """Lagged weekly CAE known at RL week ``k`` (replaces RLSVI ``b_hat`` when ``I_w = 1``)."""
+    if k <= 0:
+        val = oenv.CAE_all[0]
+    else:
+        val = oenv.CAE_all[oenv._weekly_idx(k - 1)]
+    return 0.0 if np.isnan(val) else float(val)
+
+
+def build_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int) -> np.ndarray:
+    """RLSVI-compatible state for DQN; ``b_hat`` = known lagged CAE, ``b_tilde`` = 0."""
     st = make_state(oenv.get_context(k, d, t))
-    e_w = float(st["E_w"])
-    m_y, m_e = _mask_mediators_for_slot(st["M_Y"], st["M_E"], d, t)
-    c_dt = np.asarray(st["C"], dtype=np.float64).ravel()
-    base = np.array(
-        [
-            1.0,
-            float(d),
-            float(t),
-            e_w,
-            float(d) * e_w,
-            float(t) * e_w,
-            float(b_hat),
-            float(d) * b_hat,
-            float(t) * b_hat,
-        ],
-        dtype=np.float64,
-    )
-    med_ctx = np.concatenate([m_y.ravel(), m_e.ravel(), c_dt])
-    nk = max(int(oenv.nweek) - 1, 1)
-    k_norm = float(k) / float(nk)
-    return np.concatenate([base, med_ctx, np.array([k_norm], dtype=np.float64)])
+    b_hat = known_weekly_cae(oenv, k)
+    return build_phi_state(st, d, t, b_hat=b_hat, b_tilde=0.0)
 
 
 def ste_state_dim(oenv: OnlineEnv) -> int:
-    return int(build_ste_state_vector(oenv, 0, 1, 1).size)
+    return int(build_ste_state_vector(oenv, 0, 0, 0).size)
 
 
 def collect_mdp_episode(
@@ -109,17 +111,17 @@ def collect_mdp_episode(
         i_w = int(i_w_fixed)
         oenv.start_week(k, i_w)
 
-        for d in range(1, 7):
-            for t_slot in range(1, 3):
+        for d in range(N_RL_DAYS):
+            for t_slot in range(N_RL_SLOTS):
                 s_vec = build_ste_state_vector(oenv, k, d, t_slot)
                 a = int(rng.random() < walk_prob)
                 oenv.step_action(k, d, t_slot, float(a), i_w)
 
-                if d == 6 and t_slot == 2:
+                if d == TERMINAL_D and t_slot == TERMINAL_T:
                     oenv._finalize_week(k)
                     r = float(oenv.CAE_all[k]) if not np.isnan(oenv.CAE_all[k]) else 0.0
                     if k + 1 < oenv.nweek:
-                        s2 = build_ste_state_vector(oenv, k + 1, 1, 1)
+                        s2 = build_ste_state_vector(oenv, k + 1, 0, 0)
                         term = 0
                         tout = 0
                     else:
@@ -128,10 +130,10 @@ def collect_mdp_episode(
                         tout = 1
                 else:
                     r = 0.0
-                    if t_slot == 1:
-                        s2 = build_ste_state_vector(oenv, k, d, 2)
+                    if t_slot + 1 < N_RL_SLOTS:
+                        s2 = build_ste_state_vector(oenv, k, d, t_slot + 1)
                     else:
-                        s2 = build_ste_state_vector(oenv, k, d + 1, 1)
+                        s2 = build_ste_state_vector(oenv, k, d + 1, 0)
                     term = 0
                     tout = 0
 
@@ -269,9 +271,8 @@ def rollout_total_cae(
         i_w = int(i_w_fixed)
         oenv.start_week(k, i_w)
 
-        for d in range(1, 7):
-            for t_slot in range(1, 3):
-                st_dict = make_state(oenv.get_context(k, d, t_slot))
+        for d in range(N_RL_DAYS):
+            for t_slot in range(N_RL_SLOTS):
                 if policy == "zero":
                     a = 0
                 elif policy == "bernoulli":
@@ -283,7 +284,6 @@ def rollout_total_cae(
                     a = int(np.asarray(pred, dtype=np.int64).reshape(-1)[0])
                 else:
                     raise ValueError(policy)
-                _ = st_dict
                 oenv.step_action(k, d, t_slot, float(a), i_w)
         oenv._finalize_week(k)
 
@@ -397,7 +397,14 @@ def aggregate_ste(
     burn_in_rows: int = 0,
 ) -> float:
     """
-    STE = mean over users of ``mean(R_opt - R_zero) / std(R_zero)`` (see ``ste_variants.py``).
+    Population STE (``STE_pop``):
+
+        mean_i(hat_Delta_i) / sqrt(mean_i(hat_sigma_i^2))
+
+    where, for each participant type ``i`` with ``B_eval`` Monte Carlo rows,
+
+        hat_Delta_i = mean(G_opt) - mean(G_zero)
+        hat_sigma_i^2 = sample variance of ``G_zero`` (ddof=1).
 
     Expects ``results_ste/exp{exp}/res{exp}_{userid}.txt`` with two columns:
     ``sum_CAE_zero``, ``sum_CAE_opt`` per Monte Carlo row.
@@ -407,7 +414,8 @@ def aggregate_ste(
     path = Path("results_ste") / f"exp{exp}"
     idx_zero, idx_opt = 0, 1
 
-    user_ratios = []
+    delta_hat = []
+    sigma_sq_hat = []
     for userid in userid_all:
         fp = path / f"res{exp}_{int(userid)}.txt"
         if not fp.is_file():
@@ -417,12 +425,21 @@ def aggregate_ste(
             reward = reward.reshape(1, -1)
         if reward.shape[0] > burn_in_rows > 0:
             reward = reward[burn_in_rows:]
-        adv = np.mean(reward[:, idx_opt] - reward[:, idx_zero])
-        denom = float(np.std(reward[:, idx_zero]))
-        if denom <= 0.0:
-            raise ValueError(f"Zero std for user {userid}")
-        user_ratios.append(adv / denom)
-    return float(np.mean(user_ratios))
+        g_zero = reward[:, idx_zero]
+        g_opt = reward[:, idx_opt]
+        if g_zero.size < 2:
+            raise ValueError(
+                f"Need at least 2 evaluation episodes for user {userid}, got {g_zero.size}"
+            )
+        delta_hat.append(float(np.mean(g_opt) - np.mean(g_zero)))
+        var_i = float(np.var(g_zero, ddof=1))
+        if var_i <= 0.0:
+            raise ValueError(f"Zero variance under pi^0 for user {userid}")
+        sigma_sq_hat.append(var_i)
+
+    mean_delta = float(np.mean(delta_hat))
+    mean_sigma_sq = float(np.mean(sigma_sq_hat))
+    return mean_delta / float(np.sqrt(mean_sigma_sq))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -447,7 +464,7 @@ def main(argv: list[str] | None = None) -> None:
     pe.add_argument("--nweek", type=int, default=None)
     pe.add_argument("--noise", type=str, default="random", choices=("random", "sequential"))
 
-    pa = sub.add_parser("aggregate", help="Print pooled STE from saved eval files")
+    pa = sub.add_parser("aggregate", help="Print population STE_pop from saved eval files")
     pa.add_argument("--exp", type=str, default="1")
     pa.add_argument("--user-ids", type=str, default=None)
     pa.add_argument("--burn-in-rows", type=int, default=0)
