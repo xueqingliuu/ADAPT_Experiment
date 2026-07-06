@@ -34,12 +34,19 @@ from matplotlib.ticker import MaxNLocator
 plt.ion()
 
 DATA_FOLDER = Path(
-    "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined"
+    "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing"
 )
 folder = DATA_FOLDER
 
 MIN_ACTIVE_SPAN_DAYS = 83
-EXCLUDED_PARTICIPANT_IDS = ("112", "117", "219")
+# Manual wearable-quality exclusions (see wearable_step_quality_audit.csv after extraction):
+# 112: no usable HR and all-zero steps in the active window
+# 117: no usable HR even though step rows are present
+# 219: no usable HR and very sparse nonzero step data
+# 13:  step/HR rows present but HourWearing never flagged during decision windows
+# 22:  sparse prior2hour but zero post-decision hourly/FourSC step counts
+# 248, 291: no usable step counts in prior2hour / hourly / today decision windows
+EXCLUDED_PARTICIPANT_IDS = ("112", "117", "219", "13", "22", "248", "291")
 EXTRA_TESTER_IDS = ("test-Yuxuan",)
 
 # %%
@@ -253,15 +260,14 @@ summary_surveytask.rename(columns={'ParticipantIdentifier': 'ParticipantIdentifi
 print(summary_surveytask)
 
 # filter out participants who have span_days longer than 84 days
-complete_participant_ids = summary_surveytask[
+span_qualified_participant_ids = summary_surveytask[
     summary_surveytask['span_days'] >= MIN_ACTIVE_SPAN_DAYS
 ]['ParticipantIdentifier'].unique()
-print(complete_participant_ids, len(complete_participant_ids))
+print(span_qualified_participant_ids, len(span_qualified_participant_ids))
 
-# remove participants with clearly problematic wearable quality
-# remove 117 because the step count/heart rate data is not correct
-# remove 219 because the step count/heart rate data is very sparse
-complete_participant_ids = np.setdiff1d(complete_participant_ids, list(EXCLUDED_PARTICIPANT_IDS))
+complete_participant_ids = np.setdiff1d(
+    span_qualified_participant_ids, list(EXCLUDED_PARTICIPANT_IDS)
+)
 print(complete_participant_ids, len(complete_participant_ids))
 
 # filter out incomplete participants from surveytask and surveyquestionresults
@@ -708,6 +714,58 @@ df_daily_filled = fill_daily_85(df_daily_survey)
 # , survey_task_eod)
 
 
+def _wearable_exclude_reason(n_prior, n_hourly, n_today):
+    """Return a short reason string when a participant should be flagged for exclusion."""
+    if n_prior == 0 and n_hourly == 0 and n_today == 0:
+        return "no_wearable_steps_any_window"
+    if n_hourly == 0:
+        return "no_hourly_fourSC"
+    return ""
+
+
+def audit_wearable_step_quality(participant_ids, df_prior_2hours, df_hourly, df_today):
+    """
+    Summarize non-NaN wearable step outcomes per participant.
+
+    Returns (audit_df, exclude_candidates) where exclude_candidates are active
+    participants lacking usable FourSC (hourly) step counts, including cases
+    with sparse prior2hour/today data but zero post-decision 4-hour windows.
+    """
+    excluded = {str(pid) for pid in EXCLUDED_PARTICIPANT_IDS}
+    rows = []
+    for pid in participant_ids:
+        pid_key = str(pid)
+        p_prior = df_prior_2hours[
+            df_prior_2hours["ParticipantIdentifier"].astype(str) == pid_key
+        ]
+        p_hourly = df_hourly[
+            df_hourly["ParticipantIdentifier"].astype(str) == pid_key
+        ]
+        p_today = df_today[
+            df_today["ParticipantIdentifier"].astype(str) == pid_key
+        ]
+        n_prior = int(p_prior["StepCount"].notna().sum())
+        n_hourly = int(p_hourly["StepCount"].notna().sum())
+        n_today = int(p_today["TodayStepCount"].notna().sum())
+        reason = _wearable_exclude_reason(n_prior, n_hourly, n_today)
+        rows.append(
+            {
+                "ParticipantIdentifier": pid_key,
+                "prior2hour_non_nan": n_prior,
+                "hourly_non_nan": n_hourly,
+                "today_non_nan": n_today,
+                "manually_excluded": pid_key in excluded,
+                "recommend_exclude": bool(reason),
+                "exclude_reason": reason,
+            }
+        )
+    audit_df = pd.DataFrame(rows)
+    exclude_candidates = audit_df[
+        audit_df["recommend_exclude"] & ~audit_df["manually_excluded"]
+    ].copy()
+    return audit_df, exclude_candidates
+
+
 def _mean_prior_rows(series, window=7, min_periods=1):
     """Mean over prior `window` calendar rows; excludes the current row."""
     return series.shift(1).rolling(window=window, min_periods=min_periods).mean()
@@ -1062,6 +1120,8 @@ print(df_wakeup_bedtime)
 
 def resolve_schedule_for_date(df_wb_participant, date):
     """Weekday/weekend wake and bed times effective on `date` → (wakeup_time, bedtime_time)."""
+    # Align with QuestionStartDate (datetime.date) so multi-row schedules compare safely.
+    date = pd.Timestamp(date).date()
     wb = df_wb_participant
     if wb.shape[0] == 1:
         weekday_wakeup = wb["WeekdayWakeup"].iloc[0]
@@ -1889,7 +1949,7 @@ for participant_id in complete_participant_ids:
 
    
     start_date = pd.to_datetime(summary_row['date_min']).date() - pd.Timedelta(days=7)
-    end_date = start_date + pd.Timedelta(days=85)
+    end_date = start_date + pd.Timedelta(days=91)
     heartratebymin_participant = heartratebymin_participant[heartratebymin_participant.Date >= start_date]
     heartratebymin_participant = heartratebymin_participant[heartratebymin_participant.Date <= end_date]
     heartratebymin_selected.append(heartratebymin_participant)
@@ -1948,7 +2008,7 @@ for participant_id in complete_participant_ids:
     ].iloc[0]  # assumes one row per participant
 
     start_date = pd.to_datetime(summary_row['date_min']).date() - pd.Timedelta(days=7)
-    end_date = start_date + pd.Timedelta(days=85)
+    end_date = start_date + pd.Timedelta(days=91)
     print(start_date, end_date)
     stepcountbymin_participant = stepcountbymin_participant[stepcountbymin_participant.Date >= start_date]
     stepcountbymin_participant = stepcountbymin_participant[stepcountbymin_participant.Date <= end_date]
@@ -2273,13 +2333,21 @@ def _to_time(x):
     return None if pd.isna(t) else t.time()
 
 
+def _participant_mask(series, participant_id):
+    """Match participant IDs across int/float/str storage."""
+    return series.astype(str) == str(participant_id)
+
+
 def _get_wakeup_bedtime(df_wb_participant, date):
     if df_wb_participant.empty:
         return None, None
     try:
-        return resolve_schedule_for_date(df_wb_participant, date)
+        wakeup_time, bedtime_time = resolve_schedule_for_date(df_wb_participant, date)
     except Exception:
         return None, None
+    if pd.isna(wakeup_time) or pd.isna(bedtime_time):
+        return None, None
+    return wakeup_time, bedtime_time
 
 
 def _valid_minutes(hr_df, step_df):
@@ -2319,6 +2387,7 @@ morning_lookup = (
     .max()
     .rename(columns={'HourWearing': 'morning_wearing'})
 )
+morning_lookup['ParticipantIdentifier'] = morning_lookup['ParticipantIdentifier'].astype(str)
 morning_lookup = morning_lookup.set_index(['ParticipantIdentifier', 'Date'])['morning_wearing']
 
 wear_rows = []
@@ -2331,7 +2400,7 @@ for participant_id in complete_participant_ids:
         stepcountbymin_selected['ParticipantIdentifier'] == participant_id
     ].copy()
     wb_p = df_wakeup_bedtime.loc[
-        df_wakeup_bedtime['ParticipantIdentifier'] == participant_id
+        _participant_mask(df_wakeup_bedtime['ParticipantIdentifier'], participant_id)
     ].copy()
 
     if hr_p.empty:
@@ -2340,16 +2409,13 @@ for participant_id in complete_participant_ids:
     hr_p['Date'] = pd.to_datetime(hr_p['Date']).dt.normalize()
     step_p['Date'] = pd.to_datetime(step_p['Date']).dt.normalize()
 
-    min_date = pd.to_datetime(
-        summary_surveytask.loc[
-            summary_surveytask['ParticipantIdentifier'] == participant_id
-        ].iloc[0].date_min,
-        errors='coerce'
-    )
+    # Match missing_2hours / df_2hours calendar grid (date_min as date, not normalized Timestamp).
+    min_date = summary_surveytask.loc[
+        summary_surveytask['ParticipantIdentifier'] == participant_id
+    ].iloc[0].date_min
     if pd.isna(min_date):
         continue
 
-    min_date = min_date.normalize()
     date_range_length = 85
 
     for i in range(date_range_length):
@@ -2373,7 +2439,10 @@ for participant_id in complete_participant_ids:
         ]
 
         restday_valid_minutes = _valid_minutes(hr_rest, step_rest)
-        morning_wearing = int(morning_lookup.get((participant_id, date), 0))
+        lookup_date = pd.Timestamp(date).normalize()
+        morning_wearing = int(
+            morning_lookup.get((str(participant_id), lookup_date), 0)
+        )
 
         wear_rows.append({
             'ParticipantIdentifier': participant_id,
@@ -2384,6 +2453,42 @@ for participant_id in complete_participant_ids:
         })
 
 wear_day = pd.DataFrame(wear_rows)
+
+# Safety net: if the HR/rest-day loop skipped a user, still emit morning_wearing from df_2hours.
+if not wear_day.empty:
+    have_wear = set(
+        zip(
+            wear_day['ParticipantIdentifier'].astype(str),
+            pd.to_datetime(wear_day['Date']).dt.normalize(),
+        )
+    )
+else:
+    have_wear = set()
+
+backfill_rows = []
+for participant_id in complete_participant_ids:
+    morning_rows = df_2hours.loc[
+        (df_2hours['DecisionTime'] == 0)
+        & _participant_mask(df_2hours['ParticipantIdentifier'], participant_id)
+    ].copy()
+    if morning_rows.empty:
+        continue
+    morning_rows['Date'] = pd.to_datetime(morning_rows['Date'], errors='coerce').dt.normalize()
+    for _, mrow in morning_rows.iterrows():
+        key = (str(participant_id), mrow['Date'])
+        if key in have_wear:
+            continue
+        backfill_rows.append({
+            'ParticipantIdentifier': participant_id,
+            'Date': mrow['Date'],
+            'restday_valid_minutes': np.nan,
+            'morning_wearing': int(mrow['HourWearing']),
+            'restday_wearing': np.nan,
+        })
+        have_wear.add(key)
+
+if backfill_rows:
+    wear_day = pd.concat([wear_day, pd.DataFrame(backfill_rows)], ignore_index=True)
 
 wear_2x2 = pd.crosstab(
     wear_day['morning_wearing'].astype(int),
@@ -2737,6 +2842,53 @@ nan_ratio = (
 )
 print(nan_ratio)
 
+# Wearable step quality audit (flags participants to add to EXCLUDED_PARTICIPANT_IDS).
+_wearable_audit_df, _wearable_exclude_candidates = audit_wearable_step_quality(
+    complete_participant_ids,
+    df_prior_2hours_step_counts,
+    df_hourly_step_counts,
+    df_today_step_counts,
+)
+_wearable_audit_path = os.path.join(folder, "wearable_step_quality_audit.csv")
+_wearable_audit_df.to_csv(_wearable_audit_path, index=False)
+print(f"Wrote wearable step quality audit to {_wearable_audit_path}")
+
+_excluded_from_span = [
+    str(pid)
+    for pid in span_qualified_participant_ids
+    if str(pid) in {str(x) for x in EXCLUDED_PARTICIPANT_IDS}
+]
+if _excluded_from_span:
+    print(
+        "Wearable step quality: manually excluded span-qualified participants "
+        f"({len(_excluded_from_span)}): "
+        + ", ".join(sorted(_excluded_from_span))
+    )
+
+if _wearable_exclude_candidates.empty:
+    print(
+        "Wearable step quality: no new exclusion candidates among active participants."
+    )
+else:
+    _candidate_path = os.path.join(folder, "wearable_exclude_candidates.txt")
+    candidate_ids = _wearable_exclude_candidates["ParticipantIdentifier"].tolist()
+    with open(_candidate_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(candidate_ids))
+        f.write("\n")
+    print(
+        "Wearable step quality: NEW participants with no usable FourSC (hourly) "
+        "step counts (add to EXCLUDED_PARTICIPANT_IDS):"
+    )
+    for _, row in _wearable_exclude_candidates.iterrows():
+        print(
+            f"  {row['ParticipantIdentifier']}: "
+            f"prior2hour={row['prior2hour_non_nan']}, "
+            f"hourly={row['hourly_non_nan']}, "
+            f"today={row['today_non_nan']}, "
+            f"reason={row['exclude_reason']}"
+        )
+    print(f"Wrote candidate IDs to {_candidate_path}")
+
 # %%
 # save the dataframe
 df_today_step_counts.to_csv(os.path.join(folder, 'today_step_counts.csv'), index=False)
@@ -2796,5 +2948,4 @@ df_recorded_physical_activity.to_csv(os.path.join(folder, 'recorded_physical_act
 
 # %%
 # Active minutes data
-
 

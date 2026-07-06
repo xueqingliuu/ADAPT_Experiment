@@ -32,7 +32,7 @@ from matplotlib.ticker import MaxNLocator
 plt.ion()
 
 DATA_FOLDER = Path(
-    "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined"
+    "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing"
 )
 folder = DATA_FOLDER
 

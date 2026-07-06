@@ -35,7 +35,7 @@ PROJECT_ROOT = Path(
 COMBINED_DIR = Path(
     os.getenv(
         "ADAPR_COMBINED_DIR",
-        "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined",
+        "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing",
     )
 ).expanduser().resolve()
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"

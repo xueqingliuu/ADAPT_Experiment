@@ -193,6 +193,7 @@ def train_dqn_ste(
     model_path.parent.mkdir(parents=True, exist_ok=True)
     logger_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_dir.mkdir(parents=True, exist_ok=True)
+    tensorboard_dir.mkdir(parents=True, exist_ok=True)
 
     dataset = d3rlpy.dataset.MDPDataset(
         observations=buffer["states"],

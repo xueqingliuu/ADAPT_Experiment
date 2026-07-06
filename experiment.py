@@ -53,7 +53,14 @@ def _rolling_mean_last(values, window=RPA_ROLLING_WINDOW, min_values=EWM_MIN_VAL
         return 0.0
     return float(np.mean(v))
 # %%
-from vani_env import Env, EnvConfig, make_initial_state, PARAMS_DIR, P_FOURSC, P_ANTIC
+from vani_env import (
+    Env,
+    EnvConfig,
+    make_initial_state,
+    PARAMS_DIR as DEFAULT_PARAMS_DIR,
+    P_FOURSC,
+    P_ANTIC,
+)
 from agents import (
     MicroQueryAgent,
     MicroQueryAgent_rewardshaping,
@@ -95,6 +102,16 @@ from agents.ew_hat import (
 )
 
 SUNDAY_D_W = TERMINAL_D + 1
+
+
+def resolve_params_dir(params_dir=None):
+    """Resolve the parameter folder selected for this experiment run."""
+    raw = (
+        params_dir
+        or os.getenv("ADAPR_EXPERIMENT_PARAMS_DIR")
+        or DEFAULT_PARAMS_DIR
+    )
+    return Path(raw).expanduser().resolve()
 
 
 # %%
@@ -202,7 +219,7 @@ class EpisodeDataset:
 class OnlineEnv:
     def __init__(
         self, env, nweek=None, seed=None, start_dow=1,
-        df_fit_11week_csv=None, df_fit_full=None,
+        df_fit_11week_csv=None, df_fit_full=None, params_dir=None,
     ):
         # ``start_dow``: civil weekday index in ``{1,…,7}`` with **1 = Monday** (``df_fit`` / study).
         # ``df_fit_full``: optional pre-loaded df_fit DataFrame (multi-week aggregates)
@@ -211,6 +228,9 @@ class OnlineEnv:
             rd.seed(seed)
 
         self.env = env
+        self.params_dir = resolve_params_dir(
+            params_dir or getattr(self.env.cfg, "params_dir", None)
+        )
         self.K = env.K
         self.W_days = env.W
         if self.W_days != N_RL_DAYS + 1:
@@ -284,6 +304,8 @@ class OnlineEnv:
 
         self._hist_daily_pv = []
 
+        if df_fit_11week_csv is None:
+            df_fit_11week_csv = self.params_dir / "df_fit_11week.csv"
         self.s = make_initial_state(
             df_fit_11week_csv, participant_id=self.env.cfg.userid
         )
@@ -377,7 +399,7 @@ class OnlineEnv:
         # Pooled linear coefficients for the agent-visible E_w_hat approximation
         # (fitted offline by ``6_est_Ew_weights.py``).
         try:
-            self._ew_coefs = load_pooled_coefs()
+            self._ew_coefs = load_pooled_coefs(work_dir=self.params_dir)
         except FileNotFoundError as exc:
             raise RuntimeError(
                 "Ew_pooled_linear_coefs.json missing; run 6_est_Ew_weights.py first."
@@ -499,14 +521,56 @@ class OnlineEnv:
             return float(self.s.get("prior2HourStepCountEma7d", 0.0))
         return float(np.mean(self._hist_prior2hour_observed[-7:]))
 
-    def _agent_prior2hour(self, d_global: int, prior2hour_latent: float):
-        """Return (observed, agent-visible) prior-2-hour values for one slot."""
+    def _agent_prior2hour(self, d_global: int, prior2hour_latent: float, step_idx: int):
+        """Return (observed, agent-visible) prior-2-hour values for one slot.
+
+        When Fitbit was not worn on the morning starting ``d_global``, the
+        observed value is ``NaN`` and the agent-visible value is model-imputed.
+        """
         if self._morning_fitbit_worn(d_global):
             val = float(prior2hour_latent)
-            self._hist_prior2hour_observed.append(val)
+            if not np.isfinite(self.prior2HourStepCountObsAll[step_idx]):
+                self._hist_prior2hour_observed.append(val)
             return val, val
         imputed = self._impute_prior2hour_7day_mean()
         return np.nan, imputed
+
+    def _ensure_day_started(self, sim_w, d_w, d_global):
+        """Run morning-day setup once per simulated calendar day."""
+        if (sim_w, d_w) not in self._day_started:
+            self._day_started[(sim_w, d_w)] = True
+            self._start_day(sim_w, d_w, d_global)
+
+    def _generate_prior2hour_for_slot(self, sim_w, d_w, t_sim, d_global, step_idx):
+        """Draw and log prior-2-hour steps for the current decision slot.
+
+        Called before ``get_context`` / ``act`` so ``C`` carries this slot's
+        own 2-hour-window covariate (not the previous slot's). Idempotent per
+        ``step_idx`` so ``step_action`` can reuse the same draw.
+        """
+        step_idx = int(step_idx)
+        if np.isfinite(self.prior2HourStepCountAgentAll[step_idx]):
+            return
+
+        slot = int(t_sim)
+        self.s["decisionTimeSlot"] = float(t_sim)
+        ema_hist = self._hist_prior2hour_by_slot[slot]
+        if ema_hist:
+            self.s["prior2HourStepCountEma7d"] = _ewm_prior_gamma_last(ema_hist)
+        else:
+            self.s["prior2HourStepCountEma7d"] = float(
+                self.s.get("prior2HourStepCountEma7d", 0.0)
+            )
+
+        prior2HourStepCount = self.env.gen_prior2hour_step_count(self.s, step_idx)
+        p2h_obs, p2h_agent = self._agent_prior2hour(
+            d_global, prior2HourStepCount, step_idx
+        )
+        self.prior2HourStepCountAll[step_idx] = prior2HourStepCount
+        self.prior2HourStepCountObsAll[step_idx] = p2h_obs
+        self.prior2HourStepCountAgentAll[step_idx] = p2h_agent
+        self.s["prior2HourStepCount"] = prior2HourStepCount
+        self.s["prior2HourStepCountAgent"] = p2h_agent
 
     def _active_particle_state(self):
         """Return the current particle CAE paths and weights for mediator imputation."""
@@ -595,21 +659,10 @@ class OnlineEnv:
         )
         return np.nan, imputed
 
-    def run_episode(self, agent, dataset):
-        agent.reset(dataset)
-        # Fixed-policy baselines (never/always/random send) set
-        # ``needs_belief = False``: their ``act`` ignores the belief state and
-        # the RLSVI betas, and the evaluated outcome (env latent CAE) never
-        # reads them, so the particle filter and the RLSVI refit are pure
-        # overhead and are skipped. Mediator imputation and ``results`` already
-        # tolerate a ``None`` PF runtime / unfilled belief & beta stores.
-        needs_belief = getattr(agent, "needs_belief", True)
-        pf_runtime = (
-            ParticleFilterRuntime(agent, dataset, agent.rng)
-            if needs_belief else None
-        )
-        self._active_agent = agent
-        self._active_pf_runtime = pf_runtime
+    def _reset_episode_state(self, active_agent=None, active_pf_runtime=None):
+        """Reset mutable episode histories before simulating a policy."""
+        self._active_agent = active_agent
+        self._active_pf_runtime = active_pf_runtime
         self._hist_daily_suggestions.clear()
         self.s["activitySuggestionsSentLast7Days"] = (
             self._activitySuggestionsSentLast7Days_initial
@@ -623,7 +676,6 @@ class OnlineEnv:
         self._hist_recordedPhysicalActivityToday = [self._rpa7_initial] * RPA_ROLLING_WINDOW
         self.s["activityCompletedLast7Days"] = self._rpa7_initial
 
-        
         self.s["morningFitbitWearLast7Days"] = self._wear7_initial
         self._hist_morning_wear = [self._wear7_initial] * 7
         self._hist_active_days = [self._active_days7_initial] * RPA_ROLLING_WINDOW
@@ -652,6 +704,18 @@ class OnlineEnv:
         self.activityCompletedLast7DaysAll[0] = float(self.s.get("activityCompletedLast7Days", 0.0))
         self.logActiveDaysLast7Days[0] = float(self.s.get("activeDaysLast7Days", 0.0))
 
+    def run_episode(self, agent, dataset):
+        agent.reset(dataset)
+        # Adaptive agents need the PF/RLSVI machinery. Agents can opt out with
+        # ``needs_belief = False``; the fixed baselines use a faster dedicated
+        # path in ``_run_fixed_policy_fast`` and normally do not enter here.
+        needs_belief = getattr(agent, "needs_belief", True)
+        pf_runtime = (
+            ParticleFilterRuntime(agent, dataset, agent.rng)
+            if needs_belief else None
+        )
+        self._reset_episode_state(agent, pf_runtime)
+
         for k in range(self.nweek):
             packet = self.get_week_packet(k)
             dataset.record_week_start(
@@ -672,6 +736,10 @@ class OnlineEnv:
                 if needs_belief and d == 1 and hasattr(agent, "update_rlsvi"):
                     agent.update_rlsvi(k)
                 for t in range(self.K):
+                    d_global = self._day_idx(k, d)
+                    step_idx = self._step_idx(k, d, t)
+                    self._ensure_day_started(k, d, d_global)
+                    self._generate_prior2hour_for_slot(k, d, t, d_global, step_idx)
                     context = self.get_context(k, d, t)
                     state = make_state(context)
                     A_wdt, pi_A = agent.act(k, d, t, state)
@@ -701,9 +769,7 @@ class OnlineEnv:
 
         self._Iw_per_week[sim_w] = I_w
 
-        if t_sim == 0 and (sim_w, d_w) not in self._day_started:
-            self._day_started[(sim_w, d_w)] = True
-            self._start_day(sim_w, d_w, d_global)
+        self._ensure_day_started(sim_w, d_w, d_global)
 
         self.s["decisionTimeSlot"] = float(t_sim)
         Ah = float(action)
@@ -720,26 +786,17 @@ class OnlineEnv:
         self.s["stepCountLast7DaysEma"] = self._stepCountLast7DaysEma_by_slot[slot]
         self.logStepCountLast7DaysEma[step_idx] = float(self.s["stepCountLast7DaysEma"])
 
+        # Pre-decision covariate: same slot's 2-hour window (also set before act()).
+        self._generate_prior2hour_for_slot(sim_w, d_w, t_sim, d_global, step_idx)
+        prior2HourStepCount = float(self.prior2HourStepCountAll[step_idx])
+        p2h_agent = float(self.prior2HourStepCountAgentAll[step_idx])
+
         fourSC = self.env.gen_fourSC(self.s, Ah, step_idx)
         pv = self.env.gen_pageview(self.s, Ah, I_w*self.wp_all[sim_w], step_idx)
 
-        # Generate current-slot auxiliary mediators using the OLD state summaries.
-        # Important: interaction history should not include the current slot
-        # until after ws_interaction has been generated.
-        ema_hist = self._hist_prior2hour_by_slot[slot]
-        if ema_hist:
-            self.s["prior2HourStepCountEma7d"] = _ewm_prior_gamma_last(ema_hist)
-        else:
-            self.s["prior2HourStepCountEma7d"] = float(
-                self.s.get("prior2HourStepCountEma7d", 0.0)
-            )
-        prior2HourStepCount = self.env.gen_prior2hour_step_count(self.s, step_idx)
+        # Interaction history should not include the current slot until after
+        # ``ws_interaction`` has been generated.
         ws_interaction = self.env.gen_ws_interaction(self.s, step_idx)
-
-        p2h_obs, p2h_agent = self._agent_prior2hour(d_global, prior2HourStepCount)
-        self.prior2HourStepCountAll[step_idx] = prior2HourStepCount
-        self.prior2HourStepCountObsAll[step_idx] = p2h_obs
-        self.prior2HourStepCountAgentAll[step_idx] = p2h_agent
 
         sc_obs, sc_agent = self._agent_fourSC(step_idx, d_global, Ah, fourSC)
 
@@ -1122,10 +1179,8 @@ class OnlineEnv:
     def _rl_context_vector(self, k, d, t):
         d_global = self._day_idx(k, d)
         step_idx = self._step_idx(k, d, t)
-        if step_idx > 0 and np.isfinite(self.prior2HourStepCountAgentAll[step_idx - 1]):
-            p2h = float(self.prior2HourStepCountAgentAll[step_idx - 1])
-        elif np.isfinite(self.prior2HourStepCountAgentAll[0]):
-            p2h = float(self.prior2HourStepCountAgentAll[0])
+        if np.isfinite(self.prior2HourStepCountAgentAll[step_idx]):
+            p2h = float(self.prior2HourStepCountAgentAll[step_idx])
         else:
             p2h = float(self.s.get("prior2HourStepCountAgent", self._initial_prior2hour))
         return build_rl_context_vector(
@@ -1295,11 +1350,10 @@ def _save_trajectories_for_algo(save_mode, algo_name):
 
 
 # ──────────────────────────────────────────────────────────────────
-# Load priors estimated from df_fit (env_para_vanilla/rl_priors.json).
-# Run ``python est_prior.py`` to (re)generate that file. If it is missing
-# (or USE_ESTIMATED_PRIORS=0 is set in the environment) we fall back to
-# the original zero / identity placeholder priors so a fresh checkout
-# still runs.
+# Load priors estimated from df_fit (``<params_dir>/rl_priors.json``).
+# Run ``python est_prior.py`` to (re)generate vanilla priors, or copy/regenerate
+# the priors into the selected parameter folder. If the file is missing (or
+# USE_ESTIMATED_PRIORS=0 is set) we fall back to zero / identity placeholders.
 # ──────────────────────────────────────────────────────────────────
 def _default_pf_priors():
     return {
@@ -1331,98 +1385,131 @@ def _default_rl_joint_priors(p_eta, p_beta):
     return (np.zeros(p), np.eye(p), int(p_eta), 1.0)
 
 
-def _load_priors():
-    """Try ``est_prior.load_estimated_priors``; fall back to defaults on miss."""
+_PRIORS_CONFIGURED_DIR = None
+_priors_src = None
+
+
+def _load_priors(params_dir=None):
+    """Try selected-dir ``rl_priors.json``; fall back to defaults on miss."""
     if os.getenv("USE_ESTIMATED_PRIORS", "0") == "0":
         return None, "USE_ESTIMATED_PRIORS=0 -> defaults"
     try:
-        from est_prior import load_estimated_priors, OUTPUT_PATH
-        if not OUTPUT_PATH.exists():
-            return None, f"{OUTPUT_PATH} not found"
-        return load_estimated_priors(), str(OUTPUT_PATH)
+        from est_prior import load_estimated_priors
+        prior_path = resolve_params_dir(params_dir) / "rl_priors.json"
+        if not prior_path.exists():
+            return None, f"{prior_path} not found"
+        return load_estimated_priors(prior_path), str(prior_path)
     except Exception as exc:  # noqa: BLE001 - any failure -> safe fallback
         return None, f"load_estimated_priors failed: {exc!r}"
 
 
-_priors, _priors_src = _load_priors()
-if _priors is None:
-    _setup_log(f"[priors] using default zero/identity priors ({_priors_src})")
-    _pf = _default_pf_priors()
-    nu_0_MY        = _pf["nu_0_MY"]
-    Gamma_0_MY     = _pf["Gamma_0_MY"]
-    sigma2_MY      = _pf["sigma2_MY"]
-    nu_0_Y         = _pf["nu_0_Y"]
-    Gamma_0_Y      = _pf["Gamma_0_Y"]
-    sigma2_Y       = _pf["sigma2_Y"]
-    nu_0_tilde_Y   = _pf["nu_0_tilde_Y"]
-    Gamma_0_tilde_Y= _pf["Gamma_0_tilde_Y"]
-    sigma2_tilde_Y = _pf["sigma2_tilde_Y"]
-    mu_0_micro,     Sigma_0_micro,     sigma2_rl_micro     = _default_rl_priors(P_RL_MICRO)
-    mu_0_reward,    Sigma_0_reward,    sigma2_reward      = _default_rl_priors(P_RL_REWARDSHAPING)
-    # Joint (alpha, beta) prior for the modified-TD-loss RLSVI agents.
-    (mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint,
-     sigma2_Q_mtd_joint) = _default_rl_joint_priors(
-        P_RL_BOTTLENECK, P_RL_MICRO)
-else:
-    _setup_log(f"[priors] loaded estimated priors from {_priors_src}")
-    nu_0_MY        = _priors["nu_0_MY"]
-    Gamma_0_MY     = _priors["Gamma_0_MY"]
-    sigma2_MY      = _priors["sigma2_MY"]
-    nu_0_Y         = _priors["nu_0_Y"]
-    Gamma_0_Y      = _priors["Gamma_0_Y"]
-    sigma2_Y       = _priors["sigma2_Y"]
-    nu_0_tilde_Y   = _priors["nu_0_tilde_Y"]
-    Gamma_0_tilde_Y= _priors["Gamma_0_tilde_Y"]
-    sigma2_tilde_Y = _priors["sigma2_tilde_Y"]
-    # Q prior used by MicroQueryAgent / MicroQueryAgent_rewardshaping
-    # (no TD-modify variant).
-    mu_0_micro      = _priors["mu_0_micro"]
-    Sigma_0_micro   = _priors["Sigma_0_micro"]
-    sigma2_rl_micro = _priors["sigma2_rl_micro"]
-    mu_0_reward     = _priors["mu_0_reward"]
-    Sigma_0_reward  = _priors["Sigma_0_reward"]
-    sigma2_reward   = _priors["sigma2_reward"]
-    # Joint (alpha, beta) prior for the modified-TD-loss RLSVI agents.
-    # Sigma_0 is the FULL joint covariance across users (not block-diagonal).
-    # Falls back to the block-diagonal default if the older rl_priors.json
-    # was produced before est_prior.py started emitting q_td_modify_joint.
-    if "mu_0_micro_mtd_joint" in _priors and _priors["mu_0_micro_mtd_joint"] is not None:
-        mu_0_mtd_joint              = _priors["mu_0_micro_mtd_joint"]
-        Sigma_0_mtd_joint           = _priors["Sigma_0_micro_mtd_joint"]
-        p_eta_mtd_joint             = int(_priors["p_eta_micro_mtd_joint"])
-        sigma2_Q_mtd_joint          = float(_priors.get(
-            "sigma2_Q_mtd_joint",
-            _priors.get("sigma2_TD_mtd_joint", 1.0),
-        ))
-    else:
-        _setup_log("[priors] q_td_modify_joint missing from rl_priors.json -> "
-                   "falling back to default joint prior (rerun est_prior.py "
-                   "to regenerate).")
+def _configure_priors(params_dir=None, *, force=False):
+    """Configure module-level PF/RL priors for the selected parameter folder."""
+    global _PRIORS_CONFIGURED_DIR, _priors_src
+    global nu_0_MY, Gamma_0_MY, sigma2_MY
+    global nu_0_Y, Gamma_0_Y, sigma2_Y
+    global nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y
+    global mu_0_micro, Sigma_0_micro, sigma2_rl_micro
+    global mu_0_reward, Sigma_0_reward, sigma2_reward
+    global mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint
+    global sigma2_Q_mtd_joint, _P_MTD_JOINT
+
+    params_dir = resolve_params_dir(params_dir)
+    if not force and _PRIORS_CONFIGURED_DIR == str(params_dir):
+        return
+
+    _priors, _priors_src = _load_priors(params_dir)
+    if _priors is None:
+        _setup_log(f"[priors] using default zero/identity priors ({_priors_src})")
+        _pf = _default_pf_priors()
+        nu_0_MY        = _pf["nu_0_MY"]
+        Gamma_0_MY     = _pf["Gamma_0_MY"]
+        sigma2_MY      = _pf["sigma2_MY"]
+        nu_0_Y         = _pf["nu_0_Y"]
+        Gamma_0_Y      = _pf["Gamma_0_Y"]
+        sigma2_Y       = _pf["sigma2_Y"]
+        nu_0_tilde_Y   = _pf["nu_0_tilde_Y"]
+        Gamma_0_tilde_Y= _pf["Gamma_0_tilde_Y"]
+        sigma2_tilde_Y = _pf["sigma2_tilde_Y"]
+        mu_0_micro, Sigma_0_micro, sigma2_rl_micro = _default_rl_priors(P_RL_MICRO)
+        mu_0_reward, Sigma_0_reward, sigma2_reward = _default_rl_priors(
+            P_RL_REWARDSHAPING
+        )
+        # Joint (alpha, beta) prior for the modified-TD-loss RLSVI agents.
         (mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint,
          sigma2_Q_mtd_joint) = _default_rl_joint_priors(
             P_RL_BOTTLENECK, P_RL_MICRO)
+    else:
+        _setup_log(f"[priors] loaded estimated priors from {_priors_src}")
+        nu_0_MY        = _priors["nu_0_MY"]
+        Gamma_0_MY     = _priors["Gamma_0_MY"]
+        sigma2_MY      = _priors["sigma2_MY"]
+        nu_0_Y         = _priors["nu_0_Y"]
+        Gamma_0_Y      = _priors["Gamma_0_Y"]
+        sigma2_Y       = _priors["sigma2_Y"]
+        nu_0_tilde_Y   = _priors["nu_0_tilde_Y"]
+        Gamma_0_tilde_Y= _priors["Gamma_0_tilde_Y"]
+        sigma2_tilde_Y = _priors["sigma2_tilde_Y"]
+        # Q prior used by MicroQueryAgent / MicroQueryAgent_rewardshaping
+        # (no TD-modify variant).
+        mu_0_micro      = _priors["mu_0_micro"]
+        Sigma_0_micro   = _priors["Sigma_0_micro"]
+        sigma2_rl_micro = _priors["sigma2_rl_micro"]
+        mu_0_reward     = _priors["mu_0_reward"]
+        Sigma_0_reward  = _priors["Sigma_0_reward"]
+        sigma2_reward   = _priors["sigma2_reward"]
+        # Joint (alpha, beta) prior for the modified-TD-loss RLSVI agents.
+        # Sigma_0 is the FULL joint covariance across users (not block-diagonal).
+        # Falls back to the block-diagonal default if the older rl_priors.json
+        # was produced before est_prior.py started emitting q_td_modify_joint.
+        if (
+            "mu_0_micro_mtd_joint" in _priors
+            and _priors["mu_0_micro_mtd_joint"] is not None
+        ):
+            mu_0_mtd_joint              = _priors["mu_0_micro_mtd_joint"]
+            Sigma_0_mtd_joint           = _priors["Sigma_0_micro_mtd_joint"]
+            p_eta_mtd_joint             = int(_priors["p_eta_micro_mtd_joint"])
+            sigma2_Q_mtd_joint          = float(_priors.get(
+                "sigma2_Q_mtd_joint",
+                _priors.get("sigma2_TD_mtd_joint", 1.0),
+            ))
+        else:
+            _setup_log("[priors] q_td_modify_joint missing from rl_priors.json -> "
+                       "falling back to default joint prior (rerun est_prior.py "
+                       "to regenerate).")
+            (mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint,
+             sigma2_Q_mtd_joint) = _default_rl_joint_priors(
+                P_RL_BOTTLENECK, P_RL_MICRO)
 
-# Sanity check: every loaded prior must agree with the phi-builder dims.
-assert nu_0_MY[0].shape == (P_MY_FOURSC,), f"fourSC dim {nu_0_MY[0].shape} != {P_MY_FOURSC}"
-assert nu_0_MY[1].shape == (P_MY_ANTIC,),  f"antic dim {nu_0_MY[1].shape} != {P_MY_ANTIC}"
-assert nu_0_Y.shape       == (P_CAE,),     f"CAE dim {nu_0_Y.shape} != {P_CAE}"
-assert nu_0_tilde_Y.shape == (P_TY,),      f"CAE_short dim {nu_0_tilde_Y.shape} != {P_TY}"
-assert mu_0_micro.shape       == (P_RL_MICRO,)
-assert mu_0_reward.shape      == (P_RL_REWARDSHAPING,)
-_P_MTD_JOINT = P_RL_BOTTLENECK + P_RL_MICRO
-assert mu_0_mtd_joint.shape    == (_P_MTD_JOINT,), \
-    f"joint mu_0 dim {mu_0_mtd_joint.shape} != ({_P_MTD_JOINT},)"
-assert Sigma_0_mtd_joint.shape == (_P_MTD_JOINT, _P_MTD_JOINT), \
-    f"joint Sigma_0 shape {Sigma_0_mtd_joint.shape} != " \
-    f"({_P_MTD_JOINT}, {_P_MTD_JOINT})"
-assert p_eta_mtd_joint == P_RL_BOTTLENECK, \
-    f"joint p_eta {p_eta_mtd_joint} != P_RL_BOTTLENECK={P_RL_BOTTLENECK}"
+    # Sanity check: every loaded prior must agree with the phi-builder dims.
+    assert nu_0_MY[0].shape == (P_MY_FOURSC,), f"fourSC dim {nu_0_MY[0].shape} != {P_MY_FOURSC}"
+    assert nu_0_MY[1].shape == (P_MY_ANTIC,),  f"antic dim {nu_0_MY[1].shape} != {P_MY_ANTIC}"
+    assert nu_0_Y.shape       == (P_CAE,),     f"CAE dim {nu_0_Y.shape} != {P_CAE}"
+    assert nu_0_tilde_Y.shape == (P_TY,),      f"CAE_short dim {nu_0_tilde_Y.shape} != {P_TY}"
+    assert mu_0_micro.shape       == (P_RL_MICRO,)
+    assert mu_0_reward.shape      == (P_RL_REWARDSHAPING,)
+    _P_MTD_JOINT = P_RL_BOTTLENECK + P_RL_MICRO
+    assert mu_0_mtd_joint.shape    == (_P_MTD_JOINT,), \
+        f"joint mu_0 dim {mu_0_mtd_joint.shape} != ({_P_MTD_JOINT},)"
+    assert Sigma_0_mtd_joint.shape == (_P_MTD_JOINT, _P_MTD_JOINT), \
+        f"joint Sigma_0 shape {Sigma_0_mtd_joint.shape} != " \
+        f"({_P_MTD_JOINT}, {_P_MTD_JOINT})"
+    assert p_eta_mtd_joint == P_RL_BOTTLENECK, \
+        f"joint p_eta {p_eta_mtd_joint} != P_RL_BOTTLENECK={P_RL_BOTTLENECK}"
 
-_setup_log(
-    f"Priors ready:  p_rl(micro)={P_RL_MICRO}, "
-    f"p_rs={P_RL_REWARDSHAPING}, p_b={P_RL_BOTTLENECK}, "
-    f"p_mtd_joint={_P_MTD_JOINT}"
-)
+    _PRIORS_CONFIGURED_DIR = str(params_dir)
+    _setup_log(
+        f"Priors ready:  p_rl(micro)={P_RL_MICRO}, "
+        f"p_rs={P_RL_REWARDSHAPING}, p_b={P_RL_BOTTLENECK}, "
+        f"p_mtd_joint={_P_MTD_JOINT}"
+    )
+
+
+def _ensure_priors_configured(params_dir=None):
+    _configure_priors(params_dir=params_dir, force=False)
+
+
+_configure_priors()
 
 # %%
 # ──────────────────────────────────────────────────────────────────
@@ -1453,11 +1540,19 @@ def _episode_seed(exp_seed: int, draw_idx: int) -> int:
     return int(np.random.SeedSequence([exp_seed, draw_idx]).generate_state(1)[0])
 
 
-def run_micro_query(uid, seed=42, gamma_bar=0.5):
-    cfg = EnvConfig(uid)
+def _make_online_env(uid, seed=42, params_dir=None):
+    params_dir = resolve_params_dir(params_dir)
+    cfg = EnvConfig(uid, params_dir=params_dir)
     nweek = cfg.nweek
     env = Env(cfg, noise="sequential")
-    oenv = OnlineEnv(env, nweek=nweek, seed=seed)
+    oenv = OnlineEnv(env, nweek=nweek, seed=seed, params_dir=params_dir)
+    return cfg, env, oenv
+
+
+def run_micro_query(uid, seed=42, gamma_bar=0.5, params_dir=None):
+    _ensure_priors_configured(params_dir)
+    cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
+    nweek = cfg.nweek
 
     dataset = EpisodeDataset(nweek)
     agent = MicroQueryAgent(
@@ -1478,12 +1573,11 @@ def run_micro_query(uid, seed=42, gamma_bar=0.5):
     return result, oenv
 
 
-def run_micro_query_rs(uid, seed=42, gamma_bar=0.5):
+def run_micro_query_rs(uid, seed=42, gamma_bar=0.5, params_dir=None):
     """Micro-query agent with reward shaping (per-slot R_dt = phi_rs · eta)."""
-    cfg = EnvConfig(uid)
+    _ensure_priors_configured(params_dir)
+    cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
     nweek = cfg.nweek
-    env = Env(cfg, noise="sequential")
-    oenv = OnlineEnv(env, nweek=nweek, seed=seed)
 
     agent = MicroQueryAgent_rewardshaping(
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
@@ -1505,12 +1599,11 @@ def run_micro_query_rs(uid, seed=42, gamma_bar=0.5):
     return result, oenv
 
 
-def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5):
+def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5, params_dir=None):
     """Micro-query agent with modified TD loss (week-start bottleneck V_alpha)."""
-    cfg = EnvConfig(uid)
+    _ensure_priors_configured(params_dir)
+    cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
     nweek = cfg.nweek
-    env = Env(cfg, noise="sequential")
-    oenv = OnlineEnv(env, nweek=nweek, seed=seed)
 
     agent = MicroQueryAgent_ModifiedTDLoss(
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
@@ -1532,12 +1625,11 @@ def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5):
     return result, oenv
 
 
-def run_micro_query_rs_mtd(uid, seed=42, gamma_bar=0.5):
+def run_micro_query_rs_mtd(uid, seed=42, gamma_bar=0.5, params_dir=None):
     """Micro-query agent with both reward shaping and modified TD loss."""
-    cfg = EnvConfig(uid)
+    _ensure_priors_configured(params_dir)
+    cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
     nweek = cfg.nweek
-    env = Env(cfg, noise="sequential")
-    oenv = OnlineEnv(env, nweek=nweek, seed=seed)
 
     agent = MicroQueryAgent_rewardshaping_modifiedTD(
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
@@ -1561,48 +1653,109 @@ def run_micro_query_rs_mtd(uid, seed=42, gamma_bar=0.5):
     return result, oenv
 
 
-def _run_fixed_policy(agent_cls, uid, seed=42):
-    """Run a fixed walking-suggestion policy (never/always/random send).
+def _fixed_policy_rng_after_legacy_reset(seed: int):
+    """RNG positioned where the old fixed-policy ``MicroQueryAgent.reset`` left it.
 
-    These agents share MicroQueryAgent's query + belief-state machinery; only
-    the action is fixed, so the RLSVI discount (gamma_bar) is irrelevant and a
-    single configuration suffices.
+    Fixed policies do not use RLSVI betas, but older output consumed the week-0
+    bootstrap actions and initial beta draws before weekly query/action draws.
+    Skipping those draws would change the simulated query path and random-send
+    actions. ``Generator.multivariate_normal(..., size=B)`` consumes the same
+    standard-normal stream as the call below; this keeps reproducibility without
+    paying for the unused covariance transform.
     """
-    cfg = EnvConfig(uid)
-    nweek = cfg.nweek
-    env = Env(cfg, noise="sequential")
-    oenv = OnlineEnv(env, nweek=nweek, seed=seed)
+    rng = np.random.default_rng(seed)
+    rng.integers(0, 2, size=(N_RL_DAYS, N_RL_SLOTS))
+    rng.standard_normal(size=(B_ENSEMBLES, mu_0_micro.shape[0]))
+    return rng
 
-    agent = agent_cls(
-        W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
-        mu_0_rl=mu_0_micro, Sigma_0_rl=Sigma_0_micro, sigma2_rl=sigma2_rl_micro,
-        gamma_dt=_gamma_dt_micro(0.0), gamma_bar=0.0,
-        target_update_C=TARGET_C,
-        nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
-        nu_0_Y=nu_0_Y, Gamma_0_Y=Gamma_0_Y, sigma2_Y=sigma2_Y,
-        nu_0_tilde_Y=nu_0_tilde_Y, Gamma_0_tilde_Y=Gamma_0_tilde_Y,
-        sigma2_tilde_Y=sigma2_tilde_Y,
-        Y_1=float(oenv.CAE_all[0]),
-        rng=np.random.default_rng(seed),
-    )
-    dataset = EpisodeDataset(nweek)
-    result = oenv.run_episode(agent, dataset)
+
+def _fixed_policy_begin_week(k: int, rng) -> int:
+    if k == 0:
+        return 1
+    if k == 1:
+        return 1
+    return int(rng.binomial(1, 0.5))
+
+
+def _run_fixed_policy_fast(policy: str, uid, seed=42, params_dir=None):
+    """Run fixed baselines without PF/RLSVI/state-feature bookkeeping."""
+    _ensure_priors_configured(params_dir)
+    cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
+    nweek = cfg.nweek
+
+    if policy not in {"never_send", "always_send", "random_send"}:
+        raise ValueError(f"unknown fixed policy {policy!r}")
+
+    rng = _fixed_policy_rng_after_legacy_reset(seed)
+    I_hist = np.zeros(nweek, dtype=int)
+    A_hist = np.zeros((nweek, N_RL_DAYS, N_RL_SLOTS), dtype=int)
+    pi_A_hist = np.full((nweek, N_RL_DAYS, N_RL_SLOTS), np.nan)
+    b_hat_hist = np.full(nweek, np.nan)
+    b_tilde_hist = np.full(nweek, np.nan)
+    b_hat_hist[0] = float(oenv.CAE_all[0])
+    b_tilde_hist[0] = 0.0
+
+    oenv._reset_episode_state()
+
+    for k in range(nweek):
+        I_w = _fixed_policy_begin_week(k, rng)
+        I_hist[k] = I_w
+        oenv.start_week(k, I_w)
+
+        for d in range(N_RL_DAYS):
+            for t in range(N_RL_SLOTS):
+                if policy == "never_send":
+                    action, pi_A = 0, 0.0
+                elif policy == "always_send":
+                    action, pi_A = 1, 1.0
+                else:
+                    pi_A = 0.5
+                    action = int(rng.binomial(1, pi_A))
+
+                A_hist[k, d, t] = action
+                pi_A_hist[k, d, t] = pi_A
+                oenv.step_action(k, d, t, action, I_w)
+
+        oenv._finalize_week(k)
+
+    result = {
+        "I": I_hist,
+        "A": A_hist,
+        "b_hat": b_hat_hist,
+        "b_tilde": b_tilde_hist,
+        "pi_A": pi_A_hist,
+        "y_hat": None,
+        "v_hat": None,
+        "pf": {},
+        "betas": np.empty((nweek, 0, 0), dtype=float),
+    }
     return result, oenv
 
 
-def run_never_send(uid, seed=42):
+def _run_fixed_policy(agent_cls, uid, seed=42, params_dir=None):
+    """Run a fixed walking-suggestion policy (never/always/random send)."""
+    if agent_cls is NeverSendAgent:
+        return _run_fixed_policy_fast("never_send", uid, seed=seed, params_dir=params_dir)
+    if agent_cls is AlwaysSendAgent:
+        return _run_fixed_policy_fast("always_send", uid, seed=seed, params_dir=params_dir)
+    if agent_cls is RandomSendAgent:
+        return _run_fixed_policy_fast("random_send", uid, seed=seed, params_dir=params_dir)
+    raise TypeError(f"unsupported fixed-policy class {agent_cls!r}")
+
+
+def run_never_send(uid, seed=42, params_dir=None):
     """Baseline: never send a walking suggestion (A = 0 in every slot)."""
-    return _run_fixed_policy(NeverSendAgent, uid, seed=seed)
+    return _run_fixed_policy(NeverSendAgent, uid, seed=seed, params_dir=params_dir)
 
 
-def run_always_send(uid, seed=42):
+def run_always_send(uid, seed=42, params_dir=None):
     """Baseline: always send a walking suggestion (A = 1 in every slot)."""
-    return _run_fixed_policy(AlwaysSendAgent, uid, seed=seed)
+    return _run_fixed_policy(AlwaysSendAgent, uid, seed=seed, params_dir=params_dir)
 
 
-def run_random_send(uid, seed=42):
+def run_random_send(uid, seed=42, params_dir=None):
     """Baseline: send at random with fixed propensity pi_A = 0.5."""
-    return _run_fixed_policy(RandomSendAgent, uid, seed=seed)
+    return _run_fixed_policy(RandomSendAgent, uid, seed=seed, params_dir=params_dir)
 
 
 # Algorithm registry: name -> (runner, display label).
@@ -1704,7 +1857,21 @@ if __name__ == "__main__":
             "Override with SAVE_MODE=<mode>."
         ),
     )
+    parser.add_argument(
+        "--params-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Parameter folder containing user_ids.txt, params_env_<id>.json, "
+            "std_params.json, df_fit_11week.csv, and Ew_pooled_linear_coefs.json. "
+            "Defaults to ADAPR_EXPERIMENT_PARAMS_DIR, then env_para_vanilla."
+        ),
+    )
     args = parser.parse_args()
+
+    params_dir = resolve_params_dir(args.params_dir)
+    _configure_priors(params_dir=params_dir, force=True)
+    print(f"Using parameter directory: {params_dir}")
 
     save_mode = _parse_save_mode(args.save_mode or os.getenv("SAVE_MODE"))
     save_pf = _save_pf_pkl(save_mode)
@@ -1718,7 +1885,7 @@ if __name__ == "__main__":
         f"(pf.pkl={'yes' if save_pf else 'no'}, {traj_msg})"
     )
 
-    user_ids = np.loadtxt(PARAMS_DIR / "user_ids.txt", dtype=int)
+    user_ids = np.loadtxt(params_dir / "user_ids.txt", dtype=int)
     N_EXPERIMENTS = 100
     all_seeds = list(range(N_EXPERIMENTS))
     seed_idx = args.seed_idx
@@ -1786,7 +1953,7 @@ if __name__ == "__main__":
 
             summary_parts = []
             for name, (runner, _label) in ALGORITHMS.items():
-                res, oenv = runner(uid, seed=draw_seed)
+                res, oenv = runner(uid, seed=draw_seed, params_dir=params_dir)
                 snap = _snapshot_oenv(oenv)
                 if _save_trajectories_for_algo(save_mode, name):
                     oenv_runs[name][exp_idx].append(snap)
@@ -1864,6 +2031,10 @@ if __name__ == "__main__":
             "target_update_C": TARGET_C,
             "save_mode":      save_mode,
             "trajectory_reference_algo": TRAJECTORY_REFERENCE_ALGO,
+            "params_dir":      str(params_dir),
+            "priors_source":   _priors_src,
+            "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID"),
+            "slurm_job_id":       os.getenv("SLURM_JOB_ID"),
         }, f, indent=2)
 
     np.save(OUTPUT_DIR / "run_uids.npy", run_uids_arr)

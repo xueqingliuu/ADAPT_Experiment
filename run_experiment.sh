@@ -25,18 +25,23 @@ export OPENBLAS_NUM_THREADS=4
 export MPLBACKEND=Agg
 export MPLCONFIGDIR="${SLURM_SUBMIT_DIR}/.matplotlib"
 
-# results parent dir shared by all array tasks (aggregate.py reads the same)
-export RESULTS_ROOT="${SLURM_SUBMIT_DIR}/results_vanilla"
+# Override at submit time, e.g.:
+#   ADAPR_EXPERIMENT_PARAMS_DIR=env_para_positivedirection \
+#   RESULTS_ROOT=results_positivedirection \
+#   sbatch --export=ALL run_experiment.sh
+export ADAPR_EXPERIMENT_PARAMS_DIR="${ADAPR_EXPERIMENT_PARAMS_DIR:-${SLURM_SUBMIT_DIR}/env_para_vanilla}"
+export RESULTS_ROOT="${RESULTS_ROOT:-${SLURM_SUBMIT_DIR}/results_vanilla}"
 # compact: skip pf.pkl; full trajectory arrays only for random_send (see experiment.py)
 export SAVE_MODE="${SAVE_MODE:-compact}"
 
 echo "Host: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID:-local}  Task ID: ${SLURM_ARRAY_TASK_ID:-none}"
+echo "ADAPR_EXPERIMENT_PARAMS_DIR=${ADAPR_EXPERIMENT_PARAMS_DIR}"
 echo "RESULTS_ROOT=${RESULTS_ROOT}"
 echo "SAVE_MODE=${SAVE_MODE}"
 
 # sanity check before a long run
-test -f env_para_vanilla/user_ids.txt
+test -f "${ADAPR_EXPERIMENT_PARAMS_DIR}/user_ids.txt"
 
 python experiment.py
 # SLURM_ARRAY_TASK_ID is picked up automatically as --seed-idx

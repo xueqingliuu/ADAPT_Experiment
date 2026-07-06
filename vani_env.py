@@ -35,7 +35,9 @@ import numpy.random as rd
 PROJECT_ROOT = Path(
     os.environ.get("ADAPR_PROJECT_ROOT", Path(__file__).resolve().parent)
 ).expanduser().resolve()
-PARAMS_DIR = PROJECT_ROOT / "env_para_vanilla"
+PARAMS_DIR = Path(
+    PROJECT_ROOT / "env_para_vanilla"
+).expanduser().resolve()
 
 
 def load_CAE_norm_params(params_dir=PARAMS_DIR):
@@ -55,17 +57,111 @@ def denormalize_CAE(cae_norm, params_dir=PARAMS_DIR):
     shift, scale = load_CAE_norm_params(params_dir)
     return shift + scale * np.asarray(cae_norm, dtype=float)
 
+THETA_PRIOR2HOUR_STEP_COUNT_NAMES = [
+    "intercept",
+    "EMA_Prior2HourStepCount",
+    "dow",
+    "decision_time",
+]
+
+THETA_RECORDED_PHYSICAL_ACTIVITY_NAMES = [
+    "intercept",
+    "Previous7DaysRPA",
+    "dow",
+]
+
+THETA_ACTIVE_STATUS_NAMES = [
+    "intercept",
+    "active_status_fraction_7days",
+    "dow",
+]
+
+THETA_WS_INTERACTION_NAMES = [
+    "intercept",
+    "Interacted_7d_walk",
+    "dow",
+    "decision_time",
+]
+
+THETA_FOURSC_NAMES = [
+    "intercept",
+    "fourSC_lag1",
+    "yesterday_step_count",
+    "seven_day_step_count_avg",
+    "prior2hour_step_count",
+    "Previous7DaysRPA",
+    "recent_burden",
+    "seven_day_pageview_count",
+    "past7days_morning_wearing",
+    "yesterday_salience_message",
+    "Interacted_7d_walk",
+    "anticipated_affect_yesterday",
+    "fractionofactivedayspast7days",
+    "dow",
+    "decision_time",
+    "perceived_utility_lastweek",
+    "CAE_avg_lastweek",
+    "WalkingSuggestion",
+    "WalkingSuggestion_by_yesterday_step_count",
+    "WalkingSuggestion_by_prior2hour_step_count",
+    "WalkingSuggestion_by_recent_burden",
+    "WalkingSuggestion_by_seven_day_pageview_count",
+    "WalkingSuggestion_by_past7days_morning_wearing",
+    "WalkingSuggestion_by_yesterday_salience_message",
+    "WalkingSuggestion_by_Interacted_7d_walk",
+    "WalkingSuggestion_by_anticipated_affect_yesterday",
+    "WalkingSuggestion_by_dow",
+    "WalkingSuggestion_by_decision_time",
+    "WalkingSuggestion_by_perceived_utility_lastweek",
+    "WalkingSuggestion_by_CAE_avg_lastweek",
+]
+
+THETA_ANTIC_NAMES = [
+    "intercept",
+    "anticipated_affect_yesterday",
+    "today_step_count",
+    "recorded_physical_activity",
+    "active_status",
+    "salience_message",
+    "dow",
+    "perceived_utility_lastweek",
+    "CAE_avg_lastweek",
+    "A0_morning",
+    "A1_afternoon",
+    "A0_morning_by_salience_message",
+    "A1_afternoon_by_salience_message",
+    "A0_morning_by_dow",
+    "A1_afternoon_by_dow",
+    "A0_morning_by_perceived_utility_lastweek",
+    "A1_afternoon_by_perceived_utility_lastweek",
+    "A0_morning_by_CAE_avg_lastweek",
+    "A1_afternoon_by_CAE_avg_lastweek",
+]
+
+THETA_CAE_NAMES = (
+    ["intercept", "CAE_avg_lastweek", "week"]
+    + [f"fourSC_slot_{j}" for j in range(14)]
+    + [f"anticipated_affect_day_{j}" for j in range(7)]
+)
+
+THETA_CAE_SHORT_AVG_NAMES = [
+    "intercept",
+    "CAE_avg",
+]
+
 # Design sizes (``5_fit_vanilla_testbed.py``); no 7-day salience-interaction covariate.
 # The environment uses the full fitted fourSC model, including the
 # ``seven_day_pageview_count`` and ``anticipated_affect_yesterday`` predictors
 # (and their WalkingSuggestion interactions) — these are NOT trimmed away.
-P_FOURSC = 30
+P_FOURSC = len(THETA_FOURSC_NAMES)
 _LEGACY_INTERACT_DROP = (2,)  # removed legacy salience-history covariate
 _LEGACY_ANTIC_DROP = (11, 12, 13, 14, 15, 16)  # removed WS×(step, RPA, active) terms
-P_ANTIC = 19
-P_ACTIVE_STATUS = 3
-P_PRIOR2HOUR = 4
-P_RPA = 3
+P_ANTIC = len(THETA_ANTIC_NAMES)
+P_ACTIVE_STATUS = len(THETA_ACTIVE_STATUS_NAMES)
+P_PRIOR2HOUR = len(THETA_PRIOR2HOUR_STEP_COUNT_NAMES)
+P_RPA = len(THETA_RECORDED_PHYSICAL_ACTIVITY_NAMES)
+P_CAE = len(THETA_CAE_NAMES)
+P_CAE_SHORT = len(THETA_CAE_SHORT_AVG_NAMES)
 _LEGACY_RPA_DROP = (3,)  # decisionTimeSlot in legacy 4-dim RPA fits
 PV_ML_BASE = 9
 PV_ML_QUERY = 5
@@ -85,6 +181,77 @@ def _json_float_list(key: str, d: dict, n: int | None = None) -> np.ndarray:
     if n is not None and out.shape[0] != n:
         raise ValueError(f"{key}: expected length {n}, got {out.shape[0]}")
     return out
+
+
+def _validate_json_names(
+    key: str,
+    d: dict,
+    expected: list[str],
+    *,
+    legacy_lengths: tuple[int, ...] = (),
+) -> None:
+    raw = d.get(key)
+    if raw is None:
+        return
+    got = [str(x) for x in raw]
+    if got == list(expected):
+        return
+    if len(got) in legacy_lengths:
+        return
+    raise ValueError(
+        f"{key}: fitted coefficient names do not match 5_fit_vanilla_testbed.py. "
+        f"Expected {list(expected)!r}, got {got!r}."
+    )
+
+
+def _finite_mean_or_default(x: np.ndarray, default: float = 0.0) -> float:
+    vals = np.asarray(x, dtype=float).ravel()
+    finite = vals[np.isfinite(vals)]
+    if finite.size == 0:
+        return float(default)
+    return float(np.mean(finite))
+
+
+def _fill_nan_with_finite_mean(x: np.ndarray, default: float = 0.0) -> np.ndarray:
+    vals = np.asarray(x, dtype=float).copy()
+    if np.all(np.isfinite(vals)):
+        return vals
+    return np.where(np.isfinite(vals), vals, _finite_mean_or_default(vals, default))
+
+
+def build_CAE_features(CAE_lastweek, week_norm, foursc_wk, antic_wk) -> np.ndarray:
+    """Feature vector matching ``THETA_CAE_NAMES`` in ``5_fit_vanilla_testbed.py``."""
+    foursc = np.asarray(foursc_wk, dtype=float).ravel()
+    if foursc.size != 14:
+        raise ValueError(f"foursc_wk must have 14 weekly decision slots, got {foursc.size}")
+    foursc = _fill_nan_with_finite_mean(foursc)
+
+    antic = np.asarray(antic_wk, dtype=float).ravel()
+    if antic.size == 14:
+        # Fitter converts 14 AM/PM decision rows into 7 daily means.
+        antic = _fill_nan_with_finite_mean(antic).reshape(7, 2).mean(axis=1)
+    elif antic.size == 7:
+        antic = _fill_nan_with_finite_mean(antic)
+    else:
+        raise ValueError(
+            f"antic_wk must have 7 daily values or 14 AM/PM slots, got {antic.size}"
+        )
+
+    x = np.concatenate(
+        [
+            np.array([1.0, CAE_lastweek, week_norm], dtype=float),
+            foursc,
+            antic,
+        ]
+    )
+    if x.size != P_CAE:
+        raise RuntimeError(f"CAE feature length {x.size} != {P_CAE}")
+    return x
+
+
+def build_CAE_short_features(caeAverage) -> np.ndarray:
+    """Feature vector matching ``THETA_CAE_SHORT_AVG_NAMES``."""
+    return np.array([1.0, caeAverage], dtype=float)
 
 
 def trim_theta_interaction(theta, *, name: str = "theta") -> np.ndarray:
@@ -185,7 +352,8 @@ class EnvConfig:
         self.nweek = int(nweek)
         self.D = self.nweek * self.W
 
-        params_path = Path(params_dir)
+        params_path = Path(params_dir).expanduser().resolve()
+        self.params_dir = params_path
         with open(params_path / "std_params.json", encoding="utf-8") as f:
             std = json.load(f)
         self.limits_fourSC = std["4hour_step_count_limit"]
@@ -213,6 +381,34 @@ class EnvConfig:
         self.limits_exp2 = [0.125, 1.0]
         with open(params_path / f"params_env_{userid}.json", encoding="utf-8") as f:
             p = json.load(f)
+
+        _validate_json_names(
+            "theta_prior2hour_step_count_names",
+            p,
+            THETA_PRIOR2HOUR_STEP_COUNT_NAMES,
+        )
+        _validate_json_names(
+            "theta_recorded_physical_activity_names",
+            p,
+            THETA_RECORDED_PHYSICAL_ACTIVITY_NAMES,
+            legacy_lengths=(4,),
+        )
+        _validate_json_names("theta_active_status_names", p, THETA_ACTIVE_STATUS_NAMES)
+        _validate_json_names(
+            "theta_ws_interaction_names",
+            p,
+            THETA_WS_INTERACTION_NAMES,
+            legacy_lengths=(5,),
+        )
+        _validate_json_names("theta_fourSC_names", p, THETA_FOURSC_NAMES)
+        _validate_json_names(
+            "theta_antic_names",
+            p,
+            THETA_ANTIC_NAMES,
+            legacy_lengths=(25,),
+        )
+        _validate_json_names("theta_CAE_names", p, THETA_CAE_NAMES)
+        _validate_json_names("theta_CAE_short_avg_names", p, THETA_CAE_SHORT_AVG_NAMES)
 
         self.theta_prior2hour_step_count = _json_float_list("theta_prior2hour_step_count", p)
         self.theta_recorded_physical_activity = trim_theta_rpa(
@@ -274,8 +470,8 @@ class EnvConfig:
             "theta_ws_interaction": 4,
             "theta_fourSC": P_FOURSC,
             "theta_antic": P_ANTIC,
-            "theta_CAE": 24,
-            "theta_CAE_short": 2,
+            "theta_CAE": P_CAE,
+            "theta_CAE_short": P_CAE_SHORT,
         }
 
         for name, n in expected.items():
@@ -630,13 +826,7 @@ class Env:
     # ----- weekly -----
 
     def gen_CAE_mean(self, CAE_lastweek, week_norm, foursc_wk, antic_wk):
-        X = np.concatenate(
-            [
-                np.array([1.0, CAE_lastweek, week_norm], dtype=float),
-                np.asarray(foursc_wk, dtype=float).ravel(),
-                np.asarray(antic_wk, dtype=float).ravel(),
-            ]
-        )
+        X = build_CAE_features(CAE_lastweek, week_norm, foursc_wk, antic_wk)
         return float(self.cfg.theta_CAE @ X)
 
     def gen_CAE(self, CAE_lastweek, week_norm, foursc_wk, antic_wk, week_idx):
@@ -691,7 +881,7 @@ class Env:
         return float(rd.binomial(1, p))
 
     def gen_CAE_short_mean(self, caeAverage):
-        return float(self.cfg.theta_CAE_short @ np.array([1.0, caeAverage], dtype=float))
+        return float(self.cfg.theta_CAE_short @ build_CAE_short_features(caeAverage))
 
     def gen_CAE_short(self, caeAverage, week_idx):
         mean = self.gen_CAE_short_mean(caeAverage)

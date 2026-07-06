@@ -2,26 +2,20 @@
 from __future__ import annotations
 
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import os
-from matplotlib.ticker import MaxNLocator
-import matplotlib.dates as mdates
-import datetime
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Iterable
 
 # %%
 # ---------- CONFIG ----------
-ROOT_DIR = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata")   # e.g. ".../exports"
-OUT_DIR = ROOT_DIR / "_combined"   # where combined JSON/CSV will go
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+BASE_DIR = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/")   # e.g. ".../exports"
+ROOT_DIR = BASE_DIR / "rawdata"
+OUT_DIR = BASE_DIR / "Xueqing"   # where combined JSON/CSV will go
 
-DATE_START = "2025-09-13"
-DATE_END = "2026-05-16"
+DATE_START = "2024-11-01"
+DATE_END = "2026-07-03"
 FOLDER_FMT = "%Y-%m-%d"
 
 # Combine only files that end with _YYYYMMDD.json or _YYYYMMDD-YYYYMMDD.json
@@ -32,7 +26,7 @@ FIXED_NAME_DATASETS = {
     "ProjectDeviceData_cleaned.json",
     "filtered_activities-steps.json",
     # "filtered_hrv.json",
-    "filtered_activities-heart.json"
+    "filtered_activities-heart.json",
     # add more if needed, e.g. "Manifest.json"
 }
 
@@ -211,12 +205,16 @@ PATTERN = "FitbitIntradayCombined_*.json"
 
 def iter_jsonl_records(path: Path) -> Iterable[dict[str, Any]]:
     # FitbitIntradayCombined rows look like JSONL: one JSON object per line
-    with path.open("r", encoding="utf-8") as f:
-        for ln in f:
+    with path.open("r", encoding="utf-8-sig", errors="replace") as f:
+        for line_no, ln in enumerate(f, start=1):
             ln = ln.strip()
             if not ln:
                 continue
-            obj = json.loads(ln)
+            try:
+                obj = json.loads(ln)
+            except json.JSONDecodeError as e:
+                print(f"[skip bad line] {path}:{line_no} ({e})")
+                continue
             yield obj if isinstance(obj, dict) else {"value": obj}
 
 
@@ -284,6 +282,22 @@ def _activities_heart_datetimes(rec: dict) -> tuple[Any, Any]:
 def _to_minute_iso(val: Any) -> str | None:
     if val is None:
         return None
+
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        try:
+            parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+        else:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed.replace(second=0, microsecond=0).isoformat()
+
     ts = pd.to_datetime(val, errors="coerce", utc=True)
     if pd.isna(ts):
         return None
@@ -411,6 +425,7 @@ def extract_types_per_date_folder() -> None:
 # %%
 # ---------- MAIN ----------
 def main() -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     date_range = pd.date_range(start=DATE_START, end=DATE_END, freq="D")
     groups: dict[str, list[Path]] = {}
 
@@ -448,7 +463,6 @@ def main() -> None:
 # 1) Read JSON
 # - Use lines=True if file is NDJSON (one JSON object per line)
 # - If this errors, try removing lines=True
-json_path = OUT_DIR / "ProjectDeviceData_cleaned.json"
 # df = pd.read_json(OUT_DIR / "ProjectDeviceData_cleaned.json", lines=True)
 
 # 2) try normal JSON first, then NDJSON, then manual line parsing
@@ -495,53 +509,98 @@ def parse_value(v):
             return {}
     return {}
 
+
+def _project_device_paths() -> list[Path]:
+    paths: list[Path] = []
+    for d in pd.date_range(start=DATE_START, end=DATE_END, freq="D"):
+        p = ROOT_DIR / d.strftime(FOLDER_FMT) / "ProjectDeviceData_cleaned.json"
+        if p.exists():
+            paths.append(p)
+
+    if paths:
+        return paths
+
+    combined_path = OUT_DIR / "ProjectDeviceData_cleaned.json"
+    if combined_path.exists():
+        return [combined_path]
+
+    raise FileNotFoundError(
+        f"Missing ProjectDeviceData_cleaned.json under {ROOT_DIR} and {combined_path}."
+    )
+
+
+def _to_date_iso(val: Any) -> str | None:
+    if val is None:
+        return None
+
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        try:
+            parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+        else:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed.date().isoformat()
+
+    ts = pd.to_datetime(val, errors="coerce", utc=True)
+    if pd.isna(ts):
+        return None
+    return ts.date().isoformat()
+
+
 def extract_project_device_fields() -> pd.DataFrame:
-    df = load_json_flex(json_path)
-    print(df.shape)
+    seen: set[tuple[Any, Any, Any, Any, Any]] = set()
+    source_count = 0
 
-    rows = []
-    for _, r in df.iterrows():
-        value_obj = parse_value(r.get("Value"))
+    for path in _project_device_paths():
+        for r in iter_json_records(path):
+            source_count += 1
+            value_obj = parse_value(r.get("Value"))
 
-        user = value_obj.get("user", {}) if isinstance(value_obj.get("user"), dict) else {}
-        demographics = user.get("demographics", {}) if isinstance(user.get("demographics"), dict) else {}
-        custom_fields = user.get("customFields", {}) if isinstance(user.get("customFields"), dict) else {}
+            user = value_obj.get("user", {}) if isinstance(value_obj.get("user"), dict) else {}
+            demographics = user.get("demographics", {}) if isinstance(user.get("demographics"), dict) else {}
+            custom_fields = user.get("customFields", {}) if isinstance(user.get("customFields"), dict) else {}
 
-        # timestamp under Value (fallback: Value.event.timestamp)
-        timestamp = value_obj.get("timestamp")
-        if timestamp is None and isinstance(value_obj.get("event"), dict):
-            timestamp = value_obj["event"].get("timestamp")
+            # timestamp under Value (fallback: Value.event.timestamp)
+            timestamp = value_obj.get("timestamp")
+            if timestamp is None and isinstance(value_obj.get("event"), dict):
+                timestamp = value_obj["event"].get("timestamp")
 
-        participantidentifier = r.get("ParticipantIdentifier")
-        if pd.isna(participantidentifier) or participantidentifier is None:
-            participantidentifier = user.get("participantIdentifier")
+            participantidentifier = r.get("ParticipantIdentifier")
+            if pd.isna(participantidentifier) or participantidentifier is None:
+                participantidentifier = user.get("participantIdentifier")
 
-        rows.append({
-            "timeZone": demographics.get("timeZone"),
-            "phase": custom_fields.get("Phase"),
-            "participantidentifier": participantidentifier,
-            "utcOffset": demographics.get("utcOffset"),
-            "timestamp": timestamp,
-        })
+            seen.add((
+                demographics.get("timeZone"),
+                custom_fields.get("Phase"),
+                participantidentifier,
+                demographics.get("utcOffset"),
+                _to_date_iso(timestamp),
+            ))
 
+    rows = sorted(seen, key=lambda row: tuple("" if v is None else str(v) for v in row))
     out = pd.DataFrame(rows, columns=[
-        "timeZone", "phase", "participantidentifier", "utcOffset", "timestamp"
+        "timeZone", "phase", "participantidentifier", "utcOffset", "date"
     ])
+    print(f"ProjectDeviceData source records: {source_count}")
     print(out.shape)
-
-    # convert timestamp string -> datetime
-    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce", utc=True)
-    out["date"] = out["timestamp"].dt.date
-    out = out.drop(columns=["timestamp"])
-    out = out.drop_duplicates()
 
     out.to_csv(OUT_DIR / "ProjectDeviceData_selected_fields_combined.csv", index=False)
     return out
 
 
-if __name__ == "__main__":
+def run_pipeline() -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     extract_types_per_date_folder()
     main()
     extract_project_device_fields()
 
 
+if __name__ == "__main__":
+    run_pipeline()

@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed")
-COMBINED_DIR = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined")
+COMBINED_DIR = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing")
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
