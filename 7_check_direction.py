@@ -22,9 +22,16 @@ Direction constraints:
      theta_fourSC WalkingSuggestion_by_{perceived_utility_lastweek,CAE_avg_lastweek}
      and theta_antic A0/A1 morning/afternoon interaction coefficients with
      perceived_utility_lastweek and CAE_avg_lastweek.
+  5. E_w -> M^E is nonnegative for pageview, Fitbit wearing, and daily survey
+     completion:
+     theta_ml_PV alpha1_Ew, theta_ml_FW beta1_Ew, theta_ml_PJ theta1_Ew.
+  6. Walking-suggestion main effects -> M^E are nonpositive (intercept only):
+     theta_ml_PV alpha3_action; theta_ml_FW beta3_A0_morning and
+     beta5_A1_afternoon; theta_ml_PJ theta3_A0_morning and theta5_A1_afternoon.
 
-Negative constrained coefficients are flipped with abs(value). Positive values
-and exact zeros are preserved.
+Nonnegative constraints flip negative values with abs(value). Nonpositive
+constraints flip positive values with -abs(value). Values already in the
+target direction and exact zeros are preserved.
 """
 from __future__ import annotations
 
@@ -34,7 +41,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 
 PROJECT_ROOT = Path(
@@ -42,7 +49,8 @@ PROJECT_ROOT = Path(
 ).expanduser().resolve()
 
 DEFAULT_SOURCE_DIR = PROJECT_ROOT / "env_para_vanilla"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "env_para_positivedirection"
+# DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "env_para_positivedirection"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "env_para_positivenegative"
 
 REQUIRED_SUPPORTING_FILES = (
     "std_params.json",
@@ -110,12 +118,33 @@ def _is_antic_suggestion_effect(name: str) -> bool:
     return name in {"A0_morning", "A1_afternoon"} or name in _ANTIC_ACTION_PU_CAE_INTERACTIONS
 
 
+def _is_me_ew_effect(name: str) -> bool:
+    return name in {"alpha1_Ew", "beta1_Ew", "theta1_Ew"}
+
+
+_FW_ACTION_INTERCEPTS = frozenset({"beta3_A0_morning", "beta5_A1_afternoon"})
+_PJ_ACTION_INTERCEPTS = frozenset({"theta3_A0_morning", "theta5_A1_afternoon"})
+
+
+def _is_pv_action_intercept(name: str) -> bool:
+    return name == "alpha3_action"
+
+
+def _is_fw_action_intercept(name: str) -> bool:
+    return name in _FW_ACTION_INTERCEPTS
+
+
+def _is_pj_action_intercept(name: str) -> bool:
+    return name in _PJ_ACTION_INTERCEPTS
+
+
 def _correct_named_theta(
     params: dict,
     *,
     user_id: str,
     theta_key: str,
     predicate: Callable[[str], bool],
+    sign: Literal["nonnegative", "nonpositive"] = "nonnegative",
 ) -> list[dict]:
     names_key = f"{theta_key}_names"
     if theta_key not in params:
@@ -137,15 +166,23 @@ def _correct_named_theta(
             continue
 
         before = _json_number(theta[idx], key=theta_key, name=name)
-        after = abs(before) if before < 0 else before
-        theta[idx] = after
-
-        if before < 0:
-            action = "flipped"
-        elif before == 0:
-            action = "kept_zero"
+        if sign == "nonnegative":
+            after = abs(before) if before < 0 else before
+            if before < 0:
+                action = "flipped"
+            elif before == 0:
+                action = "kept_zero"
+            else:
+                action = "kept_positive"
         else:
-            action = "kept_positive"
+            after = -abs(before) if before > 0 else before
+            if before > 0:
+                action = "flipped"
+            elif before == 0:
+                action = "kept_zero"
+            else:
+                action = "kept_negative"
+        theta[idx] = after
 
         rows.append(
             {
@@ -153,6 +190,7 @@ def _correct_named_theta(
                 "theta_key": theta_key,
                 "index": idx,
                 "coefficient_name": name,
+                "target_sign": sign,
                 "before": before,
                 "after": after,
                 "action": action,
@@ -225,6 +263,42 @@ def build_positive_direction_parameters(
                 predicate=_is_antic_suggestion_effect,
             )
         )
+        for theta_key in ("theta_ml_PV", "theta_ml_FW", "theta_ml_PJ"):
+            audit_rows.extend(
+                _correct_named_theta(
+                    params,
+                    user_id=user_id,
+                    theta_key=theta_key,
+                    predicate=_is_me_ew_effect,
+                )
+            )
+        audit_rows.extend(
+            _correct_named_theta(
+                params,
+                user_id=user_id,
+                theta_key="theta_ml_PV",
+                predicate=_is_pv_action_intercept,
+                sign="nonpositive",
+            )
+        )
+        audit_rows.extend(
+            _correct_named_theta(
+                params,
+                user_id=user_id,
+                theta_key="theta_ml_FW",
+                predicate=_is_fw_action_intercept,
+                sign="nonpositive",
+            )
+        )
+        audit_rows.extend(
+            _correct_named_theta(
+                params,
+                user_id=user_id,
+                theta_key="theta_ml_PJ",
+                predicate=_is_pj_action_intercept,
+                sign="nonpositive",
+            )
+        )
 
         with dst.open("w", encoding="utf-8") as f:
             json.dump(params, f, indent=2, allow_nan=False)
@@ -237,6 +311,7 @@ def build_positive_direction_parameters(
             "theta_key",
             "index",
             "coefficient_name",
+            "target_sign",
             "before",
             "after",
             "action",
@@ -254,6 +329,7 @@ def build_positive_direction_parameters(
         "n_constrained_coefficients": len(audit_rows),
         "n_flipped": sum(1 for r in audit_rows if r["action"] == "flipped"),
         "n_kept_positive": sum(1 for r in audit_rows if r["action"] == "kept_positive"),
+        "n_kept_negative": sum(1 for r in audit_rows if r["action"] == "kept_negative"),
         "n_kept_zero": sum(1 for r in audit_rows if r["action"] == "kept_zero"),
         "constraints": {
             "theta_CAE": [
@@ -274,6 +350,18 @@ def build_positive_direction_parameters(
                 "A0_morning_by_CAE_avg_lastweek",
                 "A1_afternoon_by_CAE_avg_lastweek",
             ],
+            "theta_ml_PV": {
+                "nonnegative": ["alpha1_Ew"],
+                "nonpositive": ["alpha3_action"],
+            },
+            "theta_ml_FW": {
+                "nonnegative": ["beta1_Ew"],
+                "nonpositive": ["beta3_A0_morning", "beta5_A1_afternoon"],
+            },
+            "theta_ml_PJ": {
+                "nonnegative": ["theta1_Ew"],
+                "nonpositive": ["theta3_A0_morning", "theta5_A1_afternoon"],
+            },
         },
     }
 
@@ -303,6 +391,7 @@ def main() -> None:
         f"{summary['n_constrained_coefficients']} "
         f"({summary['n_flipped']} flipped, "
         f"{summary['n_kept_positive']} already positive, "
+        f"{summary['n_kept_negative']} already negative, "
         f"{summary['n_kept_zero']} zero)"
     )
 

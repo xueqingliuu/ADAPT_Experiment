@@ -37,6 +37,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 PARAMETER_SETS = {
     "vanilla": PROJECT_ROOT / "env_para_vanilla",
     "positive_direction": PROJECT_ROOT / "env_para_positivedirection",
+    "positive_negative_direction": PROJECT_ROOT / "env_para_positivenegative",
 }
 
 CAE_FIELDS = frozenset({"CAE_all", "CAE_mean_all"})

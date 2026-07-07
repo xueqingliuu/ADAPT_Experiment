@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from vani_env import denormalize_CAE
 
 # Must match experiment.py's RESULTS_ROOT (env-overridable, same default).
-DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla"))
+DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_positivedirection"))
 
 # ── CAE reporting conventions ────────────────────────────────────────────
 # We build the 4-panel overview for BOTH weekly-CAE variants, on the *raw*
