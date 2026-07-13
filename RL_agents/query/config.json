@@ -1,6 +1,0 @@
-{
-  "query_prob": 0.5,
-  "force_query_week": 2,
-  "burn_in_days": 6,
-  "seed": null
-}
