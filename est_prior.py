@@ -83,6 +83,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.stats import t as student_t
+from statsmodels.genmod.cov_struct import Exchangeable
+from statsmodels.genmod.families import Gaussian
+from statsmodels.genmod.generalized_estimating_equations import GEE
 
 # Feature builders for the RL Q / reward / bottleneck regressions.
 # We import directly from algorithm.py to guarantee the prior dimensions stay
@@ -104,11 +108,24 @@ PROJECT_ROOT = Path(
 COMBINED_DIR = Path(
     os.getenv(
         "ADAPR_COMBINED_DIR",
-        "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/rawdata/_combined",
+        "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing",
     )
 ).expanduser().resolve()
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
 OUTPUT_PATH = WORK_DIR / "rl_priors.json"
+REWARD_PRIOR_PATH = WORK_DIR / "reward_shaping_prior.json"
+RL_Q_PRIOR_PATH = WORK_DIR / "rl_q_priors.json"
+SUMMARY_TABLE_PATH = WORK_DIR / "rl_prior_tables.md"
+PF_SUMMARY_PATH = WORK_DIR / "prior_summary_pf.csv"
+RL_SUMMARY_PATH = WORK_DIR / "prior_summary_rl.csv"
+REWARD_SUMMARY_PATH = WORK_DIR / "prior_summary_reward_shaping.csv"
+RL_Q_SUMMARY_PATH = WORK_DIR / "prior_summary_rl_q.csv"
+JOINT_SUMMARY_PATH = WORK_DIR / "prior_summary_joint.csv"
+POOLED_PF_REGRESSION_PATH = WORK_DIR / "prior_summary_pooled_pf_regression.csv"
+POOLED_PF_GEE_PATH = WORK_DIR / "prior_summary_pooled_pf_gee.csv"
+POOLED_RL_Q_PATH = WORK_DIR / "prior_summary_pooled_rl_q.csv"
+GEE_WORKING_CORR = "exchangeable"
+MIN_FEATURE_STD = 1e-12
 
 # Slot / day structure (mirrors experiment.py constants)
 K_SLOTS_WEEK = 14                # 7 days × 2 slots in df_fit
@@ -166,8 +183,23 @@ def _filter_users_with_cae_obs(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[df["ParticipantIdentifier"].isin(keep_ids)].copy()
 
 
+def _default_df_fit_path() -> Path:
+    candidates = [
+        COMBINED_DIR / "df_fit.csv",
+        WORK_DIR / "df_fit_11week.csv",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    searched = "\n  ".join(str(p) for p in candidates)
+    raise FileNotFoundError(
+        "Could not find df_fit input. Set ADAPR_COMBINED_DIR or pass a path. "
+        f"Searched:\n  {searched}"
+    )
+
+
 def load_df_fit(path: Optional[Path] = None) -> pd.DataFrame:
-    p = path or (COMBINED_DIR / "df_fit.csv")
+    p = Path(path).expanduser().resolve() if path is not None else _default_df_fit_path()
     return _filter_users_with_cae_obs(_week_fix_and_filter(pd.read_csv(p)))
 
 
@@ -211,6 +243,252 @@ def _ridge_fit(
     else:
         sigma2 = 1.0
     return theta, sigma2
+
+
+def _feature_column_std(X: np.ndarray, index: int) -> float:
+    """Sample std of one design column (0 => structurally unused)."""
+    return float(np.nanstd(np.asarray(X, dtype=float)[:, index]))
+
+
+def _unidentified_inference() -> Dict[str, Any]:
+    """Placeholder significance flags for zero-variance features."""
+    return {
+        "significant_0.05": False,
+        "significant_0.01": False,
+    }
+
+
+def _ridge_fit_summary(
+    X: np.ndarray,
+    y: np.ndarray,
+    names: List[str],
+    *,
+    model: str,
+    outcome: str,
+    alpha: float = RIDGE_ALPHA_PF,
+) -> pd.DataFrame:
+    """Pooled ridge coefficients with approximate two-sided p-values.
+
+    Standard errors use the ridge sandwich
+    ``sigma2 * (X'X + alpha I)^{-1} X'X (X'X + alpha I)^{-1}``; p-values are
+    Student-t with ``df = n_obs - n_features``. These are approximate because
+    ridge shrinks coefficients.
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    ok = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+    Xo, yo = X[ok], y[ok]
+    n_obs, n_features = Xo.shape
+    if n_obs == 0:
+        return pd.DataFrame()
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xtx = Xo.T @ Xo
+        a_mat = xtx + alpha * np.eye(n_features)
+        a_inv = np.linalg.inv(a_mat)
+        theta = a_inv @ (Xo.T @ yo)
+        resid = yo - Xo @ theta
+
+    if resid.size > 1:
+        sigma2 = max(float(np.var(resid, ddof=1)), MIN_SIGMA2)
+    else:
+        sigma2 = 1.0
+
+    cov = sigma2 * (a_inv @ xtx @ a_inv)
+    se = np.sqrt(np.maximum(np.diag(cov), 0.0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_stat = np.where(se > 0, theta / se, np.nan)
+    df = max(n_obs - n_features, 1)
+    p_value = 2.0 * student_t.sf(np.abs(t_stat), df)
+
+    rows = []
+    for i, feature in enumerate(names):
+        col_std = _feature_column_std(Xo, i)
+        identified = col_std >= MIN_FEATURE_STD
+        if identified:
+            p_i = float(p_value[i])
+            infer = {
+                "std_error": float(se[i]),
+                "t_stat": float(t_stat[i]),
+                "p_value": p_i,
+                "significant_0.05": bool(np.isfinite(p_i) and p_i < 0.05),
+                "significant_0.01": bool(np.isfinite(p_i) and p_i < 0.01),
+            }
+        else:
+            infer = {
+                "std_error": np.nan,
+                "t_stat": np.nan,
+                "p_value": np.nan,
+                **_unidentified_inference(),
+            }
+        rows.append({
+            "model": model,
+            "outcome": outcome,
+            "index": i,
+            "feature": feature,
+            "coefficient": float(theta[i]),
+            "identified": identified,
+            "feature_std": col_std,
+            **infer,
+            "n_obs": int(n_obs),
+            "n_features": int(n_features),
+            "ridge_alpha": float(alpha),
+            "residual_sigma2": float(sigma2),
+        })
+    return pd.DataFrame(rows)
+
+
+def _pooled_pf_model_specs() -> Tuple[
+    Tuple[str, Any, Tuple[str, ...], str], ...
+]:
+    return (
+        ("fourSC", _build_fourSC_design, THETA_FOURSC_NAMES, "4hour_step_norm"),
+        ("antic", _build_antic_design, THETA_ANTIC_NAMES, "anticipated_affect_norm"),
+        ("CAE", _build_CAE_design, THETA_CAE_NAMES, "CAE_avg_norm"),
+    )
+
+
+def _stack_pooled_pf_designs(df_fit: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    """Stack per-user PF designs for pooled fourSC / antic / CAE fits."""
+    stacked: Dict[str, Dict[str, Any]] = {}
+    for model, builder, names, outcome in _pooled_pf_model_specs():
+        x_parts: List[np.ndarray] = []
+        y_parts: List[np.ndarray] = []
+        group_parts: List[np.ndarray] = []
+        for uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False):
+            dat = dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True)
+            x_part, y_part = builder(dat)
+            x_parts.append(x_part)
+            y_parts.append(y_part)
+            group_parts.append(np.full(len(y_part), int(uid), dtype=int))
+        stacked[model] = {
+            "X": np.vstack(x_parts),
+            "y": np.concatenate(y_parts),
+            "groups": np.concatenate(group_parts),
+            "names": list(names),
+            "outcome": outcome,
+        }
+    return stacked
+
+
+def build_pooled_pf_regression_summary(df_fit: pd.DataFrame) -> pd.DataFrame:
+    """Summarize pooled PF ridge regressions for fourSC, antic, and weekly CAE."""
+    frames: List[pd.DataFrame] = []
+    for model, payload in _stack_pooled_pf_designs(df_fit).items():
+        frames.append(
+            _ridge_fit_summary(
+                payload["X"],
+                payload["y"],
+                payload["names"],
+                model=model,
+                outcome=payload["outcome"],
+                alpha=RIDGE_ALPHA_PF,
+            )
+        )
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _gee_fit_summary(
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    names: List[str],
+    *,
+    model: str,
+    outcome: str,
+    working_corr: str = GEE_WORKING_CORR,
+    skip_indices: Optional[frozenset[int]] = None,
+    block: Optional[str] = None,
+    row_meta: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
+    """Pooled GEE coefficients with cluster-robust p-values by participant."""
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    groups = np.asarray(groups)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    ok = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+    xo, yo, go = X[ok], y[ok], groups[ok]
+    n_obs, n_features = xo.shape
+    if n_obs == 0:
+        return pd.DataFrame()
+
+    cov_struct = Exchangeable()
+    gee = GEE(
+        yo,
+        xo,
+        groups=go,
+        family=Gaussian(),
+        cov_struct=cov_struct,
+    )
+    result = gee.fit()
+
+    meta = dict(row_meta or {})
+    rows = []
+    for i, feature in enumerate(names):
+        if skip_indices and i in skip_indices:
+            continue
+        col_std = _feature_column_std(xo, i)
+        identified = col_std >= MIN_FEATURE_STD
+        if identified:
+            p_i = float(result.pvalues[i])
+            infer = {
+                "robust_se": float(result.bse[i]),
+                "z_stat": float(result.tvalues[i]),
+                "p_value": p_i,
+                "significant_0.05": bool(np.isfinite(p_i) and p_i < 0.05),
+                "significant_0.01": bool(np.isfinite(p_i) and p_i < 0.01),
+            }
+        else:
+            infer = {
+                "robust_se": np.nan,
+                "z_stat": np.nan,
+                "p_value": np.nan,
+                **_unidentified_inference(),
+            }
+        row = {
+            "coefficient": float(result.params[i]),
+            **infer,
+            "model": model,
+            "outcome": outcome,
+            "index": i,
+            "feature": feature,
+            "identified": identified,
+            "feature_std": col_std,
+            "n_obs": int(n_obs),
+            "n_clusters": int(len(np.unique(go))),
+            "n_features": int(n_features),
+            "working_correlation": working_corr,
+            **meta,
+        }
+        if block is not None:
+            row["block"] = block
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_pooled_pf_gee_summary(df_fit: pd.DataFrame) -> pd.DataFrame:
+    """Summarize pooled PF GEE fits for fourSC, antic, and weekly CAE."""
+    frames: List[pd.DataFrame] = []
+    for model, payload in _stack_pooled_pf_designs(df_fit).items():
+        frames.append(
+            _gee_fit_summary(
+                payload["X"],
+                payload["y"],
+                payload["groups"],
+                payload["names"],
+                model=model,
+                outcome=payload["outcome"],
+                working_corr=GEE_WORKING_CORR,
+            )
+        )
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 def _mean_user_sigma2(user_sigma2s: List[Optional[float]]) -> float:
@@ -269,24 +547,24 @@ def _pool_user_fits(
 # ──────────────────────────────────────────────────────────────────
 THETA_FOURSC_NAMES = [
     "intercept", "yesterdayStepCount", "stepCountLast7DaysEma",
-    "prior2HourStepCount", "activityCompletedLast7Days",     "activitySuggestionsSentLast7Days", "morningFitbitWearLast7Days",
+    "prior2HourStepCount", "activitySuggestionsSentLast7Days", "morningFitbitWearLast7Days",
     "salienceMessageSentYesterday", "activitySuggestionInteractLast7Days",
     "activeDaysLast7Days",
-    "dayOfWeekNorm", "decisionTimeSlot", "perceivedUtilityLastWeek", "caeAverageLastWeek",
+    "isWeekend", "decisionTimeSlot", "perceivedUtilityLastWeek", "caeAverageLastWeek",
     "Ah", "Ah*yesterdayStepCount", "Ah*prior2HourStepCount", "Ah*activitySuggestionsSentLast7Days",
     "Ah*morningFitbitWearLast7Days",
     "Ah*salienceMessageSentYesterday", "Ah*activitySuggestionInteractLast7Days",
-    "Ah*dayOfWeekNorm", "Ah*decisionTimeSlot",
+    "Ah*isWeekend", "Ah*decisionTimeSlot",
     "Ah*perceivedUtilityLastWeek", "Ah*caeAverageLastWeek",
 ]
 
 THETA_ANTIC_NAMES = [
     "intercept", "dailyAnticipatedAffectYesterday", "todayStepCount",
-    "recordedPhysicalActivityToday", "activityStatusToday", "salienceMessageSentToday", "dayOfWeekNorm",
+    "activityStatusToday", "salienceMessageSentToday", "isWeekend",
     "perceivedUtilityLastWeek", "caeAverageLastWeek",
     "ws_morning", "ws_afternoon",
     "ws_morning*salienceMessageSentToday", "ws_afternoon*salienceMessageSentToday",
-    "ws_morning*dayOfWeekNorm", "ws_afternoon*dayOfWeekNorm",
+    "ws_morning*isWeekend", "ws_afternoon*isWeekend",
     "ws_morning*perceivedUtilityLastWeek",
     "ws_afternoon*perceivedUtilityLastWeek",
     "ws_morning*caeAverageLastWeek", "ws_afternoon*caeAverageLastWeek",
@@ -332,7 +610,6 @@ def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     yest_step = _fill_nan(dat["YesterdayStepCount_norm"].to_numpy())
     seven_step = _fill_nan(dat["EMA_StepCount_norm"].to_numpy())
     prior2 = _fill_nan(dat["prior2hour_step_norm"].to_numpy())
-    prev7rpa = _fill_nan(dat["Previous7DaysRPA"].to_numpy())
     rb = _fill_nan(
         dat["recent_burden_norm" if "recent_burden_norm" in dat.columns else "recentBurdenEma_norm"].to_numpy()
     )
@@ -340,18 +617,18 @@ def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     y_sal = _fill_nan(dat["yesterday_SalienceMessage"].to_numpy())
     i7w = _fill_nan(dat["Interacted_7d_walk"].to_numpy())
     act_frac7 = _fill_nan(dat["active_status_fraction_7days"].to_numpy())
-    dayOfWeekNorm = dat["dow_norm"].to_numpy()
+    is_weekend = dat["is_weekend"].to_numpy()
     dt_ = dat["DecisionTime"].to_numpy().astype(float)
     pu = _fill_nan(dat["perceived_utility_lastweek"].to_numpy())
     cae = _fill_nan(dat["CAE_avg_lastweek_norm"].to_numpy())
     Ah = dat["WalkingSuggestion"].to_numpy().astype(float)
 
     X = np.column_stack([
-        int_, yest_step, seven_step, prior2, prev7rpa, rb,
-        past7_wear, y_sal, i7w, act_frac7, dayOfWeekNorm, dt_, pu, cae,
+        int_, yest_step, seven_step, prior2, rb,
+        past7_wear, y_sal, i7w, act_frac7, is_weekend, dt_, pu, cae,
         Ah, Ah * yest_step, Ah * prior2, Ah * rb,
         Ah * past7_wear, Ah * y_sal, Ah * i7w,
-        Ah * dayOfWeekNorm, Ah * dt_, Ah * pu, Ah * cae,
+        Ah * is_weekend, Ah * dt_, Ah * pu, Ah * cae,
     ])
     y = dat["4hour_step_norm"].to_numpy(dtype=float)
     assert X.shape[1] == len(THETA_FOURSC_NAMES)
@@ -388,10 +665,9 @@ def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     int_ = np.ones(n)
     antic_yest = _fill_nan(dat_am["anticipated_affect_yesterday_norm"].to_numpy())
     todayStepCount = _fill_nan(dat_am["TodayStepCount_norm"].to_numpy())
-    rpa = _fill_nan(dat_am["RecordedPhysicalActivity"].to_numpy())
     act = _fill_nan(dat_am["active_status"].to_numpy())
     sal_msg = _fill_nan(dat_am["SalienceMessage"].to_numpy())
-    dayOfWeekNorm = dat_am["dow_norm"].to_numpy()
+    is_weekend = dat_am["is_weekend"].to_numpy()
     pu = _fill_nan(dat_am["perceived_utility_lastweek"].to_numpy())
     cae = _fill_nan(dat_am["CAE_avg_lastweek_norm"].to_numpy())
 
@@ -402,10 +678,10 @@ def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     ws_a = pair[:n, 1]
 
     X = np.column_stack([
-        int_, antic_yest, todayStepCount, rpa, act, sal_msg, dayOfWeekNorm, pu, cae,
+        int_, antic_yest, todayStepCount, act, sal_msg, is_weekend, pu, cae,
         ws_m, ws_a,
         ws_m * sal_msg, ws_a * sal_msg,
-        ws_m * dayOfWeekNorm, ws_a * dayOfWeekNorm,
+        ws_m * is_weekend, ws_a * is_weekend,
         ws_m * pu, ws_a * pu,
         ws_m * cae, ws_a * cae,
     ])
@@ -548,7 +824,6 @@ def _build_rl_context_vector_from_row(row) -> np.ndarray:
         float(row["YesterdayStepCount_norm"]),
         float(row["EMA_StepCount_norm"]),
         float(row["prior2hour_step_norm"]),
-        float(row["Previous7DaysRPA"]),
         float(row["active_status_fraction_7days"]),
         float(row["recent_burden_norm" if "recent_burden_norm" in row.index else "recentBurdenEma_norm"]),
         float(row["yesterday_SalienceMessage"]),
@@ -562,7 +837,7 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
 
     ``dat`` must be one participant, sorted by (Date, DecisionTime), with
     a length that is a multiple of K_SLOTS_WEEK.  Day order within each week
-    is Monday .. Sunday (dayOfWeekNorm = 1 .. 7).  Rows are NaN-filled with the
+    is Monday .. Sunday.  Rows are NaN-filled with the
     participant's mean so the resulting tensors are finite.
     """
     n_w = len(dat) // K_SLOTS_WEEK
@@ -570,8 +845,7 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
 
     cols = [
         "YesterdayStepCount_norm", "EMA_StepCount_norm", "prior2hour_step_norm",
-        "Previous7DaysRPA", "recent_burden_norm",
-        "active_status_fraction_7days",
+        "recent_burden_norm", "active_status_fraction_7days",
         "yesterday_SalienceMessage", "Interacted_7d_walk",
         "anticipated_affect_yesterday_norm",
         "4hour_step_norm", "HourlyPageviewCount_norm",
@@ -584,7 +858,7 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
         dat[c] = _fill_nan(dat[c].to_numpy())
 
     n_rl = N_RL_SLOTS_WEEK   # 12 slots Mon-Sat
-    p_C = 9                  # build_rl_context_vector dim
+    p_C = 8                  # build_rl_context_vector dim
 
     # Per-slot quantities for d in 1..6 (Mon-Sat).
     C_slot = np.zeros((n_w, n_rl, p_C))
@@ -658,8 +932,8 @@ def _slot_state(t_dict: Dict[str, np.ndarray], k: int, rl_idx: int) -> Dict[str,
 
 
 def _phi_action(t_dict, k, rl_idx, action) -> np.ndarray:
-    d = rl_idx // 2 + 1
-    t = rl_idx %  2 + 1
+    d = rl_idx // 2
+    t = rl_idx %  2
     return build_phi_action(
         b_hat=float(t_dict["b_hat_slot"][k, rl_idx]),
         b_tilde=0.0,
@@ -670,8 +944,8 @@ def _phi_action(t_dict, k, rl_idx, action) -> np.ndarray:
 
 
 def _phi_rs(t_dict, k, rl_idx) -> np.ndarray:
-    d = rl_idx // 2 + 1
-    t = rl_idx %  2 + 1
+    d = rl_idx // 2
+    t = rl_idx %  2
     return build_phi_action_rewardshaping(
         b_hat=float(t_dict["b_hat_slot"][k, rl_idx]),
         b_tilde=0.0,
@@ -822,7 +1096,17 @@ def _fqi_iterate(
     alpha_for_boot: Optional[np.ndarray],
     use_td_modify: bool,
     n_iters: int = N_FQI_ITERS,
-) -> Tuple[Optional[np.ndarray], Optional[float], Optional[float]]:
+    *,
+    user_ids: Optional[List[int]] = None,
+    return_design: bool = False,
+) -> Tuple[
+    Optional[np.ndarray],
+    Optional[float],
+    Optional[float],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+]:
     """Run FQI on one or more users' precomputed features.
 
     With one entry in ``feats_list`` this is per-user FQI; with many it is a
@@ -830,14 +1114,27 @@ def _fqi_iterate(
     rebuilds targets per (user, week, slot) using the current ``theta`` and
     refits a ridge regression on the stacked rows.
 
-    Returns ``(theta, sigma2, None)``, where ``sigma2`` is the residual
-    variance over the fitted-Q rows.
+    Returns ``(theta, sigma2, None)`` by default. When ``return_design=True``,
+    also returns the final fitted-Q design ``(X, y, groups)``.
     """
+    empty_extra = (None, None, None) if return_design else ()
     if not feats_list:
-        return None, None, None
-    p_phi = feats_list[0]["p_phi"]
+        return (None, None, None, *empty_extra)
 
-    X_all = np.concatenate([f["phi_obs"].reshape(-1, p_phi) for f in feats_list])
+    p_phi = feats_list[0]["p_phi"]
+    x_parts = [f["phi_obs"].reshape(-1, p_phi) for f in feats_list]
+    X_all = np.concatenate(x_parts)
+    groups = None
+    if return_design:
+        if user_ids is None or len(user_ids) != len(feats_list):
+            raise ValueError(
+                "return_design=True requires user_ids aligned with feats_list"
+            )
+        group_parts = [
+            np.full(x_part.shape[0], int(uid), dtype=int)
+            for x_part, uid in zip(x_parts, user_ids)
+        ]
+        groups = np.concatenate(group_parts)
 
     theta = np.zeros(p_phi)
     y_all = np.zeros(X_all.shape[0])
@@ -849,12 +1146,10 @@ def _fqi_iterate(
             for k in range(n_train):
                 for idx in range(N_RL_SLOTS_WEEK):
                     if idx < N_RL_SLOTS_WEEK - 1:
-                        # non-terminal: successor is same-week next slot
                         q0 = f["phi_a0"][k, idx + 1] @ theta
                         q1 = f["phi_a1"][k, idx + 1] @ theta
                         targets[k, idx] = GAMMA_DT_SCALAR * max(q0, q1)
                     else:
-                        # terminal (6, 2): reward + γ_terminal · bootstrap
                         if use_td_modify and alpha_for_boot is not None:
                             boot = float(f["phi_next_bot"][k] @ alpha_for_boot)
                         else:
@@ -866,7 +1161,7 @@ def _fqi_iterate(
         y_all = np.concatenate(chunks)
         theta_new, _ = _ridge_fit(X_all, y_all, alpha=RIDGE_ALPHA_RL)
         if theta_new is None:
-            return None, None, None
+            return (None, None, None, *empty_extra)
         if np.linalg.norm(theta_new - theta) < 1e-6 * (np.linalg.norm(theta) + 1e-12):
             theta = theta_new
             break
@@ -875,6 +1170,8 @@ def _fqi_iterate(
     resid = y_all - X_all @ theta
     sigma2 = (max(float(np.var(resid, ddof=1)), MIN_SIGMA2)
               if resid.size > 1 else 1.0)
+    if return_design:
+        return theta, sigma2, None, X_all, y_all, groups
     return theta, sigma2, None
 
 
@@ -997,6 +1294,63 @@ def fit_q_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
     return {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
 
 
+def _collect_q_features_pool(
+    df_fit: pd.DataFrame,
+) -> Tuple[List[Dict[str, Any]], List[int]]:
+    """Precompute no-TD-modify Q features for all users with >= 2 weeks."""
+    feats_list: List[Dict[str, Any]] = []
+    user_ids: List[int] = []
+    for uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False):
+        dat = dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True)
+        td = _user_weekly_tensors(dat)
+        feats = _precompute_q_features(td, use_td_modify=False)
+        if feats is not None:
+            feats_list.append(feats)
+            user_ids.append(int(uid))
+    return feats_list, user_ids
+
+
+def build_pooled_rl_q_summary(df_fit: pd.DataFrame) -> pd.DataFrame:
+    """Summarize pooled no-TD-modify RL Q via GEE on the final FQI design.
+
+    Fits a Gaussian GEE on the final fitted-Q regression rows
+    (``phi_obs`` vs bootstrap targets), clustered by participant.
+    Features with zero variance in the design (e.g. unused ``b_tilde`` or
+    masked mediators) are flagged with ``identified=False`` and omitted
+    SE / p-values.
+    """
+    feats_list, user_ids = _collect_q_features_pool(df_fit)
+    if not feats_list:
+        return pd.DataFrame()
+
+    _theta, sigma2, _, x_all, y_all, groups = _fqi_iterate(
+        feats_list,
+        None,
+        use_td_modify=False,
+        user_ids=user_ids,
+        return_design=True,
+    )
+    if x_all is None or y_all is None or groups is None:
+        return pd.DataFrame()
+
+    return _gee_fit_summary(
+        x_all,
+        y_all,
+        groups,
+        _phi_action_names(),
+        model="q_no_td_modify",
+        outcome="fqi_target",
+        working_corr=GEE_WORKING_CORR,
+        skip_indices=_placeholder_context_skip_indices(len(_phi_action_names())),
+        block="beta",
+        row_meta={
+            "fqi_iters": N_FQI_ITERS,
+            "ridge_alpha": RIDGE_ALPHA_RL,
+            "residual_sigma2": float(sigma2) if sigma2 is not None else np.nan,
+        },
+    )
+
+
 # ──────────────────────────────────────────────────────────────────
 # 5b. Joint (eta, beta) prior for the modified-TD-loss RLSVI
 # ──────────────────────────────────────────────────────────────────
@@ -1116,6 +1470,419 @@ def save_priors(priors: Dict[str, Any], path: Path = OUTPUT_PATH) -> Path:
     return path
 
 
+# ──────────────────────────────────────────────────────────────────
+# 7. Human-readable prior summaries
+# ──────────────────────────────────────────────────────────────────
+def _rl_context_names() -> list[str]:
+    return [
+        "yesterday_step_count",
+        "ema_step_count",
+        "prior2hour_step_count",
+        "active_status_fraction_7days",
+        "recent_burden",
+        "salience_yesterday",
+        "walk_interaction_7d",
+    ]
+
+
+def _placeholder_context_skip_indices(n_features: int) -> frozenset[int]:
+    """Phi indices for the hardcoded-zero context slot omitted from audit tables."""
+    n_context = 8  # build_rl_context_vector length; last entry is always 0
+    n_action_block = 9 + n_context
+    if n_features <= n_context:
+        return frozenset()
+    if n_features <= n_action_block:
+        return frozenset({n_features - 1})
+    state_n = n_features - n_action_block
+    return frozenset({state_n - 1, n_features - 1})
+
+
+def _rl_my_names() -> list[str]:
+    cols = ["fourSC_morning", "fourSC_afternoon", "anticipated_affect"]
+    return [f"M_Y_day{d}_{name}" for d in range(1, 7) for name in cols]
+
+
+def _rl_me_names() -> list[str]:
+    cols = [
+        "pageview_morning",
+        "pageview_afternoon",
+        "morning_fitbit_wear",
+        "daily_survey_complete",
+    ]
+    return [f"M_E_day{d}_{name}" for d in range(1, 7) for name in cols]
+
+
+def _phi_state_names() -> list[str]:
+    return [
+        "intercept",
+        "weekday_vs_weekend",
+        "slot_pm",
+        "E_w",
+        "weekday_vs_weekend*E_w",
+        "slot_pm*E_w",
+        "b_hat",
+        "weekday_vs_weekend*b_hat",
+        "slot_pm*b_hat",
+        "b_tilde",
+    ] + _rl_my_names() + _rl_me_names() + _rl_context_names()
+
+
+def _phi_action_names() -> list[str]:
+    action_context = [
+        "A",
+        "A*E_w",
+        "A*b_hat",
+        "A*weekday_vs_weekend",
+        "A*slot_pm",
+        "A*weekday_vs_weekend*E_w",
+        "A*slot_pm*E_w",
+        "A*weekday_vs_weekend*b_hat",
+        "A*slot_pm*b_hat",
+    ] + [f"A*{name}" for name in _rl_context_names()]
+    return _phi_state_names() + action_context
+
+
+def _joint_feature_names(q_joint: Dict[str, Any]) -> tuple[list[str], list[str]]:
+    mu_joint = q_joint.get("mu_0")
+    if mu_joint is None:
+        return [], []
+    n_joint = np.asarray(mu_joint, dtype=float).ravel().size
+    p_eta = q_joint.get("p_eta")
+    p_eta = 0 if p_eta is None else int(p_eta)
+    eta_names = _names_with_fallback(
+        ["eta_intercept", "eta_E_w", "eta_b_hat", "eta_b_tilde"],
+        min(p_eta, n_joint),
+        "eta_coef",
+    )
+    beta_n = max(n_joint - p_eta, 0)
+    beta_names = [f"beta_{name}" for name in _names_with_fallback(
+        _phi_action_names(), beta_n, "beta_coef"
+    )]
+    return eta_names, beta_names
+
+
+def save_split_rl_prior_files(
+    priors: Dict[str, Any],
+    *,
+    reward_path: Path = REWARD_PRIOR_PATH,
+    rl_q_path: Path = RL_Q_PRIOR_PATH,
+) -> dict[str, Path]:
+    """Save reward-shaping eta and RL Q priors as separate JSON files.
+
+    The combined ``rl_priors.json`` remains the canonical backward-compatible
+    file used by ``experiment.py``. These split files are for easier inspection
+    or independent loading.
+    """
+    reward_path.parent.mkdir(parents=True, exist_ok=True)
+    q_joint = priors.get("q_td_modify_joint") or {}
+    eta_names, beta_names = _joint_feature_names(q_joint)
+
+    reward_payload = {
+        "model": "reward_shaping",
+        "block": "eta",
+        "feature_names": _phi_state_names(),
+        **priors["reward"],
+    }
+    rl_q_payload = {
+        "q_no_td_modify": {
+            "model": "q_no_td_modify",
+            "block": "beta",
+            "feature_names": _phi_action_names(),
+            **priors["q_no_td_modify"],
+        },
+        "q_td_modify_joint": {
+            "model": "q_td_modify_joint",
+            "block": "eta_beta",
+            "eta_feature_names": eta_names,
+            "beta_feature_names": beta_names,
+            **q_joint,
+        },
+    }
+
+    with open(reward_path, "w", encoding="utf-8") as f:
+        json.dump(_to_jsonable(reward_payload), f, indent=2, allow_nan=False)
+    with open(rl_q_path, "w", encoding="utf-8") as f:
+        json.dump(_to_jsonable(rl_q_payload), f, indent=2, allow_nan=False)
+    return {"reward": reward_path, "rl_q": rl_q_path}
+
+
+def _names_with_fallback(base_names: list[str], n: int, prefix: str) -> list[str]:
+    if len(base_names) >= n:
+        return base_names[:n]
+    return base_names + [f"{prefix}_{i}" for i in range(len(base_names), n)]
+
+
+def _diag_variance(cov: Any, n: int) -> np.ndarray:
+    if cov is None:
+        return np.full(n, np.nan, dtype=float)
+    arr = np.asarray(cov, dtype=float)
+    if arr.ndim == 1:
+        out = arr.ravel()
+    elif arr.ndim == 2:
+        out = np.diag(arr)
+    else:
+        out = np.full(n, np.nan, dtype=float)
+    if out.size < n:
+        out = np.pad(out, (0, n - out.size), constant_values=np.nan)
+    return out[:n]
+
+
+def _summary_rows(
+    *,
+    prior_family: str,
+    model: str,
+    block: str,
+    mean: Any,
+    cov: Any,
+    names: list[str],
+) -> list[dict[str, Any]]:
+    if mean is None:
+        return []
+    mu = np.asarray(mean, dtype=float).ravel()
+    var = _diag_variance(cov, mu.size)
+    feature_names = _names_with_fallback(names, mu.size, f"{model}_coef")
+    skip = _placeholder_context_skip_indices(mu.size)
+    return [
+        {
+            "prior_family": prior_family,
+            "model": model,
+            "block": block,
+            "index": i,
+            "feature": feature_names[i],
+            "prior_mean": float(mu[i]),
+            "prior_variance": float(var[i]),
+        }
+        for i in range(mu.size)
+        if i not in skip
+    ]
+
+
+def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame]:
+    """Return the three summary tables requested for audit.
+
+    ``prior_variance`` is the diagonal entry of the prior covariance matrix.
+    For the modified-TD joint prior the full covariance is still stored in
+    ``rl_priors.json``; the table shows its marginal variances.
+    """
+    pf = priors["pf"]
+    reward = priors["reward"]
+    q_no_mod = priors["q_no_td_modify"]
+    q_joint = priors.get("q_td_modify_joint") or {}
+
+    pf_rows: list[dict[str, Any]] = []
+    for model_name, d in pf.items():
+        pf_rows.extend(_summary_rows(
+            prior_family="PF",
+            model=model_name,
+            block="theta",
+            mean=d.get("nu_0"),
+            cov=d.get("Gamma_0"),
+            names=list(d.get("names") or []),
+        ))
+
+    rl_rows: list[dict[str, Any]] = []
+    rl_rows.extend(_summary_rows(
+        prior_family="RL",
+        model="reward_shaping",
+        block="eta",
+        mean=reward.get("mu_0"),
+        cov=reward.get("Sigma_0"),
+        names=_phi_state_names(),
+    ))
+    rl_rows.extend(_summary_rows(
+        prior_family="RL",
+        model="q_no_td_modify",
+        block="beta",
+        mean=q_no_mod.get("mu_0"),
+        cov=q_no_mod.get("Sigma_0"),
+        names=_phi_action_names(),
+    ))
+
+    joint_rows: list[dict[str, Any]] = []
+    mu_joint = q_joint.get("mu_0")
+    if mu_joint is not None:
+        mu_joint_arr = np.asarray(mu_joint, dtype=float).ravel()
+        p_eta = q_joint.get("p_eta")
+        p_eta = 0 if p_eta is None else int(p_eta)
+        var_joint = _diag_variance(q_joint.get("Sigma_0"), mu_joint_arr.size)
+        eta_names = _names_with_fallback(
+            ["eta_intercept", "eta_E_w", "eta_b_hat", "eta_b_tilde"],
+            min(p_eta, mu_joint_arr.size),
+            "eta_coef",
+        )
+        beta_n = max(mu_joint_arr.size - p_eta, 0)
+        beta_names = [f"beta_{name}" for name in _names_with_fallback(
+            _phi_action_names(), beta_n, "beta_coef"
+        )]
+        names = eta_names + beta_names
+        beta_skip = _placeholder_context_skip_indices(beta_n)
+        for i, feature in enumerate(names):
+            if i >= p_eta and (i - p_eta) in beta_skip:
+                continue
+            joint_rows.append({
+                "prior_family": "Joint Modified TD",
+                "model": "q_td_modify_joint",
+                "block": "eta" if i < p_eta else "beta",
+                "index": i,
+                "feature": feature,
+                "prior_mean": float(mu_joint_arr[i]),
+                "prior_variance": float(var_joint[i]),
+            })
+
+    columns = [
+        "prior_family",
+        "model",
+        "block",
+        "index",
+        "feature",
+        "prior_mean",
+        "prior_variance",
+    ]
+    return {
+        "pf": pd.DataFrame(pf_rows, columns=columns),
+        "rl": pd.DataFrame(rl_rows, columns=columns),
+        "joint": pd.DataFrame(joint_rows, columns=columns),
+    }
+
+
+def _format_table_value(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    if isinstance(value, (float, np.floating)):
+        value = float(value)
+        if value == 0.0:
+            return "0.000000"
+        if abs(value) < 1e-4 or abs(value) >= 1e6:
+            return f"{value:.6e}"
+        return f"{value:.6f}"
+    return str(value)
+
+
+def _dataframe_to_markdown(df: pd.DataFrame) -> str:
+    columns = list(df.columns)
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join(["---"] * len(columns)) + " |",
+    ]
+    for _, row in df.iterrows():
+        lines.append(
+            "| "
+            + " | ".join(_format_table_value(row[col]) for col in columns)
+            + " |"
+        )
+    return "\n".join(lines)
+
+
+def save_prior_summary_tables(
+    priors: Dict[str, Any],
+    *,
+    pf_path: Path = PF_SUMMARY_PATH,
+    rl_path: Path = RL_SUMMARY_PATH,
+    reward_path: Path = REWARD_SUMMARY_PATH,
+    rl_q_path: Path = RL_Q_SUMMARY_PATH,
+    joint_path: Path = JOINT_SUMMARY_PATH,
+    markdown_path: Path = SUMMARY_TABLE_PATH,
+    pooled_pf_regression: Optional[pd.DataFrame] = None,
+    pooled_pf_regression_path: Path = POOLED_PF_REGRESSION_PATH,
+    pooled_pf_gee: Optional[pd.DataFrame] = None,
+    pooled_pf_gee_path: Path = POOLED_PF_GEE_PATH,
+    pooled_rl_q: Optional[pd.DataFrame] = None,
+    pooled_rl_q_path: Path = POOLED_RL_Q_PATH,
+) -> dict[str, Path]:
+    tables = build_prior_summary_tables(priors)
+    pf_path.parent.mkdir(parents=True, exist_ok=True)
+    tables["pf"].to_csv(pf_path, index=False)
+    tables["rl"].to_csv(rl_path, index=False)
+    tables["rl"].loc[
+        tables["rl"]["model"] == "reward_shaping"
+    ].to_csv(reward_path, index=False)
+    tables["rl"].loc[
+        tables["rl"]["model"] == "q_no_td_modify"
+    ].to_csv(rl_q_path, index=False)
+    tables["joint"].to_csv(joint_path, index=False)
+
+    md = [
+        "# Prior Mean and Variance Summary",
+        "",
+        "`prior_variance` is the diagonal entry of the prior covariance. "
+        "For `q_td_modify_joint`, the full covariance remains in "
+        "`rl_priors.json`; this table reports marginal variances.",
+        "",
+        "## PF Priors",
+        "",
+        _dataframe_to_markdown(tables["pf"]),
+        "",
+        "## RL Priors",
+        "",
+        _dataframe_to_markdown(tables["rl"]),
+        "",
+        "## Joint Modified-TD Priors",
+        "",
+        _dataframe_to_markdown(tables["joint"]),
+        "",
+    ]
+    out_paths = {
+        "pf": pf_path,
+        "rl": rl_path,
+        "reward": reward_path,
+        "rl_q": rl_q_path,
+        "joint": joint_path,
+        "markdown": markdown_path,
+    }
+    if pooled_pf_regression is not None and not pooled_pf_regression.empty:
+        pooled_pf_regression.to_csv(pooled_pf_regression_path, index=False)
+        md.extend([
+            "## Pooled PF Regression Coefficients",
+            "",
+            "Coefficients are from the all-user stacked ridge fits used as PF "
+            "prior means. `p_value` uses ridge sandwich standard errors and is "
+            "approximate because ridge shrinks coefficients. "
+            "`identified=False` marks zero-variance design columns; SE / "
+            "p-values are omitted for those rows.",
+            "",
+            _dataframe_to_markdown(pooled_pf_regression),
+            "",
+        ])
+        out_paths["pooled_pf_regression"] = pooled_pf_regression_path
+
+    if pooled_pf_gee is not None and not pooled_pf_gee.empty:
+        pooled_pf_gee.to_csv(pooled_pf_gee_path, index=False)
+        md.extend([
+            "## Pooled PF GEE Coefficients",
+            "",
+            "Population-averaged GEE fits on the same stacked PF designs, "
+            "clustered by `ParticipantIdentifier`. `p_value` uses GEE "
+            "sandwich standard errors with exchangeable working correlation. "
+            "`identified=False` marks zero-variance design columns; SE / "
+            "p-values are omitted for those rows. "
+            "These are for inference/audit only; PF priors still use ridge.",
+            "",
+            _dataframe_to_markdown(pooled_pf_gee),
+            "",
+        ])
+        out_paths["pooled_pf_gee"] = pooled_pf_gee_path
+
+    if pooled_rl_q is not None and not pooled_rl_q.empty:
+        pooled_rl_q.to_csv(pooled_rl_q_path, index=False)
+        md.extend([
+            "## Pooled RL Q GEE Coefficients",
+            "",
+            "Gaussian GEE on the final fitted-Q regression from pooled FQI "
+            "(``phi_obs`` vs bootstrap targets), clustered by participant. "
+            "``identified=False`` marks structurally unused features with "
+            "zero design variance (e.g. ``b_tilde``, masked day-6 mediators); "
+            "SE / p-values are omitted for those rows. RL priors still use "
+            "ridge-FQI for ``mu_0_micro``.",
+            "",
+            _dataframe_to_markdown(pooled_rl_q),
+            "",
+        ])
+        out_paths["pooled_rl_q"] = pooled_rl_q_path
+
+    markdown_path.write_text("\n".join(md), encoding="utf-8")
+    return out_paths
+
+
 def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
     """Read ``rl_priors.json`` and convert lists back to numpy arrays.
 
@@ -1180,6 +1947,32 @@ def main() -> Dict[str, Any]:
         n = None if d["nu_0"] is None else len(d["nu_0"])
         print(f"  {name:9s}: p={n}, sigma2={d['sigma2']:.4f}")
 
+    print("Summarizing pooled PF regression coefficients ...")
+    pooled_pf_regression = build_pooled_pf_regression_summary(df_fit)
+    for model in ("fourSC", "antic", "CAE"):
+        sub = pooled_pf_regression.loc[pooled_pf_regression["model"] == model]
+        if sub.empty:
+            continue
+        identified = sub.get("identified", pd.Series(True, index=sub.index))
+        n_sig = int(sub.loc[identified, "significant_0.05"].sum())
+        print(
+            f"  ridge {model:7s}: {int(identified.sum())} identified / "
+            f"{len(sub)} coefficients, {n_sig} significant at 0.05"
+        )
+
+    print("Summarizing pooled PF GEE coefficients ...")
+    pooled_pf_gee = build_pooled_pf_gee_summary(df_fit)
+    for model in ("fourSC", "antic", "CAE"):
+        sub = pooled_pf_gee.loc[pooled_pf_gee["model"] == model]
+        if sub.empty:
+            continue
+        identified = sub.get("identified", pd.Series(True, index=sub.index))
+        n_sig = int(sub.loc[identified, "significant_0.05"].sum())
+        print(
+            f"  GEE   {model:7s}: {int(identified.sum())} identified / "
+            f"{len(sub)} coefficients, {n_sig} significant at 0.05"
+        )
+
     print("Fitting reward-shaping eta prior ...")
     reward = fit_reward_prior(df_fit)
     print(f"  reward: p={len(reward['mu_0'])}, sigma2={reward['sigma2']:.4f}")
@@ -1188,6 +1981,18 @@ def main() -> Dict[str, Any]:
     q_no_mod = fit_q_prior(df_fit)
     print(f"  Q (no TD-modify): p={len(q_no_mod['mu_0'])}, "
           f"sigma2={q_no_mod['sigma2']:.4f}")
+
+    print("Summarizing pooled RL Q GEE coefficients ...")
+    pooled_rl_q = build_pooled_rl_q_summary(df_fit)
+    if pooled_rl_q.empty:
+        print("  pooled RL Q GEE: no users contributed")
+    else:
+        identified = pooled_rl_q["identified"]
+        n_sig = int(pooled_rl_q.loc[identified, "significant_0.05"].sum())
+        print(
+            f"  pooled RL Q GEE: {int(identified.sum())} identified / "
+            f"{len(pooled_rl_q)} coefficients, {n_sig} significant at 0.05"
+        )
 
     print("Fitting joint (alpha, beta) prior for modified-TD-loss RLSVI ...")
     q_mod_joint = fit_q_td_modify_joint_prior(df_fit)
@@ -1207,6 +2012,29 @@ def main() -> Dict[str, Any]:
     }
     path = save_priors(priors)
     print(f"Saved priors -> {path}")
+    split_paths = save_split_rl_prior_files(priors)
+    print("Saved split RL prior JSON files:")
+    print(f"  Reward shaping -> {split_paths['reward']}")
+    print(f"  RL Q           -> {split_paths['rl_q']}")
+    table_paths = save_prior_summary_tables(
+        priors,
+        pooled_pf_regression=pooled_pf_regression,
+        pooled_pf_gee=pooled_pf_gee,
+        pooled_rl_q=pooled_rl_q,
+    )
+    print("Saved prior summary tables:")
+    print(f"  PF    -> {table_paths['pf']}")
+    print(f"  RL combined     -> {table_paths['rl']}")
+    print(f"  Reward shaping  -> {table_paths['reward']}")
+    print(f"  RL Q            -> {table_paths['rl_q']}")
+    print(f"  Joint           -> {table_paths['joint']}")
+    if "pooled_pf_regression" in table_paths:
+        print(f"  Pooled PF ridge -> {table_paths['pooled_pf_regression']}")
+    if "pooled_pf_gee" in table_paths:
+        print(f"  Pooled PF GEE   -> {table_paths['pooled_pf_gee']}")
+    if "pooled_rl_q" in table_paths:
+        print(f"  Pooled RL Q GEE -> {table_paths['pooled_rl_q']}")
+    print(f"  MD              -> {table_paths['markdown']}")
     return priors
 
 

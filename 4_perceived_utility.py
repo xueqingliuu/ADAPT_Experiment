@@ -4,11 +4,23 @@ Joint state-space model for perceived utility E_w with weekly AR dynamics and
 within-week outcomes (J_week, U1, U2, hourly PV, daily FW, daily PJ).
 
 Likelihood for latent E_2,...,E_W is approximated by 1D quadrature (trapezoid
-grid) with prediction / filtering recursion as on the slides. Optionally E_1 is
-fixed (known); otherwise a Gaussian prior on E_1 at week 1 is estimated.
+over the support of E) with prediction / filtering recursion as on the slides.
+With ``e1_known``, E_1 is the fixed baseline (= week-1 ``perceived_utility_lastweek``);
+E_2 is the state at end of week 1 / start of week 2. Otherwise a Gaussian prior
+on E_1 is estimated.
 
-Observation models (conditional on latent E_w for that calendar week; ``grid`` in
-code is quadrature over E_w). Weekly survey outcomes:
+Study weeks w = 1,...,12 index observation blocks; latent E_w is the state at
+the start of week w (week-w outcomes are conditional on E_w). The AR transition
+after week w yields E_{w+1}; with 12 weeks this produces E_1,...,E_12 in the
+likelihood and a terminal E_13 at end of week 12 (predictive only, no week-13
+data). On each ``df_fit`` row at study week w (1..12), the exported columns are
+``perceived_utility`` = \\hat E_{w+1} (spans E_2,...,E_13; week 12 uses the
+predictive terminal E_13) and ``perceived_utility_lastweek`` = \\hat E_w (spans
+E_1,...,E_12); by construction ``perceived_utility_lastweek`` is the literal
+weekly lag of ``perceived_utility``. ``pred_penalized_filtered_Ew`` in the JSON
+export stores the same E_2,...,E_13 series (one entry per study week 1..12).
+
+Observation models (conditional on latent E_w for that study week). Weekly survey outcomes:
 
   - J_week (``week_present``): Bernoulli, \\mathrm{logit}(p) = b_0 + b_1 E_w.
   - U1, U2 (``Exp-tool-1_norm``, ``Exp-tool-2_norm``; only if J_week = 1):
@@ -19,49 +31,57 @@ Within-week intensive measures:
 
   - PV (hourly ``HourlyPageviewCount_norm``):  Gaussian,
         \\mu = \\alpha_0 + \\alpha_1 E_w
-             + \\alpha_{2,\\mathrm{dow}}\\,\\mathrm{dow}
+             + \\alpha_{2,\\mathrm{we}}\\,\\mathrm{is\\_weekend}
              + \\alpha_{2,\\mathrm{dt}}\\,\\mathrm{dt}
              + \\alpha_{2,\\mathrm{rb}}\\,\\mathrm{recent\\_burden}
              + \\alpha_{\\mathrm{AR}}\\, z^{\\mathrm{PV,lag1}}
              + A(\\alpha_3 + \\alpha_4 E_w),
         where z^{\\mathrm{PV,lag1}} is ``hourly_pageview_count_lag1`` (same row);
-        (dow, dt, recent_burden) from ``dow_norm``, ``DecisionTime``,
+        (is_weekend, dt, recent_burden) from ``is_weekend``, ``DecisionTime``,
         ``recent_burden_norm``; A = hourly ``WalkingSuggestion``; noise
         \\sigma_{\\mathrm{PV}}.
 
   - FW (daily outcome ``nextday_wearing``):  Bernoulli,
         \\eta = \\beta_0 + \\beta_1 E_w
-             + \\beta_{2,\\mathrm{dow}}\\,\\mathrm{dow}
+             + \\beta_{2,\\mathrm{we}}\\,\\mathrm{is\\_weekend}
              + \\beta_{2,\\mathrm{rb}}\\,\\mathrm{recent\\_burden}
              + \\beta_{\\mathrm{AR}}\\, z^{\\mathrm{FW,lag}}
              + A_0(\\beta_3 + \\beta_4 E_w) + A_1(\\beta_5 + \\beta_6 E_w),
         where z^{\\mathrm{FW,lag}} is ``morning_wearing`` on the morning row;
-        (dow, recent_burden) from that row; A_0, A_1 from morning/afternoon
-        ``WalkingSuggestion`` (see ``build_user_blocks``).
+        (is_weekend, recent_burden) from that row; A_0, A_1 from morning/afternoon
+        ``WalkingSuggestion`` .
 
   - PJ (daily ``daily_present``):  Bernoulli,
         \\eta = \\theta_0 + \\theta_1 E_w
-             + \\theta_{2,\\mathrm{dow}}\\,\\mathrm{dow}
+             + \\theta_{2,\\mathrm{we}}\\,\\mathrm{is\\_weekend}
              + \\theta_{2,\\mathrm{rb}}\\,\\mathrm{recent\\_burden}
              + \\theta_{\\mathrm{AR}}\\, z^{\\mathrm{PJ,lag}}
              + A_0(\\theta_3 + \\theta_4 E_w) + A_1(\\theta_5 + \\theta_6 E_w),
         where z^{\\mathrm{PJ,lag}} is ``daily_present_yesterday`` on the morning row;
-        same (dow, burden, A_0, A_1) construction as FW.
+        same (is_weekend, burden, A_0, A_1) construction as FW.
 
 Lag covariates are read from ``df_fit`` (aligned per hour or per day); missing
 values are treated as 0 in the linear predictor.
 """
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from math import ceil
+import logging
+import os
+import time
 from pathlib import Path
 from typing import Optional
+import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
+from scipy.special import logsumexp
 import json
+
+logger = logging.getLogger(__name__)
 
 # %%
 # read data
@@ -73,14 +93,7 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 folder = COMBINED_DIR
 
 df_fit = pd.read_csv(folder / "df_fit.csv")
-
-# %%
-for userid in df_fit["ParticipantIdentifier"].unique():
-    vc = df_fit.loc[df_fit["ParticipantIdentifier"] == userid, "week"].value_counts()
-    if vc.get(0, 0) > 2:
-        m = df_fit["ParticipantIdentifier"] == userid
-        df_fit.loc[m, "week"] = df_fit.loc[m, "week"] + 1
-df_fit = df_fit[df_fit["week"] < 13]
+# df_fit is already study weeks 1–12 (burn-in / week 0 / week 13 dropped upstream).
 
 
 def sigmoid(x):
@@ -103,6 +116,10 @@ def normal_logpdf(y, mu, sigma):
 
 def trapezoid_weights(grid):
     grid = np.asarray(grid, dtype=float)
+    if grid.ndim != 1 or grid.size < 2:
+        raise ValueError("Quadrature grid must be a one-dimensional array with at least 2 points.")
+    if not np.all(np.isfinite(grid)) or not np.all(np.diff(grid) > 0):
+        raise ValueError("Quadrature grid must be finite and strictly increasing.")
     w = np.empty_like(grid)
     w[1:-1] = 0.5 * (grid[2:] - grid[:-2])
     w[0] = 0.5 * (grid[1] - grid[0])
@@ -110,10 +127,95 @@ def trapezoid_weights(grid):
     return w
 
 
+def validate_quadrature_support(
+    grid: np.ndarray,
+    weights: np.ndarray,
+    *,
+    e1_known: Optional[float] = None,
+) -> None:
+    """Validate quadrature inputs and warn when fixed E1 is at the support edge."""
+    grid = np.asarray(grid, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if grid.ndim != 1 or weights.shape != grid.shape:
+        raise ValueError("Quadrature grid and weights must be one-dimensional with equal length.")
+    if grid.size < 2 or not np.all(np.isfinite(grid)) or not np.all(np.diff(grid) > 0):
+        raise ValueError("Quadrature grid must contain at least 2 finite, increasing points.")
+    if not np.all(np.isfinite(weights)) or np.any(weights <= 0):
+        raise ValueError("Quadrature weights must be finite and strictly positive.")
+    if e1_known is None:
+        return
+
+    e1 = float(e1_known)
+    if not np.isfinite(e1) or e1 < grid[0] or e1 > grid[-1]:
+        raise ValueError(
+            f"Fixed E1={e1_known!r} must lie within [{grid[0]}, {grid[-1]}]."
+        )
+    edge_distance = min(e1 - grid[0], grid[-1] - e1)
+    if edge_distance <= np.max(np.diff(grid)):
+        warnings.warn(
+            f"Fixed E1={e1:g} is at/within one grid cell of quadrature boundary "
+            f"[{grid[0]:g}, {grid[-1]:g}]; transition mass may be truncated.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def _normalize_log_density(
+    log_density: np.ndarray,
+    weights: np.ndarray,
+    *,
+    label: str,
+) -> tuple[np.ndarray, float]:
+    """Normalize a grid density in log space; return density and log retained mass."""
+    log_density = np.asarray(log_density, dtype=float)
+    log_norm = float(logsumexp(log_density + np.log(weights)))
+    if not np.isfinite(log_norm):
+        raise FloatingPointError(f"invalid {label} density normalization")
+    density = np.exp(log_density - log_norm)
+    if not np.all(np.isfinite(density)):
+        raise FloatingPointError(f"non-finite normalized {label} density")
+    return density, log_norm
+
+
+def _predict_density_log(
+    grid: np.ndarray,
+    weights: np.ndarray,
+    previous_density: np.ndarray,
+    prev_block: dict,
+    par: dict,
+) -> tuple[np.ndarray, float]:
+    """Propagate a grid density through the Gaussian transition in log space."""
+    mu_prev = (
+        par["a0"]
+        + par["a1"] * grid
+        + par["a2"] * prev_block["PV_sum_trans"]
+        + par["a3"] * prev_block["FW_sum_trans"]
+        + par["a4"] * prev_block["PJ_sum_trans"]
+    )
+    previous_mass = np.asarray(previous_density, dtype=float) * weights
+    log_previous_mass = np.full_like(previous_mass, -np.inf)
+    positive = previous_mass > 0
+    log_previous_mass[positive] = np.log(previous_mass[positive])
+    log_transition = normal_logpdf(
+        grid[:, None],
+        mu_prev[None, :],
+        par["sigma_E"],
+    )
+    log_predictive = logsumexp(
+        log_transition + log_previous_mass[None, :],
+        axis=1,
+    )
+    return _normalize_log_density(
+        log_predictive,
+        weights,
+        label="predictive",
+    )
+
+
 def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     """
-    If e1_known: no (m0, sigma0) at the end — E_1 is fixed outside the vector.
-    Otherwise last two entries are m0, log(sigma0) for the week-1 prior on E_1.
+    If e1_known: no (m0, sigma0) at the end — baseline E_1 is fixed outside theta.
+    Otherwise last two entries are m0, log(sigma0) for a Gaussian prior on E_1.
     """
     i = 0
     theta = np.asarray(theta, dtype=float)
@@ -155,7 +257,7 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     i += 1
     alpha1 = theta[i]
     i += 1
-    alpha2_dow = theta[i]
+    alpha2_is_weekend = theta[i]
     i += 1
     alpha2_dt = theta[i]
     i += 1
@@ -182,7 +284,7 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     i += 1
     beta6 = theta[i]
     i += 1
-    beta2_dow = theta[i]
+    beta2_is_weekend = theta[i]
     i += 1
     beta2_rb = theta[i]
     i += 1
@@ -201,7 +303,7 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     i += 1
     theta6 = theta[i]
     i += 1
-    theta2_dow = theta[i]
+    theta2_is_weekend = theta[i]
     i += 1
     theta2_rb = theta[i]
     i += 1
@@ -225,7 +327,7 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "sigma_U2": sigma_U2,
         "alpha0": alpha0,
         "alpha1": alpha1,
-        "alpha2_dow": alpha2_dow,
+        "alpha2_is_weekend": alpha2_is_weekend,
         "alpha2_dt": alpha2_dt,
         "alpha2_rb": alpha2_rb,
         "alpha3": alpha3,
@@ -238,7 +340,7 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "beta4": beta4,
         "beta5": beta5,
         "beta6": beta6,
-        "beta2_dow": beta2_dow,
+        "beta2_is_weekend": beta2_is_weekend,
         "beta2_rb": beta2_rb,
         "beta_ar1": beta_ar1,
         "theta0": theta0,
@@ -247,7 +349,7 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "theta4": theta4,
         "theta5": theta5,
         "theta6": theta6,
-        "theta2_dow": theta2_dow,
+        "theta2_is_weekend": theta2_is_weekend,
         "theta2_rb": theta2_rb,
         "theta_ar1": theta_ar1,
     }
@@ -257,6 +359,58 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         out["sigma0"] = np.exp(theta[i])
         i += 1
     return out
+
+
+def log_pooled_theta(
+    pooled_theta: np.ndarray,
+    *,
+    e1_known: bool,
+    nll: Optional[float] = None,
+    success: Optional[bool] = None,
+    nit: Optional[int] = None,
+) -> dict:
+    """Log the pooled MLE vector and its unpacked parameter dictionary."""
+    pooled_theta = np.asarray(pooled_theta, dtype=float)
+    par = unpack_theta(pooled_theta, e1_known=e1_known)
+
+    header_parts = ["Pooled theta"]
+    if success is not None:
+        header_parts.append(f"success={success}")
+    if nll is not None:
+        header_parts.append(f"nll={nll:.6f}")
+    if nit is not None:
+        header_parts.append(f"nit={nit}")
+    header_parts.append(f"dim={pooled_theta.size}")
+    logger.info(" | ".join(header_parts))
+
+    groups = [
+        ("E_w AR", ["a0", "a1", "a2", "a3", "a4", "sigma_E"]),
+        ("J_week", ["b0", "b1"]),
+        ("U1", ["c0", "c1", "sigma_U1"]),
+        ("U2", ["d0", "d1", "sigma_U2"]),
+        ("PV", [
+            "alpha0", "alpha1", "alpha2_is_weekend", "alpha2_dt", "alpha2_rb",
+            "alpha3", "alpha4", "sigma_PV", "alpha_ar1",
+        ]),
+        ("FW", [
+            "beta0", "beta1", "beta3", "beta4", "beta5", "beta6",
+            "beta2_is_weekend", "beta2_rb", "beta_ar1",
+        ]),
+        ("PJ", [
+            "theta0", "theta1", "theta3", "theta4", "theta5", "theta6",
+            "theta2_is_weekend", "theta2_rb", "theta_ar1",
+        ]),
+    ]
+    if not e1_known:
+        groups.append(("E1 prior", ["m0", "sigma0"]))
+
+    for group_name, keys in groups:
+        logger.info("[%s]", group_name)
+        for key in keys:
+            logger.info("  %s = %.6g", key, par[key])
+
+    logger.debug("pooled_theta raw: %s", np.array2string(pooled_theta, precision=6, separator=", "))
+    return par
 
 
 def theta_dim(*, e1_known: bool) -> int:
@@ -342,7 +496,7 @@ def build_user_blocks(
     FW_col="nextday_wearing",
                       PJ_col="daily_present",
     a_col="WalkingSuggestion",
-    dow_col="dow_norm",
+    weekend_col="is_weekend",
     burden_col="recent_burden_norm",
     PV_lag1_col="hourly_pageview_count_lag1",
     FW_lag_col="morning_wearing",
@@ -353,16 +507,23 @@ def build_user_blocks(
     missing_week_mode="mean_impute_transition",  # or "error"
 ):
     """
-    Build one block per calendar week.
+    Build one block per study week ``w`` (default ``full_weeks=range(1, 13)`` →
+    weeks 1..12). This is the discrete-time index of the AR state E_w, not the
+    quadrature grid over E.
 
     Key design:
       - The within-week likelihood uses only actually observed rows:
             pv_y, FW_daily, PJ_daily
-        plus ``day_dow`` and ``day_burden`` (aligned with each calendar day, from the
+        plus ``day_is_weekend`` and ``day_burden`` (aligned with each calendar day, from the
         afternoon row) for FW/PJ logit covariates.
         AR coefficients multiply precomputed lag columns: ``PV_lag1_col`` per hour,
         ``FW_lag_col`` / ``PJ_lag_col`` per day (NaNs treated as 0 in the likelihood).
         Missing weeks keep these as empty arrays.
+
+      - Weekly intensity summaries for the transition use fixed denominators
+        (``nansum(pv)/14``, ``nansum(FW|PJ)/7``): each slot contributes 0 if NaN,
+        not a mean over observed-only slots. With a complete 14-slot / 7-day
+        panel this matches zero-imputed averages.
 
       - The state transition uses separate weekly summaries:
             PV_sum_trans, FW_sum_trans, PJ_sum_trans
@@ -408,7 +569,7 @@ def build_user_blocks(
         pv_ctx_rows = []
         a0_list, a1_list = [], []
         fw_list, pj_list = [], []
-        day_dow_list, day_burden_list = [], []
+        day_is_weekend_list, day_burden_list = [], []
         day_fw_lag_list, day_pj_lag_list = [], []
 
         for _d, g_day in g_week.groupby(date_col, sort=True):
@@ -416,7 +577,7 @@ def build_user_blocks(
 
             aa = g_day[a_col].to_numpy(dtype=float)
             pv = g_day[PV_col].to_numpy(dtype=float)
-            dowv = g_day[dow_col].to_numpy(dtype=float)
+            weekendv = g_day[weekend_col].to_numpy(dtype=float)
             burden = g_day[burden_col].to_numpy(dtype=float)
             dtv = g_day[decision_col].to_numpy(dtype=float)
             lag1v = (
@@ -431,10 +592,10 @@ def build_user_blocks(
                 pv_lag1_list.append(
                     float(lag1v[k]) if not np.isnan(lag1v[k]) else np.nan
                 )
-                dow_k = float(dowv[k]) if not np.isnan(dowv[k]) else np.nan
+                weekend_k = float(weekendv[k]) if not np.isnan(weekendv[k]) else np.nan
                 rb_k = float(burden[k]) if not np.isnan(burden[k]) else np.nan
                 dt_k = float(dtv[k]) if (hourly_pv and not np.isnan(dtv[k])) else 0.0
-                pv_ctx_rows.append([dow_k, dt_k, rb_k])
+                pv_ctx_rows.append([weekend_k, dt_k, rb_k])
 
             row_morning = g_day.loc[g_day[decision_col] == 0].iloc[0]
             row_afternoon = g_day.loc[g_day[decision_col] == 1].iloc[0]
@@ -449,8 +610,8 @@ def build_user_blocks(
             pj_list.append(float(row_morning[PJ_col]) if not pd.isna(row_morning[PJ_col]) else np.nan)
 
 
-            day_dow_list.append(
-                float(row_afternoon[dow_col]) if not pd.isna(row_afternoon[dow_col]) else np.nan
+            day_is_weekend_list.append(
+                float(row_afternoon[weekend_col]) if not pd.isna(row_afternoon[weekend_col]) else np.nan
             )
             day_burden_list.append(
                 float(row_afternoon[burden_col]) if not pd.isna(row_afternoon[burden_col]) else np.nan
@@ -477,7 +638,7 @@ def build_user_blocks(
         day_A1 = np.asarray(a1_list, dtype=float)
         FW_daily = np.asarray(fw_list, dtype=float)
         PJ_daily = np.asarray(pj_list, dtype=float)
-        day_dow = np.asarray(day_dow_list, dtype=float)
+        day_is_weekend = np.asarray(day_is_weekend_list, dtype=float)
         day_burden = np.asarray(day_burden_list, dtype=float)
         day_FW_lag = np.asarray(day_fw_lag_list, dtype=float)
         day_PJ_lag = np.asarray(day_pj_lag_list, dtype=float)
@@ -497,7 +658,7 @@ def build_user_blocks(
             "pv_a": np.asarray(pv_a_list, dtype=float),
             "day_A0": day_A0,
             "day_A1": day_A1,
-            "day_dow": day_dow,
+            "day_is_weekend": day_is_weekend,
             "day_burden": day_burden,
             "day_FW_lag": day_FW_lag,
             "day_PJ_lag": day_PJ_lag,
@@ -554,7 +715,7 @@ def build_user_blocks(
                 "pv_a": np.asarray([], dtype=float),
                 "day_A0": np.asarray([], dtype=float),
                 "day_A1": np.asarray([], dtype=float),
-                "day_dow": np.asarray([], dtype=float),
+                "day_is_weekend": np.asarray([], dtype=float),
                 "day_burden": np.asarray([], dtype=float),
                 "day_FW_lag": np.asarray([], dtype=float),
                 "day_PJ_lag": np.asarray([], dtype=float),
@@ -603,7 +764,7 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
     pv_ctx = block["pv_c_ctx"]
     pv_a = block["pv_a"]
     coef2 = np.array(
-        [par["alpha2_dow"], par["alpha2_dt"], par["alpha2_rb"]],
+        [par["alpha2_is_weekend"], par["alpha2_dt"], par["alpha2_rb"]],
         dtype=float,
     )
 
@@ -639,11 +800,11 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
         a1 = block["day_A1"][d]
         a0 = 0.0 if np.isnan(a0) else a0
         a1 = 0.0 if np.isnan(a1) else a1
-        dd = block.get("day_dow")
+        dd = block.get("day_is_weekend")
         bd = block.get("day_burden")
-        dow_d = float(dd[d]) if dd is not None and len(dd) > d else np.nan
+        weekend_d = float(dd[d]) if dd is not None and len(dd) > d else np.nan
         bd_d = float(bd[d]) if bd is not None and len(bd) > d else np.nan
-        dow_d = 0.0 if np.isnan(dow_d) else dow_d
+        weekend_d = 0.0 if np.isnan(weekend_d) else weekend_d
         bd_d = 0.0 if np.isnan(bd_d) else bd_d
         fl = block.get("day_FW_lag")
         y_lag = (
@@ -654,7 +815,7 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
         eta = (
             par["beta0"]
             + par["beta1"] * grid
-            + par["beta2_dow"] * dow_d
+            + par["beta2_is_weekend"] * weekend_d
             + par["beta2_rb"] * bd_d
             + par["beta_ar1"] * y_lag
             + a0 * (par["beta3"] + par["beta4"] * grid)
@@ -670,11 +831,11 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
         a1 = block["day_A1"][d]
         a0 = 0.0 if np.isnan(a0) else a0
         a1 = 0.0 if np.isnan(a1) else a1
-        dd = block.get("day_dow")
+        dd = block.get("day_is_weekend")
         bd = block.get("day_burden")
-        dow_d = float(dd[d]) if dd is not None and len(dd) > d else np.nan
+        weekend_d = float(dd[d]) if dd is not None and len(dd) > d else np.nan
         bd_d = float(bd[d]) if bd is not None and len(bd) > d else np.nan
-        dow_d = 0.0 if np.isnan(dow_d) else dow_d
+        weekend_d = 0.0 if np.isnan(weekend_d) else weekend_d
         bd_d = 0.0 if np.isnan(bd_d) else bd_d
         pl = block.get("day_PJ_lag")
         y_lag = (
@@ -685,7 +846,7 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
         eta = (
             par["theta0"]
             + par["theta1"] * grid
-            + par["theta2_dow"] * dow_d
+            + par["theta2_is_weekend"] * weekend_d
             + par["theta2_rb"] * bd_d
             + par["theta_ar1"] * y_lag
             + a0 * (par["theta3"] + par["theta4"] * grid)
@@ -705,7 +866,7 @@ def week_loglik_at_point(e: float, block: dict, par: dict) -> float:
     return float(_week_loglik_components_on_grid(g, block, par)[0])
 
 
-def ml_json_export(
+def penalized_json_export(
     res,
     filt: dict,
     blocks: list,
@@ -716,8 +877,8 @@ def ml_json_export(
     Build two dicts for merging into params_env_<id>.json and pred_<id>.json.
 
     Parameter convention:
-      - one theta_ml_* key per model
-      - companion theta_ml_*_names key documents parameter order
+      - one theta_penalized_* key per model
+      - companion theta_penalized_*_names key documents parameter order
 
     Prediction/residual convention:
       - prediction and residual arrays have the same length
@@ -740,8 +901,10 @@ def ml_json_export(
     def _sigm(z):
         return 1.0 / (1.0 + np.exp(-np.clip(z, -50.0, 50.0)))
 
-    env_ml: dict = {
-        "theta_ml_Ew": [
+    env_penalized: dict = {
+        "estimation_method": "ridge_penalized_likelihood",
+        "ridge_lambda": r3(filt.get("ridge_lambda")),
+        "theta_penalized_Ew": [
             r3(par["a0"]),
             r3(par["a1"]),
             r3(par["a2"]),
@@ -749,7 +912,7 @@ def ml_json_export(
             r3(par["a4"]),
             r3(par["sigma_E"]),
         ],
-        "theta_ml_Ew_names": [
+        "theta_penalized_Ew_names": [
             "a0",
             "a1",
             "a2_PV_lag_week",
@@ -758,41 +921,41 @@ def ml_json_export(
             "sigma_E",
         ],
 
-        "theta_ml_J": [
+        "theta_penalized_J": [
             r3(par["b0"]),
             r3(par["b1"]),
         ],
-        "theta_ml_J_names": [
+        "theta_penalized_J_names": [
             "b0",
             "b1_Ew",
         ],
 
-        "theta_ml_U1": [
+        "theta_penalized_U1": [
             r3(par["c0"]),
             r3(par["c1"]),
             r3(par["sigma_U1"]),
         ],
-        "theta_ml_U1_names": [
+        "theta_penalized_U1_names": [
             "c0",
             "c1_Ew",
             "sigma_U1",
         ],
 
-        "theta_ml_U2": [
+        "theta_penalized_U2": [
             r3(par["d0"]),
             r3(par["d1"]),
             r3(par["sigma_U2"]),
         ],
-        "theta_ml_U2_names": [
+        "theta_penalized_U2_names": [
             "d0",
             "d1_Ew",
             "sigma_U2",
         ],
 
-        "theta_ml_PV": [
+        "theta_penalized_PV": [
             r3(par["alpha0"]),
             r3(par["alpha1"]),
-            r3(par["alpha2_dow"]),
+            r3(par["alpha2_is_weekend"]),
             r3(par["alpha2_dt"]),
             r3(par["alpha2_rb"]),
             r3(par["alpha_ar1"]),
@@ -800,10 +963,10 @@ def ml_json_export(
             r3(par["alpha4"]),
             r3(par["sigma_PV"]),
         ],
-        "theta_ml_PV_names": [
+        "theta_penalized_PV_names": [
             "alpha0",
             "alpha1_Ew",
-            "alpha2_dow",
+            "alpha2_is_weekend",
             "alpha2_decision_time",
             "alpha2_recent_burden",
             "alpha_ar1_hourly_pageview_lag1",
@@ -812,10 +975,10 @@ def ml_json_export(
             "sigma_PV",
         ],
 
-        "theta_ml_FW": [
+        "theta_penalized_FW": [
             r3(par["beta0"]),
             r3(par["beta1"]),
-            r3(par["beta2_dow"]),
+            r3(par["beta2_is_weekend"]),
             r3(par["beta2_rb"]),
             r3(par["beta_ar1"]),
             r3(par["beta3"]),
@@ -823,10 +986,10 @@ def ml_json_export(
             r3(par["beta5"]),
             r3(par["beta6"]),
         ],
-        "theta_ml_FW_names": [
+        "theta_penalized_FW_names": [
             "beta0",
             "beta1_Ew",
-            "beta2_dow",
+            "beta2_is_weekend",
             "beta2_recent_burden",
             "beta_ar1_morning_wearing",
             "beta3_A0_morning",
@@ -835,10 +998,10 @@ def ml_json_export(
             "beta6_A1_afternoon_by_Ew",
         ],
 
-        "theta_ml_PJ": [
+        "theta_penalized_PJ": [
             r3(par["theta0"]),
             r3(par["theta1"]),
-            r3(par["theta2_dow"]),
+            r3(par["theta2_is_weekend"]),
             r3(par["theta2_rb"]),
             r3(par["theta_ar1"]),
             r3(par["theta3"]),
@@ -846,10 +1009,10 @@ def ml_json_export(
             r3(par["theta5"]),
             r3(par["theta6"]),
         ],
-        "theta_ml_PJ_names": [
+        "theta_penalized_PJ_names": [
             "theta0",
             "theta1_Ew",
-            "theta2_dow",
+            "theta2_is_weekend",
             "theta2_recent_burden",
             "theta_ar1_daily_present_yesterday",
             "theta3_A0_morning",
@@ -858,18 +1021,18 @@ def ml_json_export(
             "theta6_A1_afternoon_by_Ew",
         ],
 
-        # "theta_ml_full_vector": np.round(np.asarray(res.x, dtype=float), digits).tolist(),
-        # "ml_loglik": r3(filt["loglik"]),
-        # "ml_opt_success": bool(res.success),
-        # "ml_opt_nit": int(res.nit) if hasattr(res, "nit") else None,
+        "penalized_loglik": r3(filt["loglik"]),
+        "penalized_objective": r3(res.fun),
+        "penalized_opt_success": bool(res.success),
+        "penalized_opt_nit": int(res.nit) if hasattr(res, "nit") else None,
     }
 
     if not e1_fixed:
-        env_ml["theta_ml_E1_prior"] = [
+        env_penalized["theta_penalized_E1_prior"] = [
             r3(par.get("m0")),
             r3(par.get("sigma0")),
         ]
-        env_ml["theta_ml_E1_prior_names"] = [
+        env_penalized["theta_penalized_E1_prior_names"] = [
             "m0",
             "sigma0",
         ]
@@ -931,7 +1094,7 @@ def ml_json_export(
         # Residual is None if observed PV is missing.
         # ------------------------------------------------------------
         coef2 = np.array(
-            [par["alpha2_dow"], par["alpha2_dt"], par["alpha2_rb"]],
+            [par["alpha2_is_weekend"], par["alpha2_dt"], par["alpha2_rb"]],
             dtype=float,
         )
 
@@ -994,15 +1157,15 @@ def ml_json_export(
                 else 0.0
             )
 
-            day_dow = block.get("day_dow")
+            day_is_weekend = block.get("day_is_weekend")
             day_burden = block.get("day_burden")
             day_FW_lag = block.get("day_FW_lag")
 
-            dow_d = (
-                float(day_dow[d])
-                if day_dow is not None
-                and len(day_dow) > d
-                and not np.isnan(day_dow[d])
+            weekend_d = (
+                float(day_is_weekend[d])
+                if day_is_weekend is not None
+                and len(day_is_weekend) > d
+                and not np.isnan(day_is_weekend[d])
                 else 0.0
             )
             burden_d = (
@@ -1023,7 +1186,7 @@ def ml_json_export(
             eta = (
                 par["beta0"]
                 + par["beta1"] * e
-                + par["beta2_dow"] * dow_d
+                + par["beta2_is_weekend"] * weekend_d
                 + par["beta2_rb"] * burden_d
                 + par["beta_ar1"] * lag_d
                 + A0 * (par["beta3"] + par["beta4"] * e)
@@ -1059,15 +1222,15 @@ def ml_json_export(
                 else 0.0
             )
 
-            day_dow = block.get("day_dow")
+            day_is_weekend = block.get("day_is_weekend")
             day_burden = block.get("day_burden")
             day_PJ_lag = block.get("day_PJ_lag")
 
-            dow_d = (
-                float(day_dow[d])
-                if day_dow is not None
-                and len(day_dow) > d
-                and not np.isnan(day_dow[d])
+            weekend_d = (
+                float(day_is_weekend[d])
+                if day_is_weekend is not None
+                and len(day_is_weekend) > d
+                and not np.isnan(day_is_weekend[d])
                 else 0.0
             )
             burden_d = (
@@ -1088,7 +1251,7 @@ def ml_json_export(
             eta = (
                 par["theta0"]
                 + par["theta1"] * e
-                + par["theta2_dow"] * dow_d
+                + par["theta2_is_weekend"] * weekend_d
                 + par["theta2_rb"] * burden_d
                 + par["theta_ar1"] * lag_d
                 + A0 * (par["theta3"] + par["theta4"] * e)
@@ -1103,24 +1266,25 @@ def ml_json_export(
             else:
                 rPJ.append(r3(float(y) - ph))
 
-    env_ml["resid_ml_J_week"] = rJ
-    env_ml["resid_ml_U1"] = rU1
-    env_ml["resid_ml_U2"] = rU2
-    env_ml["resid_ml_hourly_pageview"] = rPV
-    env_ml["resid_ml_nextday_wearing"] = rFW
-    env_ml["resid_ml_daily_present"] = rPJ
+    env_penalized["resid_penalized_J_week"] = rJ
+    env_penalized["resid_penalized_U1"] = rU1
+    env_penalized["resid_penalized_U2"] = rU2
+    env_penalized["resid_penalized_hourly_pageview"] = rPV
+    env_penalized["resid_penalized_nextday_wearing"] = rFW
+    env_penalized["resid_penalized_daily_present"] = rPJ
 
-    pred_ml = {
-        "pred_ml_filtered_Ew": [r3(x) for x in E.tolist()],
-        "pred_ml_J_week": pJ,
-        "pred_ml_U1": pU1,
-        "pred_ml_U2": pU2,
-        "pred_ml_hourly_pageview": pPV,
-        "pred_ml_nextday_wearing": pFW,
-        "pred_ml_daily_present": pPJ,
+    E_export = build_exported_Ew_series(filt)
+    pred_penalized = {
+        "pred_penalized_filtered_Ew": [r3(x) for x in E_export.tolist()],
+        "pred_penalized_J_week": pJ,
+        "pred_penalized_U1": pU1,
+        "pred_penalized_U2": pU2,
+        "pred_penalized_hourly_pageview": pPV,
+        "pred_penalized_nextday_wearing": pFW,
+        "pred_penalized_daily_present": pPJ,
     }
 
-    return env_ml, pred_ml
+    return env_penalized, pred_penalized
 
 
 def attach_filtered_Ew_to_df_fit(
@@ -1132,14 +1296,25 @@ def attach_filtered_Ew_to_df_fit(
     pu_last_col: str = "perceived_utility_lastweek",
     week_col: str = "week",
 ) -> pd.DataFrame:
-    """Add filtered \\hat E_w (perceived utility) and its weekly lag to ``df_fit``.
+    """Add exported \\hat E_{w+1} and its literal one-week lag \\hat E_w to ``df_fit``.
 
-    ``filtered_states[uid]['filtered_means']`` is indexed ``0..T-1`` and
-    corresponds to relabeled weeks ``1..T`` (matches ``full_weeks=range(1, 13)``
-    in ``build_user_blocks``). With ``e1_known=v``, ``filtered_means[0]`` equals
-    ``v`` (the fixed week-1 latent), and the regression-friendly column
-    ``perceived_utility_lastweek`` stores ``NaN`` for week 1 unless ``e1_known``
-    is supplied (in which case the same fixed value is used).
+    ``filtered_states[uid]['filtered_means']`` is indexed ``0..T-1`` for study
+    weeks ``1..T`` (``full_weeks=range(1, 13)`` → T=12), with ``fm[w-1]`` =
+    filtered \\hat E_w for week w (``fm[0]`` = the fixed baseline E_1 = v).
+
+    Each existing row at study week w (1..T) gets, with ``e1_known=v``:
+      - ``perceived_utility_lastweek`` = \\hat E_w = ``fm[w-1]`` (the state
+        entering week w, known before week w's own data — this is exactly the
+        state that governs week w's likelihood in the model). Spans
+        E_1,...,E_T over weeks 1..T.
+      - ``perceived_utility`` = \\hat E_{w+1} = ``fm[w]`` for w<T, or the
+        predictive ``terminal_predicted_mean`` (E_{T+1}) for w=T (end of week
+        T, one AR step past the last filtered state). Spans E_2,...,E_{T+1}
+        over weeks 1..T.
+
+    By construction ``perceived_utility_lastweek`` on week w equals
+    ``perceived_utility`` on week w-1 (literal weekly lag), with week 1's
+    lastweek anchored to the E_1 baseline v (no week-0 row exists).
 
     Returns a new dataframe; the input is not modified.
     """
@@ -1149,28 +1324,26 @@ def attach_filtered_Ew_to_df_fit(
 
     for uid, filt in filtered_states.items():
         fm = np.asarray(filt.get("filtered_means", []), dtype=float)
-        if fm.size == 0:
+        T = fm.size
+        if T == 0:
             continue
         user_mask = out["ParticipantIdentifier"] == uid
         if not user_mask.any():
             continue
-        for w in range(1, fm.size + 1):
+        terminal = filt.get("terminal_predicted_mean")
+        terminal = float(terminal) if terminal is not None else np.nan
+        for w in range(1, T + 1):
             row_mask = user_mask & (out[week_col] == w)
             if not row_mask.any():
                 continue
-            v_now = fm[w - 1]
+            v_lastweek = fm[w - 1]
+            out.loc[row_mask, pu_last_col] = (
+                float(v_lastweek) if np.isfinite(v_lastweek) else np.nan
+            )
+            v_now = fm[w] if w < T else terminal
             out.loc[row_mask, pu_col] = (
                 float(v_now) if np.isfinite(v_now) else np.nan
             )
-            if w == 1:
-                out.loc[row_mask, pu_last_col] = (
-                    float(e1_known) if e1_known is not None else np.nan
-                )
-            else:
-                v_prev = fm[w - 2]
-                out.loc[row_mask, pu_last_col] = (
-                    float(v_prev) if np.isfinite(v_prev) else np.nan
-                )
     return out
 
 
@@ -1184,13 +1357,12 @@ def save_df_fit_with_perceived_utility(
     pu_last_col: str = "perceived_utility_lastweek",
     week_col: str = "week",
 ) -> pd.DataFrame:
-    """Attach filtered E_w columns to ``df_fit`` and write the result to ``out_path``.
+    """Attach exported E_w columns to ``df_fit`` and write the result to ``out_path``.
 
-    The week column is whatever ``df_fit`` carries when this is called (typically
-    after the ``vc.get(0, 0) > 2`` relabel and the ``week < 13`` filter applied at
-    the top of this module). Re-running ``perceived_utility.py`` or
-    ``2_fit_vanilla_testbed.py`` reapplies the same relabel idempotently, so the
-    saved CSV is safe as the new ``df_fit.csv`` source for the vanilla fit step.
+    Expects study weeks 1–12 in ``df_fit``. On row week=w (1..12):
+    ``perceived_utility`` = \\hat E_{w+1} (E_2..E_13 over weeks 1..12, terminal
+    E_13 on week 12 is predictive); ``perceived_utility_lastweek`` = \\hat E_w
+    (E_1..E_12 over weeks 1..12).
     """
     out = attach_filtered_Ew_to_df_fit(
         df_fit,
@@ -1210,7 +1382,7 @@ def save_df_fit_with_perceived_utility(
     return out
 
 
-def write_joint_ml_into_vanilla_json_files(
+def write_joint_penalized_into_vanilla_json_files(
     userid,
     res,
     filt: dict,
@@ -1220,15 +1392,15 @@ def write_joint_ml_into_vanilla_json_files(
     digits: int = 3,
 ) -> None:
     """
-    Write joint ML parameters, residuals, and predictions to:
+    Write joint ridge-penalized parameters, residuals, and predictions to:
 
       params_env_<id>.json
       pred_<id>.json
 
-    The files are **overwritten** with the ML-only keys (any stale vanilla keys
+    The files are **overwritten** with the penalized-fit keys (any stale vanilla keys
     or query-imputation suffix from a prior run are wiped). The downstream
     ``2_fit_vanilla_testbed.py`` then merges its vanilla keys into the same
-    JSONs while preserving the ML keys written here.
+    JSONs while preserving the penalized-fit keys written here.
     """
     wd = WORK_DIR if work_dir is None else Path(work_dir)
     wd.mkdir(parents=True, exist_ok=True)
@@ -1238,17 +1410,19 @@ def write_joint_ml_into_vanilla_json_files(
     p_env = wd / f"params_env_{uid}.json"
     p_pred = wd / f"pred_{uid}.json"
 
-    env_ml, pred_ml = ml_json_export(res, filt, blocks, digits=digits)
+    env_penalized, pred_penalized = penalized_json_export(
+        res, filt, blocks, digits=digits
+    )
 
     with open(p_env, "w", encoding="utf-8") as f:
-        json.dump(env_ml, f, allow_nan=False)
+        json.dump(env_penalized, f, allow_nan=False)
 
     with open(p_pred, "w", encoding="utf-8") as f:
-        json.dump(pred_ml, f, allow_nan=False)
+        json.dump(pred_penalized, f, allow_nan=False)
 
 
 # Indices into the perceived-utility fitted parameter vectors used for empirical-Bayes imputation.
-# These are based on theta_ml_PV, theta_ml_FW, and theta_ml_PJ.
+# These are based on theta_penalized_PV/FW/PJ.
 
 PV_QUERY_IMPUTE_IDX = np.array([0, 1, 2, 3, 4], dtype=int)
 FB_QUERY_IMPUTE_IDX = np.array([0, 1, 2, 3], dtype=int)
@@ -1280,9 +1454,9 @@ def impute_query_action_interaction_effects(
 
     This appends imputed coefficients to:
 
-      theta_ml_PV
-      theta_ml_FW
-      theta_ml_PJ
+      theta_penalized_PV
+      theta_penalized_FW
+      theta_penalized_PJ
 
     The function is idempotent: if it was previously run, it removes the previously
     appended suffix before appending a fresh imputed suffix.
@@ -1378,9 +1552,9 @@ def impute_query_action_interaction_effects(
         return np.round(sub, digits)
 
     # Use perceived-utility model keys, not old vanilla keys.
-    pv_rows = collect_rows("theta_ml_PV", PV_STAT_LEN)
-    fb_rows = collect_rows("theta_ml_FW", FB_STAT_LEN)
-    pj_rows = collect_rows("theta_ml_PJ", PJ_STAT_LEN)
+    pv_rows = collect_rows("theta_penalized_PV", PV_STAT_LEN)
+    fb_rows = collect_rows("theta_penalized_FW", FB_STAT_LEN)
+    pj_rows = collect_rows("theta_penalized_PJ", PJ_STAT_LEN)
 
     pv_s = population_sample(
         pv_rows,
@@ -1419,9 +1593,9 @@ def impute_query_action_interaction_effects(
             t_stripped, nm_stripped = _strip_imputed_suffix(t, nm)
             return t_stripped, nm_stripped
 
-        old_pv, old_pv_names = load_base("theta_ml_PV")
-        old_fb, old_fb_names = load_base("theta_ml_FW")
-        old_pj, old_pj_names = load_base("theta_ml_PJ")
+        old_pv, old_pv_names = load_base("theta_penalized_PV")
+        old_fb, old_fb_names = load_base("theta_penalized_FW")
+        old_pj, old_pj_names = load_base("theta_penalized_PJ")
 
         new_pv = pv_s[i].astype(float, copy=True)
         new_fb = fb_s[i].astype(float, copy=True)
@@ -1434,7 +1608,7 @@ def impute_query_action_interaction_effects(
         #   new_pj: 4 entries, valid indices 0..3
 
         # PV imputed suffix:
-        # [query_intercept_like, query_Ew_like, query_dow_like,
+        # [query_intercept_like, query_Ew_like, query_weekend_like,
         #  query_decision_time_like, query_recent_burden_like]
         new_pv[0] = -np.abs(new_pv[0])
         new_pv[1] = np.abs(new_pv[1])
@@ -1443,7 +1617,7 @@ def impute_query_action_interaction_effects(
         new_pv[4] = -np.abs(new_pv[4])
 
         # FW imputed suffix:
-        # [query_intercept_like, query_Ew_like, query_dow_like,
+        # [query_intercept_like, query_Ew_like, query_weekend_like,
         #  query_recent_burden_like]
         new_fb[0] = -np.abs(new_fb[0])
         new_fb[1] = np.abs(new_fb[1])
@@ -1451,55 +1625,55 @@ def impute_query_action_interaction_effects(
         new_fb[3] = -np.abs(new_fb[3])
 
         # PJ imputed suffix:
-        # [query_intercept_like, query_Ew_like, query_dow_like,
+        # [query_intercept_like, query_Ew_like, query_weekend_like,
         #  query_recent_burden_like]
         new_pj[0] = -np.abs(new_pj[0])
         new_pj[1] = np.abs(new_pj[1])
         new_pj[2] = -np.abs(new_pj[2])
         new_pj[3] = -np.abs(new_pj[3])
 
-        env_para["theta_ml_PV"] = np.round(
+        env_para["theta_penalized_PV"] = np.round(
             np.concatenate([old_pv, new_pv]),
             digits,
         ).tolist()
 
-        env_para["theta_ml_FW"] = np.round(
+        env_para["theta_penalized_FW"] = np.round(
             np.concatenate([old_fb, new_fb]),
             digits,
         ).tolist()
 
-        env_para["theta_ml_PJ"] = np.round(
+        env_para["theta_penalized_PJ"] = np.round(
             np.concatenate([old_pj, new_pj]),
             digits,
         ).tolist()
 
-        env_para["theta_ml_PV_names"] = old_pv_names + [
+        env_para["theta_penalized_PV_names"] = old_pv_names + [
             "query_imputed_intercept_like",
             "query_imputed_Ew_like",
-            "query_imputed_dow_like",
+            "query_imputed_weekend_like",
             "query_imputed_decision_time_like",
             "query_imputed_recent_burden_like",
         ]
 
-        env_para["theta_ml_FW_names"] = old_fb_names + [
+        env_para["theta_penalized_FW_names"] = old_fb_names + [
             "query_imputed_intercept_like",
             "query_imputed_Ew_like",
-            "query_imputed_dow_like",
+            "query_imputed_weekend_like",
             "query_imputed_recent_burden_like",
         ]
 
-        env_para["theta_ml_PJ_names"] = old_pj_names + [
+        env_para["theta_penalized_PJ_names"] = old_pj_names + [
             "query_imputed_intercept_like",
             "query_imputed_Ew_like",
-            "query_imputed_dow_like",
+            "query_imputed_weekend_like",
             "query_imputed_recent_burden_like",
         ]
 
         # Sanity-check that array lengths line up with the names arrays.
         for key, expected_k in (
-            ("theta_ml_PV", PV_IMPUTE_K),
-            ("theta_ml_FW", FB_IMPUTE_K),
-            ("theta_ml_PJ", PJ_IMPUTE_K),
+            ("theta_penalized_PV", PV_IMPUTE_K),
+            ("theta_penalized_FW", FB_IMPUTE_K),
+            ("theta_penalized_PJ", PJ_IMPUTE_K),
         ):
             arr_len = len(env_para[key])
             nm_len = len(env_para[f"{key}_names"])
@@ -1510,13 +1684,47 @@ def impute_query_action_interaction_effects(
                     f"(expected suffix k={expected_k})."
                 )
 
-        meta_root["theta_ml_PV"] = {"k": PV_IMPUTE_K}
-        meta_root["theta_ml_FW"] = {"k": FB_IMPUTE_K}
-        meta_root["theta_ml_PJ"] = {"k": PJ_IMPUTE_K}
+        meta_root["theta_penalized_PV"] = {"k": PV_IMPUTE_K}
+        meta_root["theta_penalized_FW"] = {"k": FB_IMPUTE_K}
+        meta_root["theta_penalized_PJ"] = {"k": PJ_IMPUTE_K}
         env_para[_META_KEY] = meta_root
 
         with open(p_env, "w", encoding="utf-8") as f:
             json.dump(env_para, f, allow_nan=False)
+
+
+def _terminal_predicted_mean(
+    grid: np.ndarray,
+    weights: np.ndarray,
+    blocks: list,
+    p_list: list[np.ndarray],
+    par: dict,
+) -> float:
+    """One-step-ahead predictive mean E_{T+1} after the final filtered state."""
+    if not blocks or not p_list:
+        return float("nan")
+    q, _ = _predict_density_log(
+        grid,
+        weights,
+        p_list[-1],
+        blocks[-1],
+        par,
+    )
+    return float(np.sum(grid * q * weights))
+
+
+def build_exported_Ew_series(filt: dict) -> np.ndarray:
+    """Build E_2,...,E_{T+1} for export (filtered through E_T, terminal predictive)."""
+    fm = np.asarray(filt.get("filtered_means", []), dtype=float)
+    terminal = float(filt.get("terminal_predicted_mean", np.nan))
+    if fm.size < 2:
+        if np.isfinite(terminal):
+            return np.array([terminal], dtype=float)
+        return np.empty(0, dtype=float)
+    out = np.empty(fm.size, dtype=float)
+    out[:-1] = fm[1:]
+    out[-1] = terminal
+    return out
 
 
 def transition_matrix(grid, prev_block, par):
@@ -1543,20 +1751,27 @@ def quadrature_loglik(
     hat c_w = sum_k ell_w(e_k) hat q_w(e_k) omega_k; log L ~= sum_w log hat c_w
     (with w=1 either ell_1(E_1) at a point or integrated against a prior on E_1).
 
-    If e1_known is float: first term is log p(Y_1|E_1=e1); hat q_2 is the Gaussian
-    transition from E_1. If None: week 1 uses prior N(m0,sigma0^2) on E_1.
+    If e1_known is float: E_1 is the fixed baseline (week-1 start / lastweek);
+    first term is log p(Y_1|E_1=e1) and hat q_2 transitions from that baseline
+    to E_2 (end of week 1 / start of week 2). If None: week 1 uses prior
+    N(m0,sigma0^2) on E_1.
     """
     e1_fixed = e1_known is not None
     par = unpack_theta(theta, e1_known=e1_fixed)
     grid = np.asarray(grid, dtype=float)
     weights = np.asarray(weights, dtype=float)
+    validate_quadrature_support(grid, weights, e1_known=e1_known)
     T = len(blocks)
+    if T == 0:
+        raise ValueError("At least one weekly block is required.")
 
     q_list = []
     p_list = []
-    c_list = []
+    log_c_list = []
     pred_mean = np.empty(T)
     filt_mean = np.empty(T)
+    predictive_grid_mass = np.full(T, np.nan)
+    filtered_boundary_mass = np.full(T, np.nan)
     loglik = 0.0
 
     if e1_fixed:
@@ -1565,18 +1780,26 @@ def quadrature_loglik(
         if not np.isfinite(log_ell1):
             raise FloatingPointError("invalid week-1 log-likelihood at fixed E_1")
         loglik += log_ell1
-        c_list.append(float(np.exp(log_ell1)))
+        log_c_list.append(float(log_ell1))
         pred_mean[0] = np.nan
         filt_mean[0] = e1
 
         if T == 1:
+            log_increments = np.asarray(log_c_list, dtype=float)
+            terminal_predicted_mean = _terminal_predicted_mean(
+                grid, weights, blocks, p_list, par
+            )
             return {
                 "loglik": float(loglik),
                 "predicted_densities": np.zeros((0, len(grid))),
                 "filtered_densities": np.zeros((0, len(grid))),
-                "increments": np.asarray(c_list),
+                "increments": np.exp(np.clip(log_increments, -745.0, 709.0)),
+                "log_increments": log_increments,
                 "predicted_means": pred_mean,
                 "filtered_means": filt_mean,
+                "terminal_predicted_mean": terminal_predicted_mean,
+                "predictive_grid_mass": predictive_grid_mass,
+                "filtered_boundary_mass": filtered_boundary_mass,
                 "params": par,
                 "e1_known": e1_known,
             }
@@ -1590,11 +1813,12 @@ def quadrature_loglik(
             + par["a3"] * blocks[0]["FW_sum_trans"]
             + par["a4"] * blocks[0]["PJ_sum_trans"]
         )
-        q = normal_pdf(grid, mu2, par["sigma_E"])
-        denq = np.sum(q * weights)
-        if denq <= 0 or not np.isfinite(denq):
-            raise FloatingPointError("invalid predictive density for E_2")
-        q /= denq
+        q, log_grid_mass = _normalize_log_density(
+            normal_logpdf(grid, mu2, par["sigma_E"]),
+            weights,
+            label="predictive E_2",
+        )
+        predictive_grid_mass[1] = np.exp(log_grid_mass)
 
         for t in range(1, T):
             q_list.append(q.copy())
@@ -1604,26 +1828,37 @@ def quadrature_loglik(
             m = np.max(log_ell)
             num = np.exp(log_ell - m) * q
             den = np.sum(num * weights)
-            c = np.exp(m) * den
-            if (not np.isfinite(c)) or (c <= 0):
+            if (not np.isfinite(den)) or (den <= 0):
                 raise FloatingPointError(f"invalid c_{t+1}")
+            log_c = float(m + np.log(den))
+            if not np.isfinite(log_c):
+                raise FloatingPointError(f"invalid log c_{t+1}")
 
             p = num / den
             p_list.append(p.copy())
-            c_list.append(c)
+            log_c_list.append(log_c)
             filt_mean[t] = np.sum(grid * p * weights)
-            loglik += np.log(c)
+            filtered_boundary_mass[t] = np.sum(
+                p[[0, -1]] * weights[[0, -1]]
+            )
+            loglik += log_c
 
             if t < T - 1:
-                F = transition_matrix(grid, blocks[t], par)
-                q = F @ (p * weights)
-                denq = np.sum(q * weights)
-                if denq <= 0 or not np.isfinite(denq):
-                    raise FloatingPointError(f"invalid predictive density week {t+2}")
-                q /= denq
+                q, log_grid_mass = _predict_density_log(
+                    grid,
+                    weights,
+                    p,
+                    blocks[t],
+                    par,
+                )
+                predictive_grid_mass[t + 1] = np.exp(log_grid_mass)
     else:
-        q = normal_pdf(grid, par["m0"], par["sigma0"])
-        q /= np.sum(q * weights)
+        q, log_grid_mass = _normalize_log_density(
+            normal_logpdf(grid, par["m0"], par["sigma0"]),
+            weights,
+            label="E_1 prior",
+        )
+        predictive_grid_mass[0] = np.exp(log_grid_mass)
         for t in range(T):
             q_list.append(q.copy())
             pred_mean[t] = np.sum(grid * q * weights)
@@ -1632,31 +1867,48 @@ def quadrature_loglik(
             m = np.max(log_ell)
             num = np.exp(log_ell - m) * q
             den = np.sum(num * weights)
-            c = np.exp(m) * den
-            if (not np.isfinite(c)) or (c <= 0):
+            if (not np.isfinite(den)) or (den <= 0):
                 raise FloatingPointError(f"invalid c_{t+1}")
+            log_c = float(m + np.log(den))
+            if not np.isfinite(log_c):
+                raise FloatingPointError(f"invalid log c_{t+1}")
 
             p = num / den
             p_list.append(p.copy())
-            c_list.append(c)
+            log_c_list.append(log_c)
             filt_mean[t] = np.sum(grid * p * weights)
-            loglik += np.log(c)
+            filtered_boundary_mass[t] = np.sum(
+                p[[0, -1]] * weights[[0, -1]]
+            )
+            loglik += log_c
 
             if t < T - 1:
-                F = transition_matrix(grid, blocks[t], par)
-                q = F @ (p * weights)
-                denq = np.sum(q * weights)
-                if denq <= 0 or not np.isfinite(denq):
-                    raise FloatingPointError(f"invalid predictive density week {t+2}")
-                q /= denq
+                q, log_grid_mass = _predict_density_log(
+                    grid,
+                    weights,
+                    p,
+                    blocks[t],
+                    par,
+                )
+                predictive_grid_mass[t + 1] = np.exp(log_grid_mass)
 
+    log_increments = np.asarray(log_c_list, dtype=float)
+    terminal_predicted_mean = _terminal_predicted_mean(
+        grid, weights, blocks, p_list, par
+    )
     return {
         "loglik": float(loglik),
         "predicted_densities": np.vstack(q_list),
         "filtered_densities": np.vstack(p_list),
-        "increments": np.asarray(c_list),
+        # ``increments`` is retained for compatibility; use log_increments for
+        # calculations because the probability-scale values may underflow.
+        "increments": np.exp(np.clip(log_increments, -745.0, 709.0)),
+        "log_increments": log_increments,
         "predicted_means": pred_mean,
         "filtered_means": filt_mean,
+        "terminal_predicted_mean": terminal_predicted_mean,
+        "predictive_grid_mass": predictive_grid_mass,
+        "filtered_boundary_mass": filtered_boundary_mass,
         "params": par,
         "e1_known": e1_known,
     }
@@ -1698,6 +1950,109 @@ def neg_loglik_all_users(theta, user_blocks, grid, weights, e1_known, lam=1e-2):
     penalty = lam * np.sum(theta ** 2)
     return total_nll + penalty
 
+
+class _PooledFitProgress:
+    """Track and print pooled L-BFGS-B progress (objective is very expensive)."""
+
+    def __init__(
+        self,
+        user_blocks,
+        grid,
+        weights,
+        e1_known,
+        lam,
+        *,
+        e1_fixed: bool,
+        log_every_evals: int = 5,
+        min_log_interval_s: float = 15.0,
+    ):
+        self._args = (user_blocks, grid, weights, e1_known, lam)
+        self._e1_fixed = e1_fixed
+        self._log_every_evals = max(1, int(log_every_evals))
+        self._min_log_interval_s = float(min_log_interval_s)
+        self.n_eval = 0
+        self.n_iter = 0
+        self.t0 = time.perf_counter()
+        self._last_log_t = self.t0
+        self.last_nll = float("inf")
+        self.best_nll = float("inf")
+        self.best_theta: Optional[np.ndarray] = None
+
+    def objective(self, theta: np.ndarray) -> float:
+        self.n_eval += 1
+        nll = neg_loglik_all_users(theta, *self._args)
+        self.last_nll = float(nll)
+        if nll < self.best_nll:
+            self.best_nll = nll
+            self.best_theta = np.asarray(theta, dtype=float).copy()
+
+        now = time.perf_counter()
+        should_log = (
+            self.n_eval == 1
+            or self.n_eval % self._log_every_evals == 0
+            or (now - self._last_log_t) >= self._min_log_interval_s
+        )
+        if should_log:
+            self._log(theta, nll, now, kind="eval")
+            self._last_log_t = now
+        return nll
+
+    def callback(self, theta: np.ndarray) -> bool:
+        self.n_iter += 1
+        now = time.perf_counter()
+        self._log(theta, self.last_nll, now, kind="iter")
+        self._last_log_t = now
+        return False
+
+    def _log(self, theta: np.ndarray, nll: float, now: float, *, kind: str) -> None:
+        elapsed = now - self.t0
+        par = unpack_theta(theta, e1_known=self._e1_fixed)
+        if kind == "eval":
+            prefix = f"pooled eval {self.n_eval:4d}"
+        else:
+            prefix = f"pooled iter {self.n_iter:3d} (eval {self.n_eval:4d})"
+        logger.info(
+            "%s | elapsed %5.1fs | nll=%.4f | best=%.4f | "
+            "a0=%.3g a1=%.3g sigE=%.3g b1=%.3g alpha1=%.3g beta1=%.3g",
+            prefix,
+            elapsed,
+            nll,
+            self.best_nll,
+            par["a0"],
+            par["a1"],
+            par["sigma_E"],
+            par["b1"],
+            par["alpha1"],
+            par["beta1"],
+        )
+
+    def finish(self) -> None:
+        elapsed = time.perf_counter() - self.t0
+        logger.info(
+            "Pooled optimization finished in %.1fs (%d func evals, %d iterations, best nll=%.4f)",
+            elapsed,
+            self.n_eval,
+            self.n_iter,
+            self.best_nll,
+        )
+
+
+def _summarize_pooled_workload(user_blocks, grid) -> dict:
+    n_users = len(user_blocks)
+    n_weeks = sum(len(blocks) for blocks in user_blocks.values())
+    n_pv_rows = sum(
+        len(b["pv_y"])
+        for blocks in user_blocks.values()
+        for b in blocks
+    )
+    return {
+        "n_users": n_users,
+        "n_weeks": n_weeks,
+        "n_pv_rows": n_pv_rows,
+        "grid_size": len(grid),
+    }
+
+
 def make_bounds(*, e1_known: bool):
     bounds = [(None, None)] * theta_dim(e1_known=e1_known)
 
@@ -1720,7 +2075,7 @@ def fit_pooled_model(
     grid=None,
     *,
     e1_known: Optional[float] = None,
-    maxiter=1000,
+    maxiter=500,
     week_col="week",
     date_col="Date",
     decision_col="DecisionTime",
@@ -1730,7 +2085,7 @@ def fit_pooled_model(
     FW_col="nextday_wearing",
     PJ_col="daily_present",
     a_col="WalkingSuggestion",
-    dow_col="dow_norm",
+    weekend_col="is_weekend",
     burden_col="recent_burden_norm",
     PV_col="HourlyPageviewCount_norm",
     PV_lag1_col="hourly_pageview_count_lag1",
@@ -1738,11 +2093,16 @@ def fit_pooled_model(
     PJ_lag_col="daily_present_yesterday",
     hourly_pv=True,
     lam: float = 1e-2,
+    progress: bool = True,
+    progress_every_evals: int = 5,
+    progress_min_interval_s: float = 15.0,
 ):
     if grid is None:
-        grid = np.linspace(-2.0, 2.0, 121)
+        grid = np.linspace(-3.0, 3.0, 121)
 
+    e1_fixed = e1_known is not None
     weights = trapezoid_weights(grid)
+    validate_quadrature_support(grid, weights, e1_known=e1_known)
     user_blocks = prepare_all_user_blocks(
         df_fit,
         week_col=week_col,
@@ -1754,7 +2114,7 @@ def fit_pooled_model(
         FW_col=FW_col,
         PJ_col=PJ_col,
         a_col=a_col,
-        dow_col=dow_col,
+        weekend_col=weekend_col,
         burden_col=burden_col,
         PV_col=PV_col,
         PV_lag1_col=PV_lag1_col,
@@ -1768,14 +2128,58 @@ def fit_pooled_model(
     for blocks in user_blocks.values():
         all_blocks.extend(blocks)
 
-    x0 = initial_theta_from_blocks(all_blocks, e1_known=(e1_known is not None))
+    x0 = initial_theta_from_blocks(all_blocks, e1_known=e1_fixed)
 
+    workload = _summarize_pooled_workload(user_blocks, grid)
+    theta_d = theta_dim(e1_known=e1_fixed)
+    logger.info(
+        "Starting pooled fit: users=%d, participant-weeks=%d, hourly-PV rows=%d, "
+        "grid=%d points, theta dim=%d, maxiter=%d",
+        workload["n_users"],
+        workload["n_weeks"],
+        workload["n_pv_rows"],
+        workload["grid_size"],
+        theta_d,
+        maxiter,
+    )
+    logger.info(
+        "Why this stage is slow: each optimizer evaluation runs a 12-week "
+        "quadrature filter for all %d users (~%d grid-point updates per user-week, "
+        "plus hourly PV / daily FW-PJ likelihoods). L-BFGS-B has no analytic "
+        "gradient here, so SciPy uses finite differences (~%d+ extra evals per "
+        "iteration). Expect many minutes before the first iteration line appears "
+        "if logging is sparse.",
+        workload["n_users"],
+        workload["grid_size"],
+        theta_d,
+    )
+
+    if progress:
+        tracker = _PooledFitProgress(
+            user_blocks,
+            grid,
+            weights,
+            e1_known,
+            lam,
+            e1_fixed=e1_fixed,
+            log_every_evals=progress_every_evals,
+            min_log_interval_s=progress_min_interval_s,
+        )
+        objective = tracker.objective
+        callback = tracker.callback
+    else:
+        tracker = None
+        objective = neg_loglik_all_users
+        callback = None
+
+    logger.info("Pooled fit: beginning L-BFGS-B (first eval starting now)...")
     res = minimize(
-        neg_loglik_all_users,
+        objective,
         x0,
-        args=(user_blocks, grid, weights, e1_known, lam),
+        args=(user_blocks, grid, weights, e1_known, lam) if not progress else (),
         method="L-BFGS-B",
-        bounds=make_bounds(e1_known=(e1_known is not None)),
+        bounds=make_bounds(e1_known=e1_fixed),
+        callback=callback,
         options={
             "maxiter": maxiter,
             "maxfun": 1_500_000,
@@ -1784,10 +2188,21 @@ def fit_pooled_model(
             "gtol": 1e-4,
         },
     )
+    if tracker is not None:
+        tracker.finish()
 
     print(
         f"Pooled fit: success={res.success}, "
         f"nll={res.fun:.4f}, nit={res.nit}, message={res.message}"
+    )
+
+    pooled_theta = np.asarray(res.x, dtype=float).copy()
+    log_pooled_theta(
+        pooled_theta,
+        e1_known=e1_fixed,
+        nll=float(res.fun),
+        success=bool(res.success),
+        nit=int(res.nit),
     )
 
     return res, user_blocks
@@ -1797,7 +2212,7 @@ def fit_one_user(
     grid,
     *,
     e1_known: Optional[float] = None,
-    maxiter=500,
+    maxiter=1000,
     week_col="week",
     date_col="Date",
     decision_col="DecisionTime",
@@ -1807,7 +2222,7 @@ def fit_one_user(
     FW_col="nextday_wearing",
     PJ_col="daily_present",
     a_col="WalkingSuggestion",
-    dow_col="dow_norm",
+    weekend_col="is_weekend",
     burden_col="recent_burden_norm",
     PV_col="HourlyPageviewCount_norm",
     PV_lag1_col="hourly_pageview_count_lag1",
@@ -1828,7 +2243,7 @@ def fit_one_user(
         FW_col=FW_col,
         PJ_col=PJ_col,
         a_col=a_col,
-        dow_col=dow_col,
+        weekend_col=weekend_col,
         burden_col=burden_col,
         PV_col=PV_col,
         PV_lag1_col=PV_lag1_col,
@@ -1839,6 +2254,7 @@ def fit_one_user(
         missing_week_mode="mean_impute_transition",
     )
     weights = trapezoid_weights(grid)
+    validate_quadrature_support(grid, weights, e1_known=e1_known)
     e1_fixed = e1_known is not None
 
     if x0 is None:
@@ -1861,7 +2277,33 @@ def fit_one_user(
         }
     )
     filt = quadrature_loglik(blocks, res.x, grid, weights, e1_known=e1_known)
+    filt["ridge_lambda"] = float(lam)
+
+    retained = np.asarray(filt.get("predictive_grid_mass", []), dtype=float)
+    retained = retained[np.isfinite(retained)]
+    boundary = np.asarray(filt.get("filtered_boundary_mass", []), dtype=float)
+    boundary = boundary[np.isfinite(boundary)]
+    if retained.size and np.min(retained) < 0.99:
+        warnings.warn(
+            f"Participant grid retained as little as {np.min(retained):.3%} "
+            "of predictive transition mass; widen the E grid.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if boundary.size and np.max(boundary) > 0.05:
+        warnings.warn(
+            f"Participant filtered boundary mass reached {np.max(boundary):.3%}; "
+            "the E grid may be too narrow.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return res, filt, blocks
+
+
+def _fit_one_user_task(uid, dat_user, grid, fit_kwargs):
+    """Pickle-friendly process-pool wrapper for one participant fit."""
+    res, filt, blocks = fit_one_user(dat_user, grid=grid, **fit_kwargs)
+    return uid, res, filt, blocks
 
 
 def fit_all_users(
@@ -1879,7 +2321,7 @@ def fit_all_users(
     FW_col="nextday_wearing",
     PJ_col="daily_present",
     a_col="WalkingSuggestion",
-    dow_col="dow_norm",
+    weekend_col="is_weekend",
     burden_col="recent_burden_norm",
     PV_col="HourlyPageviewCount_norm",
     PV_lag1_col="hourly_pageview_count_lag1",
@@ -1891,40 +2333,53 @@ def fit_all_users(
     merge_into_vanilla_json: bool = False,
     vanilla_work_dir: Optional[Path] = None,
     json_digits: int = 3,
+    n_jobs: Optional[int] = None,
 ):
     if grid is None:
-        grid = np.linspace(-2.0, 2.0, 241)
+        grid = np.linspace(-3.0, 3.0, 241)
 
+    user_data = [
+        (
+            uid,
+            g.sort_values(
+                ["week", "Date", "DecisionTime"], na_position="last"
+            ).reset_index(drop=True),
+        )
+        for uid, g in df_fit.groupby("ParticipantIdentifier")
+    ]
+    if n_jobs is None:
+        available_cpus = max(1, (os.cpu_count() or 2) - 1)
+        n_jobs = min(8, available_cpus, len(user_data))
+    if n_jobs < 1:
+        raise ValueError("n_jobs must be at least 1.")
+
+    fit_kwargs = {
+        "e1_known": e1_known,
+        "maxiter": maxiter,
+        "week_col": week_col,
+        "date_col": date_col,
+        "decision_col": decision_col,
+        "J_col": J_col,
+        "U1_col": U1_col,
+        "U2_col": U2_col,
+        "FW_col": FW_col,
+        "PJ_col": PJ_col,
+        "a_col": a_col,
+        "weekend_col": weekend_col,
+        "burden_col": burden_col,
+        "PV_col": PV_col,
+        "PV_lag1_col": PV_lag1_col,
+        "FW_lag_col": FW_lag_col,
+        "PJ_lag_col": PJ_lag_col,
+        "hourly_pv": hourly_pv,
+        "x0": pooled_x0,
+        "lam": lam,
+    }
     results = {}
     filtered_states = {}
     blocks_by_user = {}
 
-    for uid, g in df_fit.groupby("ParticipantIdentifier"):
-        g = g.sort_values(["week", "Date", "DecisionTime"], na_position="last").reset_index(drop=True)
-        res, filt, blocks = fit_one_user(
-            g,
-            grid=grid,
-            e1_known=e1_known,
-            maxiter=maxiter,
-            week_col=week_col,
-            date_col=date_col,
-            decision_col=decision_col,
-            J_col=J_col,
-            U1_col=U1_col,
-            U2_col=U2_col,
-            FW_col=FW_col,
-            PJ_col=PJ_col,
-            a_col=a_col,
-            dow_col=dow_col,
-            burden_col=burden_col,
-            PV_col=PV_col,
-            PV_lag1_col=PV_lag1_col,
-            FW_lag_col=FW_lag_col,
-            PJ_lag_col=PJ_lag_col,
-            hourly_pv=hourly_pv,
-            x0=pooled_x0,
-            lam=lam,
-        )
+    def record_fit(uid, res, filt, blocks):
         results[uid] = res
         filtered_states[uid] = filt
         blocks_by_user[uid] = blocks
@@ -1935,7 +2390,7 @@ def fit_all_users(
 
         if merge_into_vanilla_json:
             try:
-                write_joint_ml_into_vanilla_json_files(
+                write_joint_penalized_into_vanilla_json_files(
                     uid,
                     res,
                     filt,
@@ -1944,7 +2399,25 @@ def fit_all_users(
                     digits=json_digits,
                 )
             except Exception as exc:
-                print(f"Participant {uid}: could not merge ML into vanilla JSON: {exc}")
+                print(
+                    f"Participant {uid}: could not merge penalized fit into "
+                    f"vanilla JSON: {exc}"
+                )
+
+    print(f"Fitting {len(user_data)} participants with {n_jobs} worker process(es).")
+    if n_jobs == 1:
+        for uid, g in user_data:
+            record_fit(*_fit_one_user_task(uid, g, grid, fit_kwargs))
+    else:
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            futures = {
+                executor.submit(
+                    _fit_one_user_task, uid, g, grid, fit_kwargs
+                ): uid
+                for uid, g in user_data
+            }
+            for future in as_completed(futures):
+                record_fit(*future.result())
 
     return results, filtered_states, blocks_by_user
 
@@ -1960,7 +2433,7 @@ def prepare_all_user_blocks(
     FW_col="nextday_wearing",
     PJ_col="daily_present",
     a_col="WalkingSuggestion",
-    dow_col="dow_norm",
+    weekend_col="is_weekend",
     burden_col="recent_burden_norm",
     PV_col="HourlyPageviewCount_norm",
     PV_lag1_col="hourly_pageview_count_lag1",
@@ -1982,7 +2455,7 @@ def prepare_all_user_blocks(
             FW_col=FW_col,
             PJ_col=PJ_col,
             a_col=a_col,
-            dow_col=dow_col,
+            weekend_col=weekend_col,
             burden_col=burden_col,
             PV_col=PV_col,
             PV_lag1_col=PV_lag1_col,
@@ -2045,13 +2518,16 @@ def plot_quadrature_diagnostics(
         r, c = divmod(idx, _n_cols)
         ax = axes_ew[r][c]
         ax.set_visible(True)
-        pu = filtered_states[uid]["filtered_means"]
-        w = np.arange(len(pu))
+        pu = build_exported_Ew_series(filtered_states[uid])
+        w = np.arange(1, 1 + len(pu))
         ax.plot(w, pu, marker="o", ms=2, lw=1)
         ax.set_title(f"Participant {uid}", fontsize=9)
         ax.set_xlabel(r"$w$", fontsize=8)
         ax.set_ylabel(r"$E_w$", fontsize=8)
-    fig_ew.suptitle(r"Filtered mean $E_w$ (quadrature posterior mean on grid)", fontsize=11)
+    fig_ew.suptitle(
+        r"Exported $\hat E_{w+1}$ by study week $w$=1..12 (filtered; last point predictive $E_{13}$)",
+        fontsize=11,
+    )
     fig_ew.tight_layout()
     _maybe_save_close(fig_ew, "Ew_filtered_mean_by_user.png")
 
@@ -2170,7 +2646,7 @@ def plot_quadrature_diagnostics(
     _pv_specs = [
         (r"$\alpha_0$", lambda p: p["alpha0"]),
         (r"$\alpha_1$ ($E_w$)", lambda p: p["alpha1"]),
-        (r"$\alpha_{2,\mathrm{dow}}$", lambda p: p["alpha2_dow"]),
+        (r"$\alpha_{2,\mathrm{we}}$", lambda p: p["alpha2_is_weekend"]),
         (r"$\alpha_{2,\mathrm{dt}}$", lambda p: p["alpha2_dt"]),
         (r"$\alpha_{2,\mathrm{rb}}$", lambda p: p["alpha2_rb"]),
         (
@@ -2190,7 +2666,7 @@ def plot_quadrature_diagnostics(
     fig_pv.tight_layout()
     _maybe_save_close(fig_pv, "params_group_pv.png")
 
-    # --- FW / PJ: intercept, E_w, dow, burden, AR(1) within week ---
+    # --- FW / PJ: intercept, E_w, is_weekend, burden, AR(1) within week ---
     fig_ft, axes_ft = plt.subplots(2, 5, figsize=(16, 6.0), squeeze=False)
     _bar_users_one_series(
         axes_ft[0][0],
@@ -2207,8 +2683,8 @@ def plot_quadrature_diagnostics(
     _bar_users_one_series(
         axes_ft[0][2],
         "Estimate",
-        r"$\beta_{2,\mathrm{dow}}$ (FW)",
-        [float(filtered_states[u]["params"]["beta2_dow"]) for u in _users],
+        r"$\beta_{2,\mathrm{we}}$ (FW)",
+        [float(filtered_states[u]["params"]["beta2_is_weekend"]) for u in _users],
     )
     _bar_users_one_series(
         axes_ft[0][3],
@@ -2237,8 +2713,8 @@ def plot_quadrature_diagnostics(
     _bar_users_one_series(
         axes_ft[1][2],
         "Estimate",
-        r"$\theta_{2,\mathrm{dow}}$ (PJ)",
-        [float(filtered_states[u]["params"]["theta2_dow"]) for u in _users],
+        r"$\theta_{2,\mathrm{we}}$ (PJ)",
+        [float(filtered_states[u]["params"]["theta2_is_weekend"]) for u in _users],
     )
     _bar_users_one_series(
         axes_ft[1][3],
@@ -2253,7 +2729,7 @@ def plot_quadrature_diagnostics(
         [float(filtered_states[u]["params"]["theta_ar1"]) for u in _users],
     )
     fig_ft.suptitle(
-        r"Daily FW / PJ logits — intercept, $E_w$, dow, burden, lag covariates",
+        r"Daily FW / PJ logits — intercept, $E_w$, is_weekend, burden, lag covariates",
         fontsize=11,
         y=1.02,
     )
@@ -2269,16 +2745,22 @@ def plot_quadrature_diagnostics(
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
     # Stage 1: pooled fit on a coarser grid
     pooled_res, pooled_blocks = fit_pooled_model(
         df_fit,
-        grid=np.linspace(-4.5, 4.5, 121),
+        grid=np.linspace(-3.0, 3.0, 121),
         e1_known=2.0,
-        maxiter=2000,
+        maxiter=500,
         lam=1e-2,
     )
 
-    pooled_x0 = pooled_res.x.copy()
+    pooled_theta = pooled_res.x.copy()
+    pooled_x0 = pooled_theta.copy()
 
     print("pooled success:", pooled_res.success)
     print("pooled message:", pooled_res.message)
@@ -2299,14 +2781,15 @@ if __name__ == "__main__":
     _e1_known = 2.0
     results, filtered_states, blocks_by_user = fit_all_users(
         df_fit,
-        grid=np.linspace(-4.5, 4.5, 241),
+        grid=np.linspace(-3.0, 3.0, 241),
         e1_known=_e1_known,
-        maxiter=2000,
+        maxiter=500,
         pooled_x0=pooled_x0,
         lam=1e-2,
         merge_into_vanilla_json=True,
         vanilla_work_dir=WORK_DIR,
         json_digits=3,
+        n_jobs=None,
     )
 
     # Write filtered E_w (perceived utility) back to df_fit.csv so that
@@ -2318,7 +2801,7 @@ if __name__ == "__main__":
         e1_known=_e1_known,
     )
 
-    _diag_dir = WORK_DIR / "plots_ml_perceived_utility"
+    _diag_dir = WORK_DIR / "plots_penalized_perceived_utility"
     plot_quadrature_diagnostics(
         results,
         filtered_states,

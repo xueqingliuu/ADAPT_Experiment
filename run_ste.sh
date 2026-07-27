@@ -4,13 +4,13 @@
 #SBATCH -c 4
 #SBATCH -t 2-00:00:00
 #SBATCH --mem=32GB
-#SBATCH --array=0-13
+#SBATCH --array=0-30
 #SBATCH -o logs/ste_%A_%a.out
 #SBATCH -e logs/ste_%A_%a.err
 
-# Population STE for the vanilla testbed (ste_vanilla.py).
+# Average user STE for the vanilla testbed (ste_vanilla.py).
 #
-# Single submission (train + eval for all 14 types, then STE_pop):
+# Single submission (train + eval for all 31 participants, then average user STE):
 #   mkdir -p logs
 #   sbatch run_ste.sh
 #
@@ -51,6 +51,13 @@ echo "STE_N_TRAIN=${STE_N_TRAIN}  STE_N_EVAL=${STE_N_EVAL}  STE_N_STEPS=${STE_N_
 
 test -f "${USER_IDS}"
 test -f ste_vanilla.py
+
+NUM_USERS=$(wc -l < "${USER_IDS}")
+if [[ -n "${SLURM_ARRAY_TASK_COUNT:-}" && "${SLURM_ARRAY_TASK_COUNT}" != "${NUM_USERS}" ]]; then
+  echo "ERROR: SLURM array has ${SLURM_ARRAY_TASK_COUNT} tasks but ${USER_IDS} has ${NUM_USERS} rows." >&2
+  echo "Update #SBATCH --array=0-$((NUM_USERS - 1)) in this script to match." >&2
+  exit 1
+fi
 
 COMMON_ARGS=(
   --exp "${STE_EXP}"
@@ -102,7 +109,7 @@ case "${STE_PHASE}" in
     ;;
   train|eval|all)
     if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-      echo "ERROR: STE_PHASE=${STE_PHASE} requires a SLURM array task id (0-13)." >&2
+      echo "ERROR: STE_PHASE=${STE_PHASE} requires a SLURM array task id (0-$((NUM_USERS - 1)))." >&2
       echo "Submit with: sbatch run_ste.sh" >&2
       exit 1
     fi

@@ -625,20 +625,21 @@ def weekly_pv_sum_for_ew(slot_pv, *, shift=None, scale=None):
     """
     v = np.asarray(slot_pv, dtype=float).ravel()
     if v.size == 0:
-        return float("nan")
+        return 0.0
     if shift is not None and scale is not None:
         v = np.where(np.isfinite(v), v, 0.0)
         logged = np.log(v + 1.0)
         v = (logged - float(shift)) / float(scale)
     if not np.any(np.isfinite(v)):
-        return float("nan")
+        return 0.0
     return float(np.nansum(v) / 14.0)
 
 
 def apply_pooled_coefs(coefs, J_w, half_J_tool8, PV_sum, FW_sum, PJ_sum):
     """Apply the pooled linear approximation for agent-visible E_w."""
     return float(
-        coefs["J_w"] * float(J_w)
+        float(coefs.get("intercept", 0.0))
+        + coefs["J_w"] * float(J_w)
         + coefs["half_J_tool8"] * float(half_J_tool8)
         + coefs["PV_sum"] * float(PV_sum)
         + coefs["FW_sum"] * float(FW_sum)
@@ -1258,8 +1259,8 @@ def _cumulative_discount(gamma_dt):
 try:
     from vani_env import P_FOURSC, P_ANTIC, make_initial_state
 except ImportError:  # pragma: no cover
-    P_FOURSC = 30
-    P_ANTIC = 19
+    P_FOURSC = 29
+    P_ANTIC = 18
 
     def make_initial_state(participant_id=118):  # type: ignore[misc]
         raise ImportError("vani_env required for make_initial_state")
@@ -1270,13 +1271,12 @@ def build_fourSC_features(
     yesterdayStepCount,
     stepCountLast7DaysEma,
     prior2HourStepCount,
-    activityCompletedLast7Days,
     activitySuggestionsSentLast7Days,
     morningFitbitWearLast7Days,
     salienceMessageSentYesterday,
     activitySuggestionInteractLast7Days,
     activeDaysLast7Days,
-    dayOfWeekNorm,
+    isWeekend,
     decisionTimeSlot,
     perceivedUtility,
     caeAverageLastWeek,
@@ -1298,23 +1298,23 @@ def build_fourSC_features(
     _pu = float(perceivedUtility) if pu is None else float(pu)
     _cae = float(caeAverageLastWeek) if cae is None else float(cae)
     wear7 = float(morningFitbitWearLast7Days)
-    dayOfWeekNorm_n = float(dayOfWeekNorm)
+    is_weekend = float(isWeekend)
     Ah = float(Ah)
     return np.array([
         1.0, float(yesterdayStepCount), float(stepCountLast7DaysEma),
-        float(prior2HourStepCount), float(activityCompletedLast7Days),
+        float(prior2HourStepCount),
         float(activitySuggestionsSentLast7Days),
         wear7,
         float(salienceMessageSentYesterday),
         float(activitySuggestionInteractLast7Days),
         float(activeDaysLast7Days),
-        dayOfWeekNorm_n, float(decisionTimeSlot), _pu, _cae,
+        is_weekend, float(decisionTimeSlot), _pu, _cae,
         Ah,
         Ah * float(yesterdayStepCount), Ah * float(prior2HourStepCount),
         Ah * float(activitySuggestionsSentLast7Days),
         Ah * wear7, Ah * float(salienceMessageSentYesterday),
         Ah * float(activitySuggestionInteractLast7Days),
-        Ah * dayOfWeekNorm_n, Ah * float(decisionTimeSlot), Ah * _pu, Ah * _cae,
+        Ah * is_weekend, Ah * float(decisionTimeSlot), Ah * _pu, Ah * _cae,
     ], dtype=float)
 
 
@@ -1323,17 +1323,15 @@ def build_rl_context_vector(
     yesterdayStepCount,
     stepCountLast7DaysEma,
     prior2HourStepCountAgent,
-    activityCompletedLast7Days,
     activeDaysLast7Days,
     activitySuggestionsSentLast7Days,
     salienceMessageSentYesterday,
     activitySuggestionInteractLast7Days,
 ):
-    """Per-decision context ``C`` for RLSVI (length 9; salience 7d interact fixed at 0)."""
+    """Per-decision context ``C`` for RLSVI (length 8; salience 7d interact fixed at 0)."""
     return np.array([
         float(yesterdayStepCount), float(stepCountLast7DaysEma),
-        float(prior2HourStepCountAgent), float(activityCompletedLast7Days),
-        float(activeDaysLast7Days),
+        float(prior2HourStepCountAgent), float(activeDaysLast7Days),
         float(activitySuggestionsSentLast7Days),
         float(salienceMessageSentYesterday),
         float(activitySuggestionInteractLast7Days),
@@ -1341,7 +1339,7 @@ def build_rl_context_vector(
     ], dtype=float)
 
 
-N_RL_CONTEXT = 9
+N_RL_CONTEXT = 8
 
 RL_MY_SHAPE = (6, 3)
 RL_ME_SHAPE = (6, 4)
@@ -1351,14 +1349,14 @@ N_MED_SLOT = 12
 N_MED_ANTIC_DAY = 6
 N_MED = N_MED_SLOT + N_MED_ANTIC_DAY
 
-_FOURSC_CAE_COL = 13
-_FOURSC_AH_COL = 14
-_FOURSC_AH_CAE_COL = 24
-_ANTIC_CAE_COL = 7
-_ANTIC_WS_M_COL = 8
-_ANTIC_WS_A_COL = 9
-_ANTIC_CAE_WS_M_COL = 17
-_ANTIC_CAE_WS_A_COL = 18
+_FOURSC_CAE_COL = 12
+_FOURSC_AH_COL = 13
+_FOURSC_AH_CAE_COL = 23
+_ANTIC_CAE_COL = 6
+_ANTIC_WS_M_COL = 7
+_ANTIC_WS_A_COL = 8
+_ANTIC_CAE_WS_M_COL = 16
+_ANTIC_CAE_WS_A_COL = 17
 _CAE_AR1_COL = 1
 
 
@@ -1385,10 +1383,9 @@ def build_antic_features(
     *,
     dailyAnticipatedAffectYesterday,
     todayStepCount,
-    recordedPhysicalActivityToday,
     activityStatusToday,
     salienceMessageSentToday,
-    dayOfWeekNorm,
+    isWeekend,
     perceivedUtility,
     caeAverageLastWeek,
     ws_morning,
@@ -1400,17 +1397,16 @@ def build_antic_features(
     _pu = float(perceivedUtility) if pu is None else float(pu)
     _cae = float(caeAverageLastWeek) if cae is None else float(cae)
     ys = float(todayStepCount)
-    rpa = float(recordedPhysicalActivityToday)
     act = float(activityStatusToday)
     sal = float(salienceMessageSentToday)
-    dayOfWeekNorm_n = float(dayOfWeekNorm)
+    is_weekend = float(isWeekend)
     ws_morning = float(ws_morning)
     ws_afternoon = float(ws_afternoon)
     return np.array([
-        1.0, float(dailyAnticipatedAffectYesterday), ys, rpa, act, sal, dayOfWeekNorm_n, _pu, _cae,
+        1.0, float(dailyAnticipatedAffectYesterday), ys, act, sal, is_weekend, _pu, _cae,
         ws_morning, ws_afternoon,
         ws_morning * sal, ws_afternoon * sal,
-        ws_morning * dayOfWeekNorm, ws_afternoon * dayOfWeekNorm,
+        ws_morning * is_weekend, ws_afternoon * is_weekend,
         ws_morning * _pu, ws_afternoon * _pu,
         ws_morning * _cae, ws_afternoon * _cae,
     ], dtype=float)
@@ -1622,30 +1618,33 @@ def _mask_mediators_for_slot(M_Y, M_E, d, t):
     return M_Y, M_E
 
 
-def _normalize_dt(d, t):
-    """Map zero-based walking slot ``(d, t)`` into the feature scale used inside phi.
+def _time_features(d, t):
+    """Map zero-based walking slot ``(d, t)`` into time features for phi.
 
-    d in 0..5 -> d_feat in [-1, 1]
-    t in 0..1 -> t_feat in {0, 1}
+    The walking policy acts on Monday-Saturday only.  The first feature is
+    therefore a binary weekday/weekend indicator: Monday-Friday -> 0, Saturday
+    -> 1.  The slot feature is morning/afternoon: morning -> 0, afternoon -> 1.
     """
-    d_feat = 2.0 * float(d) / float(N_RL_DAYS - 1) - 1.0
-    t_feat = float(t)
-    return d_feat, t_feat
+    weekday_vs_weekend = 1.0 if int(d) >= N_RL_DAYS - 1 else 0.0
+    slot_pm = float(t)
+    return weekday_vs_weekend, slot_pm
 
 
 def build_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0):
     """
     State-only features shared by RLSVI and DQN (no action cross-terms).
 
-    phi_state = [1, d, t, E_w, d*E_w, t*E_w, b_hat, d*b_hat, t*b_hat, b_tilde]
+    phi_state = [1, weekend, t, E_w, weekend*E_w, t*E_w,
+                 b_hat, weekend*b_hat, t*b_hat, b_tilde]
               ⌢ [tilde_M^Y, tilde_M^E, C_{w,d,t}]
 
-    ``d`` / ``t`` are zero-based walking indices; day/slot enter via
-    :func:`_normalize_dt`. For STE DQN with ``I_w = 1``, pass the known
-    lagged weekly CAE as ``b_hat`` and ``b_tilde = 0``.
+    ``d`` / ``t`` are zero-based walking indices. The day feature is a binary
+    weekday/weekend indicator over the Monday-Saturday RL days. For STE DQN
+    with ``I_w = 1``, pass the known lagged weekly CAE as ``b_hat`` and
+    ``b_tilde = 0``.
     """
     E_w = state["E_w"]
-    d_feat, t_feat = _normalize_dt(d, t)
+    d_feat, t_feat = _time_features(d, t)
 
     M_Y_m, M_E_m = _mask_mediators_for_slot(state["M_Y"], state["M_E"], d, t)
     C_dt = np.asarray(state["C"]).ravel()
@@ -1664,13 +1663,15 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
     """
     Feature map  phi(tilde_S_{w,d,t}, A_{w,d,t}).
 
-    phi = [1, d, t, E_w, d*E_w, t*E_w, b_w, d*b_w, t*b_w, b_tilde]    (10)
+    phi = [1, weekend, t, E_w, weekend*E_w, t*E_w,
+           b_w, weekend*b_w, t*b_w, b_tilde]                         (10)
         ⌢ [tilde_M^Y, tilde_M^E, C_{w,d,t}]                             (n_my + n_me + n_c)
-        ⌢ A * [1, E_w, b_w, d, t, d*E_w, t*E_w, d*b_w, t*b_w, C_{w,d,t}] (9+n_c)
+        ⌢ A * [1, E_w, b_w, weekend, t, weekend*E_w, t*E_w,
+               weekend*b_w, t*b_w, C_{w,d,t}]                         (9+n_c)
 
-    The day index ``d`` (0..5) is normalized to ``[-1, 1]`` and the slot
-    index ``t`` (0..1) is mapped to ``{0, 1}`` before entering ``phi``;
-    raw ``d``/``t`` are still used internally for mediator masking.
+    The day index ``d`` (0..5) enters as a weekday/weekend indicator
+    (Monday-Friday=0, Saturday=1), and the slot index ``t`` (0..1) is mapped to
+    ``{0, 1}``; raw ``d``/``t`` are still used internally for mediator masking.
 
     M_Y, M_E are (6, n_j) with first two columns slot-ordered; remaining
     columns are day-level (_mask_mediators_for_slot).
@@ -1696,7 +1697,7 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
     E_w = state['E_w']
     b_w = b_hat
 
-    d_feat, t_feat = _normalize_dt(d, t)
+    d_feat, t_feat = _time_features(d, t)
     C_dt = np.asarray(state['C']).ravel()
     state_part = build_phi_state(state, d, t, b_hat=b_hat, b_tilde=b_tilde)
 
@@ -1715,7 +1716,8 @@ def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
     """
     Feature map  phi(tilde_S_{w,d,t}).
 
-    phi = [1, d, t, E_w, d*E_w, t*E_w, b_w, d*b_w, t*b_w, b_tilde]    (10)  
+    phi = [1, weekend, t, E_w, weekend*E_w, t*E_w,
+           b_w, weekend*b_w, t*b_w, b_tilde]                         (10)
         ⌢ [tilde_M^Y, tilde_M^E, C_{w,d,t}]                             (n_my + n_me + n_c)
 
     M_Y, M_E are (6, n_j) with first two columns slot-ordered; remaining
@@ -1741,7 +1743,7 @@ def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
     E_w = state['E_w']
     b_w = b_hat
 
-    d_feat, t_feat = _normalize_dt(d, t)
+    d_feat, t_feat = _time_features(d, t)
 
     next_slot = _next_slot(d, t)
     if next_slot is None:
@@ -2580,7 +2582,7 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
       block 1: shared walking block (for is_query=False decisions)
 
     When is_query = True  (query-action decision):
-      • d and t are unused (set to 0 internally), so all d/t
+      • d and t are unused (set to 0 internally), so all time
         interactions in the base vanish.
       • M_Y and M_E are all zeroed (no mediators observed yet).
       • Context C is also zeroed (the query decision has no
@@ -2593,11 +2595,14 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
     When is_query = False  (walking-action decision):
       • Query block (block 0) is always zero; walking block (block 1)
         is active. Time effects are encoded inside the shared walking
-        interaction via d/t terms (no per-slot parameter blocks).
+        interaction via weekday/weekend and AM/PM terms (no per-slot parameter
+        blocks).
 
-    phi = [1, d, t, E, d·E, t·E, b, d·b, t·b, b_tilde]                (10)
+    phi = [1, weekend, t, E, weekend·E, t·E, b, weekend·b, t·b,
+           b_tilde]                                                   (10)
         ⌢ [tilde_M^Y, tilde_M^E, C_{w,d,t}]                             (n_my+n_me+n_c)
-        ⌢ [query: 1, E, b, C] ⌢ [walk: 1, E, b, d, t, d·E, t·E, d·b, t·b, C]
+        ⌢ [query: 1, E, b, C]
+        ⌢ [walk: 1, E, b, weekend, t, weekend·E, t·E, weekend·b, t·b, C]
 
     Parameters
     ----------
@@ -2631,14 +2636,13 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
     M_E_ref = np.asarray(state.get('M_E', np.zeros((6, 4))))
 
     if is_query:
-        # d_feat=0 is unique to query (no walking day normalizes to 0);
-        # t_feat=0 coincides with t=0 (morning) but the query/walking
-        # distinction is also carried by query_block vs walk_block below.
+        # Query has no walking time. Set both time features to 0; the
+        # query/walking distinction is carried by query_block vs walk_block.
         d_feat, t_feat = 0.0, 0.0
         M_Y_tilde = np.zeros(M_Y_ref.size)
         M_E_tilde = np.zeros(M_E_ref.size)
     else:
-        d_feat, t_feat = _normalize_dt(d, t)
+        d_feat, t_feat = _time_features(d, t)
 
         M_Y_m, M_E_m = _mask_mediators_for_slot(state['M_Y'], state['M_E'], d, t)
         M_Y_tilde = M_Y_m.ravel()

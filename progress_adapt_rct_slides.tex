@@ -1,0 +1,198 @@
+% LaTeX template: mahmoud.s.fahmy@students.kasralainy.edu.eg
+% For more details: https://www.sharelatex.com/learn/Beamer
+\documentclass[10pt]{beamer}					% Document class
+\usepackage[english]{babel}				% Set language
+\usepackage[utf8x]{inputenc}			% Set encoding
+\usepackage{color}
+\usepackage[normalem]{ulem}
+\mode<presentation>						% Set options
+{
+  \usetheme{default}					% Set theme
+  \usecolortheme{default} 				% Set colors
+  \usefonttheme{default}  				% Set font theme
+  \setbeamertemplate{caption}[numbered]	% Set caption to be numbered
+}
+% Uncomment this to highlight the current section in the outline at the start of each section.
+%\AtBeginSection[]
+%{
+%  \begin{frame}{Outline}
+%    \tableofcontents[currentsection]
+%  \end{frame}
+%}
+\usepackage{graphicx}					% For including figures
+\usepackage{url}
+\usepackage{booktabs}					% For table rules
+\usepackage{hyperref}					% For cross-referencing
+\input{macro}
+
+\title{Progress on the ADAPT RCT}	% Presentation title
+\author{Xueqing Liu}								% Presentation author
+% \institute{Harvard University}					% Author affiliation
+\date{\today}									% Today's date
+\begin{document}
+
+\maketitle
+
+\begin{frame}{Outline}
+    \tableofcontents
+\end{frame}
+
+\section{Previously\ldots}
+
+\begin{frame}{Previously\ldots}
+On the vanilla testbed, all RL variants achieve similar performance. We attribute this to two factors:
+    \begin{itemize}
+        \item the standardized treatment effect (STE) is too small on the vanilla testbed;
+        \item the RL algorithm carries too many state variables.
+    \end{itemize}
+\end{frame}
+
+\section{Mediators}
+
+\begin{frame}{Mediators related to perceived utility $E_w$}
+    \begin{enumerate}
+        \item Unprompted app page views over the next 4 hours, $M^{E,PV}_{w,d,t} \in \mathbb{Z}$.
+        \item Next-morning Fitbit wear status, $M^{E,FW}_{w,d+1}\in \{0,1\}$.
+        \begin{itemize}
+            \item Measured over the 2 hours preceding the morning decision time.
+            \item Defined as ``worn'' if heart rate is positive or step count is positive for at least 100 minutes.
+            \item \textbf{Issue:} the new Fitbit (Google Health) omits rows in which heart rate is 0, so we cannot distinguish ``not worn'' from ``not synced.''
+        \end{itemize}
+        \item Next-morning check-in completion status, $M^{E,PJ}_{w,d+1} \in \{0,1\}$.
+        \begin{itemize}
+            \item The morning check-in window is 6\,am to 11\,am.
+            \item $M^{E,PJ}_{w,d+1}$ can be observed only between the morning and afternoon decision times.
+            \item When used in the state for $A_{w,d+1,1}$ and $A_{w,d+1,2}$, we split it into $M^{E,PJ}_{w,d+1,1}$ and $M^{E,PJ}_{w,d+1,2}$.
+            \item \textbf{Question:} should we treat $M^{E,PJ}_{w,d,1}$ and $M^{E,PJ}_{w,d,2}$ as the mediators, where $M^{E,PJ}_{w,d,1}$ mediates the previous day's two actions $A_{w,d-1,1}$ and $A_{w,d-1,2}$, while $M^{E,PJ}_{w,d,2}$ mediates both the previous day's actions and this morning's action $A_{w,d,1}$?
+        \end{itemize}
+    \end{enumerate}
+\end{frame}
+
+\begin{frame}{Mediators related to CAE $Y_w$}
+    \begin{enumerate}
+        \item Active minutes over the next 4 hours, $M^{Y,SC}_{w,d,t} \in \mathbb{Z}$.
+        \item Anticipated affect from the next-morning check-in, $M^{Y,AA}_{w,d+1}$.
+        \begin{itemize}
+            \item As with $M^{E,PJ}_{w,d+1}$, it can be observed only between the morning and afternoon decision times.
+            \item When used in the state for $A_{w,d+1,1}$ and $A_{w,d+1,2}$, we split it into
+            $M^{Y,AA}_{w,d+1,1}\cdot M^{E,PJ}_{w,d+1} \cdot I_{w,d+1}^{\text{day}}$ and
+            $M^{Y,AA}_{w,d+1,2}\cdot M^{E,PJ}_{w,d+1} \cdot I_{w,d+1}^{\text{day}}$,
+            where $I_{w,d+1}^{\text{day}}=1$ indicates that the anticipated-affect question is delivered within the morning check-in.
+            \item \textbf{Question:} should we treat $M^{Y,AA}_{w,d+1,1}$ and $M^{Y,AA}_{w,d+1,2}$ as the mediators?
+        \end{itemize}
+    \end{enumerate}
+\end{frame}
+
+\begin{frame}{Constructing state variables from mediator history}
+    Each state variable is an exponentially weighted average of the corresponding mediator observed before the current decision time $(w,d,t)$, with decay factor $r=\tfrac{h-1}{h}$ and horizon $h = 2(d-1) + t-1$ (unless stated otherwise).
+    \begin{enumerate}
+        \item $\overline{M}^{Y,AA}_{w,d,t}=\displaystyle\sum_{i=1}^{h} r^{\,i-1}\, M^{Y,AA}_{w,i}\cdot M^{E,PJ}_{w,i} \cdot I_{w,i}^{\text{day}}$.
+        \item $\overline{M}^{Y,SC}_{w,d,t}=\displaystyle\sum_{i=1}^{h} r^{\,i-1}\, M^{Y,SC}_{w,i}$.
+        \item $\overline{M}^{E,PV}_{w,d,t}=\displaystyle\sum_{i=1}^{h} r^{\,i-1}\, M^{E,PV}_{w,i}$.
+        \item $\overline{M}^{E,PJ}_{w,d,t}=\displaystyle\sum_{i=1}^{h} r^{\,i-1}\, M^{E,PJ}_{w,i}$.
+        \item $\overline{M}^{E,FW}_{w,d,t}=\displaystyle\sum_{i=1}^{h} r^{\,i-1}\, M^{E,FW}_{w,i}$, with $h=d-1$.
+    \end{enumerate}
+\end{frame}
+
+\begin{frame}{RL state}
+    \begin{align}
+\phi(S_{w,d,t}^{\dagger},a)
+&=
+\left[
+1,\,
+d_n,\,
+t_n,\,
+\widehat e_w,\,
+d_n\widehat e_w,\,
+t_n\widehat e_w,\,
+\widehat b_w,\,
+d_n\widehat b_w,\,
+t_n\widehat b_w,\,
+\widetilde b_w
+\right] \nonumber\\
+&\quad \frown
+\left[
+\overline{M}^{Y,AA}_{w,d,t},\,
+\overline{M}^{Y,SC}_{w,d,t},\,
+\overline{M}^{E,PV}_{w,d,t},\,
+\overline{M}^{E,FW}_{w,d,t},\,
+\overline{M}^{E,PJ}_{w,d,t},\,
+C_{w,d,t}^\top
+\right] \nonumber\\
+&\quad \frown
+a
+\left[
+1,\,
+d_n,\,
+t_n,\,
+\widehat e_w,\,
+d_n\widehat e_w,\,
+t_n\widehat e_w,\,
+\widehat b_w,\,
+d_n\widehat b_w,\,
+t_n\widehat b_w,\,
+\widetilde b_w,\,
+C_{w,d,t}^\top
+\right].
+\label{eq:feature-map}
+\end{align}
+Since $C_{w,d,t}$ has dimension 7, the state has dimension 39.
+\end{frame}
+
+\section{Environment Variants}
+
+\begin{frame}{Testbed variants}
+\begin{itemize}
+    \item \textbf{Vanilla testbed:} fit the models to the MRT data and keep all model weights unchanged.
+    \item \textbf{Variant 1 (constrain the sign of the weights):}
+    \begin{itemize}
+        \item effect of $M^Y_{w,d,t}$ on $Y_{w+1}$ non-negative: $\max\{\beta,\,0.01\}$;
+        \item effect of $M^E_{w,d,t}$ on $E_{w+1}$ non-negative: $\max\{\beta,\,0.01\}$;
+        \item effect of $A_{w,d,t}$ on $M^Y_{w,d,t}$ non-negative: $\max\{\beta,\,0.01\}$;
+        \item effect of $A_{w,d,t}\cdot Y_w$ on $M^Y_{w,d,t}$ non-negative: $\max\{\beta,\,0.01\}$;
+        \item effect of $A_{w,d,t}$ on $M^E_{w,d,t}$ non-positive: $\min\{\beta,\,-0.01\}$;
+        \item effect of $A_{w,d,t}\cdot E_w$ on $M^E_{w,d,t}$ non-positive: $\min\{\beta,\,-0.01\}$;
+        \item effect of $E_w$ on $M^Y_{w,d,t}$ non-negative: $\max\{\beta,\,0.01\}$.
+    \end{itemize}
+    \item \textbf{Other variants:} in addition to constraining the signs as in Variant 1, tune the standardized treatment effect to low (0.15), medium (0.3), or high (0.5).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Standardized treatment effect}
+    \begin{itemize}
+        \item Let the cumulative reward for user $i$ be $G_i^{\pi} = \sum_{w=1}^{W} Y_{i,w}^{\pi}$, with $W=36$.
+        \item Let the expected treatment effect be $\Delta_i = \mathbb{E}\!\left[G_i^{\pi_i^\star}\right] - \mathbb{E}\!\left[G_i^{\pi^0}\right]$.
+        \item Let the variance under the zero policy be $\sigma_i^2 = \operatorname{Var}\!\left(G_i^{\pi^0}\right)$.
+    \end{itemize}
+    Prior work uses slightly different definitions \citep{gao25a,xu2025reinforcement}:
+    \begin{enumerate}
+        \item $\mathbb{E}_i\!\left[\dfrac{\Delta_i}{\sqrt{\sigma^2_i}}\right]$;
+        \item $\dfrac{\mathbb{E}_i\left[\Delta_i\right]}{\operatorname{Var}_i\!\left(\mathbb{E}\left[G_i^{\pi^0}\right]\right)}$;
+        \item $\dfrac{\mathbb{E}_i\left[\Delta_i\right]}{\sqrt{\mathbb{E}_i[\sigma^2_i]}}$.
+    \end{enumerate}
+\end{frame}
+
+\begin{frame}{Estimating the STE}
+    \begin{itemize}
+        \item Approximate the optimal policy $\pi_i^\star$ with DQN.
+        \item Generate 5000 trajectories per user to train DQN.
+        \item Evaluate the cumulative rewards of DQN and the zero policy using 500 replicates across the 29 users.
+        \item Sources of randomness within each trajectory:
+        \begin{enumerate}
+            \item activity suggestions are randomized with probability 0.5;
+            \item residuals are resampled rather than cycled deterministically;
+            \item perceived utility has no residuals and is drawn from a normal distribution;
+            \item all binary variables are drawn from Bernoulli distributions.
+        \end{enumerate}
+        \item Each trajectory is generated under weekly queries $I_w=1$ and $J_w=1$, so DQN observes the true CAE; no belief-state update is involved.
+        \item DQN uses the linearly approximated perceived utility $\widehat e_w$ rather than the ground truth $E_w$.
+        \item \textbf{Questions:} should the CAE also be latent? Should we constrain the DQN randomization probability to $[0.1,\,0.9]$?
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{References}
+    \bibliographystyle{unsrtnat}
+    \bibliography{slides/refs}
+\end{frame}
+
+\end{document}

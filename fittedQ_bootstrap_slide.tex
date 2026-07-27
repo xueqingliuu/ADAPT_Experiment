@@ -1,0 +1,102 @@
+% Drop into an existing Beamer deck, or compile standalone with:
+%   pdflatex fittedQ_bootstrap_slide.tex
+\documentclass[aspectratio=169]{beamer}
+
+\usetheme{default}
+\usecolortheme{default}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+
+\title{Bootstrap procedure for fitted-Q coefficient CIs}
+\author{}
+\date{}
+
+\begin{document}
+
+\begin{frame}{Bootstrap procedure for fitted-Q coefficient CIs}
+  \textbf{Goal.}
+  Quantify uncertainty in fitted-Q coefficients $\widehat{\beta}_h$
+  (one vector per within-week decision slot $h=1,\ldots,12$) while respecting
+  within-participant dependence.
+
+  \vspace{0.4em}
+  \begin{columns}[T,onlytextwidth]
+    \column{0.48\textwidth}
+    \textbf{Settings}
+    \begin{itemize}
+      \item Bootstrap replicates: $B = 1000$
+      \item CI: 95\% percentile intervals
+      \item Resampling unit: participant (cluster)
+      \item RNG seed: $0$
+    \end{itemize}
+
+    \column{0.48\textwidth}
+    \textbf{Held fixed vs.\ resampled}
+    \begin{itemize}
+      \item \emph{Fixed:} kernel CAE imputation, feature normalization,
+        $\bar\gamma = 0.5$, ridge penalty, $N=15$ backward sweeps
+      \item \emph{Resampled:} $n=29$ users drawn with replacement from the
+        29 eligible participants, keeping each user's full within-user
+        training tensors intact
+    \end{itemize}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{Bootstrap procedure (one replicate $b=1,\ldots,B$)}
+  \begin{enumerate}
+    \item \textbf{Resample participants.}
+      Draw indices $i_1,\ldots,i_{29} \sim \mathrm{Unif}\{1,\ldots,29\}$
+      with replacement. Some users appear multiple times; others may be omitted.
+
+    \item \textbf{Rebuild the pooled training design.}
+      Stack the resampled users' precomputed weekly tensors into one pooled
+      dataset. Imputed CAE values are unchanged from the canonical trajectory fit.
+
+    \item \textbf{Re-fit fitted Q from scratch.}
+      Run the full backward-induction FQI loop with $N=15$ sweeps and ridge
+      regression at each slot $h$. Store $\widehat{\beta}_h^{(b)}$.
+
+    \item \textbf{Form percentile confidence intervals.}
+      For each coefficient $j$ at slot $h$, take the 2.5th and 97.5th
+      percentiles of $\{\widehat{\beta}_{hj}^{(b)}\}_{b=1}^B$ as the 95\% CI.
+      Bootstrap SE is the sample SD across replicates.
+      Point estimates come from the full-sample fit, not the bootstrap mean.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Design choices and outputs}
+  \begin{columns}[T,onlytextwidth]
+    \column{0.48\textwidth}
+    \textbf{Why cluster bootstrap?}
+    \begin{itemize}
+      \item All decision points from the same user stay together.
+      \item Row-level resampling would break serial dependence across weeks
+        and slots within a user.
+    \end{itemize}
+
+    \vspace{0.6em}
+    \textbf{Imputation.}
+    \begin{itemize}
+      \item CAE kernel imputation is performed once before bootstrap and held
+        fixed in every replicate.
+    \end{itemize}
+
+    \column{0.48\textwidth}
+    \textbf{Outputs}
+    \begin{itemize}
+      \item CI lower/upper bounds and bootstrap SE for each $(h,j)$
+      \item Saved in model JSON and CSV summary
+      \item Error bars on coefficient plots
+    \end{itemize}
+
+    \vspace{0.6em}
+    \small
+    \emph{Source:} \texttt{fittedQ.py}, function
+    \texttt{bootstrap\_coefficient\_intervals()}.
+  \end{columns}
+\end{frame}
+
+\end{document}

@@ -24,10 +24,12 @@ Direction constraints:
      perceived_utility_lastweek and CAE_avg_lastweek.
   5. E_w -> M^E is nonnegative for pageview, Fitbit wearing, and daily survey
      completion:
-     theta_ml_PV alpha1_Ew, theta_ml_FW beta1_Ew, theta_ml_PJ theta1_Ew.
+     theta_penalized_PV alpha1_Ew, theta_penalized_FW beta1_Ew,
+     theta_penalized_PJ theta1_Ew.
   6. Walking-suggestion main effects -> M^E are nonpositive (intercept only):
-     theta_ml_PV alpha3_action; theta_ml_FW beta3_A0_morning and
-     beta5_A1_afternoon; theta_ml_PJ theta3_A0_morning and theta5_A1_afternoon.
+     theta_penalized_PV alpha3_action; theta_penalized_FW beta3_A0_morning and
+     beta5_A1_afternoon; theta_penalized_PJ theta3_A0_morning and
+     theta5_A1_afternoon.
 
 Nonnegative constraints flip negative values with abs(value). Nonpositive
 constraints flip positive values with -abs(value). Values already in the
@@ -263,7 +265,15 @@ def build_positive_direction_parameters(
                 predicate=_is_antic_suggestion_effect,
             )
         )
-        for theta_key in ("theta_ml_PV", "theta_ml_FW", "theta_ml_PJ"):
+        fitted_keys = {
+            outcome: (
+                f"theta_penalized_{outcome}"
+                if f"theta_penalized_{outcome}" in params
+                else f"theta_ml_{outcome}"
+            )
+            for outcome in ("PV", "FW", "PJ")
+        }
+        for theta_key in fitted_keys.values():
             audit_rows.extend(
                 _correct_named_theta(
                     params,
@@ -276,7 +286,7 @@ def build_positive_direction_parameters(
             _correct_named_theta(
                 params,
                 user_id=user_id,
-                theta_key="theta_ml_PV",
+                theta_key=fitted_keys["PV"],
                 predicate=_is_pv_action_intercept,
                 sign="nonpositive",
             )
@@ -285,7 +295,7 @@ def build_positive_direction_parameters(
             _correct_named_theta(
                 params,
                 user_id=user_id,
-                theta_key="theta_ml_FW",
+                theta_key=fitted_keys["FW"],
                 predicate=_is_fw_action_intercept,
                 sign="nonpositive",
             )
@@ -294,7 +304,7 @@ def build_positive_direction_parameters(
             _correct_named_theta(
                 params,
                 user_id=user_id,
-                theta_key="theta_ml_PJ",
+                theta_key=fitted_keys["PJ"],
                 predicate=_is_pj_action_intercept,
                 sign="nonpositive",
             )
@@ -350,15 +360,15 @@ def build_positive_direction_parameters(
                 "A0_morning_by_CAE_avg_lastweek",
                 "A1_afternoon_by_CAE_avg_lastweek",
             ],
-            "theta_ml_PV": {
+            "theta_penalized_PV": {
                 "nonnegative": ["alpha1_Ew"],
                 "nonpositive": ["alpha3_action"],
             },
-            "theta_ml_FW": {
+            "theta_penalized_FW": {
                 "nonnegative": ["beta1_Ew"],
                 "nonpositive": ["beta3_A0_morning", "beta5_A1_afternoon"],
             },
-            "theta_ml_PJ": {
+            "theta_penalized_PJ": {
                 "nonnegative": ["theta1_Ew"],
                 "nonpositive": ["theta3_A0_morning", "theta5_A1_afternoon"],
             },

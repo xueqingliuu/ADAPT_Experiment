@@ -33,6 +33,10 @@ DIGITS = 3
 DAY_RANGE = 84
 WEEK_RANGE = 12
 
+# Ordinal survey items treated as 0..7 (raw export includes occasional 0s).
+LIKERT_MIN = 0
+LIKERT_MAX = 7
+
 # Columns expected in df_merged (missing cols are skipped with a warning)
 FIT_COLUMNS = [
     "ParticipantIdentifier",
@@ -60,8 +64,6 @@ FIT_COLUMNS = [
     "prior2hour_step",
     "EMA_Prior2HourStepCount",
     # wearables / activity
-    "RecordedPhysicalActivity",
-    "Previous7DaysRPA",
     "morning_wearing",
     "nextday_wearing",
     "past7days_morning_wearing",
@@ -69,6 +71,7 @@ FIT_COLUMNS = [
     "DailyPageviewCount",
     "Past7DaysPageviewEMA",
     "HourlyPageviewCount",
+    "HourlyPageviewCount_lag1",
     "Past7DaysHourlyPageviewEMA",
     # surveys
     "week_present",
@@ -99,6 +102,7 @@ LOG_COLUMNS = [
     "DailyPageviewCount",
     "Past7DaysPageviewEMA",
     "HourlyPageviewCount",
+    "HourlyPageviewCount_lag1",
     "Past7DaysHourlyPageviewEMA",
 ]
 
@@ -126,9 +130,8 @@ RAW_UNIT_INTERVAL_COLS = [
     # ActivityCheck rolling fractions
     ("active_status_fraction_7days", "active_status_fraction_7days_limit"),
     ("active_status_fraction_7days_yesterday", "active_status_fraction_7days_yesterday_limit"),
-    # Rolling interaction / wear / RPA fractions
+    # Rolling interaction / wear fractions
     ("Interacted_7d_walk", "Interacted_7d_walk_limit"),
-    ("Previous7DaysRPA", "Previous7DaysRPA_limit"),
     ("past7days_morning_wearing", "past7days_morning_wearing_limit"),
 ]
 
@@ -143,21 +146,50 @@ LIKERT_SPECS = [
 
 
 def _zscore(series, digits=DIGITS):
-    shift = np.round(np.mean(series), digits)
-    scale = np.round(np.std(series), digits)
-    if scale == 0:
+    vals = pd.to_numeric(series, errors="coerce")
+    shift = float(np.round(np.nanmean(vals), digits))
+    scale = float(np.round(np.nanstd(vals, ddof=0), digits))
+    if scale == 0 or np.isnan(scale):
         scale = 1.0
-    norm = (series - shift) / scale
-    limit = [np.round(norm.min(), digits), np.round(norm.max(), digits)]
+    norm = (vals - shift) / scale
+    limit = [
+        float(np.round(np.nanmin(norm), digits)),
+        float(np.round(np.nanmax(norm), digits)),
+    ]
     return norm, shift, scale, limit
 
 
-def _likert_norm(series, digits=DIGITS):
-    # Fixed-scale normalization for ordinal survey items coded on 0..7.
-    # Maps scale midpoint to 0 and keeps outputs comparable to other
-    # standardized predictors on approximately [-1, 1].
-    norm = 2 * series / 7 - 1
-    limit = [np.round(norm.min(), digits), np.round(norm.max(), digits)]
+def _likert_norm(
+    series,
+    digits=DIGITS,
+    lo=LIKERT_MIN,
+    hi=LIKERT_MAX,
+):
+    """
+    Map ordinal Likert responses on {lo,...,hi} (default 0..7) to [-1, 1].
+
+    Uses:  2 * (x - lo) / (hi - lo) - 1
+    so 0 → -1, midpoint 3.5 → 0, 7 → 1.
+    Values outside [lo, hi] are set to NaN.
+    """
+    vals = pd.to_numeric(series, errors="coerce")
+    invalid = vals.notna() & ((vals < lo) | (vals > hi))
+    if invalid.any():
+        n_bad = int(invalid.sum())
+        print(
+            f"Warning: {n_bad} Likert values outside [{lo}, {hi}] "
+            f"set to NaN before normalization"
+        )
+        vals = vals.mask(invalid)
+
+    norm = 2.0 * (vals - lo) / (hi - lo) - 1.0
+    if vals.notna().any():
+        limit = [
+            float(np.round(np.nanmin(norm), digits)),
+            float(np.round(np.nanmax(norm), digits)),
+        ]
+    else:
+        limit = [-1.0, 1.0]
     return norm, limit
 
 
@@ -208,6 +240,14 @@ for src, norm, shift_key, scale_key, limit_key in ZSCORE_SPECS:
     std_params[scale_key] = scale
     std_params[limit_key] = limit
 
+# This lag was constructed on the padded pageview panel before the 84-day
+# analysis filter. Put it on exactly the same log/z-score scale as its outcome.
+if "HourlyPageviewCount_lag1" in df_fit.columns:
+    df_fit["hourly_pageview_count_lag1"] = (
+        df_fit["HourlyPageviewCount_lag1"]
+        - std_params["HourlyPageviewCount_shift"]
+    ) / std_params["HourlyPageviewCount_scale"]
+
 for src, norm, limit_key in LIKERT_SPECS:
     if src not in df_fit.columns:
         continue
@@ -243,8 +283,6 @@ df_fit = df_fit.sort_values(
 lag_specs = [
     ("4hour_step_norm", "FourSC_lag1", 1),
     ("prior2hour_step_norm", "prior2hour_step_count_lag1", 1),
-    ("HourlyPageviewCount_norm", "hourly_pageview_count_lag1", 1),
-    ("RecordedPhysicalActivity", "recorded_physical_activity_lag1", 2),
 ]
 for src, out, n in lag_specs:
     if src in df_fit.columns:

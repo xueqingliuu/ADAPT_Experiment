@@ -1,17 +1,24 @@
 """
 Standardized treatment effect (STE) utilities for the vanilla ``vani_env`` + ``OnlineEnv``
-simulator, following the STE6 archive pattern (``opt_policy.py`` / ``eval_ste.py`` /
-``ste_variants.py``):
+simulator):
 
   * Train a discrete-action DQN on a large offline dataset generated under a fixed
-    random walking policy (Bernoulli ``P0``) with ``I_w = 1`` (full CAE query).
+    random walking policy (Bernoulli ``P0``) with ``I_w = J_w = 1`` (full CAE observation).
   * Evaluate total per-episode reward ``sum_w CAE_w`` under the zero policy vs.
     greedy DQN actions.
-  * Aggregate population STE as ``mean_i(Delta_i) / sqrt(mean_i(sigma_i^2))`` over
-    fitted participant types (not the mean of per-type standardized effects).
-  * DQN observations match the RLSVI state features (:func:`build_phi_state`):
+  * Match the RL weekly discount ``gamma_bar = 0.5`` using the per-decision
+    discount ``0.5^(1/12)`` over 12 controlled slots per week.
+  * Compute each fitted participant type's STE as ``Delta_i / sigma_i``, then
+    report the average user STE ``mean_i(Delta_i / sigma_i)``.
+  * DQN observations extend the RLSVI state features (:func:`build_phi_state`):
     ``E_w`` is agent-visible perceived utility; the ``b_hat`` slot carries the
-    known lagged weekly CAE (``I_w = 1``); ``b_tilde = 0``.
+    known lagged weekly CAE. The ``b_tilde`` slot (posterior CAE uncertainty)
+    is dropped, since ``I_w = J_w = 1`` means there is no CAE measurement
+    uncertainty and it would only be a constant zero. The policy is
+    continuing, so no finite-horizon countdown is included.
+  * Training simulates one look-ahead week beyond the 36-week evaluation window.
+    The final evaluated-week transition therefore bootstraps from the first
+    state of the next week instead of being treated as terminal.
   * One job per user: ``jobid`` indexes ``user_ids.txt``. Different DGP variants
     should use separate env modules / param dirs or ``--exp`` names, not a
     generative scale knob.
@@ -23,6 +30,7 @@ Requires: ``d3rlpy``, ``numpy``, and project modules ``experiment``, ``algorithm
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +46,9 @@ from algorithm_helpers import (
 )
 from experiment import OnlineEnv
 from vani_env import PARAMS_DIR, Env, EnvConfig
+
+DQN_WEEKLY_GAMMA = 0.5
+DQN_STEP_GAMMA = DQN_WEEKLY_GAMMA ** (1.0 / (N_RL_DAYS * N_RL_SLOTS))
 
 try:
     import d3rlpy
@@ -76,11 +87,29 @@ def known_weekly_cae(oenv: OnlineEnv, k: int) -> float:
     return 0.0 if np.isnan(val) else float(val)
 
 
+_BTILDE_INDEX = 9  # index of the constant b_tilde slot in build_phi_state's base block
+
+
 def build_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int) -> np.ndarray:
-    """RLSVI-compatible state for DQN; ``b_hat`` = known lagged CAE, ``b_tilde`` = 0."""
+    """Continuing-task DQN state using the RLSVI state features.
+
+    Drops ``b_tilde``: with ``I_w = J_w = 1`` there is no CAE measurement
+    uncertainty, so ``build_phi_state`` would only supply a constant zero
+    in that slot.
+    """
     st = make_state(oenv.get_context(k, d, t))
     b_hat = known_weekly_cae(oenv, k)
-    return build_phi_state(st, d, t, b_hat=b_hat, b_tilde=0.0)
+    phi = build_phi_state(st, d, t, b_hat=b_hat, b_tilde=0.0)
+    return np.delete(phi, _BTILDE_INDEX)
+
+
+def prepare_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int) -> np.ndarray:
+    """Generate current-slot covariates before exposing the decision state."""
+    d_global = oenv._day_idx(k, d)
+    step_idx = oenv._step_idx(k, d, t)
+    oenv._ensure_day_started(k, d, d_global)
+    oenv._generate_prior2hour_for_slot(k, d, t, d_global, step_idx)
+    return build_ste_state_vector(oenv, k, d, t)
 
 
 def ste_state_dim(oenv: OnlineEnv) -> int:
@@ -91,64 +120,86 @@ def collect_mdp_episode(
     oenv: OnlineEnv,
     walk_prob: float,
     rng: np.random.Generator,
+    n_transition_weeks: int,
     i_w_fixed: int = 1,
 ) -> dict:
     """
     Roll one episode under Bernoulli(``walk_prob``) walking suggestions; build
-    dense MDP tuples with weekly CAE as reward on the last weekday slot of each week.
+    dense MDP tuples with weekly CAE as reward on the last weekday slot.
+
+    ``oenv`` must contain one additional look-ahead week. A final timeout
+    sentinel supplies the next observation for the last real transition.
+    d3rlpy excludes that sentinel itself from training while retaining the
+    final week's CAE reward and a nonterminal bootstrap target.
     """
+    if n_transition_weeks < 1:
+        raise ValueError("n_transition_weeks must be positive")
+    if oenv.nweek < n_transition_weeks + 1:
+        raise ValueError(
+            "Continuing-task collection requires one look-ahead week: "
+            f"oenv.nweek={oenv.nweek}, n_transition_weeks={n_transition_weeks}"
+        )
+
     oenv._hist_daily_suggestions.clear()
     oenv.s["activitySuggestionsSentLast7Days"] = (
         oenv._activitySuggestionsSentLast7Days_initial
     )
 
     states, actions, rewards = [], [], []
-    next_states, terminals, timeouts = [], [], []
+    terminals, timeouts = [], []
 
-    for k in range(oenv.nweek):
+    for k in range(n_transition_weeks):
         packet = oenv.get_week_packet(k)
         _ = packet
         i_w = int(i_w_fixed)
+        oenv.wp_all[k] = 1.0
         oenv.start_week(k, i_w)
 
         for d in range(N_RL_DAYS):
             for t_slot in range(N_RL_SLOTS):
-                s_vec = build_ste_state_vector(oenv, k, d, t_slot)
+                s_vec = prepare_ste_state_vector(oenv, k, d, t_slot)
                 a = int(rng.random() < walk_prob)
                 oenv.step_action(k, d, t_slot, float(a), i_w)
 
                 if d == TERMINAL_D and t_slot == TERMINAL_T:
                     oenv._finalize_week(k)
-                    r = float(oenv.CAE_all[k]) if not np.isnan(oenv.CAE_all[k]) else 0.0
-                    if k + 1 < oenv.nweek:
-                        s2 = build_ste_state_vector(oenv, k + 1, 0, 0)
-                        term = 0
-                        tout = 0
-                    else:
-                        s2 = np.zeros_like(s_vec)
-                        term = 0
-                        tout = 1
+                    weekly_idx = oenv._weekly_idx(k)
+                    r = (
+                        float(oenv.CAE_all[weekly_idx])
+                        if not np.isnan(oenv.CAE_all[weekly_idx])
+                        else 0.0
+                    )
+                    term = 0
+                    tout = 0
                 else:
                     r = 0.0
-                    if t_slot + 1 < N_RL_SLOTS:
-                        s2 = build_ste_state_vector(oenv, k, d, t_slot + 1)
-                    else:
-                        s2 = build_ste_state_vector(oenv, k, d + 1, 0)
                     term = 0
                     tout = 0
 
                 states.append(s_vec)
                 actions.append(a)
                 rewards.append(r)
-                next_states.append(s2)
                 terminals.append(term)
                 timeouts.append(tout)
+
+    # d3rlpy represents a truncated continuing trajectory with one extra
+    # observation. The sentinel's action/reward are not transitions; its state
+    # becomes S_{W+1} for the final real transition and enables bootstrapping.
+    boundary_k = n_transition_weeks
+    _ = oenv.get_week_packet(boundary_k)
+    oenv.wp_all[boundary_k] = 1.0
+    oenv.start_week(boundary_k, int(i_w_fixed))
+    boundary_state = prepare_ste_state_vector(oenv, boundary_k, 0, 0)
+    states.append(boundary_state)
+    actions.append(0)
+    rewards.append(0.0)
+    terminals.append(0)
+    timeouts.append(1)
 
     return {
         "states": np.stack(states, axis=0),
         "actions": np.asarray(actions, dtype=np.int64).reshape(-1, 1),
         "rewards": np.asarray(rewards, dtype=np.float64).reshape(-1, 1),
-        "next_states": np.stack(next_states, axis=0),
         "terminals": np.asarray(terminals, dtype=np.float64).reshape(-1, 1),
         "timeouts": np.asarray(timeouts, dtype=np.float64).reshape(-1, 1),
     }
@@ -163,13 +214,19 @@ def build_offline_buffer(
     base_seed: int,
     noise: str = "random",
 ) -> dict:
-    """Stack ``collect_mdp_episode`` outputs (concatenated trajectories)."""
-    chunks = {k: [] for k in ("states", "actions", "rewards", "next_states", "terminals", "timeouts")}
+    """Stack continuing-task trajectories with one look-ahead state each."""
+    chunks = {k: [] for k in ("states", "actions", "rewards", "terminals", "timeouts")}
     for i in range(n_episodes):
-        cfg = EnvConfig(userid, nweek=nweek)
+        simulation_weeks = nweek + 1
+        cfg = EnvConfig(userid, nweek=simulation_weeks)
         env = Env(cfg, noise=noise)
-        oenv = OnlineEnv(env, nweek=nweek, seed=base_seed + i)
-        ep = collect_mdp_episode(oenv, walk_prob, np.random.default_rng(base_seed + 10_000 * i))
+        oenv = OnlineEnv(env, nweek=simulation_weeks, seed=base_seed + i)
+        ep = collect_mdp_episode(
+            oenv,
+            walk_prob,
+            np.random.default_rng(base_seed + 10_000 * i),
+            n_transition_weeks=nweek,
+        )
         for key in chunks:
             chunks[key].append(ep[key])
     out = {key: np.vstack(parts) for key, parts in chunks.items()}
@@ -188,11 +245,12 @@ def train_dqn_ste(
     n_steps: int = 100_000,
     batch_size: int = 256,
     learning_rate: float = 1e-4,
+    seed: int = 2024,
 ) -> None:
     _require_d3()
+    d3rlpy.seed(seed)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     logger_dir.mkdir(parents=True, exist_ok=True)
-    tensorboard_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_dir.mkdir(parents=True, exist_ok=True)
 
     dataset = d3rlpy.dataset.MDPDataset(
@@ -220,7 +278,7 @@ def train_dqn_ste(
 
     dqn = d3rlpy.algos.DQNConfig(
         batch_size=batch_size,
-        gamma=0.99,
+        gamma=DQN_STEP_GAMMA,
         learning_rate=learning_rate,
         target_update_interval=5000,
         encoder_factory=encoder_factory,
@@ -270,6 +328,7 @@ def rollout_total_cae(
         packet = oenv.get_week_packet(k)
         _ = packet
         i_w = int(i_w_fixed)
+        oenv.wp_all[k] = 1.0
         oenv.start_week(k, i_w)
 
         for d in range(N_RL_DAYS):
@@ -280,21 +339,28 @@ def rollout_total_cae(
                     a = int(rng.random() < walk_prob)
                 elif policy == "dqn_greedy":
                     _require_d3()
-                    s_vec = build_ste_state_vector(oenv, k, d, t_slot).reshape(1, -1)
+                    s_vec = prepare_ste_state_vector(oenv, k, d, t_slot).reshape(1, -1)
                     pred = dqn.predict(s_vec)
                     a = int(np.asarray(pred, dtype=np.int64).reshape(-1)[0])
                 else:
                     raise ValueError(policy)
+                if policy != "dqn_greedy":
+                    prepare_ste_state_vector(oenv, k, d, t_slot)
                 oenv.step_action(k, d, t_slot, float(a), i_w)
         oenv._finalize_week(k)
 
-    return float(np.nansum(oenv.CAE_all))
+    # Index 0 is the pre-RL baseline; STE outcomes include simulated weeks only.
+    return float(np.nansum(oenv.CAE_all[1 : oenv.nweek + 1]))
 
 
 def _userid_from_job(jobid: int, userid_all: np.ndarray) -> int:
     if not (0 <= int(jobid) < len(userid_all)):
         raise IndexError(f"jobid {jobid} out of range for {len(userid_all)} users")
     return int(userid_all[int(jobid)])
+
+
+def _model_metadata_path(model_path: Path) -> Path:
+    return model_path.with_name(f"{model_path.name}.meta.json")
 
 
 def eval_ste_job(
@@ -306,7 +372,7 @@ def eval_ste_job(
     nweek: int | None = None,
     noise: str = "random",
 ) -> None:
-    """Append rows ``[sum_CAE_zero, sum_CAE_opt]`` to ``results_ste/exp{exp}/res{exp}_{userid}.txt``."""
+    """Write rows ``[sum_CAE_zero, sum_CAE_opt]`` for one validated evaluation run."""
     _require_d3()
     uid_path = Path(userid_path) if userid_path else PARAMS_DIR / "user_ids.txt"
     userid_all = np.loadtxt(uid_path, dtype=int)
@@ -319,6 +385,29 @@ def eval_ste_job(
     logger_dir = Path("d3rlpy_logs") / f"ste_exp_{exp}"
     experiment_name = f"user{userid}"
     model_dir = logger_dir / f"{experiment_name}_model.d3"
+
+    metadata_path = _model_metadata_path(model_dir)
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            f"{metadata_path} missing; retrain the STE model with the current state definition."
+        )
+    with open(metadata_path, encoding="utf-8") as f:
+        metadata = json.load(f)
+    expected = {
+        "userid": userid,
+        "nweek": nweek,
+        "noise": noise,
+        "gamma_weekly": DQN_WEEKLY_GAMMA,
+        "gamma_step": DQN_STEP_GAMMA,
+        "continuing_task": True,
+        "bootstrap_lookahead_weeks": 1,
+    }
+    for key, value in expected.items():
+        if metadata.get(key) != value:
+            raise ValueError(
+                f"STE model metadata mismatch for {key}: "
+                f"trained={metadata.get(key)!r}, evaluation={value!r}"
+            )
 
     dqn = d3rlpy.load_learnable(str(model_dir))
 
@@ -341,7 +430,7 @@ def eval_ste_job(
     path = Path("results_ste") / f"exp{exp}"
     path.mkdir(parents=True, exist_ok=True)
     filepath = path / f"res{exp}_{userid}.txt"
-    with open(filepath, "a", encoding="utf-8") as f:
+    with open(filepath, "w", encoding="utf-8") as f:
         np.savetxt(f, out, fmt="%.6f")
 
 
@@ -388,7 +477,23 @@ def train_ste_job(
         tensorboard_dir=tb_dir,
         experiment_name=experiment_name,
         n_steps=n_steps,
+        seed=seed,
     )
+    metadata = {
+        "userid": userid,
+        "nweek": int(nweek),
+        "noise": noise,
+        "state_dim": int(buffer["states"].shape[1]),
+        "gamma_weekly": DQN_WEEKLY_GAMMA,
+        "gamma_step": DQN_STEP_GAMMA,
+        "continuing_task": True,
+        "bootstrap_lookahead_weeks": 1,
+        "i_w_fixed": 1,
+        "j_w_fixed": 1,
+        "seed": seed,
+    }
+    with open(_model_metadata_path(model_dir), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
 
 def aggregate_ste(
@@ -398,9 +503,9 @@ def aggregate_ste(
     burn_in_rows: int = 0,
 ) -> float:
     """
-    Population STE (``STE_pop``):
+    Average user STE:
 
-        mean_i(hat_Delta_i) / sqrt(mean_i(hat_sigma_i^2))
+        mean_i(hat_STE_i), where hat_STE_i = hat_Delta_i / hat_sigma_i
 
     where, for each participant type ``i`` with ``B_eval`` Monte Carlo rows,
 
@@ -415,8 +520,7 @@ def aggregate_ste(
     path = Path("results_ste") / f"exp{exp}"
     idx_zero, idx_opt = 0, 1
 
-    delta_hat = []
-    sigma_sq_hat = []
+    user_ste = []
     for userid in userid_all:
         fp = path / f"res{exp}_{int(userid)}.txt"
         if not fp.is_file():
@@ -424,7 +528,15 @@ def aggregate_ste(
         reward = np.loadtxt(fp)
         if reward.ndim == 1:
             reward = reward.reshape(1, -1)
-        if reward.shape[0] > burn_in_rows > 0:
+        if reward.ndim != 2 or reward.shape[1] != 2:
+            raise ValueError(f"Expected two reward columns in {fp}, got shape {reward.shape}")
+        if not np.all(np.isfinite(reward)):
+            raise ValueError(f"Non-finite reward values in {fp}")
+        if not (0 <= burn_in_rows < reward.shape[0]):
+            raise ValueError(
+                f"burn_in_rows={burn_in_rows} must be in [0, {reward.shape[0] - 1}]"
+            )
+        if burn_in_rows:
             reward = reward[burn_in_rows:]
         g_zero = reward[:, idx_zero]
         g_opt = reward[:, idx_opt]
@@ -432,15 +544,13 @@ def aggregate_ste(
             raise ValueError(
                 f"Need at least 2 evaluation episodes for user {userid}, got {g_zero.size}"
             )
-        delta_hat.append(float(np.mean(g_opt) - np.mean(g_zero)))
+        delta_hat = float(np.mean(g_opt) - np.mean(g_zero))
         var_i = float(np.var(g_zero, ddof=1))
-        if var_i <= 0.0:
+        if not np.isfinite(var_i) or var_i <= 0.0:
             raise ValueError(f"Zero variance under pi^0 for user {userid}")
-        sigma_sq_hat.append(var_i)
+        user_ste.append(delta_hat / float(np.sqrt(var_i)))
 
-    mean_delta = float(np.mean(delta_hat))
-    mean_sigma_sq = float(np.mean(sigma_sq_hat))
-    return mean_delta / float(np.sqrt(mean_sigma_sq))
+    return float(np.mean(user_ste))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -465,7 +575,7 @@ def main(argv: list[str] | None = None) -> None:
     pe.add_argument("--nweek", type=int, default=None)
     pe.add_argument("--noise", type=str, default="random", choices=("random", "sequential"))
 
-    pa = sub.add_parser("aggregate", help="Print population STE_pop from saved eval files")
+    pa = sub.add_parser("aggregate", help="Print average user STE from saved eval files")
     pa.add_argument("--exp", type=str, default="1")
     pa.add_argument("--user-ids", type=str, default=None)
     pa.add_argument("--burn-in-rows", type=int, default=0)
@@ -495,7 +605,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     else:
         ste = aggregate_ste(args.exp, userid_path=uid_path, burn_in_rows=args.burn_in_rows)
-        print(f"STE\t{ste:.6f}")
+        print(f"average_user_STE\t{ste:.6f}")
 
 
 if __name__ == "__main__":

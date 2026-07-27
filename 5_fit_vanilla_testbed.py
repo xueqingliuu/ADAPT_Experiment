@@ -3,8 +3,8 @@
 #
 # Run order:
 #   1) ``perceived_utility.py``  → fits the joint state-space model, writes
-#      ``params_env_<id>.json`` / ``pred_<id>.json`` with the ``theta_ml_*`` /
-#      ``resid_ml_*`` keys, and adds ``perceived_utility`` /
+#      ``params_env_<id>.json`` / ``pred_<id>.json`` with the
+#      ``theta_penalized_*`` / ``resid_penalized_*`` keys, and adds ``perceived_utility`` /
 #      ``perceived_utility_lastweek`` columns to ``df_fit.csv``.
 #   2) ``5_fit_vanilla_testbed.py`` (this script) → fits the vanilla mediator
 #      / outcome models that consume ``perceived_utility_lastweek`` as a
@@ -61,18 +61,10 @@ file_params_env_prefix = str(work_folder / 'params_env_')
 file_pred_prefix = str(work_folder / 'pred_')
 file_user_ids = str(work_folder / 'user_ids.txt')
 
-for userid in df_fit["ParticipantIdentifier"].unique():
-    vc = df_fit.loc[df_fit["ParticipantIdentifier"] == userid, "week"].value_counts()
-    if vc.get(0, 0) > 2:
-        m = df_fit["ParticipantIdentifier"] == userid
-        df_fit.loc[m, "week"] = df_fit.loc[m, "week"] + 1
-df_fit = df_fit[df_fit["week"] < 13]
-
-# remove week 0 and week 1 data
-df_fit = df_fit[df_fit['week'] > 1]
-
-# turn week 2 into week 1
-df_fit['week'] = df_fit['week'] - 1
+# Combiner already drops weeks 0 and 13. Vanilla fit keeps study weeks 2–12
+# and renumbers them to 1–11.
+df_fit = df_fit[df_fit["week"] > 1]
+df_fit["week"] = df_fit["week"] - 1
 
 # Re-index calendar covariates on the retained rows (after week drop/relabel).
 VANILLA_DAY_RANGE = 84
@@ -484,26 +476,20 @@ def build_cae_short_mixedlm_data(df, userid_all, K=14):
 THETA_PRIOR2HOUR_STEP_COUNT_NAMES = [
     "intercept",
     "EMA_Prior2HourStepCount",
-    "dow",
+    "is_weekend",
     "decision_time",
-]
-
-THETA_RECORDED_PHYSICAL_ACTIVITY_NAMES = [
-    "intercept",
-    "Previous7DaysRPA",
-    "dow",
 ]
 
 THETA_ACTIVE_STATUS_NAMES = [
     "intercept",
     "active_status_fraction_7days",
-    "dow",
+    "is_weekend",
 ]
 
 THETA_WS_INTERACTION_NAMES = [
     "intercept",
     "Interacted_7d_walk",
-    "dow",
+    "is_weekend",
     "decision_time",
 ]
 
@@ -515,15 +501,13 @@ THETA_FOURSC_NAMES = [
     "yesterday_step_count",
     "seven_day_step_count_avg",
     "prior2hour_step_count",
-    "Previous7DaysRPA",
     "recent_burden",
     "seven_day_pageview_count",
     "past7days_morning_wearing",
-    "yesterday_salience_message",
     "Interacted_7d_walk",
     "anticipated_affect_yesterday",
     "fractionofactivedayspast7days",
-    "dow",
+    "is_weekend",
     "decision_time",
     "perceived_utility_lastweek",
     "CAE_avg_lastweek",
@@ -533,10 +517,9 @@ THETA_FOURSC_NAMES = [
     "WalkingSuggestion_by_recent_burden",
     "WalkingSuggestion_by_seven_day_pageview_count",
     "WalkingSuggestion_by_past7days_morning_wearing",
-    "WalkingSuggestion_by_yesterday_salience_message",
     "WalkingSuggestion_by_Interacted_7d_walk",
     "WalkingSuggestion_by_anticipated_affect_yesterday",
-    "WalkingSuggestion_by_dow",
+    "WalkingSuggestion_by_is_weekend",
     "WalkingSuggestion_by_decision_time",
     "WalkingSuggestion_by_perceived_utility_lastweek",
     "WalkingSuggestion_by_CAE_avg_lastweek",
@@ -546,18 +529,14 @@ THETA_ANTIC_NAMES = [
     "intercept",
     "anticipated_affect_yesterday",
     "today_step_count",
-    "recorded_physical_activity",
     "active_status",
-    "salience_message",
-    "dow",
+    "is_weekend",
     "perceived_utility_lastweek",
     "CAE_avg_lastweek",
     "A0_morning",
     "A1_afternoon",
-    "A0_morning_by_salience_message",
-    "A1_afternoon_by_salience_message",
-    "A0_morning_by_dow",
-    "A1_afternoon_by_dow",
+    "A0_morning_by_is_weekend",
+    "A1_afternoon_by_is_weekend",
     "A0_morning_by_perceived_utility_lastweek",
     "A1_afternoon_by_perceived_utility_lastweek",
     "A0_morning_by_CAE_avg_lastweek",
@@ -719,11 +698,8 @@ for i, userid in enumerate(userid_all):
     
     recent_burden = dat_user['recent_burden_norm'].to_numpy()
 
-    recorded_physical_activity = dat_user['RecordedPhysicalActivity'].to_numpy()
     active_status = dat_user['active_status'].to_numpy()
     active_status_fraction_7days = dat_user['active_status_fraction_7days'].to_numpy()
-    Previous7DaysRPA = dat_user['Previous7DaysRPA'].to_numpy()
-    
     DailyPageviewCount = dat_user['DailyPageviewCount_norm'].to_numpy()
     seven_day_pageview_count = dat_user['Past7DaysPageviewEMA_norm'].to_numpy()
     past7days_hourly_pageview_count = dat_user['Past7DaysHourlyPageviewEMA_norm'].to_numpy()
@@ -738,16 +714,13 @@ for i, userid in enumerate(userid_all):
     
     WalkingSuggestion = dat_user['WalkingSuggestion'].to_numpy()
     # WalkingSuggestion_lag1 = dat_user['WalkingSuggestion_lag1'].to_numpy()
-    salience_message = dat_user['SalienceMessage'].to_numpy()
     # planning_prompt = dat_user['planning_prompt'].to_numpy()
     # yesterday_planning_prompt = dat_user['yesterday_planning_prompt'].to_numpy()
-    yesterday_salience_message = dat_user['yesterday_SalienceMessage'].to_numpy()
 
-    is_weekend = dat_user['is_weekend'].to_numpy()
+    is_weekend = dat_user['is_weekend'].to_numpy(dtype=float)
     day = dat_user['day_norm'].to_numpy()
     week = dat_user['week_norm'].to_numpy() #TODO: check this
     decision_time = dat_user['DecisionTime'].to_numpy()
-    dow = dat_user['dow_norm'].to_numpy()
     
     
 
@@ -758,7 +731,6 @@ for i, userid in enumerate(userid_all):
     seven_day_step_count_avg = fill_nan_with_mean(seven_day_step_count_avg)
     prior2hour_step_count_filled = fill_nan_with_mean(prior2hour_step_count)
     ema_prior2hour_step_count = fill_nan_with_mean(ema_prior2hour_step_count)
-    Previous7DaysRPA = fill_nan_with_mean(Previous7DaysRPA)
     active_status_fraction_7days = fill_nan_with_mean(active_status_fraction_7days)
 
     recent_burden = fill_nan_with_mean(recent_burden)
@@ -789,7 +761,7 @@ for i, userid in enumerate(userid_all):
     prior2hour_step_count_cond = np.stack([
         Intercept,
         ema_prior2hour_step_count,
-        dow, decision_time
+        is_weekend, decision_time
     ], axis=1)
     #filter out rows where prior2hour_step_count is NaN
     idx_obs_prior2hour_step_count = ~np.isnan(prior2hour_step_count)
@@ -854,94 +826,12 @@ for i, userid in enumerate(userid_all):
     # print that this fit is good
     print(f"The fit of prior2hour_step_count is good for user {userid}")
 
-    #### Model 2: Recorded physical activity model #### 
-    # P(RecordedPhysicalActivity = 1 | prior 7-day RPA fraction, dow); morning rows
-    recorded_physical_activity_cond = np.stack([
-        Intercept,
-        Previous7DaysRPA,
-        dow
-    ], axis=1)
-    Cs_recorded_physical_activity = np.sort(1.0 / np.asarray(alpha_l2_list, dtype=float))
-
-    idx_obs_recorded_physical_activity = (decision_time == 0) & ~np.isnan(recorded_physical_activity)
-    cv_recorded_physical_activity = min(5, int(idx_obs_recorded_physical_activity.sum()))
-    recorded_physical_activity_cond_obs = recorded_physical_activity_cond[idx_obs_recorded_physical_activity, :]
-    recorded_physical_activity_obs = recorded_physical_activity[idx_obs_recorded_physical_activity]
-
-    has_recorded_physical_activity_obs = recorded_physical_activity_obs.size > 0
-    if has_recorded_physical_activity_obs and np.var(recorded_physical_activity_obs.astype(float)) > 0:
-        n0, n1 = int(np.sum(recorded_physical_activity_obs == 0)), int(np.sum(recorded_physical_activity_obs == 1))
-        min_class = min(n0, n1)
-        cv_rpa = min(cv_recorded_physical_activity, min_class)
-        if cv_rpa >= 2:
-            model_recorded_physical_activity = LogisticRegressionCV(
-                Cs=Cs_recorded_physical_activity,
-                cv=cv_rpa,
-                penalty="l2",
-                solver="lbfgs",
-                fit_intercept=False,
-                scoring="neg_log_loss",
-                max_iter=5000,
-                random_state=seed,
-            )
-            model_recorded_physical_activity.fit(
-                recorded_physical_activity_cond_obs, recorded_physical_activity_obs
-            )
-            C_sel = float(model_recorded_physical_activity.C_[0])
-        else:
-            C_sel = float(Cs_recorded_physical_activity[len(Cs_recorded_physical_activity) // 2])
-            model_recorded_physical_activity = LogisticRegression(
-                penalty="l2",
-                C=C_sel,
-                solver="lbfgs",
-                fit_intercept=False,
-                max_iter=5000,
-                random_state=seed,
-            )
-            model_recorded_physical_activity.fit(
-                recorded_physical_activity_cond_obs, recorded_physical_activity_obs
-            )
-        alpha_recorded_physical_activity_l2 = 1.0 / C_sel
-        theta_recorded_physical_activity_mean = model_recorded_physical_activity.coef_.ravel()
-        pred_recorded_physical_activity = model_recorded_physical_activity.predict_proba(
-            recorded_physical_activity_cond
-        )[:, 1]
-        resid_obs_recorded_physical_activity = (
-            recorded_physical_activity_obs.astype(float)
-            - pred_recorded_physical_activity[idx_obs_recorded_physical_activity]
-        )
-        resid_recorded_physical_activity = np.full_like(recorded_physical_activity, np.nan, dtype=float)
-        resid_recorded_physical_activity[idx_obs_recorded_physical_activity] = resid_obs_recorded_physical_activity
-        sigma2_recorded_physical_activity_mean = np.var(resid_obs_recorded_physical_activity)
-    else:
-        print(f"the variance of recorded_physical_activity is 0 for user {userid}")
-        const = float(
-            safe_nanmean(recorded_physical_activity_obs.astype(float), default=np.nan)
-        )
-        alpha_recorded_physical_activity_l2 = float(alpha_l2_list[0])
-        theta_recorded_physical_activity_mean = np.zeros(recorded_physical_activity_cond.shape[1])
-        if not np.isfinite(const):
-            const = 0.5
-            theta_recorded_physical_activity_mean[0] = 0.0
-        elif const <= 0.0:
-            theta_recorded_physical_activity_mean[0] = -25.0
-        elif const >= 1.0:
-            theta_recorded_physical_activity_mean[0] = 25.0
-        else:
-            theta_recorded_physical_activity_mean[0] = float(np.log(const / (1.0 - const)))
-        pred_recorded_physical_activity = np.full(len(recorded_physical_activity), const, dtype=float)
-        resid_recorded_physical_activity = np.full_like(recorded_physical_activity, np.nan, dtype=float)
-        resid_recorded_physical_activity[idx_obs_recorded_physical_activity] = 0.0
-        sigma2_recorded_physical_activity_mean = 0.0
-
-    print(f"The fit of recorded_physical_activity is good for user {userid}")
-
-    #### Model 3: Active status model ####
-    # P(active_status = 1 | prior 7-day active fraction, dow); morning rows with answered survey
+    #### Model 2: Active status model ####
+    # P(active_status = 1 | prior 7-day active fraction, is_weekend); morning rows with answered survey
     active_status_cond = np.stack([
         Intercept,
         active_status_fraction_7days,
-        dow,
+        is_weekend,
     ], axis=1)
     Cs_active_status = np.sort(1.0 / np.asarray(alpha_l2_list, dtype=float))
 
@@ -1012,13 +902,13 @@ for i, userid in enumerate(userid_all):
 
     print(f"The fit of active_status is good for user {userid}")
 
-    #### Model 4: Walking suggestion interaction model #### 
+    #### Model 3: Walking suggestion interaction model ####
 
     # P(WalkingSuggestion = 1 | context): L2 logistic CV (rows with observed WS and predictors)
     ws_interaction_cond = np.stack([
         Intercept,
         Interacted_7d_walk,
-        dow, decision_time
+        is_weekend, decision_time
     ], axis=1)
     Cs_ws_interaction = np.sort(1.0 / np.asarray(alpha_l2_list, dtype=float))
     idx_obs_ws_interaction = ~np.isnan(ws_interaction)
@@ -1085,19 +975,18 @@ for i, userid in enumerate(userid_all):
     print(f"The fit of ws_interaction is good for user {userid}")
 
 
-    #### Model 5: FourSC model #### 
+    #### Model 4: FourSC model ####
     fourSC_cond = np.stack([
         Intercept,
         fourSC_lag1,
         yesterday_step_count, seven_day_step_count_avg, 
-        prior2hour_step_count_filled, Previous7DaysRPA,
+        prior2hour_step_count_filled,
         recent_burden, seven_day_pageview_count, past7days_morning_wearing, 
-        yesterday_salience_message,
         Interacted_7d_walk,
         anticipated_affect_yesterday,
         active_status_fraction_7days,
         # is_weekend, 
-        dow, decision_time,
+        is_weekend, decision_time,
         perceived_utility_lastweek,
         CAE_avg_lastweek, 
         WalkingSuggestion, WalkingSuggestion * yesterday_step_count,
@@ -1105,11 +994,9 @@ for i, userid in enumerate(userid_all):
         WalkingSuggestion * recent_burden,
         WalkingSuggestion * seven_day_pageview_count,
         WalkingSuggestion * past7days_morning_wearing,
-        WalkingSuggestion * yesterday_salience_message,
         WalkingSuggestion * Interacted_7d_walk,
         WalkingSuggestion * anticipated_affect_yesterday,
-        # WalkingSuggestion * is_weekend,
-        WalkingSuggestion * dow,
+        WalkingSuggestion * is_weekend,
         WalkingSuggestion * decision_time,
         WalkingSuggestion * perceived_utility_lastweek,
         WalkingSuggestion * CAE_avg_lastweek
@@ -1160,10 +1047,9 @@ for i, userid in enumerate(userid_all):
     print(f"The fit of fourSC is good for user {userid}")
 
 
-    #### Model 6: Anticipated affect model #### 
+    #### Model 5: Anticipated affect model ####
     # Daily outcome: one row per calendar day (morning row). Predictors from that row except treatment,
     # which enters as both ws_morning_day and ws_afternoon_day for that day.
-    recorded_physical_activity_filled = fill_nan_with_mean(recorded_physical_activity)
     active_status_filled = fill_nan_with_mean(active_status)
     # planning_prompt_filled = np.where(np.isnan(planning_prompt), 0, planning_prompt)
     _am = idx_morning
@@ -1171,18 +1057,14 @@ for i, userid in enumerate(userid_all):
         Intercept[_am],
         anticipated_affect_yesterday[_am],
         today_step_count[_am],
-        recorded_physical_activity_filled[_am],
         active_status_filled[_am],
-        salience_message[_am],
-        dow[_am],
+        is_weekend[_am],
         perceived_utility_lastweek[_am],
         CAE_avg_lastweek[_am],
         ws_morning_day,
         ws_afternoon_day,
-        ws_morning_day * salience_message[_am],
-        ws_afternoon_day * salience_message[_am],
-        ws_morning_day * dow[_am],
-        ws_afternoon_day * dow[_am],
+        ws_morning_day * is_weekend[_am],
+        ws_afternoon_day * is_weekend[_am],
         ws_morning_day * perceived_utility_lastweek[_am],
         ws_afternoon_day * perceived_utility_lastweek[_am],
         ws_morning_day * CAE_avg_lastweek[_am],
@@ -1517,9 +1399,6 @@ for i, userid in enumerate(userid_all):
         "theta_prior2hour_step_count": json_float_list(theta_prior2hour_step_count_mean, digits),
         "theta_prior2hour_step_count_names": THETA_PRIOR2HOUR_STEP_COUNT_NAMES,
 
-        "theta_recorded_physical_activity": json_float_list(theta_recorded_physical_activity_mean, digits),
-        "theta_recorded_physical_activity_names": THETA_RECORDED_PHYSICAL_ACTIVITY_NAMES,
-
         "theta_active_status": json_float_list(theta_active_status_mean, digits),
         "theta_active_status_names": THETA_ACTIVE_STATUS_NAMES,
 
@@ -1539,7 +1418,6 @@ for i, userid in enumerate(userid_all):
         "theta_CAE_short_avg_names": THETA_CAE_SHORT_AVG_NAMES,
 
         "resid_prior2hour_step_count": json_float_list(resid_prior2hour_step_count, digits),
-        "resid_recorded_physical_activity": json_float_list(resid_recorded_physical_activity, digits),
         "resid_active_status": json_float_list(resid_active_status, digits),
         "resid_ws_interaction": json_float_list(resid_ws_interaction, digits),
         "resid_fourSC": json_float_list(resid_fourSC, digits),
@@ -1548,7 +1426,6 @@ for i, userid in enumerate(userid_all):
         "resid_CAE_short_avg": json_float_list(resid_CAE_short_avg, digits),
 
         "alpha_prior2hour_step_count_l2": json_float(alpha_prior2hour_step_count_l2, digits),
-        "alpha_recorded_physical_activity_l2": json_float(alpha_recorded_physical_activity_l2, digits),
         "alpha_active_status_l2": json_float(alpha_active_status_l2, digits),
         "alpha_ws_interaction_l2": json_float(alpha_ws_interaction_l2, digits),
         "alpha_fourSC_l2": json_float(alpha_fourSC_l2, digits),
@@ -1559,7 +1436,6 @@ for i, userid in enumerate(userid_all):
 
     predicted = {
         "pred_prior2hour_step_count": json_float_list(pred_prior2hour_step_count, digits),
-        "pred_recorded_physical_activity": json_float_list(pred_recorded_physical_activity, digits),
         "pred_active_status": json_float_list(pred_active_status, digits),
         "pred_ws_interaction": json_float_list(pred_ws_interaction, digits),
         "pred_fourSC": json_float_list(pred_fourSC, digits),
@@ -1571,7 +1447,6 @@ for i, userid in enumerate(userid_all):
     # Sanity checks: theta length must match theta-name length.
     for key in [
         "theta_prior2hour_step_count",
-        "theta_recorded_physical_activity",
         "theta_active_status",
         "theta_ws_interaction",
         "theta_fourSC",

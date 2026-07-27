@@ -112,8 +112,6 @@ def _truncated_oenv(oenv, k):
         "dailyAnticipatedAffectObsAll":          oenv.dailyAnticipatedAffectObsAll[:n_day].copy(),
         "morningFitbitWearAll":             oenv.morningFitbitWearAll[:n_day].copy(),
         "dailySurveyCompleteAll":              oenv.dailySurveyCompleteAll[:n_day].copy(),
-        "activityCompletedLast7DaysAll": oenv.activityCompletedLast7DaysAll[:n_day].copy(),
-        "activityCompletedLast7DaysAll":   oenv.activityCompletedLast7DaysAll[:n_day].copy(),
         # slot-level
         "stepCountFourHourAll":             oenv.stepCountFourHourAll[:n_slot].copy(),
         "pageViewFourHourAll":           oenv.pageViewFourHourAll[:n_slot].copy(),

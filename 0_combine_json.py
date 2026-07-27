@@ -1,12 +1,16 @@
 # %%
 from __future__ import annotations
 
-import pandas as pd
+import csv
 import json
+import os
 import re
-from datetime import datetime, timezone
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+import pandas as pd
 
 # %%
 # ---------- CONFIG ----------
@@ -15,8 +19,11 @@ ROOT_DIR = BASE_DIR / "rawdata"
 OUT_DIR = BASE_DIR / "Xueqing"   # where combined JSON/CSV will go
 
 DATE_START = "2024-11-01"
-DATE_END = "2026-07-03"
+DATE_END = "2026-07-26"
 FOLDER_FMT = "%Y-%m-%d"
+
+# Parallelism for per-day Fitbit extraction (I/O-heavy; keep modest on Dropbox)
+EXTRACT_WORKERS = max(1, min(6, (os.cpu_count() or 2) - 1))
 
 # Combine only files that end with _YYYYMMDD.json or _YYYYMMDD-YYYYMMDD.json
 DATE_SUFFIX_RE = re.compile(r"_(\d{8}(?:-\d{8})?)\.json$", re.IGNORECASE)
@@ -35,6 +42,8 @@ SKIP_DATASETS = {"FitbitIntradayCombined", "FitbitRestingHeartRates", "DeletedSu
 # Which keys to look for when a JSON file is a dict that contains a list of records
 LIST_KEYS_CANDIDATES = ("data", "events", "records", "items", "rows", "results")
 
+_IO_BUFFER = 1024 * 1024
+
 
 # ---------- HELPERS ----------
 def base_dataset_name(filename: str) -> str | None:
@@ -50,6 +59,16 @@ def base_dataset_name(filename: str) -> str | None:
     return filename[: m.start()]
 
 
+def _first_non_ws_char(f) -> str:
+    """Read ahead in a buffered chunk instead of one byte at a time."""
+    while True:
+        chunk = f.read(4096)
+        if not chunk:
+            return ""
+        for c in chunk:
+            if not c.isspace():
+                return c
+
 
 def iter_json_records(path: Path) -> Iterable[dict[str, Any]]:
     """
@@ -59,17 +78,11 @@ def iter_json_records(path: Path) -> Iterable[dict[str, Any]]:
     Skips empty/malformed files with warning.
     """
     try:
-        with path.open("r", encoding="utf-8-sig", errors="replace") as f:
-            # find first non-whitespace character
-            first = ""
-            while True:
-                c = f.read(1)
-                if c == "":
-                    print(f"[skip empty] {path}")
-                    return
-                if not c.isspace():
-                    first = c
-                    break
+        with path.open("r", encoding="utf-8-sig", errors="replace", buffering=_IO_BUFFER) as f:
+            first = _first_non_ws_char(f)
+            if not first:
+                print(f"[skip empty] {path}")
+                return
 
             f.seek(0)
 
@@ -99,8 +112,7 @@ def iter_json_records(path: Path) -> Iterable[dict[str, Any]]:
 
             # JSONL fallback
             for ln in f:
-                ln = ln.strip()
-                if not ln:
+                if not ln or ln.isspace():
                     continue
                 try:
                     rec = json.loads(ln)
@@ -113,25 +125,23 @@ def iter_json_records(path: Path) -> Iterable[dict[str, Any]]:
     except Exception as e:
         print(f"[skip unreadable] {path} ({e})")
         return
-    
 
-def add_provenance(records: list[dict[str, Any]], src: Path) -> list[dict[str, Any]]:
-    """
-    Add source metadata so you can trace rows back later.
-    """
-    folder = src.parent.name
-    fname = src.name
-    for r in records:
-        r["_source_folder"] = folder
-        r["_source_file"] = fname
-    return records
 
-def flatten_record(x: Any, parent: str = "", sep: str = ".") -> dict[str, Any]:
-    out: dict[str, Any] = {}
+def add_provenance(rec: dict[str, Any], folder: str, fname: str) -> dict[str, Any]:
+    """Add source metadata so you can trace rows back later (mutates and returns rec)."""
+    rec["_source_folder"] = folder
+    rec["_source_file"] = fname
+    return rec
+
+
+def flatten_record(x: Any, parent: str = "", sep: str = ".", out: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Flatten nested dicts into dotted keys; lists become JSON strings."""
+    if out is None:
+        out = {}
     if isinstance(x, dict):
         for k, v in x.items():
             key = f"{parent}{sep}{k}" if parent else str(k)
-            out.update(flatten_record(v, key, sep=sep))
+            flatten_record(v, key, sep=sep, out=out)
         return out
     if isinstance(x, list):
         out[parent] = json.dumps(x, ensure_ascii=False)
@@ -140,11 +150,10 @@ def flatten_record(x: Any, parent: str = "", sep: str = ".") -> dict[str, Any]:
     return out
 
 
-import csv
-
 def combine_dataset_streaming(dataset: str, paths: list[Path]) -> None:
+    """Single-pass combine: write JSON while collecting flats, then write CSV."""
     out_json = OUT_DIR / f"{dataset}.json"
-    out_csv  = OUT_DIR / f"{dataset}.csv"
+    out_csv = OUT_DIR / f"{dataset}.csv"
 
     # Always overwrite (and avoid any accidental append artifacts)
     if out_json.exists():
@@ -152,52 +161,47 @@ def combine_dataset_streaming(dataset: str, paths: list[Path]) -> None:
     if out_csv.exists():
         out_csv.unlink()
 
-    # PASS 1: collect CSV columns (without keeping all rows)
     columns: set[str] = set()
-    total = 0
-    for p in paths:
-        for rec in iter_json_records(p):
-            recs = add_provenance([rec], p)  # re-use your provenance logic
-            flat = flatten_record(recs[0], sep=".")
-            columns.update(flat.keys())
-            total += 1
+    flats: list[dict[str, Any]] = []
+    written = 0
 
-    if total == 0:
+    with out_json.open("w", encoding="utf-8", buffering=_IO_BUFFER) as jf:
+        jf.write("[\n")
+        first = True
+
+        for p in paths:
+            folder = p.parent.name
+            fname = p.name
+            for rec in iter_json_records(p):
+                add_provenance(rec, folder, fname)
+
+                if not first:
+                    jf.write(",\n")
+                jf.write(json.dumps(rec, ensure_ascii=False))
+                first = False
+
+                flat = flatten_record(rec, sep=".")
+                columns.update(flat.keys())
+                flats.append(flat)
+                written += 1
+
+        jf.write("\n]\n")
+
+    if written == 0:
         out_json.write_text("[]\n", encoding="utf-8")
         out_csv.write_text("", encoding="utf-8")
         print(f"[SKIP] {dataset}: 0 records")
         return
 
     header = sorted(columns)
-
-    # PASS 2: stream-write JSON array + CSV
-    with out_json.open("w", encoding="utf-8") as jf, out_csv.open("w", encoding="utf-8", newline="") as cf:
+    with out_csv.open("w", encoding="utf-8", newline="", buffering=_IO_BUFFER) as cf:
         writer = csv.DictWriter(cf, fieldnames=header, extrasaction="ignore")
         writer.writeheader()
-
-        jf.write("[\n")
-        first = True
-
-        written = 0
-        for p in paths:
-            for rec in iter_json_records(p):
-                rec = add_provenance([rec], p)[0]
-
-                # JSON array item (comma-separated)
-                if not first:
-                    jf.write(",\n")
-                jf.write(json.dumps(rec, ensure_ascii=False))
-                first = False
-
-                # CSV row
-                flat = flatten_record(rec, sep=".")
-                writer.writerow({k: flat.get(k, "") for k in header})
-
-                written += 1
-
-        jf.write("\n]\n")
+        for flat in flats:
+            writer.writerow({k: flat.get(k, "") for k in header})
 
     print(f"[OK] {dataset}: {written} records -> {out_json.name}, {out_csv.name}")
+
 
 # %%
 PATTERN = "FitbitIntradayCombined_*.json"
@@ -205,10 +209,9 @@ PATTERN = "FitbitIntradayCombined_*.json"
 
 def iter_jsonl_records(path: Path) -> Iterable[dict[str, Any]]:
     # FitbitIntradayCombined rows look like JSONL: one JSON object per line
-    with path.open("r", encoding="utf-8-sig", errors="replace") as f:
+    with path.open("r", encoding="utf-8-sig", errors="replace", buffering=_IO_BUFFER) as f:
         for line_no, ln in enumerate(f, start=1):
-            ln = ln.strip()
-            if not ln:
+            if not ln or ln.isspace():
                 continue
             try:
                 obj = json.loads(ln)
@@ -257,29 +260,41 @@ TARGET_TYPES = {
 # Raw Fitbit input files (must match the earlier cell, or this cell can run alone)
 PATTERN = "FitbitIntradayCombined_*.json"
 
+# Substrings used to skip json.loads for irrelevant JSONL lines (huge win on multi-GB files)
+_TARGET_TYPE_NEEDLES = tuple(TARGET_TYPES.keys())
+
 
 def _value_dict(rec: dict) -> dict:
     v = rec.get("Value")
     if isinstance(v, dict):
         return v
-    if isinstance(v, str) and v.strip().startswith("{"):
-        try:
-            o = json.loads(v)
-            return o if isinstance(o, dict) else {}
-        except json.JSONDecodeError:
-            return {}
+    if isinstance(v, str):
+        s = v.lstrip()
+        if s.startswith("{"):
+            try:
+                o = json.loads(v)
+                return o if isinstance(o, dict) else {}
+            except json.JSONDecodeError:
+                return {}
     return {}
 
 
 def _activities_heart_datetimes(rec: dict) -> tuple[Any, Any]:
     """Return raw DateTime and InsertedDate from top-level or nested Value."""
+    dt = rec.get("DateTime") or rec.get("dateTime")
+    ins = rec.get("InsertedDate")
+    if dt is not None and ins is not None:
+        return dt, ins
     vd = _value_dict(rec)
-    dt = rec.get("DateTime") or rec.get("dateTime") or vd.get("DateTime") or vd.get("dateTime")
-    ins = rec.get("InsertedDate") or vd.get("InsertedDate")
+    if dt is None:
+        dt = vd.get("DateTime") or vd.get("dateTime")
+    if ins is None:
+        ins = vd.get("InsertedDate")
     return dt, ins
 
 
 def _to_minute_iso(val: Any) -> str | None:
+    """Floor timestamp to minute in UTC ISO. Fast path for common Fitbit string shapes."""
     if val is None:
         return None
 
@@ -287,6 +302,24 @@ def _to_minute_iso(val: Any) -> str | None:
         s = val.strip()
         if not s:
             return None
+
+        # Date-only: YYYY-MM-DD
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            return f"{s}T00:00:00+00:00"
+
+        # Naive or Zulu ISO datetime: YYYY-MM-DDTHH:MM...
+        if (
+            len(s) >= 16
+            and s[4] == "-"
+            and s[7] == "-"
+            and s[10] in "T "
+            and s[13] == ":"
+        ):
+            # Non-UTC numeric offsets need full parse + UTC convert
+            body = s[:-1] if s[-1] in "Zz" else s
+            if "+" not in body[11:] and "-" not in body[11:]:
+                return f"{s[:10]}T{s[11:16]}:00+00:00"
+
         try:
             parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
         except ValueError:
@@ -298,10 +331,50 @@ def _to_minute_iso(val: Any) -> str | None:
                 parsed = parsed.astimezone(timezone.utc)
             return parsed.replace(second=0, microsecond=0).isoformat()
 
+    if isinstance(val, datetime):
+        parsed = val
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        return parsed.replace(second=0, microsecond=0).isoformat()
+
+    if isinstance(val, (int, float)):
+        try:
+            parsed = datetime.fromtimestamp(float(val), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        return parsed.replace(second=0, microsecond=0).isoformat()
+
+    # Rare fallback (non-string / odd types)
     ts = pd.to_datetime(val, errors="coerce", utc=True)
     if pd.isna(ts):
         return None
     return ts.floor("min").isoformat()
+
+
+def _heart_rate_float(v: Any) -> float | None:
+    """Parse HR bpm without pandas overhead."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, dict):
+        for key in ("value", "bpm", "Value"):
+            if key in v and v[key] is not None:
+                return _heart_rate_float(v[key])
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
 
 
 def _heart_rate_value(rec: dict) -> Any:
@@ -309,117 +382,176 @@ def _heart_rate_value(rec: dict) -> Any:
     v = rec.get("Value")
     if isinstance(v, dict):
         return v.get("value") or v.get("bpm") or v.get("Value")
-    if v is None:
-        return None
-    num = pd.to_numeric(v, errors="coerce")
-    if pd.notna(num):
-        return int(num) if float(num).is_integer() else float(num)
-    return v
+    hr = _heart_rate_float(v)
+    if hr is None:
+        return v
+    return int(hr) if hr.is_integer() else hr
 
 
 def _slim_activities_heart_record(rec: dict) -> dict[str, Any] | None:
     """One raw row: minute-rounded times + HR (used to aggregate many seconds into one minute)."""
     dt_raw, ins_raw = _activities_heart_datetimes(rec)
     dt_m = _to_minute_iso(dt_raw)
-    ins_m = _to_minute_iso(ins_raw)
     if dt_m is None:
         return None
-    pid = rec.get("ParticipantIdentifier")
-    hr = _heart_rate_value(rec)
     return {
-        "ParticipantIdentifier": pid,
-        "Value": hr,
+        "ParticipantIdentifier": rec.get("ParticipantIdentifier"),
+        "Value": _heart_rate_value(rec),
         "DateTime": dt_m,
-        "InsertedDate": ins_m,
+        "InsertedDate": _to_minute_iso(ins_raw),
     }
+
+
+def _line_may_match_target(line: str) -> bool:
+    """Cheap reject before json.loads for non-target Fitbit types."""
+    for needle in _TARGET_TYPE_NEEDLES:
+        if needle in line:
+            return True
+    return False
+
+
+def _process_one_date_folder(folder_str: str) -> dict[str, Any]:
+    """Worker: filter FitbitIntradayCombined JSONL for one date folder."""
+    folder = Path(folder_str)
+    output_names = set(TARGET_TYPES.values())
+
+    input_files = sorted(
+        p for p in folder.glob(PATTERN)
+        if p.is_file() and p.name not in output_names and not p.name.startswith("_ONLY_")
+    )
+    if not input_files:
+        return {"folder": folder.name, "counts": None, "skipped": True}
+
+    # activities-heart: average Value per (ParticipantIdentifier, DateTime minute)
+    # value layout: [sum, n, ins_max]
+    heart_agg: dict[tuple[Any, str], list[Any]] = {}
+    kept_counts = {t: 0 for t in TARGET_TYPES}
+    dumps = json.dumps
+
+    out_handles: dict[str, Any] = {}
+    try:
+        for t, out_name in TARGET_TYPES.items():
+            if t == "activities-heart":
+                continue
+            out_handles[t] = (folder / out_name).open(
+                "w", encoding="utf-8", buffering=_IO_BUFFER
+            )
+
+        for p in input_files:
+            with p.open("r", encoding="utf-8-sig", errors="replace", buffering=_IO_BUFFER) as f:
+                for line_no, ln in enumerate(f, start=1):
+                    if not _line_may_match_target(ln):
+                        continue
+                    s = ln.strip()
+                    if not s:
+                        continue
+                    try:
+                        rec = json.loads(s)
+                    except json.JSONDecodeError as e:
+                        print(f"[skip bad line] {p}:{line_no} ({e})")
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+
+                    t = rec.get("Type")
+                    if t == "activities-heart":
+                        dt_raw = rec.get("DateTime") or rec.get("dateTime")
+                        if dt_raw is None:
+                            vd = _value_dict(rec)
+                            dt_raw = vd.get("DateTime") or vd.get("dateTime")
+                            ins_raw = rec.get("InsertedDate") or vd.get("InsertedDate")
+                        else:
+                            ins_raw = rec.get("InsertedDate")
+                            if ins_raw is None:
+                                ins_raw = _value_dict(rec).get("InsertedDate")
+
+                        dt_m = _to_minute_iso(dt_raw)
+                        if dt_m is None:
+                            continue
+                        hr_f = _heart_rate_float(rec.get("Value"))
+                        if hr_f is None:
+                            continue
+
+                        ins_m = _to_minute_iso(ins_raw)
+                        key = (rec.get("ParticipantIdentifier"), dt_m)
+                        b = heart_agg.get(key)
+                        if b is None:
+                            heart_agg[key] = [hr_f, 1, ins_m]
+                        else:
+                            b[0] += hr_f
+                            b[1] += 1
+                            if ins_m is not None and (b[2] is None or ins_m > b[2]):
+                                b[2] = ins_m
+
+                    elif t in out_handles:
+                        out_handles[t].write(dumps(rec, ensure_ascii=False))
+                        out_handles[t].write("\n")
+                        kept_counts[t] += 1
+
+        heart_path = folder / TARGET_TYPES["activities-heart"]
+        with heart_path.open("w", encoding="utf-8", buffering=_IO_BUFFER) as hf:
+            for (pid, dt_m) in sorted(
+                heart_agg.keys(),
+                key=lambda k: ("" if k[0] is None else str(k[0]), k[1]),
+            ):
+                b = heart_agg[(pid, dt_m)]
+                n = b[1]
+                avg = b[0] / n if n else 0.0
+                val_out = int(round(avg)) if abs(avg - round(avg)) < 1e-9 else round(avg, 2)
+                row = {
+                    "ParticipantIdentifier": pid,
+                    "Value": val_out,
+                    "DateTime": dt_m,
+                    "InsertedDate": b[2],
+                }
+                hf.write(dumps(row, ensure_ascii=False))
+                hf.write("\n")
+        kept_counts["activities-heart"] = len(heart_agg)
+
+    finally:
+        for h in out_handles.values():
+            h.close()
+
+    return {"folder": folder.name, "counts": kept_counts, "skipped": False}
 
 
 def extract_types_per_date_folder() -> None:
     date_range = pd.date_range(start=DATE_START, end=DATE_END, freq="D")
-    output_names = set(TARGET_TYPES.values())
+    folders = [
+        str(ROOT_DIR / d.strftime(FOLDER_FMT))
+        for d in date_range
+        if (ROOT_DIR / d.strftime(FOLDER_FMT)).exists()
+    ]
+    if not folders:
+        print("No date folders found for Fitbit extraction.")
+        return
 
-    for d in date_range:
-        folder = ROOT_DIR / d.strftime(FOLDER_FMT)
-        if not folder.exists():
-            continue
+    workers = EXTRACT_WORKERS
+    print(f"Extracting Fitbit types from {len(folders)} folders using {workers} worker(s)...")
 
-        # Input pattern should target only original files
-        input_files = sorted(
-            p for p in folder.glob(PATTERN)
-            if p.is_file() and p.name not in output_names and not p.name.startswith("_ONLY_")
-        )
-        if not input_files:
-            continue
-
-        # activities-heart: average Value per (ParticipantIdentifier, DateTime minute)
-        heart_agg: dict[tuple[Any, str], dict[str, Any]] = {}
-
-        out_handles: dict[str, Any] = {}
+    results: list[dict[str, Any]]
+    if workers == 1:
+        results = [_process_one_date_folder(f) for f in folders]
+    else:
         try:
-            for t, out_name in TARGET_TYPES.items():
-                if t == "activities-heart":
-                    continue
-                out_handles[t] = (folder / out_name).open("w", encoding="utf-8")
+            results = []
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futures = {ex.submit(_process_one_date_folder, f): f for f in folders}
+                for fut in as_completed(futures):
+                    results.append(fut.result())
+            results.sort(key=lambda r: r["folder"])
+        except Exception as e:
+            # Interactive / notebook contexts often cannot spawn process pools.
+            print(f"Parallel extract unavailable ({e}); falling back to sequential.")
+            results = [_process_one_date_folder(f) for f in folders]
 
-            kept_counts = {t: 0 for t in TARGET_TYPES}
-
-            for p in input_files:
-                for rec in iter_jsonl_records(p):
-                    t = rec.get("Type")
-                    if t not in TARGET_TYPES:
-                        continue
-                    if t == "activities-heart":
-                        slim = _slim_activities_heart_record(rec)
-                        if slim is None:
-                            continue
-                        hr = slim.get("Value")
-                        if hr is None:
-                            continue
-                        try:
-                            hr_f = float(hr)
-                        except (TypeError, ValueError):
-                            continue
-                        pid = slim.get("ParticipantIdentifier")
-                        dt_m = slim["DateTime"]
-                        ins_m = slim.get("InsertedDate")
-                        key = (pid, dt_m)
-                        if key not in heart_agg:
-                            heart_agg[key] = {"sum": 0.0, "n": 0, "ins_max": None}
-                        b = heart_agg[key]
-                        b["sum"] += hr_f
-                        b["n"] += 1
-                        if ins_m is not None:
-                            if b["ins_max"] is None or ins_m > b["ins_max"]:
-                                b["ins_max"] = ins_m
-                    else:
-                        out_handles[t].write(json.dumps(rec, ensure_ascii=False) + "\n")
-                        kept_counts[t] += 1
-
-            heart_path = folder / TARGET_TYPES["activities-heart"]
-            with heart_path.open("w", encoding="utf-8") as hf:
-                for (pid, dt_m) in sorted(
-                    heart_agg.keys(), key=lambda k: (str(k[0]) if k[0] is not None else "", k[1])
-                ):
-                    b = heart_agg[(pid, dt_m)]
-                    n = b["n"]
-                    avg = b["sum"] / n if n else 0.0
-                    val_out = int(round(avg)) if abs(avg - round(avg)) < 1e-9 else round(avg, 2)
-                    row = {
-                        "ParticipantIdentifier": pid,
-                        "Value": val_out,
-                        "DateTime": dt_m,
-                        "InsertedDate": b["ins_max"],
-                    }
-                    hf.write(json.dumps(row, ensure_ascii=False) + "\n")
-            kept_counts["activities-heart"] = len(heart_agg)
-
-            print(f"[OK] {folder.name}")
-            for t in TARGET_TYPES:
-                print(f"  {t}: {kept_counts[t]} rows -> {TARGET_TYPES[t]}")
-
-        finally:
-            for h in out_handles.values():
-                h.close()
+    for r in results:
+        if r.get("skipped"):
+            continue
+        print(f"[OK] {r['folder']}")
+        counts = r["counts"] or {}
+        for t in TARGET_TYPES:
+            print(f"  {t}: {counts.get(t, 0)} rows -> {TARGET_TYPES[t]}")
 
 
 # %%
@@ -454,6 +586,7 @@ def main() -> None:
 
     for dataset, paths in sorted(groups.items()):
         combine_dataset_streaming(dataset, sorted(paths))
+
 
 # %%
 # Extract data from ProjectDeviceData_clean
@@ -499,6 +632,8 @@ def load_json_flex(path: Path) -> pd.DataFrame:
     if not rows:
         raise ValueError("Could not parse JSON file as array/object or line-delimited JSON.")
     return pd.DataFrame(rows)
+
+
 def parse_value(v):
     if isinstance(v, dict):
         return v
@@ -537,6 +672,9 @@ def _to_date_iso(val: Any) -> str | None:
         s = val.strip()
         if not s:
             return None
+        # Fast path: leading YYYY-MM-DD
+        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+            return s[:10]
         try:
             parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
         except ValueError:
@@ -547,6 +685,17 @@ def _to_date_iso(val: Any) -> str | None:
             else:
                 parsed = parsed.astimezone(timezone.utc)
             return parsed.date().isoformat()
+
+    if isinstance(val, datetime):
+        parsed = val
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        return parsed.date().isoformat()
+
+    if isinstance(val, date):
+        return val.isoformat()
 
     ts = pd.to_datetime(val, errors="coerce", utc=True)
     if pd.isna(ts):
@@ -563,17 +712,21 @@ def extract_project_device_fields() -> pd.DataFrame:
             source_count += 1
             value_obj = parse_value(r.get("Value"))
 
-            user = value_obj.get("user", {}) if isinstance(value_obj.get("user"), dict) else {}
-            demographics = user.get("demographics", {}) if isinstance(user.get("demographics"), dict) else {}
-            custom_fields = user.get("customFields", {}) if isinstance(user.get("customFields"), dict) else {}
+            user = value_obj.get("user") if isinstance(value_obj.get("user"), dict) else {}
+            demographics = user.get("demographics") if isinstance(user.get("demographics"), dict) else {}
+            custom_fields = user.get("customFields") if isinstance(user.get("customFields"), dict) else {}
 
             # timestamp under Value (fallback: Value.event.timestamp)
             timestamp = value_obj.get("timestamp")
-            if timestamp is None and isinstance(value_obj.get("event"), dict):
-                timestamp = value_obj["event"].get("timestamp")
+            if timestamp is None:
+                event = value_obj.get("event")
+                if isinstance(event, dict):
+                    timestamp = event.get("timestamp")
 
             participantidentifier = r.get("ParticipantIdentifier")
-            if pd.isna(participantidentifier) or participantidentifier is None:
+            if participantidentifier is None or (
+                isinstance(participantidentifier, float) and pd.isna(participantidentifier)
+            ):
                 participantidentifier = user.get("participantIdentifier")
 
             seen.add((

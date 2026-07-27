@@ -19,7 +19,6 @@ STATE_TODAY_STEP_COUNT = "todayStepCount"
 STATE_STEP_COUNT_LAST7_DAYS_EMA = "stepCountLast7DaysEma"
 STATE_PAGE_VIEW_LAST7_DAYS_EMA = "pageViewLast7DaysEma"
 
-STATE_ACTIVITY_COMPLETED_LAST7_DAYS = "activityCompletedLast7Days"
 STATE_ACTIVE_DAYS_LAST7_DAYS = "activeDaysLast7Days"
 STATE_ACTIVITY_SUGGESTION_INTERACT_LAST7_DAYS = "activitySuggestionInteractLast7Days"
 # Deprecated in simulation: RL context slot fixed at 0.0 (P_FOURSC=30 has no salience 7d term).
@@ -39,8 +38,6 @@ STATE_DAILY_ANTICIPATED_AFFECT = "dailyAnticipatedAffect"
 STATE_DAILY_ANTICIPATED_AFFECT_YESTERDAY = "dailyAnticipatedAffectYesterday"
 STATE_DAILY_ANTICIPATED_AFFECT_YESTERDAY_AGENT = "dailyAnticipatedAffectYesterdayAgent"
 
-STATE_RECORDED_PHYSICAL_ACTIVITY = "recordedPhysicalActivityToday"
-STATE_RECORDED_PHYSICAL_ACTIVITY_LAG1 = "recordedPhysicalActivityLag1"
 STATE_ACTIVITY_STATUS_TODAY = "activityStatusToday"
 
 STATE_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS = "activitySuggestionsSentLast7Days"
@@ -72,7 +69,6 @@ TRAJ_DAILY_ANTICIPATED_AFFECT_AGENT = "dailyAnticipatedAffectAgentAll"
 TRAJ_DAILY_ANTICIPATED_AFFECT_OBS = "dailyAnticipatedAffectObsAll"
 TRAJ_MORNING_FITBIT_WEAR = "morningFitbitWearAll"
 TRAJ_DAILY_SURVEY_COMPLETE = "dailySurveyCompleteAll"
-TRAJ_ACTIVITY_COMPLETED_LAST7_DAYS = "activityCompletedLast7DaysAll"
 TRAJ_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS = "activitySuggestionsSentLast7DaysAll"
 
 # Per-day covariate logs (PF / RL; not in ``s`` at use time)
@@ -99,9 +95,6 @@ LEGACY_TO_CANONICAL = [
     ("yesterday_salience_message", STATE_SALIENCE_MESSAGE_SENT_YESTERDAY),
     ("yesterday_pageview_afternoon", STATE_PAGE_VIEW_AFTERNOON_YESTERDAY),
     ("yesterday_pageview_morning", STATE_PAGE_VIEW_MORNING_YESTERDAY),
-    ("recorded_physical_activity_lag1", STATE_RECORDED_PHYSICAL_ACTIVITY_LAG1),
-    ("recorded_physical_activity_all", "recordedPhysicalActivityTodayAll"),
-    ("recorded_physical_activity", STATE_RECORDED_PHYSICAL_ACTIVITY),
     ("active_status", STATE_ACTIVITY_STATUS_TODAY),
     ("today_pageview_afternoon", STATE_PAGE_VIEW_AFTERNOON_TODAY),
     ("today_pageview_morning", STATE_PAGE_VIEW_MORNING_TODAY),
@@ -125,7 +118,6 @@ LEGACY_TO_CANONICAL = [
     ("antic_all", TRAJ_DAILY_ANTICIPATED_AFFECT),
     ("fitbit_all", TRAJ_MORNING_FITBIT_WEAR),
     ("daily_all", TRAJ_DAILY_SURVEY_COMPLETE),
-    ("Previous7DaysRPA_all", TRAJ_ACTIVITY_COMPLETED_LAST7_DAYS),
     ("recent_burden_all", TRAJ_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS),
     ("activitySuggestionsSentLast7DaysAll", TRAJ_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS),
     ("log_antic_yesterday_latent", LOG_DAILY_ANTICIPATED_AFFECT_YESTERDAY),
@@ -145,7 +137,6 @@ LEGACY_TO_CANONICAL = [
     ("fitbitwearing_morning", STATE_MORNING_FITBIT_WEAR),
     ("daily_present", STATE_DAILY_SURVEY_COMPLETE),
     ("anticipated_affect", STATE_DAILY_ANTICIPATED_AFFECT),
-    ("Previous7DaysRPA", STATE_ACTIVITY_COMPLETED_LAST7_DAYS),
     ("recent_burden", STATE_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS),
     ("activitySuggestionsSentLast7Days", STATE_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS),
     ("salience_message", STATE_SALIENCE_MESSAGE_SENT_TODAY),
@@ -164,7 +155,6 @@ KW_YESTERDAY_STEP = "yesterdayStepCount"
 KW_STEP_COUNT_LAST7 = "stepCountLast7DaysEma"
 KW_PRIOR2HOUR = "prior2HourStepCount"
 KW_PRIOR2HOUR_AGENT = "prior2HourStepCountAgent"
-KW_ACTIVITY_COMPLETED_LAST7 = "activityCompletedLast7Days"
 KW_ACTIVITY_SUGGESTIONS_SENT_LAST7 = "activitySuggestionsSentLast7Days"
 KW_PAGE_VIEW_LAST7 = "pageViewLast7DaysEma"
 KW_MORNING_FITBIT_LAST7 = "morningFitbitWearLast7Days"

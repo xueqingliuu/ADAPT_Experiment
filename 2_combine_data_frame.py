@@ -18,25 +18,20 @@
 # ## 0. Setup
 
 # %%
-import datetime
-import json
 from pathlib import Path
 
-import matplotlib.dates as mdates
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
-from matplotlib.ticker import MaxNLocator
-
-plt.ion()
 
 DATA_FOLDER = Path(
     "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing"
 )
 folder = DATA_FOLDER
 
-BURN_IN_DAYS = 6  # keep from day index 6 onward (= drop first 7 calendar days)
+# Drop first BURN_IN_DAYS calendar days after each participant's earliest
+# decision-panel date (Date >= min_date + BURN_IN_DAYS). With BURN_IN_DAYS=6,
+# that removes 6 days; remaining calendar + week filters yield 84 analysis days.
+BURN_IN_DAYS = 6
 EXCLUDED_WEEKS = (0, 13)
 
 DAILY_SURVEY_COLS = [
@@ -47,27 +42,33 @@ DAILY_SURVEY_COLS = [
     "active_status_fraction_7days",
 ]
 
+
+def _as_str_id(df, col="ParticipantIdentifier"):
+    if col in df.columns:
+        df[col] = df[col].astype(str)
+    return df
+
+
 # %% [markdown]
 # ## 1. Load extracted tables
 
 # %%
-df_4hour_step = pd.read_csv(folder / "hourly_step_counts.csv")
-df_today_step = pd.read_csv(folder / "today_step_counts.csv")
-df_prior2hours_step = pd.read_csv(folder / "prior_2hours_step_counts.csv")
-df_otherPA = pd.read_csv(folder / "recorded_physical_activity.csv")
+df_4hour_step = _as_str_id(pd.read_csv(folder / "hourly_step_counts.csv"))
+df_today_step = _as_str_id(pd.read_csv(folder / "today_step_counts.csv"))
+df_prior2hours_step = _as_str_id(pd.read_csv(folder / "prior_2hours_step_counts.csv"))
 
-df_weekly = pd.read_csv(folder / "df_weekly_filled.csv")
-df_daily = pd.read_csv(folder / "df_daily_filled.csv")
+df_weekly = _as_str_id(pd.read_csv(folder / "df_weekly_filled.csv"))
+df_daily = _as_str_id(pd.read_csv(folder / "df_daily_filled.csv"))
 
-df_daily_pageview = pd.read_csv(folder / "df_daily_pageview.csv")
-df_hourly_pageview = pd.read_csv(folder / "hourly_pageview.csv")
+df_daily_pageview = _as_str_id(pd.read_csv(folder / "df_daily_pageview.csv"))
+df_hourly_pageview = _as_str_id(pd.read_csv(folder / "hourly_pageview.csv"))
 
-df_gif = pd.read_csv(folder / "df_gif_all.csv")
-df_salience = pd.read_csv(folder / "df_salience_all.csv")
-df_planning = pd.read_csv(folder / "df_end_all.csv")
+df_gif = _as_str_id(pd.read_csv(folder / "df_gif_all.csv"))
+df_salience = _as_str_id(pd.read_csv(folder / "df_salience_all.csv"))
+df_planning = _as_str_id(pd.read_csv(folder / "df_end_all.csv"))
 
-df_notwearing = pd.read_csv(folder / "missing_days.csv")
-df_wearing_morning = pd.read_csv(folder / "wear_day.csv")
+df_notwearing = _as_str_id(pd.read_csv(folder / "missing_days.csv"))
+df_wearing_morning = _as_str_id(pd.read_csv(folder / "wear_day.csv"))
 
 # %% [markdown]
 # ## 2. Parse dates
@@ -76,7 +77,6 @@ df_wearing_morning = pd.read_csv(folder / "wear_day.csv")
 df_4hour_step["Date"] = pd.to_datetime(df_4hour_step["Date"])
 df_today_step["Date"] = pd.to_datetime(df_today_step["Date"])
 df_prior2hours_step["Date"] = pd.to_datetime(df_prior2hours_step["Date"])
-df_otherPA["Date"] = pd.to_datetime(df_otherPA["Date"])
 
 df_weekly["Date"] = pd.to_datetime(df_weekly["date"])
 df_daily["Date"] = pd.to_datetime(df_daily["date"])
@@ -105,7 +105,6 @@ df_merged = df_merged.merge(
     on=["ParticipantIdentifier", "Date", "DecisionTime"],
     how="left",
 )
-df_merged = df_merged.merge(df_otherPA, on=["ParticipantIdentifier", "Date"], how="left")
 df_merged = df_merged.merge(df_notwearing, on=["ParticipantIdentifier", "Date"], how="left")
 df_merged = df_merged.merge(df_wearing_morning, on=["ParticipantIdentifier", "Date"], how="left")
 df_merged = df_merged.merge(df_daily_pageview, on=["ParticipantIdentifier", "Date"], how="left")
@@ -132,10 +131,22 @@ df_weekly_unique = df_weekly.groupby(
 df_merged["iso_week"] = df_merged["Date"].dt.isocalendar().week
 df_merged["iso_year"] = df_merged["Date"].dt.isocalendar().year
 
+# Keep survey slot index as survey_week; study calendar `week` is built later.
+if "week" in df_weekly_unique.columns:
+    df_weekly_unique = df_weekly_unique.rename(columns={"week": "survey_week"})
+
 weekly_cols = [
     c
     for c in df_weekly_unique.columns
-    if c not in ["ParticipantIdentifier", "date", "Date", "iso_week", "iso_year", "observed_date"]
+    if c
+    not in [
+        "ParticipantIdentifier",
+        "date",
+        "Date",
+        "iso_week",
+        "iso_year",
+        "observed_date",
+    ]
 ]
 
 df_merged = df_merged.merge(
@@ -182,6 +193,10 @@ for col in DAILY_SURVEY_COLS:
 
 df_merged = df_merged.merge(df_daily[daily_merge_cols], on=["ParticipantIdentifier", "Date"], how="left")
 
+# An unmatched participant-date means no daily survey response. This includes
+# eligible participants with no daily-survey result rows at all.
+df_merged["daily_present"] = df_merged["daily_present"].fillna(0).astype(int)
+
 # %% [markdown]
 # ## 6. Interventions (planning, walking suggestions, salience)
 
@@ -189,9 +204,6 @@ df_merged = df_merged.merge(df_daily[daily_merge_cols], on=["ParticipantIdentifi
 planning_cols = [
     c for c in df_planning.columns if c not in ["ParticipantIdentifier", "Date", "time", "date"]
 ]
-df_planning["ParticipantIdentifier"] = pd.to_numeric(
-    df_planning["ParticipantIdentifier"], errors="coerce"
-).astype("Int64")
 
 df_merged = df_merged.merge(
     df_planning[["ParticipantIdentifier", "Date"] + planning_cols],
@@ -243,10 +255,18 @@ rename_map = {
     "Interacted_x": "Interacted_walk",
     "Interacted_y": "Interacted_salience",
     "Interacted_7d_x": "Interacted_7d_walk",
+    "Interacted_7d_y": "Interacted_7d_salience",
     "StepCount_x": "4hour_step",
     "StepCount_y": "prior2hour_step",
+    "CheckStatus_x": "CheckStatus_4hour",
+    "CheckStatus_y": "CheckStatus_prior2hour",
 }
 df_merged = df_merged.rename(columns={k: v for k, v in rename_map.items() if k in df_merged.columns})
+
+# Fail loudly if merge suffixes were left unresolved
+_leftover = [c for c in df_merged.columns if c.endswith("_x") or c.endswith("_y")]
+if _leftover:
+    print("WARNING: unresolved merge-suffix columns:", _leftover)
 
 # %% [markdown]
 # ## 8. Burn-in filter + calendar indices

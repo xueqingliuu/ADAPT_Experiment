@@ -25,7 +25,14 @@ def load_pooled_coefs(work_dir=None):
         return {k: float(v) for k, v in json.load(f).items()}
 
 
-def weekly_Ew_predictor_table(df, *, date_col="Date", decision_col="DecisionTime"):
+def weekly_Ew_predictor_table(
+    df,
+    *,
+    date_col="Date",
+    decision_col="DecisionTime",
+    u1_impute_mean=0.0,
+    u2_impute_mean=0.0,
+):
     rows = []
     for (uid, wk), g in df.groupby(["ParticipantIdentifier", "week"], sort=True):
         g = g.sort_values([date_col, decision_col], na_position="last")
@@ -34,9 +41,9 @@ def weekly_Ew_predictor_table(df, *, date_col="Date", decision_col="DecisionTime
         u1 = float(sun["Exp-tool-1"].iloc[0]) if len(sun) else np.nan
         u2 = float(sun["Exp-tool-2"].iloc[0]) if len(sun) else np.nan
         if np.isnan(u1):
-            u1 = 0.0
+            u1 = float(u1_impute_mean)
         if np.isnan(u2):
-            u2 = 0.0
+            u2 = float(u2_impute_mean)
         if np.isnan(j_w):
             j_w = 0.0
         j_w = float(j_w)
@@ -47,10 +54,10 @@ def weekly_Ew_predictor_table(df, *, date_col="Date", decision_col="DecisionTime
         for _, g_day in g.groupby(date_col, sort=True):
             g_day = g_day.sort_values(decision_col, na_position="last")
             row0 = g_day.iloc[0]
-            fw_daily.append(float(row0["nextday_wearing"]) if pd.notna(row0["nextday_wearing"]) else np.nan)
-            pj_daily.append(float(row0["daily_present"]) if pd.notna(row0["daily_present"]) else np.nan)
-        fw_sum = float(np.nansum(np.asarray(fw_daily, dtype=float)) / 7.0) if fw_daily else np.nan
-        pj_sum = float(np.nansum(np.asarray(pj_daily, dtype=float)) / 7.0) if pj_daily else np.nan
+            fw_daily.append(float(row0["nextday_wearing"]) if pd.notna(row0["nextday_wearing"]) else 0.0)
+            pj_daily.append(float(row0["daily_present"]) if pd.notna(row0["daily_present"]) else 0.0)
+        fw_sum = float(np.sum(np.asarray(fw_daily, dtype=float)) / 7.0) if fw_daily else 0.0
+        pj_sum = float(np.sum(np.asarray(pj_daily, dtype=float)) / 7.0) if pj_daily else 0.0
 
         rows.append({
             "ParticipantIdentifier": int(uid) if isinstance(uid, (int, np.integer)) else uid,
@@ -74,7 +81,11 @@ def initial_Ew_hat_for_user(user_id, df_fit=None, coefs=None):
     sub = df_fit[df_fit["ParticipantIdentifier"] == user_id]
     if sub.empty:
         return DEFAULT_EW_HAT
-    tbl = weekly_Ew_predictor_table(sub)
+    tbl = weekly_Ew_predictor_table(
+        sub,
+        u1_impute_mean=coefs.get("U1_impute_mean", 0.0),
+        u2_impute_mean=coefs.get("U2_impute_mean", 0.0),
+    )
     if tbl.empty:
         return DEFAULT_EW_HAT
     last = tbl.sort_values("week").iloc[-1]
@@ -103,8 +114,16 @@ def compute_Ew_hat_from_week(
     """Apply pooled linear coefficients to observable aggregates of week ``sim_w``."""
     J_w = float(wp_all[sim_w]) if not np.isnan(wp_all[sim_w]) else 0.0
     weekly_idx = int(sim_w) + int(baseline_offset)
-    u1 = float(U1_all[weekly_idx]) if not np.isnan(U1_all[weekly_idx]) else 0.0
-    u2 = float(U2_all[weekly_idx]) if not np.isnan(U2_all[weekly_idx]) else 0.0
+    u1 = (
+        float(U1_all[weekly_idx])
+        if not np.isnan(U1_all[weekly_idx])
+        else float(coefs.get("U1_impute_mean", 0.0))
+    )
+    u2 = (
+        float(U2_all[weekly_idx])
+        if not np.isnan(U2_all[weekly_idx])
+        else float(coefs.get("U2_impute_mean", 0.0))
+    )
     half_J_tool8 = 0.5 * J_w * ((u1 + 1.0) + (u2 + 1.0)) / 8.0
     slot_start = int(sim_w) * FOURSC_SLOTS_PER_WEEK
     slot_stop = int(sim_w + 1) * FOURSC_SLOTS_PER_WEEK

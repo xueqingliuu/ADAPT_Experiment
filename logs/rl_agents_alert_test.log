@@ -1,0 +1,2 @@
+{"timestamp": "2026-07-12T22:46:46.501059+00:00", "level": "green", "logger": "RL_agents", "message": "RL_agents logging configured", "context": {"alert_level": "green", "log_path": "logs/rl_agents_alert_test.log"}}
+{"timestamp": "2026-07-12T22:46:46.501777+00:00", "level": "yellow", "logger": "RL_agents.query.Query", "message": "query handler invoked during enrollment week w=1", "context": {"alert_level": "yellow", "action_type": "weekly_query", "user_id": "u1", "w": 1}}

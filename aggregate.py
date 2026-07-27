@@ -40,6 +40,10 @@ markers = {
     "random_send": "+-",
 }
 
+# γ̄=0.5 RL policies only (exclude always_send / random_send baselines).
+GAMMA05_ALGOS = ("micro_g05", "mtd_g05", "rs_g05", "rs_mtd_g05")
+NEVER_SEND_BASELINE = "never_send"
+
 
 def cumulative_average(x):
     """Running mean up to each week ('average over time')."""
@@ -290,6 +294,68 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks)
     plt.close(fig)
 
 
+def make_gamma05_minus_never_plot(all_cae_full, kind, suffix, *, out, labels, weeks):
+    """Plot paired CAE difference: each γ̄=0.5 policy minus never_send."""
+    if NEVER_SEND_BASELINE not in all_cae_full:
+        print(
+            f"\nWARNING: '{NEVER_SEND_BASELINE}' missing; "
+            f"skipping γ̄=0.5 minus-never plot ({suffix})."
+        )
+        return
+
+    baseline = all_cae_full[NEVER_SEND_BASELINE][..., 1:]
+    names = [n for n in GAMMA05_ALGOS if n in all_cae_full]
+    if not names:
+        print(f"\nWARNING: no γ̄=0.5 algorithms found; skipping minus-never plot ({suffix}).")
+        return
+
+    diffs = {n: all_cae_full[n][..., 1:] - baseline for n in names}
+    stats = {
+        "mean": {n: np.nanmean(d, axis=(0, 1)) for n, d in diffs.items()},
+        "se": {
+            n: np.nanstd(d, axis=(0, 1)) / np.sqrt(d.shape[0] * d.shape[1])
+            for n, d in diffs.items()
+        },
+        "cumavg": {
+            n: cumulative_average(np.nanmean(d, axis=(0, 1)))
+            for n, d in diffs.items()
+        },
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    ax = axes[0]
+    for name in names:
+        m = stats["mean"][name]
+        s = stats["se"][name]
+        ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
+        ax.fill_between(weeks, m - s, m + s, alpha=0.15)
+    ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("Week")
+    ax.set_ylabel("CAE difference (raw scale)")
+    ax.set_title(f"γ̄=0.5 CAE − never_send (± SE) — {kind}, raw scale")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    for name in names:
+        ax.plot(
+            weeks, stats["cumavg"][name], markers.get(name, "o-"),
+            label=labels.get(name, name),
+        )
+    ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Cumulative-average CAE difference (raw scale)")
+    ax.set_title(f"Average-over-time γ̄=0.5 CAE − never_send — {kind}, raw scale")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out / f"gamma05_minus_never_{suffix}.png", dpi=150, bbox_inches="tight")
+    fig.savefig(out / f"gamma05_minus_never_{suffix}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
 def write_summary(stats, kind, suffix, *, out):
     """Raw-scale summary table for one CAE variant."""
     names = list(stats["all_cae"].keys())
@@ -420,6 +486,9 @@ def main() -> None:
             out=out, labels=labels, all_piA=all_piA, weeks=weeks, rl_weeks=rl_weeks,
         )
         write_summary(stats, kind, suffix, out=out)
+        make_gamma05_minus_never_plot(
+            all_cae_full, kind, suffix, out=out, labels=labels, weeks=weeks,
+        )
 
     # Save aggregated arrays too (raw scale).
     for name in algorithms:

@@ -40,11 +40,11 @@ def _ewm_prior_gamma_last(
 
 # parameters for rolling mean
 INTERACTION_ROLLING_WINDOW = 14
-RPA_ROLLING_WINDOW = 7
+ACTIVE_STATUS_ROLLING_WINDOW = 7
 BASELINE_OFFSET = 1
 
 
-def _rolling_mean_last(values, window=RPA_ROLLING_WINDOW, min_values=EWM_MIN_VALUES):
+def _rolling_mean_last(values, window=ACTIVE_STATUS_ROLLING_WINDOW, min_values=EWM_MIN_VALUES):
     if len(values) == 0:
         return 0.0
     v = np.asarray(values[-window:], dtype=float)
@@ -284,7 +284,7 @@ class OnlineEnv:
         self.U2_all = np.full(self.nweek+1, np.nan)
 
         # Per-day covariate logs for PF / RL (not read from self.s at use time).
-        self.logDayOfWeekNorm = np.zeros(self.D)
+        self.logIsWeekend = np.zeros(self.D)
         self.logSalienceMessageSentToday = np.zeros(self.D)
         self.logSalienceMessageSentYesterday = np.zeros(self.D)
         self.logYesterdayStepCount = np.zeros(self.D)
@@ -337,14 +337,7 @@ class OnlineEnv:
             [self._ws_interaction_initial] * INTERACTION_ROLLING_WINDOW
         )
 
-        self.recordedPhysicalActivityTodayAll = np.zeros(self.D)
         self.activityStatusTodayAll = np.zeros(self.D)
-        self.activityCompletedLast7DaysAll = np.zeros(self.D)
-
-        # Seed previous-7-day RPA from df_fit_11week baseline.
-        # Repeating preserves the baseline average at simulation start.
-        self._rpa7_initial = float(self.s.get("activityCompletedLast7Days", 0.0))
-        self._hist_recordedPhysicalActivityToday = [self._rpa7_initial] * RPA_ROLLING_WINDOW
 
         # Seed previous-7-day morning-wearing fraction from df_fit_11week baseline.
         # Repeating 7 times preserves the baseline average at simulation start.
@@ -352,7 +345,7 @@ class OnlineEnv:
         self._hist_morning_wear = [self._wear7_initial] * 7
 
         self._active_days7_initial = float(self.s.get("activeDaysLast7Days", 0.0))
-        self._hist_active_days = [self._active_days7_initial] * RPA_ROLLING_WINDOW
+        self._hist_active_days = [self._active_days7_initial] * ACTIVE_STATUS_ROLLING_WINDOW
 
         # ── Baseline slot [0]: pre-study values ──────────────────────────────
         # ``caeAverageLastWeek`` and ``perceivedUtilityLastWeek`` are loaded
@@ -673,12 +666,9 @@ class OnlineEnv:
 
         self.s["activitySuggestionInteractLast7Days"] = self._ws_interaction_initial
 
-        self._hist_recordedPhysicalActivityToday = [self._rpa7_initial] * RPA_ROLLING_WINDOW
-        self.s["activityCompletedLast7Days"] = self._rpa7_initial
-
         self.s["morningFitbitWearLast7Days"] = self._wear7_initial
         self._hist_morning_wear = [self._wear7_initial] * 7
-        self._hist_active_days = [self._active_days7_initial] * RPA_ROLLING_WINDOW
+        self._hist_active_days = [self._active_days7_initial] * ACTIVE_STATUS_ROLLING_WINDOW
 
         self._hist_prior2hour_observed = []
         self._hist_prior2hour_by_slot = {0: [], 1: []}
@@ -700,8 +690,7 @@ class OnlineEnv:
         self.logDailyAnticipatedAffectYesterday[0] = float(
             self.s.get("dailyAnticipatedAffectYesterdayAgent", 0.0)
         )
-        self.logDayOfWeekNorm[0] = float(self.s["dayOfWeekNorm"])
-        self.activityCompletedLast7DaysAll[0] = float(self.s.get("activityCompletedLast7Days", 0.0))
+        self.logIsWeekend[0] = float(self.s["isWeekend"])
         self.logActiveDaysLast7Days[0] = float(self.s.get("activeDaysLast7Days", 0.0))
 
     def run_episode(self, agent, dataset):
@@ -843,24 +832,13 @@ class OnlineEnv:
         sal = float(rd.binomial(1, 0.5))
         self.s["salienceMessageSentToday"] = sal
 
-        # Daily RPA is modeled on the morning row.
         self.s["decisionTimeSlot"] = 0.0
-
-        morning_step_idx = self._step_idx(sim_w, d_w, 0)
-
-        rpa = self.env.gen_recorded_physical_activity(
-            self.s,
-            morning_step_idx,
-        )
-
-        self.s["recordedPhysicalActivityToday"] = rpa
-        self.recordedPhysicalActivityTodayAll[d_global] = rpa
 
         active_status = self.env.gen_active_status(self.s, d_global)
         self.s["activityStatusToday"] = active_status
         self.activityStatusTodayAll[d_global] = active_status
 
-        self.logDayOfWeekNorm[d_global] = dayOfWeekNorm_n
+        self.logIsWeekend[d_global] = float(self.s["isWeekend"])
         self.logSalienceMessageSentToday[d_global] = sal
         self.logSalienceMessageSentYesterday[d_global] = float(self._prev_day_salience)
         self.logActiveDaysLast7Days[d_global] = float(
@@ -873,12 +851,6 @@ class OnlineEnv:
         else:
             self.logPageViewLast7DaysEma[d_global] = float(self.s["pageViewLast7DaysEma"])
         self.logMorningFitbitWearLast7Days[d_global] = _rolling_mean_last(self._hist_morning_wear, 7)
-
-        # Store the previous-7-day predictor used during this day.
-        self.activityCompletedLast7DaysAll[d_global] = _rolling_mean_last(
-            self._hist_recordedPhysicalActivityToday,
-            RPA_ROLLING_WINDOW,
-        )
 
         if self._hist_daily_suggestions:
             self.s["activitySuggestionsSentLast7Days"] = _ewm_prior_gamma_last(
@@ -973,21 +945,10 @@ class OnlineEnv:
         self._dw_wk[d_w] = fitbit
         self._dp_wk[d_w] = daily_pres
 
-        # After today's daily RPA is known, update histories for tomorrow.
-        today_rpa = float(self.s["recordedPhysicalActivityToday"])
-
-        self._hist_recordedPhysicalActivityToday.append(today_rpa)
-
-        self.s["recordedPhysicalActivityLag1"] = today_rpa
-        self.s["activityCompletedLast7Days"] = _rolling_mean_last(
-            self._hist_recordedPhysicalActivityToday,
-            RPA_ROLLING_WINDOW,
-        )
-
         self._hist_active_days.append(float(self.s.get("activityStatusToday", 0.0)))
         self.s["activeDaysLast7Days"] = _rolling_mean_last(
             self._hist_active_days,
-            RPA_ROLLING_WINDOW,
+            ACTIVE_STATUS_ROLLING_WINDOW,
         )
 
         # fourSC / pageview use calendar-yesterday message flags (lagged one day).
@@ -1130,7 +1091,6 @@ class OnlineEnv:
             yesterdayStepCount=self.logYesterdayStepCount[d_global],
             stepCountLast7DaysEma=self.logStepCountLast7DaysEma[step_idx],
             prior2HourStepCount=float(self.prior2HourStepCountAgentAll[step_idx]),
-            activityCompletedLast7Days=self.activityCompletedLast7DaysAll[d_global],
             activitySuggestionsSentLast7Days=float(
                 self.activitySuggestionsSentLast7DaysAll[step_idx]
             ),
@@ -1138,7 +1098,7 @@ class OnlineEnv:
             salienceMessageSentYesterday=self.logSalienceMessageSentYesterday[d_global],
             activitySuggestionInteractLast7Days=self.logActivitySuggestionInteractLast7Days[step_idx],
             activeDaysLast7Days=self.logActiveDaysLast7Days[d_global],
-            dayOfWeekNorm=self.logDayOfWeekNorm[d_global],
+            isWeekend=self.logIsWeekend[d_global],
             decisionTimeSlot=float(t_sim),
             perceivedUtility=self.E_known_all[sim_w],
             caeAverageLastWeek=0.0,
@@ -1155,10 +1115,9 @@ class OnlineEnv:
         return build_antic_features(
             dailyAnticipatedAffectYesterday=self.logDailyAnticipatedAffectYesterday[d_global],
             todayStepCount=self.logTodayStepCount[d_global],
-            recordedPhysicalActivityToday=self.recordedPhysicalActivityTodayAll[d_global],
             activityStatusToday=self.activityStatusTodayAll[d_global],
             salienceMessageSentToday=self.logSalienceMessageSentToday[d_global],
-            dayOfWeekNorm=self.logDayOfWeekNorm[d_global],
+            isWeekend=self.logIsWeekend[d_global],
             perceivedUtility=self.E_known_all[sim_w],
             caeAverageLastWeek=0.0,
             ws_morning=ws_m,
@@ -1187,7 +1146,6 @@ class OnlineEnv:
             yesterdayStepCount=self.logYesterdayStepCount[d_global],
             stepCountLast7DaysEma=self._stepCountLast7DaysEma_by_slot[int(t)],
             prior2HourStepCountAgent=p2h,
-            activityCompletedLast7Days=self.activityCompletedLast7DaysAll[d_global],
             activeDaysLast7Days=float(self.s["activeDaysLast7Days"]),
             activitySuggestionsSentLast7Days=float(self.s["activitySuggestionsSentLast7Days"]),
             salienceMessageSentYesterday=self.logSalienceMessageSentYesterday[d_global],
@@ -1269,13 +1227,12 @@ P_MY_FOURSC = int(
         yesterdayStepCount=0.0,
         stepCountLast7DaysEma=0.0,
         prior2HourStepCount=0.0,
-        activityCompletedLast7Days=0.0,
         activitySuggestionsSentLast7Days=0.0,
         morningFitbitWearLast7Days=0.0,
         salienceMessageSentYesterday=0.0,
         activitySuggestionInteractLast7Days=0.0,
         activeDaysLast7Days=0.0,
-        dayOfWeekNorm=0.0,
+        isWeekend=0.0,
         decisionTimeSlot=0.0,
         perceivedUtility=0.0,
         caeAverageLastWeek=0.0,
@@ -1283,7 +1240,7 @@ P_MY_FOURSC = int(
     ).shape[0]
 )
 # Antic PF design mirrors the trimmed treatment-effect spec in 5_fit/vani_env
-# (no WS × {todayStepCount, recordedPhysicalActivityToday, activityStatusToday}).
+# (no WS × {todayStepCount, activityStatusToday}).
 P_MY_ANTIC  = P_ANTIC
 P_CAE = int(build_CAE_features(0.0, 0.0, np.zeros(FOURSC_SLOTS_PER_WEEK), np.zeros(7)).shape[0])
 P_TY  = int(build_CAE_short_features(0.0).shape[0])
@@ -1302,10 +1259,10 @@ _DUMMY_RL_STATE = {
     "C":   np.zeros(N_RL_CONTEXT),
 }
 P_RL_MICRO = int(
-    build_phi_action(0.0, 0.0, _DUMMY_RL_STATE, 1, 1, 0).shape[0]
+    build_phi_action(0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0).shape[0]
 )
 P_RL_REWARDSHAPING = int(
-    build_phi_action_rewardshaping(0.0, 0.0, _DUMMY_RL_STATE, 1, 1).shape[0]
+    build_phi_action_rewardshaping(0.0, 0.0, _DUMMY_RL_STATE, 0, 0).shape[0]
 )
 P_RL_BOTTLENECK = int(
     build_phi_bottleneck(0.0, 0.0, _DUMMY_RL_STATE).shape[0]
@@ -1818,8 +1775,6 @@ def _snapshot_oenv(oenv):
         "dailyAnticipatedAffectAgentAll":        oenv.dailyAnticipatedAffectAgentAll.copy(), # model-imputed if survey missed
         "morningFitbitWearAll":             oenv.morningFitbitWearAll.copy(),
         "dailySurveyCompleteAll":              oenv.dailySurveyCompleteAll.copy(),       # daily-survey present
-        "recordedPhysicalActivityTodayAll": oenv.recordedPhysicalActivityTodayAll.copy(),
-        "activityCompletedLast7DaysAll": oenv.activityCompletedLast7DaysAll.copy(),
         # ── slot-level ────────────────────────────────────────────
         "stepCountNext4HourAll":             oenv.stepCountNext4HourAll.copy(),      # latent
         "stepCountNext4HourObsAll":         oenv.stepCountNext4HourObsAll.copy(),  # NaN if Fitbit not worn
