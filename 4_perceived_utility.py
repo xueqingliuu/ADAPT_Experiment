@@ -2070,12 +2070,107 @@ def make_bounds(*, e1_known: bool):
 
     return bounds
 
+def _hit_iteration_limit(res, maxiter: int) -> bool:
+    """True if L-BFGS-B stopped because it ran out of iterations (not because
+    it actually satisfied ftol/gtol). ``res.success`` is False in that case,
+    and either ``nit`` reached the cap or SciPy's message says so explicitly.
+    """
+    if res.success:
+        return False
+    msg = str(getattr(res, "message", ""))
+    return int(getattr(res, "nit", 0)) >= int(maxiter) or "ITERATIONS REACHED LIMIT" in msg.upper()
+
+
+def _minimize_with_restarts(
+    objective,
+    x0,
+    *,
+    args,
+    bounds,
+    maxiter: int,
+    maxfun: int,
+    maxls: int = 50,
+    ftol: float,
+    gtol: float,
+    callback=None,
+    max_restarts: int = 4,
+    restart_multiplier: float = 2.0,
+    log_prefix: str = "",
+):
+    """Run L-BFGS-B, and if it stops purely because it hit ``maxiter`` (i.e.
+    it was still improving, not actually converged), warm-restart from the
+    last iterate with a larger iteration budget. This fixes participants
+    that get flagged as "not converged" just because a fixed maxiter (e.g.
+    500) was too small for them, without wasting extra iterations on
+    participants who already converge quickly.
+    """
+    current_maxiter = int(maxiter)
+    res = minimize(
+        objective,
+        x0,
+        args=args,
+        method="L-BFGS-B",
+        bounds=bounds,
+        callback=callback,
+        options={
+            "maxiter": current_maxiter,
+            "maxfun": maxfun,
+            "maxls": maxls,
+            "ftol": ftol,
+            "gtol": gtol,
+        },
+    )
+
+    restarts = 0
+    while _hit_iteration_limit(res, current_maxiter) and restarts < max_restarts:
+        restarts += 1
+        current_maxiter = int(round(current_maxiter * restart_multiplier))
+        logger.info(
+            "%sL-BFGS-B hit maxiter without converging (nit=%d, |grad|_inf=%s); "
+            "warm-restarting from last iterate with maxiter=%d (restart %d/%d).",
+            log_prefix,
+            int(res.nit),
+            f"{np.linalg.norm(res.jac, ord=np.inf):.3g}" if getattr(res, "jac", None) is not None else "n/a",
+            current_maxiter,
+            restarts,
+            max_restarts,
+        )
+        res = minimize(
+            objective,
+            res.x,
+            args=args,
+            method="L-BFGS-B",
+            bounds=bounds,
+            callback=callback,
+            options={
+                "maxiter": current_maxiter,
+                "maxfun": maxfun,
+                "maxls": maxls,
+                "ftol": ftol,
+                "gtol": gtol,
+            },
+        )
+
+    if restarts:
+        logger.info(
+            "%sfinished after %d warm restart(s): success=%s, nit=%d, final maxiter=%d.",
+            log_prefix,
+            restarts,
+            res.success,
+            int(res.nit),
+            current_maxiter,
+        )
+    return res, restarts
+
+
 def fit_pooled_model(
     df_fit,
     grid=None,
     *,
     e1_known: Optional[float] = None,
     maxiter=500,
+    max_restarts: int = 4,
+    restart_multiplier: float = 2.0,
     week_col="week",
     date_col="Date",
     decision_col="DecisionTime",
@@ -2173,27 +2268,28 @@ def fit_pooled_model(
         callback = None
 
     logger.info("Pooled fit: beginning L-BFGS-B (first eval starting now)...")
-    res = minimize(
+    res, restarts = _minimize_with_restarts(
         objective,
         x0,
         args=(user_blocks, grid, weights, e1_known, lam) if not progress else (),
-        method="L-BFGS-B",
         bounds=make_bounds(e1_known=e1_fixed),
         callback=callback,
-        options={
-            "maxiter": maxiter,
-            "maxfun": 1_500_000,
-            "maxls": 50,
-            "ftol": 1e-7,
-            "gtol": 1e-4,
-        },
+        maxiter=maxiter,
+        maxfun=1_500_000,
+        maxls=50,
+        ftol=1e-7,
+        gtol=1e-4,
+        max_restarts=max_restarts,
+        restart_multiplier=restart_multiplier,
+        log_prefix="Pooled fit: ",
     )
     if tracker is not None:
         tracker.finish()
 
     print(
         f"Pooled fit: success={res.success}, "
-        f"nll={res.fun:.4f}, nit={res.nit}, message={res.message}"
+        f"nll={res.fun:.4f}, nit={res.nit}, message={res.message}, "
+        f"warm_restarts={restarts}"
     )
 
     pooled_theta = np.asarray(res.x, dtype=float).copy()
@@ -2213,6 +2309,8 @@ def fit_one_user(
     *,
     e1_known: Optional[float] = None,
     maxiter=1000,
+    max_restarts: int = 4,
+    restart_multiplier: float = 2.0,
     week_col="week",
     date_col="Date",
     decision_col="DecisionTime",
@@ -2231,6 +2329,7 @@ def fit_one_user(
     hourly_pv=True,
     x0: Optional[np.ndarray] = None,
     lam: float = 1e-2,
+    uid: Optional[str] = None,
 ):
     blocks = build_user_blocks(
         dat_user,
@@ -2262,20 +2361,21 @@ def fit_one_user(
     else:
         x0 = np.asarray(x0, dtype=float).copy()
 
-    res = minimize(
+    res, restarts = _minimize_with_restarts(
         neg_loglik_blocks,
         x0,
         args=(blocks, grid, weights, e1_known, lam),
-        method="L-BFGS-B",
         bounds=make_bounds(e1_known=e1_fixed),
-        options={
-            "maxiter": maxiter,
-            "maxfun": 300000,
-            "maxls": 50,
-            "ftol": 1e-6,
-            "gtol": 1e-4,
-        }
+        maxiter=maxiter,
+        maxfun=300000,
+        maxls=50,
+        ftol=1e-6,
+        gtol=1e-4,
+        max_restarts=max_restarts,
+        restart_multiplier=restart_multiplier,
+        log_prefix=f"Participant {uid}: " if uid is not None else "",
     )
+    res.warm_restarts = restarts
     filt = quadrature_loglik(blocks, res.x, grid, weights, e1_known=e1_known)
     filt["ridge_lambda"] = float(lam)
 
@@ -2302,7 +2402,7 @@ def fit_one_user(
 
 def _fit_one_user_task(uid, dat_user, grid, fit_kwargs):
     """Pickle-friendly process-pool wrapper for one participant fit."""
-    res, filt, blocks = fit_one_user(dat_user, grid=grid, **fit_kwargs)
+    res, filt, blocks = fit_one_user(dat_user, grid=grid, uid=uid, **fit_kwargs)
     return uid, res, filt, blocks
 
 
@@ -2312,6 +2412,8 @@ def fit_all_users(
     *,
     e1_known: Optional[float] = None,
     maxiter=500,
+    max_restarts: int = 4,
+    restart_multiplier: float = 2.0,
     week_col="week",
     date_col="Date",
     decision_col="DecisionTime",
@@ -2356,6 +2458,8 @@ def fit_all_users(
     fit_kwargs = {
         "e1_known": e1_known,
         "maxiter": maxiter,
+        "max_restarts": max_restarts,
+        "restart_multiplier": restart_multiplier,
         "week_col": week_col,
         "date_col": date_col,
         "decision_col": decision_col,
@@ -2385,7 +2489,8 @@ def fit_all_users(
         blocks_by_user[uid] = blocks
         print(
             f"Participant {uid}: success={res.success}, "
-            f"nll={res.fun:.4f}, nit={res.nit}, message={res.message}"
+            f"nll={res.fun:.4f}, nit={res.nit}, message={res.message}, "
+            f"warm_restarts={getattr(res, 'warm_restarts', 0)}"
         )
 
         if merge_into_vanilla_json:
