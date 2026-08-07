@@ -1,21 +1,21 @@
 {
   "source_dir": "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed/env_para_vanilla",
   "output_dir": "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed/env_para_positivenegative",
-  "n_users": 29,
+  "n_users": 31,
   "user_ids": [
+    "13",
     "18",
+    "22",
     "31",
     "33",
     "37",
     "72",
     "75",
-    "82",
     "86",
     "106",
     "118",
     "128",
     "129",
-    "138",
     "141",
     "143",
     "151",
@@ -28,10 +28,12 @@
     "225",
     "239",
     "252",
+    "269",
     "277",
     "285",
     "299",
-    "307"
+    "307",
+    "333"
   ],
   "copied_supporting_files": [
     "std_params.json",
@@ -41,50 +43,71 @@
     "rl_priors.json",
     "rl_prior_tables.md"
   ],
-  "n_constrained_coefficients": 1131,
-  "n_flipped": 391,
-  "n_kept_positive": 658,
-  "n_kept_negative": 66,
-  "n_kept_zero": 16,
+  "n_constrained_coefficients": 1550,
+  "n_flipped": 617,
+  "n_kept_positive": 840,
+  "n_kept_negative": 78,
+  "n_kept_zero": 15,
   "constraints": {
-    "theta_CAE": [
-      "fourSC_slot_*",
-      "anticipated_affect_day_*",
-      "week"
-    ],
-    "theta_fourSC": [
-      "WalkingSuggestion",
-      "WalkingSuggestion_by_perceived_utility_lastweek",
-      "WalkingSuggestion_by_CAE_avg_lastweek"
-    ],
-    "theta_antic": [
-      "A0_morning",
-      "A1_afternoon",
-      "A0_morning_by_perceived_utility_lastweek",
-      "A1_afternoon_by_perceived_utility_lastweek",
-      "A0_morning_by_CAE_avg_lastweek",
-      "A1_afternoon_by_CAE_avg_lastweek"
-    ],
-    "theta_ml_PV": {
+    "theta_CAE": {
       "nonnegative": [
-        "alpha1_Ew"
+        "fourSC_slot_*",
+        "anticipated_affect_day_*"
+      ]
+    },
+    "theta_penalized_Ew": {
+      "nonnegative": [
+        "a2_PV_lag_week",
+        "a3_FW_lag_week",
+        "a4_PJ_lag_week"
+      ]
+    },
+    "theta_fourSC": {
+      "nonnegative": [
+        "perceived_utility_lastweek",
+        "CAE_avg_lastweek",
+        "WalkingSuggestion",
+        "WalkingSuggestion_by_perceived_utility_lastweek",
+        "WalkingSuggestion_by_CAE_avg_lastweek"
+      ]
+    },
+    "theta_antic": {
+      "nonnegative": [
+        "perceived_utility_lastweek",
+        "CAE_avg_lastweek",
+        "A0_morning",
+        "A1_afternoon",
+        "A0_morning_by_perceived_utility_lastweek",
+        "A1_afternoon_by_perceived_utility_lastweek",
+        "A0_morning_by_CAE_avg_lastweek",
+        "A1_afternoon_by_CAE_avg_lastweek"
+      ]
+    },
+    "theta_penalized_PV": {
+      "nonnegative": [
+        "alpha1_Ew",
+        "alpha4_action_by_Ew"
       ],
       "nonpositive": [
         "alpha3_action"
       ]
     },
-    "theta_ml_FW": {
+    "theta_penalized_FW": {
       "nonnegative": [
-        "beta1_Ew"
+        "beta1_Ew",
+        "beta4_A0_morning_by_Ew",
+        "beta6_A1_afternoon_by_Ew"
       ],
       "nonpositive": [
         "beta3_A0_morning",
         "beta5_A1_afternoon"
       ]
     },
-    "theta_ml_PJ": {
+    "theta_penalized_PJ": {
       "nonnegative": [
-        "theta1_Ew"
+        "theta1_Ew",
+        "theta4_A0_morning_by_Ew",
+        "theta6_A1_afternoon_by_Ew"
       ],
       "nonpositive": [
         "theta3_A0_morning",

@@ -94,6 +94,7 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     QUERY_D,
     QUERY_T,
     TERMINAL_D,
+    TERMINAL_T,
 )
 from agents.ew_hat import (
     compute_Ew_hat_from_week,
@@ -1144,7 +1145,6 @@ class OnlineEnv:
             p2h = float(self.s.get("prior2HourStepCountAgent", self._initial_prior2hour))
         return build_rl_context_vector(
             yesterdayStepCount=self.logYesterdayStepCount[d_global],
-            stepCountLast7DaysEma=self._stepCountLast7DaysEma_by_slot[int(t)],
             prior2HourStepCountAgent=p2h,
             activeDaysLast7Days=float(self.s["activeDaysLast7Days"]),
             activitySuggestionsSentLast7Days=float(self.s["activitySuggestionsSentLast7Days"]),
@@ -1245,13 +1245,10 @@ P_MY_ANTIC  = P_ANTIC
 P_CAE = int(build_CAE_features(0.0, 0.0, np.zeros(FOURSC_SLOTS_PER_WEEK), np.zeros(7)).shape[0])
 P_TY  = int(build_CAE_short_features(0.0).shape[0])
 
-_n_my_flat = RL_MY_SHAPE[0] * RL_MY_SHAPE[1]
-_n_me_flat = RL_ME_SHAPE[0] * RL_ME_SHAPE[1]
-
 # Compute phi dimensions directly from the algorithm's feature builders so
 # the priors stay in sync with whatever is in the base / mediator / context /
 # action-interaction blocks. Avoids drift when build_phi_action changes
-# (e.g. adding b_tilde to the base).
+# (e.g. mediator EWMA summaries vs flattened week grids).
 _DUMMY_RL_STATE = {
     "E_w": 0.0,
     "M_Y": np.zeros(RL_MY_SHAPE),
@@ -1269,9 +1266,10 @@ P_RL_BOTTLENECK = int(
 )
 
 # ── RL hyperparameters (shared) ──
-# Note: gamma_bar is no longer a single module-level constant; each algorithm
-# in ALGORITHMS below is registered at gamma_bar=0.0 and gamma_bar=0.5 via
-# functools.partial, and the per-slot discount is computed by _gamma_dt_micro.
+# Weekly discount used by micro-query agents. Algorithms below are registered
+# at gamma_bar=0.0 and gamma_bar=0.5 via functools.partial; the per-slot matrix
+# is built by _gamma_dt_micro (1 within week, gamma_bar on the terminal slot).
+GAMMA_BAR = 0.5
 TARGET_C     = 1
 EPSILON_0    = 0.1   # this is the clipping parameter
 J_PARTICLES  = 50
@@ -1474,17 +1472,18 @@ _configure_priors()
 # ──────────────────────────────────────────────────────────────────
 
 def _gamma_dt_micro(gamma_bar):
-    """Per-slot discount γ_{d,t} = γ_bar^{1/12}.
+    """Per-slot discounts: 1 within week; ``gamma_bar`` only on the terminal slot.
 
-    When γ_bar=0 the first 11 slots keep discount 1.0 and only the terminal
-    slot (6,2) is 0, so bootstrapping flows within the week but stops at the
-    terminal transition.
+    Non-terminal weekday slots (Mon–Sat morning/afternoon except the last)
+    use discount 1 so value flows undiscounted within the week. Only the
+    terminal controlled slot ``(TERMINAL_D, TERMINAL_T)`` (Sat afternoon)
+    applies the weekly discount ``gamma_bar`` into the next week. In
+    particular ``gamma_bar=0`` is the myopic special case (no cross-week
+    bootstrap) and ``gamma_bar=1`` is undiscounted.
     """
-    if gamma_bar == 0.0:
-        gamma_dt = np.ones((6, 2))
-        gamma_dt[5, 1] = 0.0
-        return gamma_dt
-    return (gamma_bar ** (1.0 / 12)) * np.ones((6, 2))
+    gamma_dt = np.ones((N_RL_DAYS, N_RL_SLOTS), dtype=float)
+    gamma_dt[TERMINAL_D, TERMINAL_T] = float(gamma_bar)
+    return gamma_dt
 
 
 def _episode_seed(exp_seed: int, draw_idx: int) -> int:

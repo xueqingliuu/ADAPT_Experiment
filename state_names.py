@@ -21,7 +21,6 @@ STATE_PAGE_VIEW_LAST7_DAYS_EMA = "pageViewLast7DaysEma"
 
 STATE_ACTIVE_DAYS_LAST7_DAYS = "activeDaysLast7Days"
 STATE_ACTIVITY_SUGGESTION_INTERACT_LAST7_DAYS = "activitySuggestionInteractLast7Days"
-# Deprecated in simulation: RL context slot fixed at 0.0 (P_FOURSC=30 has no salience 7d term).
 
 STATE_SALIENCE_MESSAGE_SENT_YESTERDAY = "salienceMessageSentYesterday"
 STATE_SALIENCE_MESSAGE_SENT_TODAY = "salienceMessageSentToday"

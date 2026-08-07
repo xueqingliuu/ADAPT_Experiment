@@ -1321,28 +1321,33 @@ def build_fourSC_features(
 def build_rl_context_vector(
     *,
     yesterdayStepCount,
-    stepCountLast7DaysEma,
     prior2HourStepCountAgent,
     activeDaysLast7Days,
     activitySuggestionsSentLast7Days,
     salienceMessageSentYesterday,
     activitySuggestionInteractLast7Days,
 ):
-    """Per-decision context ``C`` for RLSVI (length 8; salience 7d interact fixed at 0)."""
+    """Per-decision context ``C`` for RLSVI (length 6)."""
     return np.array([
-        float(yesterdayStepCount), float(stepCountLast7DaysEma),
+        float(yesterdayStepCount),
         float(prior2HourStepCountAgent), float(activeDaysLast7Days),
         float(activitySuggestionsSentLast7Days),
         float(salienceMessageSentYesterday),
         float(activitySuggestionInteractLast7Days),
-        0.0,
     ], dtype=float)
 
 
-N_RL_CONTEXT = 8
+N_RL_CONTEXT = 6
 
 RL_MY_SHAPE = (6, 3)
 RL_ME_SHAPE = (6, 4)
+
+# Within-week EWMA summaries replace the flattened day×slot mediator grids in
+# phi. Storage still uses RL_MY_SHAPE / RL_ME_SHAPE; only the feature map
+# compresses. Fixed step sizes: α = 1/(N_max - 1).
+N_RL_MEDIATOR_SUMMARY = 5
+RL_MEDIATOR_EWMA_ALPHA_SLOT = 1.0 / (N_RL_DAYS * N_RL_SLOTS - 1)  # 1/11
+RL_MEDIATOR_EWMA_ALPHA_DAY = 1.0 / (N_RL_DAYS - 1)               # 1/5
 
 FOURSC_SLOTS_PER_WEEK = 7 * 2
 N_MED_SLOT = 12
@@ -1429,7 +1434,8 @@ def build_CAE_short_features(caeAverage):
 def make_state(context):
     """Convert environment context into the ``state`` dict for :func:`build_phi_action`.
 
-    ``context`` must contain ``E_w``, ``M_Y``, ``M_E``, and ``C`` (length 10).
+    ``context`` must contain ``E_w``, ``M_Y``, ``M_E``, and ``C``
+    (length ``N_RL_CONTEXT``).
     """
     return {
         "E_w": float(context["E_w"]),
@@ -1618,6 +1624,67 @@ def _mask_mediators_for_slot(M_Y, M_E, d, t):
     return M_Y, M_E
 
 
+def _within_week_ewma(values, alpha):
+    """Recursive EMA over a chronological within-week sequence.
+
+    ``s_1 = x_1``, ``s_t = (1 - α) s_{t-1} + α x_t``. Empty → 0.
+    """
+    vals = np.asarray(values, dtype=float).ravel()
+    if vals.size == 0:
+        return 0.0
+    alpha = float(alpha)
+    s = float(vals[0])
+    for x in vals[1:]:
+        s = (1.0 - alpha) * s + alpha * float(x)
+    return s
+
+
+def _past_slot_stream(M, d, t, col=None):
+    """Chronological past slot-level values visible strictly before ``(d, t)``.
+
+    If ``col`` is None, morning and afternoon are pooled in week order.
+    """
+    M = np.asarray(M, dtype=float).reshape(N_RL_DAYS, -1)
+    out = []
+    for i in range(N_RL_DAYS):
+        if col is None:
+            for j in range(N_RL_SLOTS):
+                if (i, j) < (d, t):
+                    out.append(float(M[i, j]))
+        elif (i, int(col)) < (d, t):
+            out.append(float(M[i, int(col)]))
+    return out
+
+
+def _past_day_stream(M, d, col):
+    """Chronological past day-level values visible strictly before day ``d``."""
+    M = np.asarray(M, dtype=float).reshape(N_RL_DAYS, -1)
+    return [float(M[i, col]) for i in range(N_RL_DAYS) if i < d]
+
+
+def summarize_mediators_ewma(M_Y, M_E, d, t):
+    """Compress weekly mediator matrices to length-5 EWMA summaries.
+
+    Streams (AM/PM pooled for slot-level outcomes):
+      0. M^Y fourSC (4h step count), α = 1/11
+      1. M^Y anticipated affect, α = 1/5
+      2. M^E pageview, α = 1/11
+      3. M^E morning Fitbit wear, α = 1/5
+      4. M^E daily survey complete, α = 1/5
+
+    Visibility matches :func:`_mask_mediators_for_slot` at ``(d, t)``.
+    """
+    a_slot = RL_MEDIATOR_EWMA_ALPHA_SLOT
+    a_day = RL_MEDIATOR_EWMA_ALPHA_DAY
+    return np.array([
+        _within_week_ewma(_past_slot_stream(M_Y, d, t), a_slot),
+        _within_week_ewma(_past_day_stream(M_Y, d, 2), a_day),
+        _within_week_ewma(_past_slot_stream(M_E, d, t), a_slot),
+        _within_week_ewma(_past_day_stream(M_E, d, 2), a_day),
+        _within_week_ewma(_past_day_stream(M_E, d, 3), a_day),
+    ], dtype=float)
+
+
 def _time_features(d, t):
     """Map zero-based walking slot ``(d, t)`` into time features for phi.
 
@@ -1636,8 +1703,10 @@ def build_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0):
 
     phi_state = [1, weekend, t, E_w, weekend*E_w, t*E_w,
                  b_hat, weekend*b_hat, t*b_hat, b_tilde]
-              ⌢ [tilde_M^Y, tilde_M^E, C_{w,d,t}]
+              ⌢ [M_ewma (5), C_{w,d,t}]
 
+    Mediators enter as within-week EWMA summaries (see
+    :func:`summarize_mediators_ewma`), not the flattened day×slot grid.
     ``d`` / ``t`` are zero-based walking indices. The day feature is a binary
     weekday/weekend indicator over the Monday-Saturday RL days. For STE DQN
     with ``I_w = 1``, pass the known lagged weekly CAE as ``b_hat`` and
@@ -1646,7 +1715,7 @@ def build_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0):
     E_w = state["E_w"]
     d_feat, t_feat = _time_features(d, t)
 
-    M_Y_m, M_E_m = _mask_mediators_for_slot(state["M_Y"], state["M_E"], d, t)
+    M_ewma = summarize_mediators_ewma(state["M_Y"], state["M_E"], d, t)
     C_dt = np.asarray(state["C"]).ravel()
 
     base = np.array([
@@ -1655,7 +1724,7 @@ def build_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0):
         b_hat, d_feat * b_hat, t_feat * b_hat,
         b_tilde,
     ])
-    med_ctx = np.concatenate([M_Y_m.ravel(), M_E_m.ravel(), C_dt])
+    med_ctx = np.concatenate([M_ewma, C_dt])
     return np.concatenate([base, med_ctx])
 
 
@@ -1665,16 +1734,15 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
 
     phi = [1, weekend, t, E_w, weekend*E_w, t*E_w,
            b_w, weekend*b_w, t*b_w, b_tilde]                         (10)
-        ⌢ [tilde_M^Y, tilde_M^E, C_{w,d,t}]                             (n_my + n_me + n_c)
+        ⌢ [M_ewma, C_{w,d,t}]                                          (5 + n_c)
         ⌢ A * [1, E_w, b_w, weekend, t, weekend*E_w, t*E_w,
                weekend*b_w, t*b_w, C_{w,d,t}]                         (9+n_c)
 
     The day index ``d`` (0..5) enters as a weekday/weekend indicator
     (Monday-Friday=0, Saturday=1), and the slot index ``t`` (0..1) is mapped to
-    ``{0, 1}``; raw ``d``/``t`` are still used internally for mediator masking.
+    ``{0, 1}``; raw ``d``/``t`` select which past mediators enter the EWMA.
 
-    M_Y, M_E are (6, n_j) with first two columns slot-ordered; remaining
-    columns are day-level (_mask_mediators_for_slot).
+    M_Y, M_E are stored as (6, n_j) week matrices; phi uses EWMA summaries.
 
     Parameters
     ----------
@@ -1692,7 +1760,7 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
 
     Returns
     -------
-    phi : (p,) array   where  p = 10 + n_my + n_me + n_c + (9 + n_c)
+    phi : (p,) array   where  p = 10 + 5 + n_c + (9 + n_c)
     """
     E_w = state['E_w']
     b_w = b_hat
@@ -1718,10 +1786,10 @@ def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
 
     phi = [1, weekend, t, E_w, weekend*E_w, t*E_w,
            b_w, weekend*b_w, t*b_w, b_tilde]                         (10)
-        ⌢ [tilde_M^Y, tilde_M^E, C_{w,d,t}]                             (n_my + n_me + n_c)
+        ⌢ [M_ewma, C_{w,d,t}]                                          (5 + n_c)
 
-    M_Y, M_E are (6, n_j) with first two columns slot-ordered; remaining
-    columns are day-level (_mask_mediators_for_slot).
+    Mediators are EWMA summaries under *next-slot* visibility (post-action
+    credit). Storage matrices are still (6, n_j).
 
     Parameters
     ----------
@@ -1738,7 +1806,7 @@ def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
 
     Returns
     -------
-    phi : (p,) array   where  p = 10 + n_my + n_me + n_c + (9 + n_c)
+    phi : (p,) array   where  p = 10 + 5 + n_c
     """
     E_w = state['E_w']
     b_w = b_hat
@@ -1750,9 +1818,7 @@ def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
         nxt_d, nxt_t = N_RL_DAYS, 0
     else:
         nxt_d, nxt_t = next_slot
-    M_Y_m, M_E_m = _mask_mediators_for_slot(state['M_Y'], state['M_E'], nxt_d, nxt_t)
-    M_Y_tilde = M_Y_m.ravel()
-    M_E_tilde = M_E_m.ravel()
+    M_ewma = summarize_mediators_ewma(state['M_Y'], state['M_E'], nxt_d, nxt_t)
 
     # ── state for current decision point ──
     C_dt = np.asarray(state['C']).ravel()              # (n_c,)
@@ -1766,8 +1832,8 @@ def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
         b_tilde,
     ])
 
-    # ── part 2: masked mediators + state ──
-    med_ctx = np.concatenate([M_Y_tilde, M_E_tilde, C_dt])
+    # ── part 2: EWMA mediators + state ──
+    med_ctx = np.concatenate([M_ewma, C_dt])
 
     return np.concatenate([base, med_ctx])
 
@@ -1788,9 +1854,9 @@ def _rewardshaping_state(state_dt, full_mediators):
     expose the post-action mediators. We therefore swap in the *full realized*
     weekly mediator matrices (``full_mediators = (M_Y_full, M_E_full)``) while
     keeping the slot-specific ``E_w`` and context ``C`` from ``state_dt``;
-    ``build_phi_action_rewardshaping`` then masks for the *next* slot, which
-    trims the full matrices down to exactly ``V^{sh}`` / ``D^{sh}`` (including
-    the terminal slot, whose next-slot sentinel reveals the whole week).
+    ``build_phi_action_rewardshaping`` then forms EWMA summaries under *next*
+    slot visibility, which matches ``V^{sh}`` / ``D^{sh}`` (including the
+    terminal slot, whose next-slot sentinel reveals the whole week).
 
     ``full_mediators`` may be ``None`` (e.g. when no full-week record exists),
     in which case the original pre-action snapshot is returned unchanged.
@@ -2600,7 +2666,7 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
 
     phi = [1, weekend, t, E, weekend·E, t·E, b, weekend·b, t·b,
            b_tilde]                                                   (10)
-        ⌢ [tilde_M^Y, tilde_M^E, C_{w,d,t}]                             (n_my+n_me+n_c)
+        ⌢ [M_ewma, C_{w,d,t}]                                          (5 + n_c)
         ⌢ [query: 1, E, b, C]
         ⌢ [walk: 1, E, b, weekend, t, weekend·E, t·E, weekend·b, t·b, C]
 
@@ -2620,7 +2686,7 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
 
     Returns
     -------
-    phi : (p,) array   where  p = 10 + n_my + n_me + n_c + (3+n_c) + (9+n_c)
+    phi : (p,) array   where  p = 10 + 5 + n_c + (3+n_c) + (9+n_c)
     """
     E_w = state['E_w']
     b_w = b_hat
@@ -2632,21 +2698,14 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
     # (the agent uses one shared beta for both).
     C_dt_eff = np.zeros_like(C_dt) if is_query else C_dt
 
-    M_Y_ref = np.asarray(state.get('M_Y', np.zeros((6, 3))))
-    M_E_ref = np.asarray(state.get('M_E', np.zeros((6, 4))))
-
     if is_query:
         # Query has no walking time. Set both time features to 0; the
         # query/walking distinction is carried by query_block vs walk_block.
         d_feat, t_feat = 0.0, 0.0
-        M_Y_tilde = np.zeros(M_Y_ref.size)
-        M_E_tilde = np.zeros(M_E_ref.size)
+        M_ewma = np.zeros(N_RL_MEDIATOR_SUMMARY, dtype=float)
     else:
         d_feat, t_feat = _time_features(d, t)
-
-        M_Y_m, M_E_m = _mask_mediators_for_slot(state['M_Y'], state['M_E'], d, t)
-        M_Y_tilde = M_Y_m.ravel()
-        M_E_tilde = M_E_m.ravel()
+        M_ewma = summarize_mediators_ewma(state['M_Y'], state['M_E'], d, t)
 
     # ── part 1: base features ──
     base = np.array([
@@ -2656,8 +2715,8 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
         b_tilde, 
     ])
 
-    # ── part 2: masked mediators + state ──
-    med_ctx = np.concatenate([M_Y_tilde, M_E_tilde, C_dt_eff])
+    # ── part 2: EWMA mediators + state ──
+    med_ctx = np.concatenate([M_ewma, C_dt_eff])
 
     # ── part 3: action-interacted blocks (query + shared walking) ──
     query_interact = np.concatenate([[1.0, E_w, b_w], C_dt_eff])

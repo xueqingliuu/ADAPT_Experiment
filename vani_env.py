@@ -38,7 +38,7 @@ PROJECT_ROOT = Path(
     os.environ.get("ADAPR_PROJECT_ROOT", Path(__file__).resolve().parent)
 ).expanduser().resolve()
 PARAMS_DIR = Path(
-    PROJECT_ROOT / "env_para_vanilla"
+    PROJECT_ROOT / "env_para_variant1_signflip"
 ).expanduser().resolve()
 
 
@@ -112,7 +112,6 @@ THETA_FOURSC_NAMES = [
 THETA_ANTIC_NAMES = [
     "intercept",
     "anticipated_affect_yesterday",
-    "today_step_count",
     "active_status",
     "is_weekend",
     "perceived_utility_lastweek",
@@ -145,7 +144,9 @@ THETA_CAE_SHORT_AVG_NAMES = [
 P_FOURSC = len(THETA_FOURSC_NAMES)
 _LEGACY_INTERACT_DROP = (2,)  # removed legacy salience-history covariate
 _LEGACY_FOURSC_SALIENCE_DROP = (8, 21)
-_LEGACY_ANTIC_SALIENCE_DROP = (4, 10, 11)
+# Legacy antic vectors: +1 = includes today_step_count; +4 = that plus salience terms.
+_LEGACY_ANTIC_TODAY_STEP_DROP = (2,)
+_LEGACY_ANTIC_SALIENCE_AND_TODAY_STEP_DROP = (2, 4, 10, 11)
 P_ANTIC = len(THETA_ANTIC_NAMES)
 P_ACTIVE_STATUS = len(THETA_ACTIVE_STATUS_NAMES)
 P_PRIOR2HOUR = len(THETA_PRIOR2HOUR_STEP_COUNT_NAMES)
@@ -265,14 +266,17 @@ def trim_theta_foursc(theta) -> np.ndarray:
 
 
 def trim_theta_antic(theta) -> np.ndarray:
-    """Accept current fits or trim legacy salience predictors."""
+    """Accept current fits or trim legacy today_step / salience predictors."""
     a = np.asarray(theta, dtype=float).ravel()
     if a.size == P_ANTIC:
         return a
-    if a.size == P_ANTIC + 3:
-        return np.delete(a, _LEGACY_ANTIC_SALIENCE_DROP)
+    if a.size == P_ANTIC + 1:
+        return np.delete(a, _LEGACY_ANTIC_TODAY_STEP_DROP)
+    if a.size == P_ANTIC + 4:
+        return np.delete(a, _LEGACY_ANTIC_SALIENCE_AND_TODAY_STEP_DROP)
     raise ValueError(
-        f"theta_antic length {a.size}; expected {P_ANTIC} or legacy {P_ANTIC + 3}"
+        f"theta_antic length {a.size}; expected {P_ANTIC}, "
+        f"legacy {P_ANTIC + 1}, or legacy {P_ANTIC + 4}"
     )
 
 
@@ -381,7 +385,7 @@ class EnvConfig:
             "theta_antic_names",
             p,
             THETA_ANTIC_NAMES,
-            legacy_lengths=(P_ANTIC + 3,),
+            legacy_lengths=(P_ANTIC + 1, P_ANTIC + 4),
         )
         _validate_json_names("theta_CAE_names", p, THETA_CAE_NAMES)
         _validate_json_names("theta_CAE_short_avg_names", p, THETA_CAE_SHORT_AVG_NAMES)
@@ -673,12 +677,11 @@ class Env:
 
     def gen_antic_mean(self, s, ws_morning, ws_afternoon):
         """
-        Daily ridge design (morning row): 15 columns — matches
+        Daily ridge design (morning row): 14 columns — matches
         ``5_fit_vanilla_testbed`` ``anticipated_affect_cond_day``
-        (no ``planning_prompt``; includes ``perceivedUtilityLastWeek`` main and
-        AM/PM interactions).
+        (no ``today_step_count`` / ``planning_prompt``; includes
+        ``perceivedUtilityLastWeek`` main and AM/PM interactions).
         """
-        ys = float(s["todayStepCount"])
         act = float(s["activityStatusToday"])
         is_weekend = float(s["isWeekend"])
         pu = float(s["perceivedUtilityLastWeek"])
@@ -687,7 +690,6 @@ class Env:
             [
                 1.0,
                 float(s["dailyAnticipatedAffectYesterday"]),
-                ys,
                 act,
                 is_weekend,
                 pu,

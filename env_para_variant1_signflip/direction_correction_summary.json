@@ -1,0 +1,118 @@
+{
+  "source_dir": "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed/env_para_vanilla",
+  "output_dir": "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed/env_para_variant1_signflip",
+  "n_users": 31,
+  "user_ids": [
+    "13",
+    "18",
+    "22",
+    "31",
+    "33",
+    "37",
+    "72",
+    "75",
+    "86",
+    "106",
+    "118",
+    "128",
+    "129",
+    "141",
+    "143",
+    "151",
+    "160",
+    "170",
+    "184",
+    "188",
+    "195",
+    "204",
+    "225",
+    "239",
+    "252",
+    "269",
+    "277",
+    "285",
+    "299",
+    "307",
+    "333"
+  ],
+  "copied_supporting_files": [
+    "std_params.json",
+    "user_ids.txt",
+    "Ew_pooled_linear_coefs.json",
+    "df_fit_11week.csv",
+    "rl_priors.json",
+    "rl_prior_tables.md"
+  ],
+  "n_constrained_coefficients": 1550,
+  "n_flipped": 634,
+  "n_kept_positive": 839,
+  "n_kept_negative": 64,
+  "n_kept_zero": 13,
+  "constraints": {
+    "theta_CAE": {
+      "nonnegative": [
+        "fourSC_slot_*",
+        "anticipated_affect_day_*"
+      ]
+    },
+    "theta_penalized_Ew": {
+      "nonnegative": [
+        "a2_PV_lag_week",
+        "a3_FW_lag_week",
+        "a4_PJ_lag_week"
+      ]
+    },
+    "theta_fourSC": {
+      "nonnegative": [
+        "perceived_utility_lastweek",
+        "CAE_avg_lastweek",
+        "WalkingSuggestion",
+        "WalkingSuggestion_by_perceived_utility_lastweek",
+        "WalkingSuggestion_by_CAE_avg_lastweek"
+      ]
+    },
+    "theta_antic": {
+      "nonnegative": [
+        "perceived_utility_lastweek",
+        "CAE_avg_lastweek",
+        "A0_morning",
+        "A1_afternoon",
+        "A0_morning_by_perceived_utility_lastweek",
+        "A1_afternoon_by_perceived_utility_lastweek",
+        "A0_morning_by_CAE_avg_lastweek",
+        "A1_afternoon_by_CAE_avg_lastweek"
+      ]
+    },
+    "theta_penalized_PV": {
+      "nonnegative": [
+        "alpha1_Ew",
+        "alpha4_action_by_Ew"
+      ],
+      "nonpositive": [
+        "alpha3_action"
+      ]
+    },
+    "theta_penalized_FW": {
+      "nonnegative": [
+        "beta1_Ew",
+        "beta4_A0_morning_by_Ew",
+        "beta6_A1_afternoon_by_Ew"
+      ],
+      "nonpositive": [
+        "beta3_A0_morning",
+        "beta5_A1_afternoon"
+      ]
+    },
+    "theta_penalized_PJ": {
+      "nonnegative": [
+        "theta1_Ew",
+        "theta4_A0_morning_by_Ew",
+        "theta6_A1_afternoon_by_Ew"
+      ],
+      "nonpositive": [
+        "theta3_A0_morning",
+        "theta5_A1_afternoon"
+      ]
+    }
+  }
+}

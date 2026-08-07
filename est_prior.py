@@ -133,12 +133,14 @@ SLOTS_PER_DAY = 2
 DAYS_PER_WEEK_RL = 6             # RL handles Mon–Sat only
 N_RL_SLOTS_WEEK = SLOTS_PER_DAY * DAYS_PER_WEEK_RL  # 12
 
-# RL hyperparameters (must match experiment.py)
+# RL hyperparameters (must match experiment._gamma_dt_micro): discount 1 on
+# non-terminal slots; weekly ``GAMMA_BAR`` only on the terminal slot.
 GAMMA_BAR = 0.5
-GAMMA_DT_SCALAR = GAMMA_BAR ** (1.0 / 12.0)
-GAMMA_DT = GAMMA_DT_SCALAR * np.ones((6, 2))   # _gamma_dt_micro(gamma_bar)
-DELTA = _cumulative_discount(GAMMA_DT)         # Delta_{d,t} from slot (1,1)
-DELTA_TERMINAL = float(DELTA[5, 1])             # Delta_{6,2}
+GAMMA_DT = np.ones((DAYS_PER_WEEK_RL, SLOTS_PER_DAY), dtype=float)
+GAMMA_DT[DAYS_PER_WEEK_RL - 1, SLOTS_PER_DAY - 1] = GAMMA_BAR
+GAMMA_TERMINAL = float(GAMMA_DT[DAYS_PER_WEEK_RL - 1, SLOTS_PER_DAY - 1])
+DELTA = _cumulative_discount(GAMMA_DT)         # Delta_{d,t} from slot (0,0)
+DELTA_TERMINAL = float(DELTA[DAYS_PER_WEEK_RL - 1, SLOTS_PER_DAY - 1])
 
 # Mediator state shapes used by build_phi_action.
 RL_MY_SHAPE = (6, 3)
@@ -822,13 +824,11 @@ def _build_rl_context_vector_from_row(row) -> np.ndarray:
     """Match ``experiment.build_rl_context_vector``."""
     return np.array([
         float(row["YesterdayStepCount_norm"]),
-        float(row["EMA_StepCount_norm"]),
         float(row["prior2hour_step_norm"]),
         float(row["active_status_fraction_7days"]),
         float(row["recent_burden_norm" if "recent_burden_norm" in row.index else "recentBurdenEma_norm"]),
         float(row["yesterday_SalienceMessage"]),
         float(row["Interacted_7d_walk"]),
-        0.0,
     ], dtype=float)
 
 
@@ -858,7 +858,7 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
         dat[c] = _fill_nan(dat[c].to_numpy())
 
     n_rl = N_RL_SLOTS_WEEK   # 12 slots Mon-Sat
-    p_C = 8                  # build_rl_context_vector dim
+    p_C = 6                  # build_rl_context_vector dim
 
     # Per-slot quantities for d in 1..6 (Mon-Sat).
     C_slot = np.zeros((n_w, n_rl, p_C))
@@ -1148,7 +1148,8 @@ def _fqi_iterate(
                     if idx < N_RL_SLOTS_WEEK - 1:
                         q0 = f["phi_a0"][k, idx + 1] @ theta
                         q1 = f["phi_a1"][k, idx + 1] @ theta
-                        targets[k, idx] = GAMMA_DT_SCALAR * max(q0, q1)
+                        # Non-terminal within-week discount is 1.
+                        targets[k, idx] = float(max(q0, q1))
                     else:
                         if use_td_modify and alpha_for_boot is not None:
                             boot = float(f["phi_next_bot"][k] @ alpha_for_boot)
@@ -1156,7 +1157,7 @@ def _fqi_iterate(
                             q0 = f["phi_next_a0"][k] @ theta
                             q1 = f["phi_next_a1"][k] @ theta
                             boot = float(max(q0, q1))
-                        targets[k, idx] = f["R"][k] + GAMMA_DT_SCALAR * boot
+                        targets[k, idx] = f["R"][k] + GAMMA_TERMINAL * boot
             chunks.append(targets.reshape(-1))
         y_all = np.concatenate(chunks)
         theta_new, _ = _ridge_fit(X_all, y_all, alpha=RIDGE_ALPHA_RL)
@@ -1215,12 +1216,13 @@ def _mtd_joint_design(
                 X_B[row, p_eta:] = feats["phi_obs"][k, idx]
                 q0_next = feats["phi_a0"][k, idx + 1] @ beta_for_targets
                 q1_next = feats["phi_a1"][k, idx + 1] @ beta_for_targets
-                y_B[row] = GAMMA_DT_SCALAR * max(q0_next, q1_next)
+                # Non-terminal within-week discount is 1.
+                y_B[row] = float(max(q0_next, q1_next))
                 row += 1
 
         # Block C: terminal row with next-week bottleneck bootstrap in design.
         X_C = np.zeros((n_train, p))
-        X_C[:, :p_eta] = -GAMMA_DT_SCALAR * feats["phi_next_bot"]
+        X_C[:, :p_eta] = -GAMMA_TERMINAL * feats["phi_next_bot"]
         X_C[:, p_eta:] = feats["phi_obs"][:, N_RL_SLOTS_WEEK - 1, :]
         y_C = feats["R"]
 
@@ -1341,7 +1343,6 @@ def build_pooled_rl_q_summary(df_fit: pd.DataFrame) -> pd.DataFrame:
         model="q_no_td_modify",
         outcome="fqi_target",
         working_corr=GEE_WORKING_CORR,
-        skip_indices=_placeholder_context_skip_indices(len(_phi_action_names())),
         block="beta",
         row_meta={
             "fqi_iters": N_FQI_ITERS,
@@ -1476,7 +1477,6 @@ def save_priors(priors: Dict[str, Any], path: Path = OUTPUT_PATH) -> Path:
 def _rl_context_names() -> list[str]:
     return [
         "yesterday_step_count",
-        "ema_step_count",
         "prior2hour_step_count",
         "active_status_fraction_7days",
         "recent_burden",
@@ -1485,31 +1485,21 @@ def _rl_context_names() -> list[str]:
     ]
 
 
-def _placeholder_context_skip_indices(n_features: int) -> frozenset[int]:
-    """Phi indices for the hardcoded-zero context slot omitted from audit tables."""
-    n_context = 8  # build_rl_context_vector length; last entry is always 0
-    n_action_block = 9 + n_context
-    if n_features <= n_context:
-        return frozenset()
-    if n_features <= n_action_block:
-        return frozenset({n_features - 1})
-    state_n = n_features - n_action_block
-    return frozenset({state_n - 1, n_features - 1})
-
-
 def _rl_my_names() -> list[str]:
-    cols = ["fourSC_morning", "fourSC_afternoon", "anticipated_affect"]
-    return [f"M_Y_day{d}_{name}" for d in range(1, 7) for name in cols]
+    """Within-week EWMA summaries for M^Y streams (AM/PM pooled for fourSC)."""
+    return [
+        "M_Y_fourSC_ewma",
+        "M_Y_anticipated_affect_ewma",
+    ]
 
 
 def _rl_me_names() -> list[str]:
-    cols = [
-        "pageview_morning",
-        "pageview_afternoon",
-        "morning_fitbit_wear",
-        "daily_survey_complete",
+    """Within-week EWMA summaries for M^E streams (AM/PM pooled for pageview)."""
+    return [
+        "M_E_pageview_ewma",
+        "M_E_fitbit_wear_ewma",
+        "M_E_survey_complete_ewma",
     ]
-    return [f"M_E_day{d}_{name}" for d in range(1, 7) for name in cols]
 
 
 def _phi_state_names() -> list[str]:
@@ -1641,7 +1631,6 @@ def _summary_rows(
     mu = np.asarray(mean, dtype=float).ravel()
     var = _diag_variance(cov, mu.size)
     feature_names = _names_with_fallback(names, mu.size, f"{model}_coef")
-    skip = _placeholder_context_skip_indices(mu.size)
     return [
         {
             "prior_family": prior_family,
@@ -1653,7 +1642,6 @@ def _summary_rows(
             "prior_variance": float(var[i]),
         }
         for i in range(mu.size)
-        if i not in skip
     ]
 
 
@@ -1717,8 +1705,6 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
         names = eta_names + beta_names
         beta_skip = _placeholder_context_skip_indices(beta_n)
         for i, feature in enumerate(names):
-            if i >= p_eta and (i - p_eta) in beta_skip:
-                continue
             joint_rows.append({
                 "prior_family": "Joint Modified TD",
                 "model": "q_td_modify_joint",

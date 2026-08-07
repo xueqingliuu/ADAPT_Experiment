@@ -48,15 +48,13 @@ Step 2 - Choice of discount factor
 The per-slot discount matrix ``gamma_dt`` (shape ``(6, 2)``) mirrors
 ``experiment._gamma_dt_micro`` and is selected by ``gamma_bar``:
 
-  * ``gamma_bar = 0.5`` (default): every slot uses ``gamma = 0.5^(1/12) ~ 0.9439``.
-    The exponent ``1/12`` spreads a per-week discount of ``0.5`` evenly across
-    the 12 in-week transitions, so the cumulative discount from the start of a
-    week to its terminal slot equals ``0.5`` .
-  * ``gamma_bar = 0.0`` (myopic): non-terminal slots use ``gamma = 1`` and only
-    the terminal transition ``(6,2)`` uses ``gamma = 0``. Value flows *within* a
-    week but stops at the week boundary, so each week's Q reflects only that
-    week's own reward.
-  * ``gamma_bar = 1.0``: undiscounted finite horizon (all ``gamma = 1``).
+  * All non-terminal weekday slots use ``gamma = 1`` so value flows
+    undiscounted within the week.
+  * Only the terminal transition ``(6, 2)`` (Sat afternoon) uses
+    ``gamma = gamma_bar``, which discounts into the next week.
+  * ``gamma_bar = 0.5`` (default): weekly continuation discount 0.5.
+  * ``gamma_bar = 0.0`` (myopic): no cross-week bootstrap.
+  * ``gamma_bar = 1.0``: undiscounted (all entries 1).
 
 --------------------------------------------------------------------------
 Step 3 - Missing-data (CAE) handling
@@ -197,14 +195,12 @@ STD_PARAMS_PATH = RAW_DATA_DIR / "std_params.json"
 def gamma_dt_matrix(gamma_bar: float) -> np.ndarray:
     """Per-slot discount matrix ``gamma_{d,t}`` (mirrors ``experiment._gamma_dt_micro``).
 
-    See the module docstring "Choice of discount factor" for the semantics of
-    each ``gamma_bar`` regime.
+    Non-terminal slots are 1; only the terminal weekday slot equals
+    ``gamma_bar``. See the module docstring "Choice of discount factor".
     """
-    if gamma_bar == 0.0:
-        gamma_dt = np.ones((6, 2))
-        gamma_dt[5, 1] = 0.0
-        return gamma_dt
-    return (gamma_bar ** (1.0 / 12.0)) * np.ones((6, 2))
+    gamma_dt = np.ones((6, 2), dtype=float)
+    gamma_dt[5, 1] = float(gamma_bar)
+    return gamma_dt
 
 
 def _empirical_reward_bound(rewards: np.ndarray) -> float:
@@ -300,7 +296,6 @@ def _strip_unused_phi_columns(phi: np.ndarray) -> np.ndarray:
     """Drop structurally unused columns from the shared RL ``phi_action`` map.
 
     Removed columns:
-      * the hardcoded-zero context placeholder (state block and action block)
       * ``b_tilde`` (always 0 offline: we use imputed ``CAE_avg_lastweek``, not
         particle-filter belief uncertainty)
 
@@ -310,19 +305,13 @@ def _strip_unused_phi_columns(phi: np.ndarray) -> np.ndarray:
     ``CAE_avg_lastweek`` after stripping.
     """
     arr = np.asarray(phi, dtype=float)
-    raw_p = arr.shape[-1]
-    action_block_size = 18  # 9 action terms + 9 action-by-context terms
     b_tilde_idx = 9
-    state_placeholder = raw_p - action_block_size - 1
-    action_placeholder = raw_p - 1
-    drop_idx = [b_tilde_idx, state_placeholder, action_placeholder]
-    unused_values = arr[..., drop_idx]
+    unused_values = arr[..., b_tilde_idx]
     if not np.allclose(unused_values, 0.0):
         raise ValueError(
-            "Expected unused fitted-Q columns (b_tilde, context placeholders) "
-            "to be identically zero."
+            "Expected unused fitted-Q column b_tilde to be identically zero."
         )
-    return np.delete(arr, drop_idx, axis=-1)
+    return np.delete(arr, b_tilde_idx, axis=-1)
 
 
 def _feature_names_for(p: int) -> List[str]:
@@ -1387,7 +1376,7 @@ def save_fitted_q_tables(
         "# Pooled Finite-Horizon Fitted-Q",
         "",
         f"- Discount: `gamma_bar = {model['gamma_bar']}` "
-        f"(per-slot `gamma = {model['gamma_dt_scalar']:.6f}`, "
+        f"(within-week `gamma = {model['gamma_dt_scalar']:.6f}`, "
         f"terminal `gamma_{{6,2}} = {model['gamma_terminal']:.6f}`)",
         f"- Backward sweeps run: `{model['n_backward_sweeps']}` "
         f"(planned `{model.get('n_backward_sweeps_planned', model['n_backward_sweeps'])}`, "

@@ -528,7 +528,6 @@ THETA_FOURSC_NAMES = [
 THETA_ANTIC_NAMES = [
     "intercept",
     "anticipated_affect_yesterday",
-    "today_step_count",
     "active_status",
     "is_weekend",
     "perceived_utility_lastweek",
@@ -554,8 +553,7 @@ THETA_CAE_SHORT_AVG_NAMES = [
     "CAE_avg",
 ]
 
-alpha_l2_list = [0.2, 0.5, 1, 2, 5]
-alpha_lap_list = [0.5, 1, 2, 5]
+alpha_l2_list = [1, 2, 5]  # floor at 1; drop weak penalties that inflate sparse cells
 ncv = 5
 seed = 2026
 
@@ -688,7 +686,6 @@ for i, userid in enumerate(userid_all):
     # extract the predictors
     Intercept = np.ones(len(fourSC))
 
-    today_step_count = dat_user['TodayStepCount_norm'].to_numpy()
     yesterday_step_count = dat_user['YesterdayStepCount_norm'].to_numpy()
     seven_day_step_count_avg = dat_user['EMA_StepCount_norm'].to_numpy()
 
@@ -726,7 +723,6 @@ for i, userid in enumerate(userid_all):
 
     # fill in missing values (NAN) with mean for predictors except for FourSC and Intercept
     fourSC_lag1 = fill_nan_with_mean(fourSC_lag1)
-    today_step_count = fill_nan_with_mean(today_step_count)
     yesterday_step_count = fill_nan_with_mean(yesterday_step_count)
     seven_day_step_count_avg = fill_nan_with_mean(seven_day_step_count_avg)
     prior2hour_step_count_filled = fill_nan_with_mean(prior2hour_step_count)
@@ -890,9 +886,9 @@ for i, userid in enumerate(userid_all):
             const = 0.5
             theta_active_status_mean[0] = 0.0
         elif const <= 0.0:
-            theta_active_status_mean[0] = -25.0
+            theta_active_status_mean[0] = -8.0
         elif const >= 1.0:
-            theta_active_status_mean[0] = 25.0
+            theta_active_status_mean[0] = 8.0
         else:
             theta_active_status_mean[0] = float(np.log(const / (1.0 - const)))
         pred_active_status = np.full(len(active_status), const, dtype=float)
@@ -962,9 +958,9 @@ for i, userid in enumerate(userid_all):
             const = 0.5
             theta_ws_interaction_mean[0] = 0.0
         elif const <= 0.0:
-            theta_ws_interaction_mean[0] = -25.0
+            theta_ws_interaction_mean[0] = -8.0
         elif const >= 1.0:
-            theta_ws_interaction_mean[0] = 25.0
+            theta_ws_interaction_mean[0] = 8.0
         else:
             theta_ws_interaction_mean[0] = float(np.log(const / (1.0 - const)))
         pred_ws_interaction = np.full(len(ws_interaction), const, dtype=float)
@@ -1056,7 +1052,6 @@ for i, userid in enumerate(userid_all):
     anticipated_affect_cond_day = np.stack([
         Intercept[_am],
         anticipated_affect_yesterday[_am],
-        today_step_count[_am],
         active_status_filled[_am],
         is_weekend[_am],
         perceived_utility_lastweek[_am],

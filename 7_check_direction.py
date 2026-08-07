@@ -1,35 +1,36 @@
 """
-Create direction-corrected vanilla environment parameters.
+Create direction-corrected vanilla environment parameters (Variant 1).
 
 Inputs:
   - env_para_vanilla/params_env_<id>.json from 5_fit_vanilla_testbed.py
   - env_para_vanilla/Ew_pooled_linear_coefs.json from 6_est_Ew_weights.py
 
 Outputs:
-  - env_para_positivedirection/params_env_<id>.json for the 29 fitted users
+  - env_para_variant1_signflip/params_env_<id>.json for the fitted users
   - copied supporting files needed by vani_env.py / experiment.py
   - audit files documenting every constrained coefficient
 
-Direction constraints:
-  1. M^Y -> CAE is nonnegative:
-     theta_CAE fourSC_slot_* and anticipated_affect_day_* coefficients.
-  2. Study week -> CAE is nonnegative:
-     theta_CAE week coefficient.
-  3. Main twice-daily walking-suggestion effects -> M^Y are nonnegative:
-     theta_fourSC WalkingSuggestion and theta_antic A0/A1 main coefficients.
-  4. Action x CAE and action x perceived-utility interactions -> M^Y are
-     nonnegative:
-     theta_fourSC WalkingSuggestion_by_{perceived_utility_lastweek,CAE_avg_lastweek}
-     and theta_antic A0/A1 morning/afternoon interaction coefficients with
-     perceived_utility_lastweek and CAE_avg_lastweek.
-  5. E_w -> M^E is nonnegative for pageview, Fitbit wearing, and daily survey
-     completion:
-     theta_penalized_PV alpha1_Ew, theta_penalized_FW beta1_Ew,
-     theta_penalized_PJ theta1_Ew.
-  6. Walking-suggestion main effects -> M^E are nonpositive (intercept only):
-     theta_penalized_PV alpha3_action; theta_penalized_FW beta3_A0_morning and
-     beta5_A1_afternoon; theta_penalized_PJ theta3_A0_morning and
-     theta5_A1_afternoon.
+Direction constraints (Variant 1; max{β,0} / min{β,0} via sign flip):
+  1. M^Y -> Y_{w+1} nonnegative:
+     theta_CAE fourSC_slot_* and anticipated_affect_day_*.
+  2. M^E -> E_{w+1} nonnegative:
+     theta_penalized_Ew a2_PV_lag_week, a3_FW_lag_week, a4_PJ_lag_week.
+  3. E_w -> M^Y nonnegative:
+     theta_fourSC / theta_antic perceived_utility_lastweek main effects.
+  4. Y_w -> M^Y nonnegative:
+     theta_fourSC / theta_antic CAE_avg_lastweek main effects.
+  5. A -> M^Y nonnegative:
+     theta_fourSC WalkingSuggestion; theta_antic A0_morning / A1_afternoon.
+  6. A · Y_w -> M^Y nonnegative:
+     *_by_CAE_avg_lastweek action interactions in fourSC / antic.
+  7. A · E_w -> M^Y nonnegative:
+     *_by_perceived_utility_lastweek action interactions in fourSC / antic.
+  8. A -> M^E nonpositive (intercept only):
+     theta_penalized_PV alpha3_action; FW beta3/beta5; PJ theta3/theta5.
+  9. E_w -> M^E nonnegative:
+     theta_penalized_PV alpha1_Ew; FW beta1_Ew; PJ theta1_Ew.
+  10. A · E_w -> M^E nonnegative:
+     theta_penalized_PV alpha4_action_by_Ew; FW beta4/beta6; PJ theta4/theta6.
 
 Nonnegative constraints flip negative values with abs(value). Nonpositive
 constraints flip positive values with -abs(value). Values already in the
@@ -51,8 +52,7 @@ PROJECT_ROOT = Path(
 ).expanduser().resolve()
 
 DEFAULT_SOURCE_DIR = PROJECT_ROOT / "env_para_vanilla"
-# DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "env_para_positivedirection"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "env_para_positivenegative"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "env_para_variant1_signflip"
 
 REQUIRED_SUPPORTING_FILES = (
     "std_params.json",
@@ -83,45 +83,79 @@ def _json_number(x, *, key: str, name: str) -> float:
     return float(x)
 
 
-def _is_cae_mediator_effect(name: str) -> bool:
+def _is_cae_my_effect(name: str) -> bool:
+    """M^Y -> Y_{w+1}: fourSC slots and daily anticipated affect."""
     return name.startswith("fourSC_slot_") or name.startswith("anticipated_affect_day_")
 
 
-def _is_cae_study_week_effect(name: str) -> bool:
-    return name == "week"
+def _is_ew_me_effect(name: str) -> bool:
+    """M^E -> E_{w+1}: lag-week aggregates of PV / FW / PJ."""
+    return name in {"a2_PV_lag_week", "a3_FW_lag_week", "a4_PJ_lag_week"}
 
 
-def _is_cae_nonneg_constrained(name: str) -> bool:
-    return _is_cae_mediator_effect(name) or _is_cae_study_week_effect(name)
+_MY_E_MAIN = frozenset({"perceived_utility_lastweek"})
+_MY_Y_MAIN = frozenset({"CAE_avg_lastweek"})
 
+_FOURSC_ACTION_MAIN = frozenset({"WalkingSuggestion"})
+_ANTIC_ACTION_MAIN = frozenset({"A0_morning", "A1_afternoon"})
 
-_FOURSC_ACTION_PU_CAE_INTERACTIONS = frozenset(
-    {
-        "WalkingSuggestion_by_perceived_utility_lastweek",
-        "WalkingSuggestion_by_CAE_avg_lastweek",
-    }
+_FOURSC_ACTION_Y_INTERACTIONS = frozenset(
+    {"WalkingSuggestion_by_CAE_avg_lastweek"}
 )
-
-_ANTIC_ACTION_PU_CAE_INTERACTIONS = frozenset(
+_ANTIC_ACTION_Y_INTERACTIONS = frozenset(
     {
-        "A0_morning_by_perceived_utility_lastweek",
-        "A1_afternoon_by_perceived_utility_lastweek",
         "A0_morning_by_CAE_avg_lastweek",
         "A1_afternoon_by_CAE_avg_lastweek",
     }
 )
 
+_FOURSC_ACTION_E_INTERACTIONS = frozenset(
+    {"WalkingSuggestion_by_perceived_utility_lastweek"}
+)
+_ANTIC_ACTION_E_INTERACTIONS = frozenset(
+    {
+        "A0_morning_by_perceived_utility_lastweek",
+        "A1_afternoon_by_perceived_utility_lastweek",
+    }
+)
 
-def _is_foursc_suggestion_effect(name: str) -> bool:
-    return name == "WalkingSuggestion" or name in _FOURSC_ACTION_PU_CAE_INTERACTIONS
+
+def _is_foursc_my_nonneg(name: str) -> bool:
+    """E_w / Y_w / A / A·Y_w / A·E_w -> M^Y (fourSC)."""
+    return name in (
+        _MY_E_MAIN
+        | _MY_Y_MAIN
+        | _FOURSC_ACTION_MAIN
+        | _FOURSC_ACTION_Y_INTERACTIONS
+        | _FOURSC_ACTION_E_INTERACTIONS
+    )
 
 
-def _is_antic_suggestion_effect(name: str) -> bool:
-    return name in {"A0_morning", "A1_afternoon"} or name in _ANTIC_ACTION_PU_CAE_INTERACTIONS
+def _is_antic_my_nonneg(name: str) -> bool:
+    """E_w / Y_w / A / A·Y_w / A·E_w -> M^Y (anticipated affect)."""
+    return name in (
+        _MY_E_MAIN
+        | _MY_Y_MAIN
+        | _ANTIC_ACTION_MAIN
+        | _ANTIC_ACTION_Y_INTERACTIONS
+        | _ANTIC_ACTION_E_INTERACTIONS
+    )
 
 
 def _is_me_ew_effect(name: str) -> bool:
+    """E_w -> M^E."""
     return name in {"alpha1_Ew", "beta1_Ew", "theta1_Ew"}
+
+
+def _is_me_action_by_ew_effect(name: str) -> bool:
+    """A · E_w -> M^E."""
+    return name in {
+        "alpha4_action_by_Ew",
+        "beta4_A0_morning_by_Ew",
+        "beta6_A1_afternoon_by_Ew",
+        "theta4_A0_morning_by_Ew",
+        "theta6_A1_afternoon_by_Ew",
+    }
 
 
 _FW_ACTION_INTERCEPTS = frozenset({"beta3_A0_morning", "beta5_A1_afternoon"})
@@ -241,20 +275,31 @@ def build_positive_direction_parameters(
         with src.open(encoding="utf-8") as f:
             params = json.load(f)
 
+        # 1. M^Y -> Y_{w+1}
         audit_rows.extend(
             _correct_named_theta(
                 params,
                 user_id=user_id,
                 theta_key="theta_CAE",
-                predicate=_is_cae_nonneg_constrained,
+                predicate=_is_cae_my_effect,
             )
         )
+        # 2. M^E -> E_{w+1}
+        audit_rows.extend(
+            _correct_named_theta(
+                params,
+                user_id=user_id,
+                theta_key="theta_penalized_Ew",
+                predicate=_is_ew_me_effect,
+            )
+        )
+        # 3–7. E_w / Y_w / A / A·Y_w / A·E_w -> M^Y
         audit_rows.extend(
             _correct_named_theta(
                 params,
                 user_id=user_id,
                 theta_key="theta_fourSC",
-                predicate=_is_foursc_suggestion_effect,
+                predicate=_is_foursc_my_nonneg,
             )
         )
         audit_rows.extend(
@@ -262,9 +307,10 @@ def build_positive_direction_parameters(
                 params,
                 user_id=user_id,
                 theta_key="theta_antic",
-                predicate=_is_antic_suggestion_effect,
+                predicate=_is_antic_my_nonneg,
             )
         )
+
         fitted_keys = {
             outcome: (
                 f"theta_penalized_{outcome}"
@@ -273,6 +319,7 @@ def build_positive_direction_parameters(
             )
             for outcome in ("PV", "FW", "PJ")
         }
+        # 9. E_w -> M^E
         for theta_key in fitted_keys.values():
             audit_rows.extend(
                 _correct_named_theta(
@@ -282,6 +329,17 @@ def build_positive_direction_parameters(
                     predicate=_is_me_ew_effect,
                 )
             )
+        # 10. A · E_w -> M^E
+        for theta_key in fitted_keys.values():
+            audit_rows.extend(
+                _correct_named_theta(
+                    params,
+                    user_id=user_id,
+                    theta_key=theta_key,
+                    predicate=_is_me_action_by_ew_effect,
+                )
+            )
+        # 8. A -> M^E nonpositive
         audit_rows.extend(
             _correct_named_theta(
                 params,
@@ -342,34 +400,55 @@ def build_positive_direction_parameters(
         "n_kept_negative": sum(1 for r in audit_rows if r["action"] == "kept_negative"),
         "n_kept_zero": sum(1 for r in audit_rows if r["action"] == "kept_zero"),
         "constraints": {
-            "theta_CAE": [
-                "fourSC_slot_*",
-                "anticipated_affect_day_*",
-                "week",
-            ],
-            "theta_fourSC": [
-                "WalkingSuggestion",
-                "WalkingSuggestion_by_perceived_utility_lastweek",
-                "WalkingSuggestion_by_CAE_avg_lastweek",
-            ],
-            "theta_antic": [
-                "A0_morning",
-                "A1_afternoon",
-                "A0_morning_by_perceived_utility_lastweek",
-                "A1_afternoon_by_perceived_utility_lastweek",
-                "A0_morning_by_CAE_avg_lastweek",
-                "A1_afternoon_by_CAE_avg_lastweek",
-            ],
+            "theta_CAE": {
+                "nonnegative": ["fourSC_slot_*", "anticipated_affect_day_*"],
+            },
+            "theta_penalized_Ew": {
+                "nonnegative": [
+                    "a2_PV_lag_week",
+                    "a3_FW_lag_week",
+                    "a4_PJ_lag_week",
+                ],
+            },
+            "theta_fourSC": {
+                "nonnegative": [
+                    "perceived_utility_lastweek",
+                    "CAE_avg_lastweek",
+                    "WalkingSuggestion",
+                    "WalkingSuggestion_by_perceived_utility_lastweek",
+                    "WalkingSuggestion_by_CAE_avg_lastweek",
+                ],
+            },
+            "theta_antic": {
+                "nonnegative": [
+                    "perceived_utility_lastweek",
+                    "CAE_avg_lastweek",
+                    "A0_morning",
+                    "A1_afternoon",
+                    "A0_morning_by_perceived_utility_lastweek",
+                    "A1_afternoon_by_perceived_utility_lastweek",
+                    "A0_morning_by_CAE_avg_lastweek",
+                    "A1_afternoon_by_CAE_avg_lastweek",
+                ],
+            },
             "theta_penalized_PV": {
-                "nonnegative": ["alpha1_Ew"],
+                "nonnegative": ["alpha1_Ew", "alpha4_action_by_Ew"],
                 "nonpositive": ["alpha3_action"],
             },
             "theta_penalized_FW": {
-                "nonnegative": ["beta1_Ew"],
+                "nonnegative": [
+                    "beta1_Ew",
+                    "beta4_A0_morning_by_Ew",
+                    "beta6_A1_afternoon_by_Ew",
+                ],
                 "nonpositive": ["beta3_A0_morning", "beta5_A1_afternoon"],
             },
             "theta_penalized_PJ": {
-                "nonnegative": ["theta1_Ew"],
+                "nonnegative": [
+                    "theta1_Ew",
+                    "theta4_A0_morning_by_Ew",
+                    "theta6_A1_afternoon_by_Ew",
+                ],
                 "nonpositive": ["theta3_A0_morning", "theta5_A1_afternoon"],
             },
         },

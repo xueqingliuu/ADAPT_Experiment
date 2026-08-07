@@ -21,7 +21,16 @@ Scaling: 14 hourly PV slots / week; 7 daily FW and PJ values after de-duplicatio
 Missing PV, FW, and PJ measurements are imputed as zero before weekly aggregation.
 Missing U1 and U2 weekly responses are imputed with their pooled observed weekly means.
 Rows with missing outcomes are dropped before pooling across users.
-The regression includes an intercept.
+
+By default the slopes are **within-user ridge**: outcome and predictors are
+demeaned within ``ParticipantIdentifier``, then shared ridge (no intercept) is
+fit on the demeaned predictors in their original units. A single grand-mean
+intercept is then chosen so ``E ≈ intercept + β'X`` still applies to raw weekly
+predictors (``intercept = mean(E) - β'mean(X)``), matching ``apply_pooled_coefs``.
+
+Default ``ridge_alpha=3`` shrinks the collinear ``J_w`` / ``half_J_tool8``
+pair enough that both slopes stay nonnegative, with little loss of within-user
+fit relative to OLS.
 """
 from __future__ import annotations
 
@@ -31,7 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, Ridge
 
 PROJECT_ROOT = Path(
     os.getenv("ADAPR_PROJECT_ROOT", str(Path(__file__).resolve().parent))
@@ -45,10 +54,23 @@ COMBINED_DIR = Path(
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
 EW_POOLED_COEF_JSON = WORK_DIR / "Ew_pooled_linear_coefs.json"
 COEF_DECIMALS = 3
+FEATURE_COLS = ["J_w", "half_J_tool8", "PV_sum", "FW_sum", "PJ_sum"]
+OUTCOME_COL = "pred_penalized_filtered_Ew"
+DEFAULT_RIDGE_ALPHA = 3.0
 
 
 def _round_decimals(x: float, digits: int = COEF_DECIMALS) -> float:
     return float(np.round(float(x), digits))
+
+
+def _r2_score(y: np.ndarray, yhat: np.ndarray) -> float:
+    y = np.asarray(y, dtype=float).ravel()
+    yhat = np.asarray(yhat, dtype=float).ravel()
+    ss_res = float(np.sum((y - yhat) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    if ss_tot <= 0.0:
+        return 0.0
+    return 1.0 - ss_res / ss_tot
 
 
 def load_df_fit(path: Path | None = None) -> pd.DataFrame:
@@ -196,10 +218,82 @@ def build_pooled_regression_frame(
     return pd.DataFrame(out_rows)
 
 
+def fit_within_user_linear_Ew(
+    m: pd.DataFrame,
+    feature_cols: list[str] = FEATURE_COLS,
+    *,
+    ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
+):
+    """
+    Shared within-user slopes via person-mean demeaning (+ optional ridge), plus a
+    grand-mean intercept so predictions apply to raw weekly predictors.
+
+    ``ridge_alpha=0`` is within-user OLS; ``ridge_alpha>0`` is ridge on the
+    demeaned predictors in their original units.
+    """
+    ycol = OUTCOME_COL
+    md = m.copy()
+    for c in feature_cols + [ycol]:
+        md[c] = m[c] - m.groupby("ParticipantIdentifier")[c].transform("mean")
+
+    X_dm = md[feature_cols].to_numpy(dtype=float)
+    y_dm = md[ycol].to_numpy(dtype=float)
+    alpha = float(ridge_alpha)
+    if alpha < 0.0:
+        raise ValueError(f"ridge_alpha must be >= 0 (got {ridge_alpha})")
+
+    if alpha == 0.0:
+        reg = LinearRegression(fit_intercept=False)
+        reg.fit(X_dm, y_dm)
+        coef = np.asarray(reg.coef_, dtype=float).ravel()
+    else:
+        reg = Ridge(alpha=alpha, fit_intercept=False)
+        reg.fit(X_dm, y_dm)
+        coef = np.asarray(reg.coef_, dtype=float).ravel()
+
+    X = m[feature_cols].to_numpy(dtype=float)
+    y = m[ycol].to_numpy(dtype=float)
+    intercept = float(np.mean(y) - np.mean(X, axis=0) @ coef)
+    yhat_level = intercept + X @ coef
+    yhat_within = X_dm @ coef
+
+    out = {"intercept": _round_decimals(intercept, COEF_DECIMALS)}
+    out.update(
+        {
+            key: _round_decimals(value, COEF_DECIMALS)
+            for key, value in zip(feature_cols, coef)
+        }
+    )
+    return {
+        "coefficients": out,
+        "coef_raw": coef,
+        "intercept_raw": intercept,
+        "r2_within": _r2_score(y_dm, yhat_within),
+        "r2_level": _r2_score(y, yhat_level),
+        "ridge_alpha": alpha,
+    }
+
+
 def fit_pooled_linear_Ew(
     df_fit: pd.DataFrame | None = None,
     work_dir: Path = WORK_DIR,
+    *,
+    within_user: bool = True,
+    ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
 ):
+    """
+    Fit the agent-visible linear E_w proxy.
+
+    Parameters
+    ----------
+    within_user :
+        If True (default), estimate shared slopes after within-user demeaning and
+        reconstruct a grand-mean intercept for raw predictors. If False, use
+        ordinary pooled OLS on raw levels (``ridge_alpha`` ignored).
+    ridge_alpha :
+        Ridge penalty used after within-user demeaning (original predictor units).
+        Default 3. Set to 0 for within-user OLS.
+    """
     if df_fit is None:
         df_fit = load_df_fit()
     response_means = weekly_response_imputation_means(df_fit)
@@ -208,14 +302,40 @@ def fit_pooled_linear_Ew(
         work_dir=work_dir,
         response_imputation_means=response_means,
     )
-    feature_cols = ["J_w", "half_J_tool8", "PV_sum", "FW_sum", "PJ_sum"]
-    m = frame.dropna(subset=["pred_penalized_filtered_Ew"] + feature_cols)
+    feature_cols = list(FEATURE_COLS)
+    m = frame.dropna(subset=[OUTCOME_COL] + feature_cols)
     if len(m) < len(feature_cols):
         raise ValueError(
             f"Not enough complete rows for regression (n={len(m)}). "
             "Check ``pred_penalized_filtered_Ew`` and ``df_fit``."
         )
-    y = m["pred_penalized_filtered_Ew"].to_numpy(dtype=float)
+
+    if within_user:
+        n_users = int(m["ParticipantIdentifier"].nunique())
+        if n_users < 2:
+            raise ValueError(
+                "Within-user demeaning needs at least 2 participants "
+                f"(found {n_users})."
+            )
+        fit = fit_within_user_linear_Ew(
+            m,
+            feature_cols=feature_cols,
+            ridge_alpha=ridge_alpha,
+        )
+        return {
+            "coefficients": fit["coefficients"],
+            "response_imputation_means": response_means,
+            "r2": fit["r2_within"],
+            "r2_within": fit["r2_within"],
+            "r2_level": fit["r2_level"],
+            "within_user": True,
+            "ridge_alpha": fit["ridge_alpha"],
+            "n": len(m),
+            "n_users": n_users,
+            "frame": m,
+        }
+
+    y = m[OUTCOME_COL].to_numpy(dtype=float)
     X = m[feature_cols].to_numpy(dtype=float)
     reg = LinearRegression(fit_intercept=True)
     reg.fit(X, y)
@@ -226,19 +346,39 @@ def fit_pooled_linear_Ew(
             for key, value in zip(feature_cols, reg.coef_.ravel())
         }
     )
-    r2 = reg.score(X, y)
+    r2 = float(reg.score(X, y))
     return {
         "coefficients": out,
         "response_imputation_means": response_means,
         "r2": r2,
+        "r2_within": None,
+        "r2_level": r2,
+        "within_user": False,
+        "ridge_alpha": None,
         "n": len(m),
+        "n_users": int(m["ParticipantIdentifier"].nunique()),
         "frame": m,
     }
 
 
 if __name__ == "__main__":
-    result = fit_pooled_linear_Ew()
-    print(f'n = {result["n"]}, R^2 = {result["r2"]:.4f}')
+    result = fit_pooled_linear_Ew(within_user=True, ridge_alpha=DEFAULT_RIDGE_ALPHA)
+    if result["within_user"]:
+        alpha = result["ridge_alpha"]
+        mode = (
+            f"within-user ridge (alpha={alpha:g})"
+            if alpha and alpha > 0
+            else "within-user OLS"
+        )
+    else:
+        mode = "pooled OLS"
+    print(f"mode = {mode}")
+    print(f'n = {result["n"]}, n_users = {result["n_users"]}')
+    if result["within_user"]:
+        print(f'R^2_within = {result["r2_within"]:.4f}')
+        print(f'R^2_level  = {result["r2_level"]:.4f}  (raw X with grand-mean intercept)')
+    else:
+        print(f'R^2 = {result["r2"]:.4f}')
     for k, v in result["coefficients"].items():
         print(f"  {k}: {v:.3f}")
     print("Weekly-response imputation means:")

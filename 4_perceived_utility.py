@@ -1915,7 +1915,7 @@ def quadrature_loglik(
 
 
 
-def neg_loglik_blocks(theta, blocks, grid, weights, e1_known, lam=1e-2):
+def neg_loglik_blocks(theta, blocks, grid, weights, e1_known, lam=0.5):
     try:
         out = quadrature_loglik(blocks, theta, grid, weights, e1_known=e1_known)
         if not np.isfinite(out["loglik"]):
@@ -1935,7 +1935,7 @@ def neg_loglik_unpenalized_blocks(theta, blocks, grid, weights, e1_known):
         return 1e100
 
 
-def neg_loglik_all_users(theta, user_blocks, grid, weights, e1_known, lam=1e-2):
+def neg_loglik_all_users(theta, user_blocks, grid, weights, e1_known, lam=0.5):
     total_nll = 0.0
 
     for uid, blocks in user_blocks.items():
@@ -2187,7 +2187,7 @@ def fit_pooled_model(
     FW_lag_col="morning_wearing",
     PJ_lag_col="daily_present_yesterday",
     hourly_pv=True,
-    lam: float = 1e-2,
+    lam: float = 0.5,
     progress: bool = True,
     progress_every_evals: int = 5,
     progress_min_interval_s: float = 15.0,
@@ -2328,7 +2328,7 @@ def fit_one_user(
     PJ_lag_col="daily_present_yesterday",
     hourly_pv=True,
     x0: Optional[np.ndarray] = None,
-    lam: float = 1e-2,
+    lam: float = 0.5,
     uid: Optional[str] = None,
 ):
     blocks = build_user_blocks(
@@ -2431,7 +2431,7 @@ def fit_all_users(
     PJ_lag_col="daily_present_yesterday",
     hourly_pv=True,
     pooled_x0: Optional[np.ndarray] = None,
-    lam: float = 1e-2,
+    lam: float = 0.5,
     merge_into_vanilla_json: bool = False,
     vanilla_work_dir: Optional[Path] = None,
     json_digits: int = 3,
@@ -2861,7 +2861,7 @@ if __name__ == "__main__":
         grid=np.linspace(-3.0, 3.0, 121),
         e1_known=2.0,
         maxiter=500,
-        lam=1e-2,
+        lam=0.5,
     )
 
     pooled_theta = pooled_res.x.copy()
@@ -2890,7 +2890,7 @@ if __name__ == "__main__":
         e1_known=_e1_known,
         maxiter=500,
         pooled_x0=pooled_x0,
-        lam=1e-2,
+        lam=0.5,
         merge_into_vanilla_json=True,
         vanilla_work_dir=WORK_DIR,
         json_digits=3,

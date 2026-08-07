@@ -6,8 +6,11 @@ simulator):
     random walking policy (Bernoulli ``P0``) with ``I_w = J_w = 1`` (full CAE observation).
   * Evaluate total per-episode reward ``sum_w CAE_w`` under the zero policy vs.
     greedy DQN actions.
-  * Match the RL weekly discount ``gamma_bar = 0.5`` using the per-decision
-    discount ``0.5^(1/12)`` over 12 controlled slots per week.
+  * Match the RL weekly discount ``gamma_bar = 0.5`` with a sparse within-week
+    schedule: every controlled slot except the last has discount 1, and only
+    the terminal weekday slot (Sat afternoon) discounts by ``gamma_bar`` into
+    the next week. Implemented for d3rlpy via ``gamma=gamma_bar`` and
+    ``Transition.interval`` in ``{0, 1}`` (effective discount ``gamma**interval``).
   * Compute each fitted participant type's STE as ``Delta_i / sigma_i``, then
     report the average user STE ``mean_i(Delta_i / sigma_i)``.
   * DQN observations extend the RLSVI state features (:func:`build_phi_state`):
@@ -22,6 +25,10 @@ simulator):
   * One job per user: ``jobid`` indexes ``user_ids.txt``. Different DGP variants
     should use separate env modules / param dirs or ``--exp`` names, not a
     generative scale knob.
+  * Environment residuals default to ``noise="sequential"``: deterministic
+    cycling through fitted residual pools (``resid[idx % len(resid)]``),
+    matching ``experiment.py`` / ``vani_env.Env``. Use ``--noise random`` to
+    i.i.d.-resample residuals instead.
 
 Requires: ``d3rlpy``, ``numpy``, and project modules ``experiment``, ``algorithm``,
 ``vani_env``.
@@ -30,6 +37,7 @@ Requires: ``d3rlpy``, ``numpy``, and project modules ``experiment``, ``algorithm
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 from pathlib import Path
 
@@ -47,8 +55,14 @@ from algorithm_helpers import (
 from experiment import OnlineEnv
 from vani_env import PARAMS_DIR, Env, EnvConfig
 
+SLOTS_PER_WEEK = N_RL_DAYS * N_RL_SLOTS
 DQN_WEEKLY_GAMMA = 0.5
-DQN_STEP_GAMMA = DQN_WEEKLY_GAMMA ** (1.0 / (N_RL_DAYS * N_RL_SLOTS))
+# Non-terminal within-week slots use discount 1; the week-terminal slot uses
+# ``DQN_WEEKLY_GAMMA``. d3rlpy applies ``gamma ** interval``, so we set
+# ``gamma = DQN_WEEKLY_GAMMA`` and ``interval ∈ {0, 1}``.
+DQN_WITHIN_WEEK_GAMMA = 1.0
+DQN_WEEK_TERMINAL_INTERVAL = 1
+DQN_WITHIN_WEEK_INTERVAL = 0
 
 try:
     import d3rlpy
@@ -64,6 +78,31 @@ def _require_d3():
         raise ImportError(
             "d3rlpy is required for STE DQN training/eval. Install with: pip install d3rlpy"
         ) from _D3_IMPORT_ERROR
+
+
+class WeeklyDiscountTransitionPicker:
+    """d3rlpy picker with discount 1 within week and ``gamma_bar`` at week end.
+
+    ``BasicTransitionPicker`` always sets ``interval=1``. Here the last
+    controlled slot of each week (index ``% SLOTS_PER_WEEK == SLOTS_PER_WEEK-1``)
+    keeps ``interval=1`` so the TD discount is ``gamma_bar``; all earlier
+    within-week slots use ``interval=0`` so the discount is ``gamma_bar**0 = 1``.
+    """
+
+    def __init__(self, slots_per_week: int = SLOTS_PER_WEEK):
+        _require_d3()
+        self.slots_per_week = int(slots_per_week)
+        self._basic = d3rlpy.dataset.BasicTransitionPicker()
+
+    def __call__(self, episode, index: int):
+        transition = self._basic(episode, index)
+        is_week_terminal = (index % self.slots_per_week) == (self.slots_per_week - 1)
+        interval = (
+            DQN_WEEK_TERMINAL_INTERVAL
+            if is_week_terminal
+            else DQN_WITHIN_WEEK_INTERVAL
+        )
+        return dataclasses.replace(transition, interval=interval)
 
 
 def _dqn_fit_device() -> str:
@@ -212,7 +251,7 @@ def build_offline_buffer(
     n_episodes: int,
     walk_prob: float,
     base_seed: int,
-    noise: str = "random",
+    noise: str = "sequential",
 ) -> dict:
     """Stack continuing-task trajectories with one look-ahead state each."""
     chunks = {k: [] for k in ("states", "actions", "rewards", "terminals", "timeouts")}
@@ -259,6 +298,7 @@ def train_dqn_ste(
         rewards=buffer["rewards"],
         terminals=buffer["terminals"],
         timeouts=buffer["timeouts"],
+        transition_picker=WeeklyDiscountTransitionPicker(),
         action_space=d3rlpy.constants.ActionSpace.DISCRETE,
         action_size=2,
     )
@@ -278,7 +318,9 @@ def train_dqn_ste(
 
     dqn = d3rlpy.algos.DQNConfig(
         batch_size=batch_size,
-        gamma=DQN_STEP_GAMMA,
+        # Effective per-transition discount is ``gamma ** interval`` with
+        # ``interval`` from ``WeeklyDiscountTransitionPicker``.
+        gamma=DQN_WEEKLY_GAMMA,
         learning_rate=learning_rate,
         target_update_interval=5000,
         encoder_factory=encoder_factory,
@@ -304,7 +346,7 @@ def rollout_total_cae(
     seed: int,
     policy: str,
     dqn=None,
-    noise: str = "random",
+    noise: str = "sequential",
     i_w_fixed: int = 1,
     walk_prob: float = 0.5,
 ) -> float:
@@ -370,7 +412,7 @@ def eval_ste_job(
     userid_path: Path | None = None,
     n_test: int = 500,
     nweek: int | None = None,
-    noise: str = "random",
+    noise: str = "sequential",
 ) -> None:
     """Write rows ``[sum_CAE_zero, sum_CAE_opt]`` for one validated evaluation run."""
     _require_d3()
@@ -398,7 +440,8 @@ def eval_ste_job(
         "nweek": nweek,
         "noise": noise,
         "gamma_weekly": DQN_WEEKLY_GAMMA,
-        "gamma_step": DQN_STEP_GAMMA,
+        "gamma_within_week": DQN_WITHIN_WEEK_GAMMA,
+        "gamma_scheme": "terminal_only",
         "continuing_task": True,
         "bootstrap_lookahead_weeks": 1,
     }
@@ -443,7 +486,7 @@ def train_ste_job(
     nweek: int | None = None,
     walk_prob: float = 0.5,
     n_steps: int = 100_000,
-    noise: str = "random",
+    noise: str = "sequential",
 ) -> None:
     """Train DQN for ``userid = user_ids[jobid]``."""
     _require_d3()
@@ -485,7 +528,8 @@ def train_ste_job(
         "noise": noise,
         "state_dim": int(buffer["states"].shape[1]),
         "gamma_weekly": DQN_WEEKLY_GAMMA,
-        "gamma_step": DQN_STEP_GAMMA,
+        "gamma_within_week": DQN_WITHIN_WEEK_GAMMA,
+        "gamma_scheme": "terminal_only",
         "continuing_task": True,
         "bootstrap_lookahead_weeks": 1,
         "i_w_fixed": 1,
@@ -561,19 +605,19 @@ def main(argv: list[str] | None = None) -> None:
     pt.add_argument("jobid", type=int)
     pt.add_argument("--exp", type=str, default="1")
     pt.add_argument("--user-ids", type=str, default=None, help="Path to user_ids.txt")
-    pt.add_argument("--n-train-episodes", type=int, default=5000)
+    pt.add_argument("--n-train-episodes", type=int, default=100000)
     pt.add_argument("--nweek", type=int, default=None)
     pt.add_argument("--walk-prob", type=float, default=0.5)
     pt.add_argument("--n-steps", type=int, default=100_000)
-    pt.add_argument("--noise", type=str, default="random", choices=("random", "sequential"))
+    pt.add_argument("--noise", type=str, default="sequential", choices=("random", "sequential"))
 
     pe = sub.add_parser("eval", help="Evaluate zero vs DQN for user_ids[jobid]")
     pe.add_argument("jobid", type=int)
     pe.add_argument("--exp", type=str, default="1")
     pe.add_argument("--user-ids", type=str, default=None)
-    pe.add_argument("--n-test", type=int, default=500)
+    pe.add_argument("--n-test", type=int, default=1000)
     pe.add_argument("--nweek", type=int, default=None)
-    pe.add_argument("--noise", type=str, default="random", choices=("random", "sequential"))
+    pe.add_argument("--noise", type=str, default="sequential", choices=("random", "sequential"))
 
     pa = sub.add_parser("aggregate", help="Print average user STE from saved eval files")
     pa.add_argument("--exp", type=str, default="1")

@@ -19,7 +19,7 @@
 #
 # Optional overrides (sbatch --export=...):
 #   STE_PHASE=train|eval|all|aggregate   default all
-#   STE_EXP=1  STE_NOISE=random  STE_N_TRAIN=5000  STE_N_EVAL=500  STE_N_STEPS=100000
+#   STE_EXP=1  STE_NOISE=sequential  STE_N_TRAIN=5000  STE_N_EVAL=500  STE_N_STEPS=100000
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")}"
@@ -36,7 +36,7 @@ export MPLCONFIGDIR="${SLURM_SUBMIT_DIR:-$PWD}/.matplotlib"
 
 STE_EXP="${STE_EXP:-1}"
 STE_PHASE="${STE_PHASE:-all}"
-STE_NOISE="${STE_NOISE:-random}"
+STE_NOISE="${STE_NOISE:-sequential}"
 STE_N_TRAIN="${STE_N_TRAIN:-5000}"
 STE_N_EVAL="${STE_N_EVAL:-500}"
 STE_N_STEPS="${STE_N_STEPS:-100000}"
@@ -52,11 +52,15 @@ echo "STE_N_TRAIN=${STE_N_TRAIN}  STE_N_EVAL=${STE_N_EVAL}  STE_N_STEPS=${STE_N_
 test -f "${USER_IDS}"
 test -f ste_vanilla.py
 
-NUM_USERS=$(wc -l < "${USER_IDS}")
-if [[ -n "${SLURM_ARRAY_TASK_COUNT:-}" && "${SLURM_ARRAY_TASK_COUNT}" != "${NUM_USERS}" ]]; then
-  echo "ERROR: SLURM array has ${SLURM_ARRAY_TASK_COUNT} tasks but ${USER_IDS} has ${NUM_USERS} rows." >&2
-  echo "Update #SBATCH --array=0-$((NUM_USERS - 1)) in this script to match." >&2
-  exit 1
+NUM_USERS=$(( $(wc -l < "${USER_IDS}") ))
+# Non-fatal: the auto-submitted aggregate job (below) intentionally runs as a
+# single task, and a single array index is a valid way to test one
+# participant before launching the full array. This only flags likely drift
+# between the #SBATCH --array directive and USER_IDS for full train/eval runs.
+if [[ "${STE_PHASE}" != "aggregate" && -n "${SLURM_ARRAY_TASK_COUNT:-}" \
+      && "${SLURM_ARRAY_TASK_COUNT}" -gt 1 && "${SLURM_ARRAY_TASK_COUNT}" != "${NUM_USERS}" ]]; then
+  echo "WARNING: SLURM array has ${SLURM_ARRAY_TASK_COUNT} tasks but ${USER_IDS} has ${NUM_USERS} rows." >&2
+  echo "If this isn't a deliberate partial run, update #SBATCH --array=0-$((NUM_USERS - 1))." >&2
 fi
 
 COMMON_ARGS=(
