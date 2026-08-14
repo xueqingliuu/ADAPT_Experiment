@@ -4,6 +4,8 @@ from typing import Any, Dict, Optional
 
 from scipy.optimize import minimize_scalar
 
+from ewm_utils import ewma_gamma
+
 N_RL_DAYS = 6
 N_RL_SLOTS = 2
 QUERY_D = -1
@@ -1257,13 +1259,45 @@ def _cumulative_discount(gamma_dt):
 # ──────────────────────────────────────────────────────────────────
 
 try:
-    from vani_env import P_FOURSC, P_ANTIC, make_initial_state
+    from vani_env import (
+        P_FOURSC,
+        P_ANTIC,
+        THETA_ANTIC_NAMES,
+        make_initial_state,
+        build_CAE_features,
+        build_CAE_short_features,
+    )
 except ImportError:  # pragma: no cover
     P_FOURSC = 29
-    P_ANTIC = 18
+    P_ANTIC = 17
+    THETA_ANTIC_NAMES = [
+        "intercept",
+        "anticipated_affect_yesterday",
+        "active_status",
+        "is_weekend",
+        "perceived_utility_lastweek",
+        "CAE_avg_lastweek",
+        "recent_burden",
+        "A0_morning",
+        "A1_afternoon",
+        "A0_morning_by_is_weekend",
+        "A1_afternoon_by_is_weekend",
+        "A0_morning_by_perceived_utility_lastweek",
+        "A1_afternoon_by_perceived_utility_lastweek",
+        "A0_morning_by_CAE_avg_lastweek",
+        "A1_afternoon_by_CAE_avg_lastweek",
+        "A0_morning_by_recent_burden",
+        "A1_afternoon_by_recent_burden",
+    ]
 
     def make_initial_state(participant_id=118):  # type: ignore[misc]
         raise ImportError("vani_env required for make_initial_state")
+
+    def build_CAE_features(CAE_lastweek, week_norm, foursc_wk, antic_wk):  # type: ignore[misc]
+        raise ImportError("vani_env required for build_CAE_features")
+
+    def build_CAE_short_features(caeAverage):  # type: ignore[misc]
+        raise ImportError("vani_env required for build_CAE_short_features")
 
 
 def build_fourSC_features(
@@ -1344,10 +1378,8 @@ RL_ME_SHAPE = (6, 4)
 
 # Within-week EWMA summaries replace the flattened day×slot mediator grids in
 # phi. Storage still uses RL_MY_SHAPE / RL_ME_SHAPE; only the feature map
-# compresses. Fixed step sizes: α = 1/(N_max - 1).
+# compresses. Same ``gamma=6/7`` normalized discount as data extraction.
 N_RL_MEDIATOR_SUMMARY = 5
-RL_MEDIATOR_EWMA_ALPHA_SLOT = 1.0 / (N_RL_DAYS * N_RL_SLOTS - 1)  # 1/11
-RL_MEDIATOR_EWMA_ALPHA_DAY = 1.0 / (N_RL_DAYS - 1)               # 1/5
 
 FOURSC_SLOTS_PER_WEEK = 7 * 2
 N_MED_SLOT = 12
@@ -1357,11 +1389,11 @@ N_MED = N_MED_SLOT + N_MED_ANTIC_DAY
 _FOURSC_CAE_COL = 12
 _FOURSC_AH_COL = 13
 _FOURSC_AH_CAE_COL = 23
-_ANTIC_CAE_COL = 6
-_ANTIC_WS_M_COL = 7
-_ANTIC_WS_A_COL = 8
-_ANTIC_CAE_WS_M_COL = 16
-_ANTIC_CAE_WS_A_COL = 17
+_ANTIC_CAE_COL = THETA_ANTIC_NAMES.index("CAE_avg_lastweek")
+_ANTIC_WS_M_COL = THETA_ANTIC_NAMES.index("A0_morning")
+_ANTIC_WS_A_COL = THETA_ANTIC_NAMES.index("A1_afternoon")
+_ANTIC_CAE_WS_M_COL = THETA_ANTIC_NAMES.index("A0_morning_by_CAE_avg_lastweek")
+_ANTIC_CAE_WS_A_COL = THETA_ANTIC_NAMES.index("A1_afternoon_by_CAE_avg_lastweek")
 _CAE_AR1_COL = 1
 
 
@@ -1377,6 +1409,8 @@ def fourSC_cae_delta(x):
 def antic_cae_delta(x):
     """Design delta for substituting ``caeAverageLastWeek`` in an antic row."""
     x = np.asarray(x, dtype=float).ravel()
+    if x.size != P_ANTIC:
+        raise ValueError(f"antic row length {x.size} != {P_ANTIC}")
     d = np.zeros_like(x)
     d[_ANTIC_CAE_COL] = 1.0
     d[_ANTIC_CAE_WS_M_COL] = x[_ANTIC_WS_M_COL]
@@ -1387,48 +1421,54 @@ def antic_cae_delta(x):
 def build_antic_features(
     *,
     dailyAnticipatedAffectYesterday,
-    todayStepCount,
     activityStatusToday,
-    salienceMessageSentToday,
     isWeekend,
     perceivedUtility,
     caeAverageLastWeek,
+    activitySuggestionsSentLast7Days,
     ws_morning,
     ws_afternoon,
     pu=None,
     cae=None,
 ):
-    """Feature vector for ``gen_antic_mean`` / ``gen_antic`` (length ``P_ANTIC``)."""
+    """Feature vector matching ``vani_env.gen_antic_mean`` (length ``P_ANTIC``).
+
+    Pass ``cae=0.0`` for PF base rows; per-particle CAE is added via
+    :func:`build_pf_data`.  ``pu`` / ``cae`` override ``perceivedUtility`` /
+    ``caeAverageLastWeek`` when supplied.
+    """
     _pu = float(perceivedUtility) if pu is None else float(pu)
     _cae = float(caeAverageLastWeek) if cae is None else float(cae)
-    ys = float(todayStepCount)
     act = float(activityStatusToday)
-    sal = float(salienceMessageSentToday)
     is_weekend = float(isWeekend)
+    rb = float(activitySuggestionsSentLast7Days)
     ws_morning = float(ws_morning)
     ws_afternoon = float(ws_afternoon)
-    return np.array([
-        1.0, float(dailyAnticipatedAffectYesterday), ys, act, sal, is_weekend, _pu, _cae,
-        ws_morning, ws_afternoon,
-        ws_morning * sal, ws_afternoon * sal,
-        ws_morning * is_weekend, ws_afternoon * is_weekend,
-        ws_morning * _pu, ws_afternoon * _pu,
-        ws_morning * _cae, ws_afternoon * _cae,
-    ], dtype=float)
-
-
-def build_CAE_features(CAE_lastweek, week_norm, foursc_wk, antic_wk):
-    """Return the (24,) feature vector used by gen_CAE_mean."""
-    return np.concatenate([
-        [1.0, CAE_lastweek, week_norm],
-        foursc_wk.ravel(),
-        antic_wk.ravel(),
-    ])
-
-
-def build_CAE_short_features(caeAverage):
-    """Return the (2,) feature vector used by gen_CAE_short_mean."""
-    return np.array([1.0, caeAverage])
+    x = np.array(
+        [
+            1.0,
+            float(dailyAnticipatedAffectYesterday),
+            act,
+            is_weekend,
+            _pu,
+            _cae,
+            rb,
+            ws_morning,
+            ws_afternoon,
+            ws_morning * is_weekend,
+            ws_afternoon * is_weekend,
+            ws_morning * _pu,
+            ws_afternoon * _pu,
+            ws_morning * _cae,
+            ws_afternoon * _cae,
+            ws_morning * rb,
+            ws_afternoon * rb,
+        ],
+        dtype=float,
+    )
+    if x.size != P_ANTIC:
+        raise RuntimeError(f"antic feature length {x.size} != {P_ANTIC}")
+    return x
 
 
 def make_state(context):
@@ -1624,19 +1664,15 @@ def _mask_mediators_for_slot(M_Y, M_E, d, t):
     return M_Y, M_E
 
 
-def _within_week_ewma(values, alpha):
-    """Recursive EMA over a chronological within-week sequence.
+def _within_week_ewma(values, gamma=None):
+    """Normalized discounted average over a chronological within-week sequence.
 
-    ``s_1 = x_1``, ``s_t = (1 - α) s_{t-1} + α x_t``. Empty → 0.
+    Same formula as ``1_data_extraction._ewm_prior_rows``. ``gamma=None``
+    (default) derives the decay from the number of points visible so far
+    (:func:`ewm_utils.gamma_from_n`) — e.g. the 12-slot fourSC stream and the
+    6-day antic stream get different-but-comparable decay envelopes. Empty → 0.
     """
-    vals = np.asarray(values, dtype=float).ravel()
-    if vals.size == 0:
-        return 0.0
-    alpha = float(alpha)
-    s = float(vals[0])
-    for x in vals[1:]:
-        s = (1.0 - alpha) * s + alpha * float(x)
-    return s
+    return ewma_gamma(values, gamma, empty=0.0)
 
 
 def _past_slot_stream(M, d, t, col=None):
@@ -1666,22 +1702,21 @@ def summarize_mediators_ewma(M_Y, M_E, d, t):
     """Compress weekly mediator matrices to length-5 EWMA summaries.
 
     Streams (AM/PM pooled for slot-level outcomes):
-      0. M^Y fourSC (4h step count), α = 1/11
-      1. M^Y anticipated affect, α = 1/5
-      2. M^E pageview, α = 1/11
-      3. M^E morning Fitbit wear, α = 1/5
-      4. M^E daily survey complete, α = 1/5
+      0. M^Y fourSC (4h step count)
+      1. M^Y anticipated affect
+      2. M^E pageview
+      3. M^E morning Fitbit wear
+      4. M^E daily survey complete
 
+    Each stream uses ``gamma=6/7`` (same as data extraction).
     Visibility matches :func:`_mask_mediators_for_slot` at ``(d, t)``.
     """
-    a_slot = RL_MEDIATOR_EWMA_ALPHA_SLOT
-    a_day = RL_MEDIATOR_EWMA_ALPHA_DAY
     return np.array([
-        _within_week_ewma(_past_slot_stream(M_Y, d, t), a_slot),
-        _within_week_ewma(_past_day_stream(M_Y, d, 2), a_day),
-        _within_week_ewma(_past_slot_stream(M_E, d, t), a_slot),
-        _within_week_ewma(_past_day_stream(M_E, d, 2), a_day),
-        _within_week_ewma(_past_day_stream(M_E, d, 3), a_day),
+        _within_week_ewma(_past_slot_stream(M_Y, d, t)),
+        _within_week_ewma(_past_day_stream(M_Y, d, 2)),
+        _within_week_ewma(_past_slot_stream(M_E, d, t)),
+        _within_week_ewma(_past_day_stream(M_E, d, 2)),
+        _within_week_ewma(_past_day_stream(M_E, d, 3)),
     ], dtype=float)
 
 

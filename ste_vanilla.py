@@ -1,37 +1,22 @@
-"""
-Standardized treatment effect (STE) utilities for the vanilla ``vani_env`` + ``OnlineEnv``
-simulator):
+"""Train and evaluate a per-participant DQN; report average user STE.
 
-  * Train a discrete-action DQN on a large offline dataset generated under a fixed
-    random walking policy (Bernoulli ``P0``) with ``I_w = J_w = 1`` (full CAE observation).
-  * Evaluate total per-episode reward ``sum_w CAE_w`` under the zero policy vs.
-    greedy DQN actions.
-  * Match the RL weekly discount ``gamma_bar = 0.5`` with a sparse within-week
-    schedule: every controlled slot except the last has discount 1, and only
-    the terminal weekday slot (Sat afternoon) discounts by ``gamma_bar`` into
-    the next week. Implemented for d3rlpy via ``gamma=gamma_bar`` and
-    ``Transition.interval`` in ``{0, 1}`` (effective discount ``gamma**interval``).
-  * Compute each fitted participant type's STE as ``Delta_i / sigma_i``, then
-    report the average user STE ``mean_i(Delta_i / sigma_i)``.
-  * DQN observations extend the RLSVI state features (:func:`build_phi_state`):
-    ``E_w`` is agent-visible perceived utility; the ``b_hat`` slot carries the
-    known lagged weekly CAE. The ``b_tilde`` slot (posterior CAE uncertainty)
-    is dropped, since ``I_w = J_w = 1`` means there is no CAE measurement
-    uncertainty and it would only be a constant zero. The policy is
-    continuing, so no finite-horizon countdown is included.
-  * Training simulates one look-ahead week beyond the 36-week evaluation window.
-    The final evaluated-week transition therefore bootstraps from the first
-    state of the next week instead of being treated as terminal.
-  * One job per user: ``jobid`` indexes ``user_ids.txt``. Different DGP variants
-    should use separate env modules / param dirs or ``--exp`` names, not a
-    generative scale knob.
-  * Environment residuals default to ``noise="sequential"``: deterministic
-    cycling through fitted residual pools (``resid[idx % len(resid)]``),
-    matching ``experiment.py`` / ``vani_env.Env``. Use ``--noise random`` to
-    i.i.d.-resample residuals instead.
+Commands (``jobid`` is a row of ``user_ids.txt``)::
 
-Requires: ``d3rlpy``, ``numpy``, and project modules ``experiment``, ``algorithm``,
-``vani_env``.
+    python ste_vanilla.py train <jobid>
+    python ste_vanilla.py eval <jobid>
+    python ste_vanilla.py aggregate
+
+STE for user i is (mean total CAE under greedy DQN minus never-suggest)
+divided by the never-suggest SD; ``aggregate`` averages that over users.
+Training data are simulated under a random walking policy. Discount is 1
+within the week and 0.5 only at Saturday afternoon. Default residual noise
+is AR(1) bootstrap (``--noise ar1``).
+
+Checkpoints: ``d3rlpy_logs/ste_exp_<EXP>/user<uid>_model.d3``
+Eval rows:   ``results_ste/exp<EXP>/res<EXP>_<uid>.txt``
+
+Point at a tuned parameter folder with ``ADAPR_PARAMS_DIR``. Cluster:
+``sbatch run_ste.sh``. Requires ``d3rlpy``.
 """
 
 from __future__ import annotations
@@ -251,7 +236,7 @@ def build_offline_buffer(
     n_episodes: int,
     walk_prob: float,
     base_seed: int,
-    noise: str = "sequential",
+    noise: str = "ar1",
 ) -> dict:
     """Stack continuing-task trajectories with one look-ahead state each."""
     chunks = {k: [] for k in ("states", "actions", "rewards", "terminals", "timeouts")}
@@ -322,7 +307,7 @@ def train_dqn_ste(
         # ``interval`` from ``WeeklyDiscountTransitionPicker``.
         gamma=DQN_WEEKLY_GAMMA,
         learning_rate=learning_rate,
-        target_update_interval=5000,
+        target_update_interval=10000,
         encoder_factory=encoder_factory,
     ).create(device=_dqn_fit_device())
 
@@ -346,17 +331,26 @@ def rollout_total_cae(
     seed: int,
     policy: str,
     dqn=None,
-    noise: str = "sequential",
+    noise: str = "ar1",
     i_w_fixed: int = 1,
     walk_prob: float = 0.5,
-) -> float:
+    params_dir: Path | None = None,
+    return_weekly: bool = False,
+):
     """
     Run one episode; return ``sum_k CAE_k`` (primary outcome total).
 
     ``policy`` is ``"zero"``, ``"bernoulli"``, or ``"dqn_greedy"``.
+    ``params_dir`` defaults to ``vani_env.PARAMS_DIR``; ``tune_ste.py`` passes a
+    rescaled copy to evaluate alternative effect sizes.  With ``return_weekly``
+    the per-week CAE vector is returned alongside the total.
     """
     rd.seed(seed)
-    cfg = EnvConfig(userid, nweek=nweek)
+    cfg = (
+        EnvConfig(userid, nweek=nweek)
+        if params_dir is None
+        else EnvConfig(userid, params_dir=params_dir, nweek=nweek)
+    )
     env = Env(cfg, noise=noise)
     oenv = OnlineEnv(env, nweek=nweek, seed=seed)
     rng = np.random.default_rng(seed)
@@ -392,7 +386,9 @@ def rollout_total_cae(
         oenv._finalize_week(k)
 
     # Index 0 is the pre-RL baseline; STE outcomes include simulated weeks only.
-    return float(np.nansum(oenv.CAE_all[1 : oenv.nweek + 1]))
+    weekly = np.asarray(oenv.CAE_all[1 : oenv.nweek + 1], dtype=float)
+    total = float(np.nansum(weekly))
+    return (total, weekly) if return_weekly else total
 
 
 def _userid_from_job(jobid: int, userid_all: np.ndarray) -> int:
@@ -410,9 +406,9 @@ def eval_ste_job(
     *,
     exp: str = "1",
     userid_path: Path | None = None,
-    n_test: int = 500,
+    n_test: int = 1000,
     nweek: int | None = None,
-    noise: str = "sequential",
+    noise: str = "ar1",
 ) -> None:
     """Write rows ``[sum_CAE_zero, sum_CAE_opt]`` for one validated evaluation run."""
     _require_d3()
@@ -482,11 +478,11 @@ def train_ste_job(
     *,
     exp: str = "1",
     userid_path: Path | None = None,
-    n_train_episodes: int = 5000,
+    n_train_episodes: int = 10000,
     nweek: int | None = None,
     walk_prob: float = 0.5,
     n_steps: int = 100_000,
-    noise: str = "sequential",
+    noise: str = "ar1",
 ) -> None:
     """Train DQN for ``userid = user_ids[jobid]``."""
     _require_d3()
@@ -605,11 +601,13 @@ def main(argv: list[str] | None = None) -> None:
     pt.add_argument("jobid", type=int)
     pt.add_argument("--exp", type=str, default="1")
     pt.add_argument("--user-ids", type=str, default=None, help="Path to user_ids.txt")
-    pt.add_argument("--n-train-episodes", type=int, default=100000)
+    pt.add_argument("--n-train-episodes", type=int, default=10000)
     pt.add_argument("--nweek", type=int, default=None)
     pt.add_argument("--walk-prob", type=float, default=0.5)
     pt.add_argument("--n-steps", type=int, default=100_000)
-    pt.add_argument("--noise", type=str, default="sequential", choices=("random", "sequential"))
+    pt.add_argument(
+        "--noise", type=str, default="ar1", choices=("random", "sequential", "ar1")
+    )
 
     pe = sub.add_parser("eval", help="Evaluate zero vs DQN for user_ids[jobid]")
     pe.add_argument("jobid", type=int)
@@ -617,7 +615,9 @@ def main(argv: list[str] | None = None) -> None:
     pe.add_argument("--user-ids", type=str, default=None)
     pe.add_argument("--n-test", type=int, default=1000)
     pe.add_argument("--nweek", type=int, default=None)
-    pe.add_argument("--noise", type=str, default="sequential", choices=("random", "sequential"))
+    pe.add_argument(
+        "--noise", type=str, default="ar1", choices=("random", "sequential", "ar1")
+    )
 
     pa = sub.add_parser("aggregate", help="Print average user STE from saved eval files")
     pa.add_argument("--exp", type=str, default="1")

@@ -1,27 +1,13 @@
-# %%
-"""
-Generative environment for the vanilla testbed.
+"""Simulate one participant from the fitted vanilla testbed.
 
-**Vanilla mediators** (``5_fit_vanilla_testbed.py``): Ridge / L2 logistic with
-``Intercept`` in the design matrix and ``fit_intercept=False`` — the leading
-column of ones is part of ``theta_*``, not sklearn's intercept.
+``EnvConfig`` loads ``params_env_<uid>.json`` (and supporting files) from
+``PARAMS_DIR``. ``Env`` draws the next 4-hour steps, anticipated affect,
+engagement mediators, weekly CAE, and latent E_w given the current state and
+actions. Residuals default to an AR(1) bootstrap of the fitted leftovers.
 
-**Perceived-utility stack** (``4_perceived_utility.py``): parameters are merged
-into the same ``params_env_<userid>.json`` as ``theta_penalized_*`` /
-``resid_penalized_*`` (legacy ``*_ml_*`` keys remain readable).
-Within-week outcomes (hourly PV, daily FW/PJ) and weekly ``week_present`` use
-those coefficients conditional on latent ``E_w`` carried in
-``state[\"perceivedUtilityLastWeek\"]``.
-
-Weekly AR transition for ``E_w``::
-
-    E_{w+1} = a0 + a1 E_w + a2 \\bar{PV}_w + a3 \\bar{FW}_w + a4 \\bar{PJ}_w + \\varepsilon,
-
-with :math:`\\varepsilon \\sim N(0, \\sigma_E^2)` (``sigma_E`` from
-``theta_penalized_Ew``).
-Means match ``perceivedUtility.transition_matrix`` / ``est_Ew_weights`` conventions:
-``\\bar{PV}_w = (1/14)\\sum`` hourly pageviews, ``\\bar{FW}_w`` and ``\\bar{PJ}_w``
-are :math:`(1/7)\\sum` over calendar days (one value per day).
+``PARAMS_DIR`` is ``env_para_vanilla`` unless ``ADAPR_PARAMS_DIR`` is set
+(used by ``tune_ste.py`` to swap in a rescaled copy). This module does not
+run an RL agent; ``experiment.OnlineEnv`` wraps it for slot-by-slot control.
 """
 from __future__ import annotations
 
@@ -34,11 +20,16 @@ from pathlib import Path
 import numpy as np
 import numpy.random as rd
 
+from ewm_utils import ewma_gamma
+
 PROJECT_ROOT = Path(
     os.environ.get("ADAPR_PROJECT_ROOT", Path(__file__).resolve().parent)
 ).expanduser().resolve()
-PARAMS_DIR = Path(
-    PROJECT_ROOT / "env_para_variant1_signflip"
+# ``ADAPR_PARAMS_DIR`` (absolute, or relative to PROJECT_ROOT) selects an
+# alternative fitted-parameter set, e.g. one of the effect-size-tuned copies
+# written by ``tune_ste.py``, without editing any call site.
+PARAMS_DIR = (
+    PROJECT_ROOT / os.environ.get("ADAPR_PARAMS_DIR", "env_para_vanilla")
 ).expanduser().resolve()
 
 
@@ -116,6 +107,7 @@ THETA_ANTIC_NAMES = [
     "is_weekend",
     "perceived_utility_lastweek",
     "CAE_avg_lastweek",
+    "recent_burden",
     "A0_morning",
     "A1_afternoon",
     "A0_morning_by_is_weekend",
@@ -124,13 +116,17 @@ THETA_ANTIC_NAMES = [
     "A1_afternoon_by_perceived_utility_lastweek",
     "A0_morning_by_CAE_avg_lastweek",
     "A1_afternoon_by_CAE_avg_lastweek",
+    "A0_morning_by_recent_burden",
+    "A1_afternoon_by_recent_burden",
 ]
 
-THETA_CAE_NAMES = (
-    ["intercept", "CAE_avg_lastweek", "week"]
-    + [f"fourSC_slot_{j}" for j in range(14)]
-    + [f"anticipated_affect_day_{j}" for j in range(7)]
-)
+THETA_CAE_NAMES = [
+    "intercept",
+    "CAE_avg_lastweek",
+    "week",
+    "fourSC_ewma",
+    "anticipated_affect_ewma",
+]
 
 THETA_CAE_SHORT_AVG_NAMES = [
     "intercept",
@@ -144,20 +140,31 @@ THETA_CAE_SHORT_AVG_NAMES = [
 P_FOURSC = len(THETA_FOURSC_NAMES)
 _LEGACY_INTERACT_DROP = (2,)  # removed legacy salience-history covariate
 _LEGACY_FOURSC_SALIENCE_DROP = (8, 21)
-# Legacy antic vectors: +1 = includes today_step_count; +4 = that plus salience terms.
+# Legacy antic vectors (relative to the pre-recent-burden 14-column layout):
+# +1 = includes today_step_count; +4 = that plus salience terms.
 _LEGACY_ANTIC_TODAY_STEP_DROP = (2,)
 _LEGACY_ANTIC_SALIENCE_AND_TODAY_STEP_DROP = (2, 4, 10, 11)
 P_ANTIC = len(THETA_ANTIC_NAMES)
+# Pre-recent-burden fits lack the recent_burden main effect (new index 6) and
+# the two trailing A0/A1 x recent_burden interactions; they are zero-padded.
+_P_ANTIC_NO_BURDEN = P_ANTIC - 3
+_ANTIC_BURDEN_MAIN_IDX = THETA_ANTIC_NAMES.index("recent_burden")
 P_ACTIVE_STATUS = len(THETA_ACTIVE_STATUS_NAMES)
 P_PRIOR2HOUR = len(THETA_PRIOR2HOUR_STEP_COUNT_NAMES)
 P_CAE = len(THETA_CAE_NAMES)
 P_CAE_SHORT = len(THETA_CAE_SHORT_AVG_NAMES)
+CAE_FOURSC_SLOTS = 14
+CAE_ANTIC_DAYS = 7
 PV_ML_BASE = 9
-PV_ML_QUERY = 5
 FW_ML_BASE = 9
-FW_ML_QUERY = 4
 PJ_ML_BASE = 9
-PJ_ML_QUERY = 4
+# Query suffix: intercept, E_w, recent_burden (weekend / decision-time dropped).
+PV_ML_QUERY = 3
+FW_ML_QUERY = 3
+PJ_ML_QUERY = 3
+# Legacy suffixes (before weekend/decision-time were removed from the query block).
+_PV_QUERY_LEGACY_KEEP = np.array([0, 1, 4], dtype=int)  # skip weekend, decision time
+_FW_PJ_QUERY_LEGACY_KEEP = np.array([0, 1, 3], dtype=int)  # skip weekend
 
 
 def _json_float_list(key: str, d: dict, n: int | None = None) -> np.ndarray:
@@ -208,30 +215,55 @@ def _fill_nan_with_finite_mean(x: np.ndarray, default: float = 0.0) -> np.ndarra
     return np.where(np.isfinite(vals), vals, _finite_mean_or_default(vals, default))
 
 
-def build_CAE_features(CAE_lastweek, week_norm, foursc_wk, antic_wk) -> np.ndarray:
-    """Feature vector matching ``THETA_CAE_NAMES`` in ``5_fit_vanilla_testbed.py``."""
-    foursc = np.asarray(foursc_wk, dtype=float).ravel()
-    if foursc.size != 14:
-        raise ValueError(f"foursc_wk must have 14 weekly decision slots, got {foursc.size}")
-    foursc = _fill_nan_with_finite_mean(foursc)
+def within_week_ewma(values, gamma=None) -> float:
+    """Normalized discounted average over a chronological sequence.
 
+    Same formula as ``1_data_extraction._ewm_prior_rows`` / ``ewm_utils.ewma_gamma``.
+    ``gamma=None`` (default) derives the decay from how many points are being
+    averaged (:func:`ewm_utils.gamma_from_n`), so a 14-slot fourSC week and a
+    7-day antic week get different-but-comparable decay envelopes. Empty /
+    all-NaN → 0.
+    """
+    return ewma_gamma(values, gamma, empty=0.0)
+
+
+def _antic_daily_from_week(antic_wk) -> np.ndarray:
     antic = np.asarray(antic_wk, dtype=float).ravel()
     if antic.size == 14:
-        # Fitter converts 14 AM/PM decision rows into 7 daily means.
-        antic = _fill_nan_with_finite_mean(antic).reshape(7, 2).mean(axis=1)
-    elif antic.size == 7:
-        antic = _fill_nan_with_finite_mean(antic)
-    else:
-        raise ValueError(
-            f"antic_wk must have 7 daily values or 14 AM/PM slots, got {antic.size}"
-        )
+        return antic.reshape(7, 2).mean(axis=1)
+    if antic.size == 7:
+        return antic
+    raise ValueError(
+        f"antic_wk must have 7 daily values or 14 AM/PM slots, got {antic.size}"
+    )
 
-    x = np.concatenate(
-        [
-            np.array([1.0, CAE_lastweek, week_norm], dtype=float),
-            foursc,
-            antic,
-        ]
+
+def cae_mediator_ewmas(foursc_wk, antic_wk) -> tuple[float, float]:
+    """Compress one week's fourSC slots and antic days to EWMA scalars."""
+    foursc = _fill_nan_with_finite_mean(np.asarray(foursc_wk, dtype=float).ravel())
+    if foursc.size != CAE_FOURSC_SLOTS:
+        raise ValueError(
+            f"foursc_wk must have {CAE_FOURSC_SLOTS} weekly decision slots, "
+            f"got {foursc.size}"
+        )
+    antic = _fill_nan_with_finite_mean(_antic_daily_from_week(antic_wk))
+    return (
+        within_week_ewma(foursc),
+        within_week_ewma(antic),
+    )
+
+
+def build_CAE_features(CAE_lastweek, week_norm, foursc_wk, antic_wk) -> np.ndarray:
+    """Feature vector matching ``THETA_CAE_NAMES`` in ``5_fit_vanilla_testbed.py``.
+
+    fourSC (14 slots) and anticipated affect (7 days) enter as EWMA summaries
+    rather than additive slot/day terms, using the same ``gamma=6/7``
+    normalized discount as ``1_data_extraction._ewm_prior_rows``.
+    """
+    foursc_e, antic_e = cae_mediator_ewmas(foursc_wk, antic_wk)
+    x = np.array(
+        [1.0, float(CAE_lastweek), float(week_norm), foursc_e, antic_e],
+        dtype=float,
     )
     if x.size != P_CAE:
         raise RuntimeError(f"CAE feature length {x.size} != {P_CAE}")
@@ -265,18 +297,30 @@ def trim_theta_foursc(theta) -> np.ndarray:
     )
 
 
+def _pad_theta_antic_burden(a: np.ndarray) -> np.ndarray:
+    """Map a pre-recent-burden coefficient vector into the current layout."""
+    a = np.insert(a, _ANTIC_BURDEN_MAIN_IDX, 0.0)
+    return np.concatenate([a, np.zeros(2)])
+
+
 def trim_theta_antic(theta) -> np.ndarray:
-    """Accept current fits or trim legacy today_step / salience predictors."""
+    """Accept current fits; trim legacy today_step / salience predictors and
+    zero-pad pre-recent-burden fits."""
     a = np.asarray(theta, dtype=float).ravel()
     if a.size == P_ANTIC:
         return a
-    if a.size == P_ANTIC + 1:
-        return np.delete(a, _LEGACY_ANTIC_TODAY_STEP_DROP)
-    if a.size == P_ANTIC + 4:
-        return np.delete(a, _LEGACY_ANTIC_SALIENCE_AND_TODAY_STEP_DROP)
+    if a.size == _P_ANTIC_NO_BURDEN:
+        return _pad_theta_antic_burden(a)
+    if a.size == _P_ANTIC_NO_BURDEN + 1:
+        return _pad_theta_antic_burden(np.delete(a, _LEGACY_ANTIC_TODAY_STEP_DROP))
+    if a.size == _P_ANTIC_NO_BURDEN + 4:
+        return _pad_theta_antic_burden(
+            np.delete(a, _LEGACY_ANTIC_SALIENCE_AND_TODAY_STEP_DROP)
+        )
     raise ValueError(
         f"theta_antic length {a.size}; expected {P_ANTIC}, "
-        f"legacy {P_ANTIC + 1}, or legacy {P_ANTIC + 4}"
+        f"pre-recent-burden {_P_ANTIC_NO_BURDEN}, "
+        f"legacy {_P_ANTIC_NO_BURDEN + 1}, or legacy {_P_ANTIC_NO_BURDEN + 4}"
     )
 
 
@@ -293,34 +337,72 @@ def _json_resid_list(key: str, d: dict) -> np.ndarray:
     return np.asarray(nums, dtype=float)
 
 
-def _split_ml_pv_full(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+_POPULATION_RESIDUALS_CACHE: dict = {}
+
+
+def _load_population_residuals(params_dir: Path) -> dict:
+    """Load (and process-cache) the shared population residual pools written
+    by ``5_fit_vanilla_testbed.py`` (``population_residuals.json``, one array
+    per stream, pooled across every user's own observed residuals).
+
+    Missing file or keys degrade gracefully to an empty dict, so older
+    ``params_dir`` snapshots without this file simply disable the
+    population-fallback noise (every stream behaves as it did before).
+    """
+    key = str(params_dir)
+    if key in _POPULATION_RESIDUALS_CACHE:
+        return _POPULATION_RESIDUALS_CACHE[key]
+    path = Path(params_dir) / "population_residuals.json"
+    pools: dict = {}
+    if path.is_file():
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        for name, values in raw.items():
+            pools[name] = _json_resid_list(name, {name: values})
+    _POPULATION_RESIDUALS_CACHE[key] = pools
+    return pools
+
+
+def _split_ml_query(
+    theta: np.ndarray,
+    base_len: int,
+    query_len: int,
+    legacy_keep: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     t = np.asarray(theta, dtype=float).ravel()
-    base = t[:PV_ML_BASE].copy()
-    if t.size >= PV_ML_BASE + PV_ML_QUERY:
-        q = t[PV_ML_BASE : PV_ML_BASE + PV_ML_QUERY].copy()
+    base = t[:base_len].copy() if t.size >= base_len else np.zeros(base_len, dtype=float)
+    rest = t[base_len:]
+    if rest.size == query_len:
+        q = rest.copy()
+    elif rest.size >= int(legacy_keep.max()) + 1:
+        q = rest[legacy_keep].copy()
     else:
-        q = np.zeros(PV_ML_QUERY, dtype=float)
+        q = np.zeros(query_len, dtype=float)
     return base, q
+
+
+def _split_ml_pv_full(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    return _split_ml_query(theta, PV_ML_BASE, PV_ML_QUERY, _PV_QUERY_LEGACY_KEEP)
 
 
 def _split_ml_fw(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    t = np.asarray(theta, dtype=float).ravel()
-    base = t[:FW_ML_BASE].copy()
-    if t.size >= FW_ML_BASE + FW_ML_QUERY:
-        q = t[FW_ML_BASE : FW_ML_BASE + FW_ML_QUERY].copy()
-    else:
-        q = np.zeros(FW_ML_QUERY, dtype=float)
-    return base, q
+    return _split_ml_query(theta, FW_ML_BASE, FW_ML_QUERY, _FW_PJ_QUERY_LEGACY_KEEP)
 
 
 def _split_ml_pj(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    t = np.asarray(theta, dtype=float).ravel()
-    base = t[:PJ_ML_BASE].copy()
-    if t.size >= PJ_ML_BASE + PJ_ML_QUERY:
-        q = t[PJ_ML_BASE : PJ_ML_BASE + PJ_ML_QUERY].copy()
-    else:
-        q = np.zeros(PJ_ML_QUERY, dtype=float)
-    return base, q
+    return _split_ml_query(theta, PJ_ML_BASE, PJ_ML_QUERY, _FW_PJ_QUERY_LEGACY_KEEP)
+
+
+def _ml_query_features(s) -> np.ndarray:
+    """Query design: intercept, current E_w, recent burden."""
+    return np.array(
+        [
+            1.0,
+            float(s["perceivedUtilityLastWeek"]),
+            float(s["activitySuggestionsSentLast7Days"]),
+        ],
+        dtype=float,
+    )
 
 
 # %%
@@ -349,17 +431,17 @@ class EnvConfig:
         self.limits_antic = std["anticipated_affect_yesterday_limit"]
         self.limits_fitbitwearing = [0.0, 1.0]
         self.limits_dailysurvey = [0.0, 1.0]
-        self.limits_perceivedUtility = [-2.0, 2.0]
+        # Empirical range of fitted filtered E_w (pred_penalized_filtered_Ew)
+        # over the N=31 MRT types / training weeks, not the quadrature grid
+        # [-3, 3] used only at estimation time.
+        self.limits_perceivedUtility = [-2.657, 2.953]
         self.limits_week_present = [0.0, 1.0]
         self.limits_prior2hour_step_count = std["prior2hour_step_count_limit"]
         self.limits_active_status = [0.0, 1.0]
         self.limits_ws_interaction = [0.0, 1.0]
-        # Tool surveys live on the [(0+1)/8, (7+1)/8] = [0.375, 1.0] normalized scale
-        # (from ``1.5_standardization``: Exp-tool-i_norm = (Exp-tool-i + 1) / 8).
-        # self.limits_exp1 = std["exp1_limit"]
-        self.limits_exp1 = [0.125, 1.0]
-        # self.limits_exp2 = std["exp2_limit"]
-        self.limits_exp2 = [0.125, 1.0]
+        # Tool surveys are normalized from the raw 1..7 scale to [-1, 1].
+        self.limits_exp1 = [-1.0, 1.0]
+        self.limits_exp2 = [-1.0, 1.0]
         with open(params_path / f"params_env_{userid}.json", encoding="utf-8") as f:
             p = json.load(f)
 
@@ -385,7 +467,11 @@ class EnvConfig:
             "theta_antic_names",
             p,
             THETA_ANTIC_NAMES,
-            legacy_lengths=(P_ANTIC + 1, P_ANTIC + 4),
+            legacy_lengths=(
+                _P_ANTIC_NO_BURDEN,
+                _P_ANTIC_NO_BURDEN + 1,
+                _P_ANTIC_NO_BURDEN + 4,
+            ),
         )
         _validate_json_names("theta_CAE_names", p, THETA_CAE_NAMES)
         _validate_json_names("theta_CAE_short_avg_names", p, THETA_CAE_SHORT_AVG_NAMES)
@@ -411,6 +497,7 @@ class EnvConfig:
         self.resid_CAE = _json_resid_list("resid_CAE", p)
         self.resid_week_present = _json_resid_list("resid_week_present", p)
         self.resid_CAE_short = _json_resid_list("resid_CAE_short_avg", p)
+        self.population_residuals = _load_population_residuals(params_path)
 
         def _penalized_or_legacy(new_key, old_key):
             return np.asarray(
@@ -494,25 +581,141 @@ class EnvConfig:
 
 
 # %%
+def _lag1_autocorr(resid) -> float:
+    """Pearson correlation between consecutive *observed* residuals.
+
+    Consecutive means adjacent entries in ``resid`` as stored (its natural
+    chronological order for that user/stream); pairs where either side is
+    NaN are dropped. Used to size the AR(1) noise model below so simulated
+    residuals reproduce the same within-person serial correlation the fitted
+    model's residuals actually have, instead of assuming independence.
+    """
+    resid = np.asarray(resid, dtype=float)
+    if resid.size < 3:
+        return 0.0
+    x, y = resid[:-1], resid[1:]
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 3:
+        return 0.0
+    x, y = x[mask], y[mask]
+    if np.std(x) == 0.0 or np.std(y) == 0.0:
+        return 0.0
+    rho = float(np.corrcoef(x, y)[0, 1])
+    if not np.isfinite(rho):
+        return 0.0
+    # Keep the recursion well away from a unit root / numerical blow-up.
+    return float(np.clip(rho, -0.95, 0.95))
+
+
+# Streams where a too-small own residual pool gets blended with a shared
+# population pool (see ``Env._blended_draw``). Scoped to the streams that
+# feed the STE outcome most directly. Rather than a flat observation count,
+# the threshold scales with each stream's own design-matrix width: a per-user
+# Ridge/logistic fit with only a few observations per predictor column tends
+# to nearly interpolate the data and leave artificially tiny leftover
+# residuals, even when the raw observation count looks non-trivial (e.g. one
+# user had 52 antic observations against 17 columns — "plenty" by a flat
+# threshold, but still a residual std an order of magnitude below typical).
+# ``4x columns`` is a conservative-but-not-extreme floor for trusting a
+# person-specific *variance* estimate (stricter rules of thumb for stable
+# regression coefficients alone call for 10-20 obs/column).
+POPULATION_FALLBACK_MIN_OBS_PER_COL = 4.0
+
+POPULATION_FALLBACK_STREAM_COLS = {
+    "CAE": P_CAE,
+    "CAE_short": P_CAE_SHORT,
+    "antic": P_ANTIC,
+    "fourSC": P_FOURSC,
+}
+
+POPULATION_FALLBACK_MIN_OBS = {
+    name: max(1, math.ceil(POPULATION_FALLBACK_MIN_OBS_PER_COL * n_cols))
+    for name, n_cols in POPULATION_FALLBACK_STREAM_COLS.items()
+}
+
+
 class Env:
     """Generative environment: vanilla Ridge/logistic + ML perceived-utility stack."""
 
-    def __init__(self, env_config: EnvConfig, noise="sequential"):
-        assert noise in ("sequential", "random")
+    def __init__(self, env_config: EnvConfig, noise="ar1"):
+        assert noise in ("sequential", "random", "ar1")
         self.noise = noise
         self.cfg = env_config
         self.K = env_config.K
         self.W = env_config.W
+        # Per-stream state for the "ar1" noise model: last simulated residual
+        # value and cached lag-1 autocorrelation, keyed by stream name so a
+        # fresh Env (created per simulated episode) starts with fresh state.
+        self._ar_prev: dict = {}
+        self._ar_rho_cache: dict = {}
 
-    def _sample_noise(self, resid, idx, obs_resid=None):
+    def _sample_noise(self, resid, idx, obs_resid=None, name=None):
         if obs_resid is None:
             obs_resid = resid[~np.isnan(resid)]
         if len(obs_resid) == 0:
             return 0.0
         if self.noise == "sequential":
             val = resid[idx % len(resid)]
-            return float(val) if not np.isnan(val) else float(rd.choice(obs_resid))
-        return float(rd.choice(obs_resid))
+            return float(val) if not np.isnan(val) else self._blended_draw(obs_resid, name)
+        if self.noise == "ar1":
+            return self._sample_ar1_noise(resid, obs_resid, name)
+        return self._blended_draw(obs_resid, name)
+
+    def _blended_draw(self, obs_resid, name):
+        """A single scalar residual draw for stream ``name``, blending in the
+        shared population pool (re-centered to this user's own residual mean)
+        when this user's own observed count is below
+        ``POPULATION_FALLBACK_MIN_OBS[name]``.
+
+        With ``n_own = obs_resid.size`` observations, draws from the user's
+        own pool with probability ``min(1, n_own/min_obs)`` and from the
+        population pool otherwise — smoothly interpolating from "trust the
+        population" (``n_own=0``) to "trust this user alone"
+        (``n_own >= min_obs``). This exists because some users have as few as
+        1-6 observations for a given stream (e.g. only 1 observed weekly CAE
+        residual): there's nothing to resample from a single point regardless
+        of noise mode, so every mode degenerates to replaying that one value.
+        Streams outside ``POPULATION_FALLBACK_MIN_OBS``, or with no
+        population pool loaded, fall back to a plain ``rd.choice(obs_resid)``
+        (unchanged behavior).
+        """
+        n_own = obs_resid.size
+        min_obs = POPULATION_FALLBACK_MIN_OBS.get(name) if name else None
+        pop = self.cfg.population_residuals.get(f"resid_{name}_population") if min_obs else None
+        if not min_obs or pop is None or pop.size == 0 or n_own >= min_obs:
+            return float(rd.choice(obs_resid))
+        if rd.random() < n_own / float(min_obs):
+            return float(rd.choice(obs_resid))
+        own_mean = float(np.mean(obs_resid))
+        return float(rd.choice(pop)) - float(np.mean(pop)) + own_mean
+
+    def _sample_ar1_noise(self, resid, obs_resid, name):
+        """Draw a residual that preserves the stream's marginal variance *and*
+        its estimated lag-1 autocorrelation, without assuming a parametric
+        (e.g. Gaussian) shape for the innovations.
+
+        This is a sieve/AR(1) bootstrap: ``e_t = mu + rho*(e_{t-1}-mu) +
+        sqrt(1-rho^2)*z_t``, with ``rho`` the empirical lag-1 autocorrelation
+        of the fitted residuals and ``z_t`` resampled (via
+        :meth:`_blended_draw`, mean-centered) from the observed residual
+        pool. Unlike ``"sequential"`` this is stochastic every call, and
+        unlike ``"random"`` it doesn't erase the within-person serial
+        correlation that made ``"sequential"`` attractive in the first place.
+        """
+        key = name if name is not None else id(resid)
+        rho = self._ar_rho_cache.get(key)
+        if rho is None:
+            rho = _lag1_autocorr(resid)
+            self._ar_rho_cache[key] = rho
+
+        mu = float(np.mean(obs_resid))
+        innov = self._blended_draw(obs_resid, name) - mu
+        prev = self._ar_prev.get(key)
+        if prev is None:
+            prev = self._blended_draw(obs_resid, name)  # steady-state init
+        val = mu + rho * (prev - mu) + math.sqrt(max(1.0 - rho ** 2, 0.0)) * innov
+        self._ar_prev[key] = val
+        return float(val)
 
     @staticmethod
     def _sigmoid(eta):
@@ -536,7 +739,9 @@ class Env:
 
     def gen_prior2hour_step_count(self, s, step_idx):
         mean = self.gen_prior2hour_step_count_mean(s)
-        noise = self._sample_noise(self.cfg.resid_prior2hour_step_count, step_idx)
+        noise = self._sample_noise(
+            self.cfg.resid_prior2hour_step_count, step_idx, name="prior2hour_step_count"
+        )
         return float(np.clip(mean + noise, *self.cfg.limits_prior2hour_step_count))
 
     def gen_active_status_mean(self, s, return_logit=False):
@@ -555,7 +760,7 @@ class Env:
     def gen_active_status(self, s, day_idx):
         eta = self.gen_active_status_mean(s, return_logit=True)
         base_p = self._sigmoid(eta)
-        noise = self._sample_noise(self.cfg.resid_active_status, day_idx)
+        noise = self._sample_noise(self.cfg.resid_active_status, day_idx, name="active_status")
         p = float(np.clip(base_p + noise, *self.cfg.limits_active_status))
         return float(rd.binomial(1, p))
 
@@ -576,7 +781,7 @@ class Env:
     def gen_ws_interaction(self, s, step_idx):
         eta = self.gen_ws_interaction_mean(s, return_logit=True)
         base_p = self._sigmoid(eta)
-        noise = self._sample_noise(self.cfg.resid_ws_interaction, step_idx)
+        noise = self._sample_noise(self.cfg.resid_ws_interaction, step_idx, name="ws_interaction")
         p = float(np.clip(base_p + noise, *self.cfg.limits_ws_interaction))
         return float(rd.binomial(1, p))
 
@@ -626,7 +831,7 @@ class Env:
 
     def gen_fourSC(self, s, Ah, step_idx):
         mean = self.gen_fourSC_mean(s, Ah)
-        noise = self._sample_noise(self.cfg.resid_fourSC, step_idx)
+        noise = self._sample_noise(self.cfg.resid_fourSC, step_idx, name="fourSC")
         return float(np.clip(mean + noise, *self.cfg.limits_fourSC))
 
     def _ml_pv_mean(self, s, Ah: float, Iw: int) -> float:
@@ -656,8 +861,7 @@ class Env:
             + Ah * (alpha3 + alpha4 * Ew)
         )
         if Iw != 0:
-            xq = np.array([1.0, Ew, float(s["isWeekend"]), float(s["decisionTimeSlot"]), float(s["activitySuggestionsSentLast7Days"])])
-            mu += float(Iw * (q @ xq))
+            mu += float(Iw * (q @ _ml_query_features(s)))
         return float(mu)
 
     def gen_pageview_mean(self, s, Ah, Iw=0):
@@ -668,7 +872,9 @@ class Env:
         base, _ = _split_ml_pv_full(self.cfg.theta_ml_PV)
         sigma = float(base[8]) if base.size > 8 else 0.1
         if self.cfg.resid_ml_hourly_pageview.size > 0 and np.any(np.isfinite(self.cfg.resid_ml_hourly_pageview)):
-            noise = self._sample_noise(self.cfg.resid_ml_hourly_pageview, step_idx)
+            noise = self._sample_noise(
+                self.cfg.resid_ml_hourly_pageview, step_idx, name="hourly_pageview"
+            )
         else:
             noise = float(rd.normal(0.0, sigma))
         return float(np.clip(mu + noise, *self.cfg.limits_pageview))
@@ -677,15 +883,17 @@ class Env:
 
     def gen_antic_mean(self, s, ws_morning, ws_afternoon):
         """
-        Daily ridge design (morning row): 14 columns — matches
+        Daily ridge design (morning row): ``P_ANTIC`` columns — matches
         ``5_fit_vanilla_testbed`` ``anticipated_affect_cond_day``
         (no ``today_step_count`` / ``planning_prompt``; includes
-        ``perceivedUtilityLastWeek`` main and AM/PM interactions).
+        ``perceivedUtilityLastWeek`` and ``recent_burden`` mains and
+        AM/PM interactions).
         """
         act = float(s["activityStatusToday"])
         is_weekend = float(s["isWeekend"])
         pu = float(s["perceivedUtilityLastWeek"])
         cae = float(s["caeAverageLastWeek"])
+        rb = float(s["activitySuggestionsSentLast7Days"])
         X = np.array(
             [
                 1.0,
@@ -694,6 +902,7 @@ class Env:
                 is_weekend,
                 pu,
                 cae,
+                rb,
                 ws_morning,
                 ws_afternoon,
                 ws_morning * is_weekend,
@@ -702,6 +911,8 @@ class Env:
                 ws_afternoon * pu,
                 ws_morning * cae,
                 ws_afternoon * cae,
+                ws_morning * rb,
+                ws_afternoon * rb,
             ],
             dtype=float,
         )
@@ -709,7 +920,7 @@ class Env:
 
     def gen_antic(self, s, ws_morning, ws_afternoon, day_idx):
         mean = self.gen_antic_mean(s, ws_morning, ws_afternoon)
-        noise = self._sample_noise(self.cfg.resid_antic, day_idx)
+        noise = self._sample_noise(self.cfg.resid_antic, day_idx, name="antic")
         return float(np.clip(mean + noise, *self.cfg.limits_antic))
 
     def _ml_fw_eta(self, s, ws_morning, ws_afternoon, Iw: int, return_logit: bool):
@@ -731,8 +942,7 @@ class Env:
             + ws_afternoon * (beta5 + beta6 * Ew)
         )
         if Iw != 0:
-            xq = np.array([1.0, Ew, is_weekend, rb])
-            eta += float(Iw * (q @ xq))
+            eta += float(Iw * (q @ _ml_query_features(s)))
         return eta if return_logit else self._sigmoid(eta)
 
     def gen_fitbitwearing_mean(self, s, ws_morning, ws_afternoon, Iw=0, return_logit=False):
@@ -741,7 +951,9 @@ class Env:
     def gen_fitbitwearing(self, s, ws_morning, ws_afternoon, Iw, day_idx):
         eta = self._ml_fw_eta(s, ws_morning, ws_afternoon, int(Iw), return_logit=True)
         base_p = self._sigmoid(eta)
-        noise = self._sample_noise(self.cfg.resid_ml_nextday_wearing, day_idx)
+        noise = self._sample_noise(
+            self.cfg.resid_ml_nextday_wearing, day_idx, name="nextday_wearing"
+        )
         if not np.isfinite(noise):
             noise = 0.0
         p = float(np.clip(base_p + noise, *self.cfg.limits_fitbitwearing))
@@ -766,8 +978,7 @@ class Env:
             + ws_afternoon * (t5 + t6 * Ew)
         )
         if Iw != 0:
-            xq = np.array([1.0, Ew, is_weekend, rb])
-            eta += float(Iw * (q @ xq))
+            eta += float(Iw * (q @ _ml_query_features(s)))
         return eta if return_logit else self._sigmoid(eta)
 
     def gen_dailysurvey_mean(self, s, ws_morning, ws_afternoon, Iw=0, return_logit=False):
@@ -776,7 +987,9 @@ class Env:
     def gen_dailysurvey(self, s, ws_morning, ws_afternoon, Iw, day_idx):
         eta = self._ml_pj_eta(s, ws_morning, ws_afternoon, int(Iw), return_logit=True)
         base_p = self._sigmoid(eta)
-        noise = self._sample_noise(self.cfg.resid_ml_daily_present, day_idx)
+        noise = self._sample_noise(
+            self.cfg.resid_ml_daily_present, day_idx, name="daily_present"
+        )
         if not np.isfinite(noise):
             noise = 0.0
         p = float(np.clip(base_p + noise, *self.cfg.limits_dailysurvey))
@@ -790,7 +1003,7 @@ class Env:
 
     def gen_CAE(self, CAE_lastweek, week_norm, foursc_wk, antic_wk, week_idx):
         mean = self.gen_CAE_mean(CAE_lastweek, week_norm, foursc_wk, antic_wk)
-        noise = self._sample_noise(self.cfg.resid_CAE, week_idx)
+        noise = self._sample_noise(self.cfg.resid_CAE, week_idx, name="CAE")
         return float(np.clip(mean + noise, *self.cfg.limits_CAE))
 
     @staticmethod
@@ -832,9 +1045,11 @@ class Env:
     def gen_week_present(self, perceivedUtility, week_idx):
         eta = self.gen_week_present_mean(perceivedUtility, return_logit=True)
         base_p = self._sigmoid(eta)
-        noise = self._sample_noise(self.cfg.resid_ml_J_week, week_idx)
+        noise = self._sample_noise(self.cfg.resid_ml_J_week, week_idx, name="J_week")
         if not np.isfinite(noise):
-            noise = self._sample_noise(self.cfg.resid_week_present, week_idx)
+            noise = self._sample_noise(
+                self.cfg.resid_week_present, week_idx, name="week_present"
+            )
         lim = self.cfg.limits_week_present
         p = float(np.clip(base_p + noise, *lim))
         return float(rd.binomial(1, p))
@@ -844,7 +1059,7 @@ class Env:
 
     def gen_CAE_short(self, caeAverage, week_idx):
         mean = self.gen_CAE_short_mean(caeAverage)
-        noise = self._sample_noise(self.cfg.resid_CAE_short, week_idx)
+        noise = self._sample_noise(self.cfg.resid_CAE_short, week_idx, name="CAE_short")
         return float(np.clip(mean + noise, *self.cfg.limits_CAE_short))
 
     # ----- weekly tool surveys (Exp-tool-1 / Exp-tool-2) -----
@@ -852,56 +1067,56 @@ class Env:
     # agent's pooled-linear E_w approximation in ``OnlineEnv`` (``est_Ew_weights``).
     #
     # ``theta_ml_U1`` / ``theta_ml_U2`` were fit on the *normalized* scale
-    #   Exp-tool-i_norm = (Exp-tool-i + 1) / 8   (see ``1.5_standardization.py``)
+    #   Exp-tool-i_norm = 2 * (Exp-tool-i - 1) / 6 - 1
+    # (see ``3_standardization.py``)
     # so we sample + clip in normalized space (``limits_exp{1,2}``) and then
-    # transform back to the original integer 0..7 Likert scale via
-    #   raw = round(8 * norm - 1), clipped to [0, 7].
-    # In practice the observed [0.375, 1.0] norm support yields raw in {2..7}.
+    # transform back to the original integer 1..7 Likert scale via
+    #   raw = round(3 * norm + 4), clipped to [1, 7].
 
     @staticmethod
     def _norm_to_raw_int(norm):
-        """Inverse of ``Exp-tool-i_norm = (Exp-tool-i + 1) / 8`` rounded to int.
+        """Inverse of the 1..7 to [-1, 1] normalization, rounded to integer.
 
-        ``Exp-tool-i`` is an integer Likert response on the 0..7 scale, so we
-        round the de-standardized value and then clip to ``[0, 7]`` for safety.
+        ``Exp-tool-i`` is an integer Likert response on the 1..7 scale, so we
+        round the de-standardized value and then clip to ``[1, 7]`` for safety.
         """
-        return int(np.clip(np.rint(8.0 * float(norm) - 1.0), 0, 7))
+        return int(np.clip(np.rint(3.0 * float(norm) + 4.0), 1, 7))
 
     def gen_tool_U1_mean(self, Ew):
-        """Mean of ``Exp-tool-1`` on the *raw* 0..7 Likert scale (integer)."""
+        """Mean of ``Exp-tool-1`` on the *raw* 1..7 Likert scale (integer)."""
         if self.cfg.theta_ml_U1.size < 3:
             raise RuntimeError("theta_ml_U1 missing")
         c0, c1, _sig = map(float, self.cfg.theta_ml_U1[:3])
         return self._norm_to_raw_int(c0 + c1 * Ew)
 
     def gen_tool_U1(self, Ew, week_idx):
-        """Sample ``Exp-tool-1`` on the *raw* 0..7 Likert scale (integer)."""
+        """Sample ``Exp-tool-1`` on the *raw* 1..7 Likert scale (integer)."""
         if self.cfg.theta_ml_U1.size < 3:
             raise RuntimeError("theta_ml_U1 missing")
         c0, c1, _sig = map(float, self.cfg.theta_ml_U1[:3])
         sig = float(self.cfg.theta_ml_U1[2])
         if self.cfg.resid_ml_U1.size > 0 and np.any(np.isfinite(self.cfg.resid_ml_U1)):
-            noise = self._sample_noise(self.cfg.resid_ml_U1, week_idx)
+            noise = self._sample_noise(self.cfg.resid_ml_U1, week_idx, name="U1")
         else:
             noise = float(rd.normal(0.0, sig))
         norm = float(np.clip(c0 + c1 * Ew + noise, *self.cfg.limits_exp1))
         return self._norm_to_raw_int(norm)
 
     def gen_tool_U2_mean(self, Ew):
-        """Mean of ``Exp-tool-2`` on the *raw* 0..7 Likert scale (integer)."""
+        """Mean of ``Exp-tool-2`` on the *raw* 1..7 Likert scale (integer)."""
         if self.cfg.theta_ml_U2.size < 3:
             raise RuntimeError("theta_ml_U2 missing")
         d0, d1, _sig = map(float, self.cfg.theta_ml_U2[:3])
         return self._norm_to_raw_int(d0 + d1 * Ew)
 
     def gen_tool_U2(self, Ew, week_idx):
-        """Sample ``Exp-tool-2`` on the *raw* 0..7 Likert scale (integer)."""
+        """Sample ``Exp-tool-2`` on the *raw* 1..7 Likert scale (integer)."""
         if self.cfg.theta_ml_U2.size < 3:
             raise RuntimeError("theta_ml_U2 missing")
         d0, d1, _sig = map(float, self.cfg.theta_ml_U2[:3])
         sig = float(self.cfg.theta_ml_U2[2])
         if self.cfg.resid_ml_U2.size > 0 and np.any(np.isfinite(self.cfg.resid_ml_U2)):
-            noise = self._sample_noise(self.cfg.resid_ml_U2, week_idx)
+            noise = self._sample_noise(self.cfg.resid_ml_U2, week_idx, name="U2")
         else:
             noise = float(rd.normal(0.0, sig))
         norm = float(np.clip(d0 + d1 * Ew + noise, *self.cfg.limits_exp2))

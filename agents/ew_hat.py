@@ -47,7 +47,7 @@ def weekly_Ew_predictor_table(
         if np.isnan(j_w):
             j_w = 0.0
         j_w = float(j_w)
-        half_J_tool8 = 0.5 * j_w * ((u1 + 1.0) + (u2 + 1.0)) / 8.0
+        half_J_tool8 = j_w * (u1 + u2) / 14.0
         pv_sum = weekly_pv_sum_for_ew(g["HourlyPageviewCount_norm"].to_numpy(dtype=float))
 
         fw_daily, pj_daily = [], []
@@ -124,7 +124,7 @@ def compute_Ew_hat_from_week(
         if not np.isnan(U2_all[weekly_idx])
         else float(coefs.get("U2_impute_mean", 0.0))
     )
-    half_J_tool8 = 0.5 * J_w * ((u1 + 1.0) + (u2 + 1.0)) / 8.0
+    half_J_tool8 = J_w * (u1 + u2) / 14.0
     slot_start = int(sim_w) * FOURSC_SLOTS_PER_WEEK
     slot_stop = int(sim_w + 1) * FOURSC_SLOTS_PER_WEEK
     pv_sum = weekly_pv_sum_for_ew(pageViewNext4HourAll[slot_start:slot_stop])

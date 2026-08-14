@@ -1,21 +1,11 @@
 # %% [markdown]
-# # ADAPTS MRT — data extraction
+# # Extract MRT raw exports into analysis CSVs
 #
-# Notebook-style script (`# %%` cells). Outputs CSVs under `DATA_FOLDER`.
-#
-# ## Pipeline
-# 1. Setup — imports, paths, timezone lookup
-# 2. Cohort — testers removed; ≥83-day span; HourWearing + survey-missing exclusions
-# 3. Surveys — weekly (12) and daily (84) filled panels
-# 4. Schedule — wakeup/bedtime (+ push-timing imputation)
-# 5. Engagement — page views
-# 6. Interventions — walking suggestions, salience, planning prompts
-# 7. Wearables — HR/steps, wear flags, step features
-# 8. Fitbit activity log — recorded physical activity
-#
-# ## Participant exclusion / analysis-sample rules (a priori)
-# See constants below: HourWearing + FourSC availability + survey-missing rules.
-# Not a hand-picked ID list.
+# Reads the ADAPTS MRT source tables under `DATA_FOLDER` and writes one CSV per
+# stream (surveys, schedule, page views, walking suggestions, wearables, steps).
+# Cohort rules (completers, wear/FourSC availability, survey response) are the
+# constants in the setup cell below — not a hand-picked ID list.
+# Next: `2_combine_data_frame.py`.
 
 # %% [markdown]
 # ## 0. Setup
@@ -34,6 +24,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from matplotlib.ticker import MaxNLocator
+
+from ewm_utils import ewma_gamma
 
 plt.ion()
 
@@ -1022,7 +1014,7 @@ def _mean_prior_rows(series, window=7, min_periods=1):
     return series.shift(1).rolling(window=window, min_periods=min_periods).mean()
 
 
-def _ewm_prior_rows(series, gamma=6/7, window=7, min_periods=1):
+def _ewm_prior_rows(series, gamma=None, window=7, min_periods=1):
     """
     Exponentially weighted average over at most the prior `window` rows only.
     Excludes the current row.
@@ -1032,16 +1024,19 @@ def _ewm_prior_rows(series, gamma=6/7, window=7, min_periods=1):
         ---------------------------------
         sum_{j=1}^k gamma^{j-1}
 
-    where j=1 is the most recent prior row.
+    where j=1 is the most recent prior row. Same implementation as
+    ``ewm_utils.ewma_gamma`` (pandas ``ewm(alpha=1-gamma, adjust=True)``).
+
+    ``gamma=None`` (default) derives the decay from ``k``, the number of
+    prior rows actually available in this window (:func:`ewm_utils.gamma_from_n`).
+    A full 7-row window gets ``gamma=6/7`` exactly as before; a partial window
+    near the start of a participant's data (e.g. ``k=3``) gets a shallower
+    decay (``gamma=2/3``) rather than the same 6/7 with fewer terms. Pass a
+    numeric ``gamma`` to force a fixed decay regardless of ``k``.
     """
-    alpha = 1 - gamma
 
     def _ewm_last(window_values):
-        w = pd.Series(window_values, dtype=float).dropna()
-        if w.empty:
-            return np.nan
-
-        return w.ewm(alpha=alpha, adjust=True).mean().iloc[-1]
+        return ewma_gamma(window_values, gamma, empty=np.nan)
 
     return (
         series.shift(1)
@@ -1502,12 +1497,13 @@ df_daily_pageview['YesterdayPageviewCount'] = (
     .astype(int)
 )
 
-# EWM (gamma=6/7) over prior ≤7 calendar days of pageviews (excludes today)
+# EWM (gamma derived from k, the number of prior days available; 6/7 for a
+# full 7-day window) over prior ≤7 calendar days of pageviews (excludes today)
 df_daily_pageview['Past7DaysPageviewEMA'] = (
     df_daily_pageview
     .sort_values(['ParticipantIdentifier', 'Date'], kind='mergesort')
     .groupby('ParticipantIdentifier', sort=False)['DailyPageviewCount']
-    .transform(lambda s: _ewm_prior_rows(s, gamma=6/7))
+    .transform(lambda s: _ewm_prior_rows(s))
 )
 
 # get tomorrow's pageview count
@@ -1602,12 +1598,13 @@ df_hourly_pageview['HourlyPageviewCount_lag1'] = (
     .shift(1)
 )
 
-# EWM (gamma=6/7) over prior ≤7 same-slot pageviews (excludes current slot)
+# EWM (gamma derived from k, the number of prior same-slot rows available)
+# over prior ≤7 same-slot pageviews (excludes current slot)
 df_hourly_pageview['Past7DaysHourlyPageviewEMA'] = (
     df_hourly_pageview
     .sort_values(['ParticipantIdentifier', 'Date', 'DecisionTime'], kind='mergesort')
     .groupby(['ParticipantIdentifier', 'DecisionTime'], sort=False)['HourlyPageviewCount']
-    .transform(lambda s: _ewm_prior_rows(s, gamma=6/7))
+    .transform(lambda s: _ewm_prior_rows(s))
 )
 
 # save the dataframe
@@ -2031,8 +2028,9 @@ df_gif_all['Interacted_7d'] = (
 )
 
 # recent_burden: X_d = daily walking-suggestion count (sum over AM/PM slots), then
-#   _ewm_prior_rows on the daily series (gamma=6/7, window=7):
-#   (X_{d-1} + r X_{d-2} + ... + r^6 X_{d-7}) / (1 + r + ... + r^6),  r = 6/7
+#   _ewm_prior_rows on the daily series (window=7, gamma derived from k, the
+#   number of prior days available; r = 6/7 once a full 7-day window exists):
+#   (X_{d-1} + r X_{d-2} + ... + r^{k-1} X_{d-k}) / (1 + r + ... + r^{k-1})
 _daily_panel = (
     df_gif_all.groupby(['ParticipantIdentifier', 'Date'], sort=False)['WalkingSuggestion']
     .sum()
@@ -2040,7 +2038,7 @@ _daily_panel = (
 )
 _daily_panel['recent_burden'] = (
     _daily_panel.groupby('ParticipantIdentifier', sort=False)['_daily_suggestions']
-    .transform(lambda s: _ewm_prior_rows(s, gamma=6 / 7, window=7, min_periods=1))
+    .transform(lambda s: _ewm_prior_rows(s, window=7, min_periods=1))
 )
 df_gif_all = df_gif_all.merge(
     _daily_panel[['ParticipantIdentifier', 'Date', 'recent_burden']],
@@ -2861,7 +2859,8 @@ for participant_id in complete_participant_ids:
 
 df_hourly_step_counts = pd.DataFrame(hourly_step_counts)
 
-# EWM (gamma=6/7) over prior ≤7 same-slot step counts (excludes current slot)
+# EWM (gamma derived from k, the number of prior same-slot rows available)
+# over prior ≤7 same-slot step counts (excludes current slot)
 df_hourly_step_counts = df_hourly_step_counts.sort_values(
     ["ParticipantIdentifier", "DecisionTime", "Date"],
     kind="mergesort",
@@ -2869,7 +2868,7 @@ df_hourly_step_counts = df_hourly_step_counts.sort_values(
 df_hourly_step_counts["EMA_StepCount"] = (
     df_hourly_step_counts.groupby(["ParticipantIdentifier", "DecisionTime"], sort=False)[
         "StepCount"
-    ].transform(lambda s: _ewm_prior_rows(s, gamma=6/7))
+    ].transform(lambda s: _ewm_prior_rows(s))
 )
 
 # print(df_hourly_step_counts[df_hourly_step_counts['participantidentifier'] == 22])
@@ -3055,7 +3054,8 @@ for participant_id in complete_participant_ids:
 
 df_prior_2hours_step_counts = pd.DataFrame(prior_2hours_step_counts)
 
-# EWM (gamma=6/7) over prior ≤7 same-slot prior-2h step counts (excludes current slot)
+# EWM (gamma derived from k, the number of prior same-slot rows available)
+# over prior ≤7 same-slot prior-2h step counts (excludes current slot)
 df_prior_2hours_step_counts = df_prior_2hours_step_counts.sort_values(
     ["ParticipantIdentifier", "DecisionTime", "Date"],
     kind="mergesort",
@@ -3063,7 +3063,7 @@ df_prior_2hours_step_counts = df_prior_2hours_step_counts.sort_values(
 df_prior_2hours_step_counts["EMA_Prior2HourStepCount"] = (
     df_prior_2hours_step_counts.groupby(["ParticipantIdentifier", "DecisionTime"], sort=False)[
         "StepCount"
-    ].transform(lambda s: _ewm_prior_rows(s, gamma=6 / 7))
+    ].transform(lambda s: _ewm_prior_rows(s))
 )
 
 # print(df_hourly_step_counts[df_hourly_step_counts['participantidentifier'] == 22])

@@ -1,36 +1,13 @@
-# %%
-"""
-Pooled linear regression of quadrature-filtered \\hat E_w on weekly summaries from ``df_fit``.
+"""Approximate filtered E_w with a pooled linear combination of weekly summaries.
 
-Outcome: ``pred_penalized_filtered_Ew`` from ``env_para_vanilla/pred_<ParticipantIdentifier>.json``
-(one value per study week 1..12: entry i is \\hat E_{i+1}, i.e. E_2..E_13
-filtered plus a predictive E_13 for the last study week, matching
-``perceived_utility`` in ``df_fit``).
+Used at RCT time, when the latent E_w from script 4 is not available. The
+outcome is the filtered trajectory in ``pred_<uid>.json``. The five predictors
+are weekly check-in, pleasantness/helpfulness, page-view average, Fitbit-wear
+average, and daily-check-in average.
 
-Predictors (from ``df_fit`` only, aggregated per participant-week):
-  1. J_w — ``week_present`` (constant within week; first non-missing).
-  2. 0.5 * J_w * ((U1+1) + (U2+1)) / 8 — U1, U2 raw ``Exp-tool-1``, ``Exp-tool-2``.
-  3. PV_sum — (1/14) \\times sum of ``HourlyPageviewCount_norm`` in the week.
-  4. FW_sum — (1/7) \\times sum of ``nextday_wearing`` over **calendar days**,
-        using only the **first ``DecisionTime`` row per day** (matches ``build_user_blocks``;
-        avoids double-counting the two daily RCT decision times).
-  5. PJ_sum — (1/7) \\times sum of ``daily_present`` with the same day / first-row rule.
-
-Scaling: 14 hourly PV slots / week; 7 daily FW and PJ values after de-duplication.
-
-Missing PV, FW, and PJ measurements are imputed as zero before weekly aggregation.
-Missing U1 and U2 weekly responses are imputed with their pooled observed weekly means.
-Rows with missing outcomes are dropped before pooling across users.
-
-By default the slopes are **within-user ridge**: outcome and predictors are
-demeaned within ``ParticipantIdentifier``, then shared ridge (no intercept) is
-fit on the demeaned predictors in their original units. A single grand-mean
-intercept is then chosen so ``E ≈ intercept + β'X`` still applies to raw weekly
-predictors (``intercept = mean(E) - β'mean(X)``), matching ``apply_pooled_coefs``.
-
-Default ``ridge_alpha=3`` shrinks the collinear ``J_w`` / ``half_J_tool8``
-pair enough that both slopes stay nonnegative, with little loss of within-user
-fit relative to OLS.
+Fits nonnegative within-user ridge (demean each person, shared slopes, then
+one intercept on the raw scale). Writes
+``env_para_vanilla/Ew_pooled_linear_coefs.json``.
 """
 from __future__ import annotations
 
@@ -56,7 +33,8 @@ EW_POOLED_COEF_JSON = WORK_DIR / "Ew_pooled_linear_coefs.json"
 COEF_DECIMALS = 3
 FEATURE_COLS = ["J_w", "half_J_tool8", "PV_sum", "FW_sum", "PJ_sum"]
 OUTCOME_COL = "pred_penalized_filtered_Ew"
-DEFAULT_RIDGE_ALPHA = 3.0
+DEFAULT_RIDGE_ALPHA = 15.0
+DEFAULT_NONNEGATIVE_SLOPES = True
 
 
 def _round_decimals(x: float, digits: int = COEF_DECIMALS) -> float:
@@ -126,7 +104,7 @@ def weekly_predictor_table(
         if np.isnan(j_w):
             j_w = 0.0
         j_w = float(j_w)
-        tool_combo = 0.5 * j_w * ((u1 + 1.0) + (u2 + 1.0)) / 8.0
+        tool_combo = j_w * (u1 + u2) / 14.0
         pv_arr = g["HourlyPageviewCount_norm"].to_numpy(dtype=float)
         pv_arr = np.where(np.isfinite(pv_arr), pv_arr, 0.0)
         pv_sum = float(np.sum(pv_arr) / 14.0) if pv_arr.size else 0.0
@@ -223,13 +201,16 @@ def fit_within_user_linear_Ew(
     feature_cols: list[str] = FEATURE_COLS,
     *,
     ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
+    nonnegative_slopes: bool = DEFAULT_NONNEGATIVE_SLOPES,
 ):
     """
-    Shared within-user slopes via person-mean demeaning (+ optional ridge), plus a
-    grand-mean intercept so predictions apply to raw weekly predictors.
+    Shared within-user slopes via person-mean demeaning (+ optional ridge), plus
+    a grand-mean intercept so predictions apply to raw weekly predictors.
 
     ``ridge_alpha=0`` is within-user OLS; ``ridge_alpha>0`` is ridge on the
-    demeaned predictors in their original units.
+    demeaned predictors in their original units. When ``nonnegative_slopes`` is
+    true, every slope is constrained to be at least zero; the reconstructed
+    intercept remains unconstrained.
     """
     ycol = OUTCOME_COL
     md = m.copy()
@@ -243,13 +224,18 @@ def fit_within_user_linear_Ew(
         raise ValueError(f"ridge_alpha must be >= 0 (got {ridge_alpha})")
 
     if alpha == 0.0:
-        reg = LinearRegression(fit_intercept=False)
-        reg.fit(X_dm, y_dm)
-        coef = np.asarray(reg.coef_, dtype=float).ravel()
+        reg = LinearRegression(
+            fit_intercept=False,
+            positive=bool(nonnegative_slopes),
+        )
     else:
-        reg = Ridge(alpha=alpha, fit_intercept=False)
-        reg.fit(X_dm, y_dm)
-        coef = np.asarray(reg.coef_, dtype=float).ravel()
+        reg = Ridge(
+            alpha=alpha,
+            fit_intercept=False,
+            positive=bool(nonnegative_slopes),
+        )
+    reg.fit(X_dm, y_dm)
+    coef = np.asarray(reg.coef_, dtype=float).ravel()
 
     X = m[feature_cols].to_numpy(dtype=float)
     y = m[ycol].to_numpy(dtype=float)
@@ -271,6 +257,7 @@ def fit_within_user_linear_Ew(
         "r2_within": _r2_score(y_dm, yhat_within),
         "r2_level": _r2_score(y, yhat_level),
         "ridge_alpha": alpha,
+        "nonnegative_slopes": bool(nonnegative_slopes),
     }
 
 
@@ -280,6 +267,7 @@ def fit_pooled_linear_Ew(
     *,
     within_user: bool = True,
     ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
+    nonnegative_slopes: bool = DEFAULT_NONNEGATIVE_SLOPES,
 ):
     """
     Fit the agent-visible linear E_w proxy.
@@ -292,7 +280,10 @@ def fit_pooled_linear_Ew(
         ordinary pooled OLS on raw levels (``ridge_alpha`` ignored).
     ridge_alpha :
         Ridge penalty used after within-user demeaning (original predictor units).
-        Default 3. Set to 0 for within-user OLS.
+        Default 15. Set to 0 for within-user OLS.
+    nonnegative_slopes :
+        If True (default), constrain every within-user slope to be nonnegative.
+        Ignored for pooled OLS.
     """
     if df_fit is None:
         df_fit = load_df_fit()
@@ -321,6 +312,7 @@ def fit_pooled_linear_Ew(
             m,
             feature_cols=feature_cols,
             ridge_alpha=ridge_alpha,
+            nonnegative_slopes=nonnegative_slopes,
         )
         return {
             "coefficients": fit["coefficients"],
@@ -330,6 +322,7 @@ def fit_pooled_linear_Ew(
             "r2_level": fit["r2_level"],
             "within_user": True,
             "ridge_alpha": fit["ridge_alpha"],
+            "nonnegative_slopes": fit["nonnegative_slopes"],
             "n": len(m),
             "n_users": n_users,
             "frame": m,
@@ -362,7 +355,11 @@ def fit_pooled_linear_Ew(
 
 
 if __name__ == "__main__":
-    result = fit_pooled_linear_Ew(within_user=True, ridge_alpha=DEFAULT_RIDGE_ALPHA)
+    result = fit_pooled_linear_Ew(
+        within_user=True,
+        ridge_alpha=DEFAULT_RIDGE_ALPHA,
+        nonnegative_slopes=DEFAULT_NONNEGATIVE_SLOPES,
+    )
     if result["within_user"]:
         alpha = result["ridge_alpha"]
         mode = (
@@ -370,6 +367,8 @@ if __name__ == "__main__":
             if alpha and alpha > 0
             else "within-user OLS"
         )
+        if result["nonnegative_slopes"]:
+            mode = f"nonnegative {mode}"
     else:
         mode = "pooled OLS"
     print(f"mode = {mode}")

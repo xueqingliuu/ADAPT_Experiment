@@ -1,4 +1,12 @@
-# %%
+"""Online wrapper around ``vani_env.Env`` for RL training and evaluation.
+
+``OnlineEnv`` steps one decision slot at a time, logs observed vs agent-visible
+arrays, and builds week packets for the particle-filter agents. Sunday is
+generated with no walking suggestion so weekly CAE / E_w see a full 7-day week.
+
+This file also contains the RCT experiment CLI (train / eval loops over
+agents). For the simpler DQN-vs-never-suggest STE, use ``ste_vanilla.py``.
+"""
 import argparse
 import os
 import numpy as np
@@ -11,8 +19,9 @@ from pathlib import Path
 from functools import partial
 
 
+from ewm_utils import ewma_gamma
+
 # parameters for EWM
-EWM_GAMMA = 6 / 7
 EWM_WINDOW = 7
 EWM_MIN_VALUES = 4
 
@@ -23,10 +32,14 @@ def _setup_log(*args, **kwargs):
 
 
 def _ewm_prior_gamma_last(
-    values, gamma=EWM_GAMMA, window=EWM_WINDOW, min_values=EWM_MIN_VALUES
+    values, gamma=None, window=EWM_WINDOW, min_values=EWM_MIN_VALUES
 ):
     """EWM over prior ≤window values (excludes current).
 
+    Same normalized discount as ``1_data_extraction._ewm_prior_rows``.
+    ``gamma=None`` (default) derives the decay from how many of the ``window``
+    slots are actually populated (:func:`ewm_utils.gamma_from_n`), so an early
+    partial window (e.g. 4 of 7 days) decays differently than a full one.
     Non-finite entries are imputed to 0. Returns 0 if the window has fewer than
     ``min_values`` prior observations.
     """
@@ -34,8 +47,7 @@ def _ewm_prior_gamma_last(
     if w.size < min_values:
         return 0.0
     w = np.where(np.isfinite(w), w, 0.0)
-    alpha = 1.0 - gamma
-    return float(pd.Series(w, dtype=float).ewm(alpha=alpha, adjust=True).mean().iloc[-1])
+    return ewma_gamma(w, gamma, empty=0.0)
 
 
 # parameters for rolling mean
@@ -1113,14 +1125,16 @@ class OnlineEnv:
         base = self._step_idx(sim_w, d_w, 0)
         ws_m = float(self.action_all[base])
         ws_a = float(self.action_all[base + 1])
+        rb = float(self.activitySuggestionsSentLast7DaysAll[base])
+        if not np.isfinite(rb):
+            rb = float(self.s.get("activitySuggestionsSentLast7Days", 0.0))
         return build_antic_features(
             dailyAnticipatedAffectYesterday=self.logDailyAnticipatedAffectYesterday[d_global],
-            todayStepCount=self.logTodayStepCount[d_global],
             activityStatusToday=self.activityStatusTodayAll[d_global],
-            salienceMessageSentToday=self.logSalienceMessageSentToday[d_global],
             isWeekend=self.logIsWeekend[d_global],
             perceivedUtility=self.E_known_all[sim_w],
             caeAverageLastWeek=0.0,
+            activitySuggestionsSentLast7Days=rb,
             ws_morning=ws_m,
             ws_afternoon=ws_a,
             pu=self.E_known_all[sim_w],
@@ -1239,9 +1253,25 @@ P_MY_FOURSC = int(
         Ah=0.0,
     ).shape[0]
 )
-# Antic PF design mirrors the trimmed treatment-effect spec in 5_fit/vani_env
-# (no WS × {todayStepCount, activityStatusToday}).
-P_MY_ANTIC  = P_ANTIC
+# Antic PF design matches the env generative model in vani_env / 5_fit
+# (including recent_burden main effect and AM/PM interactions). Dimension is
+# taken from the PF feature builder and checked against env P_ANTIC.
+P_MY_ANTIC = int(
+    build_antic_features(
+        dailyAnticipatedAffectYesterday=0.0,
+        activityStatusToday=0.0,
+        isWeekend=0.0,
+        perceivedUtility=0.0,
+        caeAverageLastWeek=0.0,
+        activitySuggestionsSentLast7Days=0.0,
+        ws_morning=0.0,
+        ws_afternoon=0.0,
+    ).shape[0]
+)
+if P_MY_ANTIC != P_ANTIC:
+    raise RuntimeError(
+        f"PF antic dim {P_MY_ANTIC} != env P_ANTIC {P_ANTIC}"
+    )
 P_CAE = int(build_CAE_features(0.0, 0.0, np.zeros(FOURSC_SLOTS_PER_WEEK), np.zeros(7)).shape[0])
 P_TY  = int(build_CAE_short_features(0.0).shape[0])
 
@@ -1500,7 +1530,7 @@ def _make_online_env(uid, seed=42, params_dir=None):
     params_dir = resolve_params_dir(params_dir)
     cfg = EnvConfig(uid, params_dir=params_dir)
     nweek = cfg.nweek
-    env = Env(cfg, noise="sequential")
+    env = Env(cfg, noise="ar1")
     oenv = OnlineEnv(env, nweek=nweek, seed=seed, params_dir=params_dir)
     return cfg, env, oenv
 

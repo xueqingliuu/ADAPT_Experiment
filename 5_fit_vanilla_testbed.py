@@ -1,23 +1,25 @@
-# %%
-# 0. import libraries
-#
-# Run order:
-#   1) ``perceived_utility.py``  → fits the joint state-space model, writes
-#      ``params_env_<id>.json`` / ``pred_<id>.json`` with the
-#      ``theta_penalized_*`` / ``resid_penalized_*`` keys, and adds ``perceived_utility`` /
-#      ``perceived_utility_lastweek`` columns to ``df_fit.csv``.
-#   2) ``5_fit_vanilla_testbed.py`` (this script) → fits the vanilla mediator
-#      / outcome models that consume ``perceived_utility_lastweek`` as a
-#      predictor and **merges** their ``theta_*`` / ``resid_*`` keys into the
-#      same JSON files (existing ML keys are preserved).
+"""Fit the remaining generative models and write ``env_para_vanilla/``.
+
+Reads ``df_fit.csv`` (after script 4 has attached E_w). Fits, per participant
+or as a hierarchical Bayesian model:
+
+    4-hour step counts, anticipated affect, weekly CAE / short CAE,
+    prior-2h steps, active status, walking-suggestion interaction.
+
+Writes ``params_env_<uid>.json`` (mediator/outcome blocks and residuals),
+``pred_<uid>.json``, ``user_ids.txt``, and ``population_residuals.json``.
+Does not overwrite the E_w / PV / FW / PJ blocks from script 4.
+Next: ``6_est_Ew_weights.py``.
+"""
 import json
 import os
 import shutil
 import warnings
 
+import arviz as az
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
+import pymc as pm
 from patsy import dmatrix
 from pathlib import Path
 from sklearn.linear_model import (
@@ -26,7 +28,8 @@ from sklearn.linear_model import (
     Ridge,
     RidgeCV,
 )
-from statsmodels.regression.mixed_linear_model import MixedLMParams
+
+from vani_env import within_week_ewma
 
 
 # %%
@@ -127,180 +130,166 @@ def safe_nanmean(x, default=0.0):
         return default
     return np.nanmean(x)
 
-def _embed_random_effects(b_active, active_re, p):
-    """Map active random coefficients back to the full p-dimensional vector."""
-    b_full = np.zeros(p, dtype=float)
-    for k, col_idx in enumerate(active_re):
-        b_full[col_idx] = b_active[k]
-    return b_full
+def _store_group_effects_as_series(effects_by_group):
+    """Wrap a ``{group_key: 1d array}`` mapping as ``{group_key: pd.Series}``.
+
+    Matches the ``.random_effects`` interface statsmodels' ``MixedLMResults``
+    exposes, so :func:`get_user_random_effect` works unchanged.
+    """
+    return {key: pd.Series(np.asarray(vec, dtype=float)) for key, vec in effects_by_group.items()}
 
 
-class _MixedLMFitResult:
-    """MixedLM result with random effects embedded on the full design axis."""
+class _BayesianRandomCoefResult:
+    """Lightweight stand-in for a ``MixedLMResults``, backed by an MCMC posterior.
 
-    def __init__(self, inner_result, active_re, p):
-        self._inner = inner_result
-        self.active_re = list(active_re)
-        self.p = int(p)
-        self.converged = bool(inner_result.converged)
+    Exposes the same handful of attributes the rest of this script reads off a
+    ``MixedLMResults`` (``fe_params``, ``random_effects``, ``scale``,
+    ``converged``, ``summary()``), but every number here is a posterior mean
+    from a single joint fit — there is no separate "fit then re-penalize"
+    step, and no ad hoc variance floor.
+    """
+
+    def __init__(self, idata, predictor_names, group_keys):
+        self.idata = idata
+        self.predictor_names = list(predictor_names)
+        self.group_keys = list(group_keys)
+
+        post = idata.posterior
         self.fe_params = pd.Series(
-            np.asarray(inner_result.fe_params, dtype=float).ravel(),
-            index=getattr(inner_result.fe_params, "index", None),
+            post["beta"].mean(("chain", "draw")).values, index=self.predictor_names
         )
-        self.scale_var = float(inner_result.scale)
-        self.cov_re = inner_result.cov_re
-        self.random_effects = {}
-        for key, values in inner_result.random_effects.items():
-            b_active = np.asarray(values, dtype=float).ravel()
-            self.random_effects[key] = pd.Series(
-                _embed_random_effects(b_active, self.active_re, self.p)
-            )
+        sigma_re = post["sigma_re"].mean(("chain", "draw")).values
+        self.cov_re = np.diag(sigma_re ** 2)
+        sigma_eps = float(post["sigma_eps"].mean(("chain", "draw")))
+        self.scale = sigma_eps ** 2
+
+        b_mean = post["b"].mean(("chain", "draw")).values  # (n_groups, p)
+        self.random_effects = _store_group_effects_as_series(
+            {key: b_mean[i] for i, key in enumerate(self.group_keys)}
+        )
+
+        n_div = int(idata.sample_stats["diverging"].sum())
+        rhat = az.rhat(idata, var_names=["beta", "sigma_re", "sigma_eps"])
+        max_rhat = max(float(rhat[v].max()) for v in rhat.data_vars)
+        self.n_divergences = n_div
+        self.max_rhat = max_rhat
+        self.converged = bool(n_div == 0 and max_rhat < 1.01)
 
     def summary(self):
-        return self._inner.summary()
-
-    @property
-    def scale(self):
-        return self.scale_var
-
-
-def _try_fit_mixedlm(model, free, start, reml, maxiter):
-    """Try ML/REML with lbfgs and bfgs; return the first converged fit."""
-    reml_options = [False]
-    if reml:
-        reml_options.append(True)
-
-    best = None
-    for use_reml in reml_options:
-        for method in ("lbfgs", "bfgs"):
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    cand = model.fit(
-                        reml=use_reml,
-                        method=method,
-                        maxiter=maxiter,
-                        disp=False,
-                        free=free,
-                        start_params=start,
-                    )
-            except Exception as err:
-                print(f"MixedLM fit failed (reml={use_reml}, method={method}): {err}")
-                continue
-            if cand.converged:
-                return cand
-            if best is None:
-                best = cand
-    return best
+        lines = [
+            "Bayesian hierarchical random-coefficient model (NUTS via PyMC)",
+            f"  divergences={self.n_divergences}  max_rhat={self.max_rhat:.4f}"
+            f"  converged={self.converged}",
+            "",
+            "Posterior mean fixed effects (beta):",
+            str(self.fe_params),
+            "",
+            "Posterior mean random-effect SD (diag of D):",
+            str(pd.Series(np.sqrt(np.diag(self.cov_re)), index=self.predictor_names)),
+        ]
+        return "\n".join(lines)
 
 
-def fit_diag_random_coef_mixedlm(
+def fit_bayesian_random_coef_model(
     y,
     X,
     groups,
-    reml=True,
-    maxiter=8000,
-    var_floor=1e-5,
-    predictor_names=None,
+    predictor_names,
+    beta_prior_mu=0.0,
+    beta_prior_sd=5.0,
+    re_sd_prior_mode=0.15,
+    sigma_eps_prior_sd=1.0,
+    draws=2000,
+    tune=3000,
+    chains=4,
+    target_accept=0.99,
+    max_treedepth=12,
+    seed=2026,
 ):
+    """Fit ``y_ig = X_ig @ (beta + b_i) + eps_ig`` as one joint Bayesian model.
+
+    This replaces the old two-stage design (fit an unregularized MixedLM,
+    then separately ridge-shrink the fixed effects and clamp/float any
+    near-zero random-effect variances). Here both regularizers are folded
+    into a single posterior:
+
+    - ``beta_prior_sd`` (per-column, or a scalar broadcast to all columns) is
+      a Gaussian prior on the population-level slope. This *is* ridge
+      regression, expressed as a prior instead of a penalty: MAP estimation
+      under a ``Normal(mu, sd)`` prior is exactly ridge shrinkage toward
+      ``mu`` with strength ``1/sd**2``. Pass a small ``sd`` (and/or a
+      substantively motivated ``mu`` != 0) for collinear/implausible slopes,
+      and a wide ``sd`` for slopes you want the data to determine freely.
+    - ``re_sd_prior_mode`` sets a ``Gamma(shape=2, mode=re_sd_prior_mode)``
+      prior on each random-effect SD. Unlike a Half-Normal/Half-Cauchy (the
+      usual textbook default), a shape-2 Gamma has *zero density at exactly
+      0*, so the posterior is pushed off the degenerate "same slope for every
+      user" boundary without needing a hard-coded variance floor.
+
+    Both priors act inside the same likelihood that estimates ``b_i``, so
+    there's no need for a separate post-hoc ridge step or "protected"
+    column list — every column is regularized according to its own prior,
+    all at once.
+
+    Returns a :class:`_BayesianRandomCoefResult` exposing ``fe_params``,
+    ``random_effects``, ``scale``, ``converged``, and ``summary()`` so
+    existing call sites (``get_user_random_effect`` etc.) work unchanged.
     """
-    Fit MixedLM with one random coefficient per fixed-effect variable.
-
-    Model:
-        y_ij = X_ij beta + X_ij b_i + error_ij
-
-    Random effects:
-        b_i ~ N(0, D)
-
-    Here D is constrained to be diagonal, so every variable has a random effect,
-    but random-effect correlations are fixed at zero.
-
-    If the full random-coefficient model fails to converge, near-zero random-effect
-    columns are pruned and the model is refit until convergence or only one random
-    effect remains.
-    """
-    y = np.asarray(y, dtype=float)
+    y = np.asarray(y, dtype=float).ravel()
     X = np.asarray(X, dtype=float)
     groups = np.asarray(groups)
+    predictor_names = list(predictor_names)
+    p = X.shape[1]
+    if len(predictor_names) != p:
+        raise ValueError("predictor_names length must match X.shape[1]")
 
     keep = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
-    y_fit = y[keep]
-    X_fit = X[keep]
-    groups_fit = groups[keep]
+    y, X, groups = y[keep], X[keep], groups[keep]
 
-    p = X_fit.shape[1]
-    beta_ols, _, _, _ = np.linalg.lstsq(X_fit, y_fit, rcond=None)
-    start = MixedLMParams.from_components(
-        fe_params=beta_ols,
-        cov_re=0.01 * np.eye(p),
-    )
+    group_keys, group_idx = np.unique(groups, return_inverse=True)
+    n_groups = len(group_keys)
 
-    active_re = list(range(p))
-    best_result = None
+    beta_prior_mu = np.broadcast_to(np.asarray(beta_prior_mu, dtype=float), (p,)).copy()
+    beta_prior_sd = np.broadcast_to(np.asarray(beta_prior_sd, dtype=float), (p,)).copy()
+    re_sd_prior_mode = np.broadcast_to(np.asarray(re_sd_prior_mode, dtype=float), (p,)).copy()
+    re_rate = 1.0 / np.maximum(re_sd_prior_mode, 1e-6)
 
-    while active_re:
-        X_re = X_fit[:, active_re]
-        model = sm.MixedLM(
-            endog=y_fit,
-            exog=X_fit,
-            groups=groups_fit,
-            exog_re=X_re,
-            missing="none",
-        )
-        free = MixedLMParams.from_components(
-            fe_params=np.ones(p),
-            cov_re=np.eye(len(active_re)),
-        )
-        result = _try_fit_mixedlm(model, free, start, reml=reml, maxiter=maxiter)
-        if result is None:
-            raise RuntimeError("MixedLM fit failed for all optimizers.")
+    with pm.Model():
+        beta = pm.Normal("beta", mu=beta_prior_mu, sigma=beta_prior_sd, shape=p)
+        sigma_re = pm.Gamma("sigma_re", alpha=2.0, beta=re_rate, shape=p)
+        b_raw = pm.Normal("b_raw", mu=0.0, sigma=1.0, shape=(n_groups, p))
+        b = pm.Deterministic("b", b_raw * sigma_re[None, :])
+        theta = beta[None, :] + b
+        mu = pm.math.sum(X * theta[group_idx], axis=1)
+        sigma_eps = pm.HalfNormal("sigma_eps", sigma=sigma_eps_prior_sd)
+        pm.Normal("y_obs", mu=mu, sigma=sigma_eps, observed=y)
 
-        best_result = _MixedLMFitResult(result, active_re, p)
-        if result.converged:
-            if len(active_re) < p:
-                dropped = [j for j in range(p) if j not in active_re]
-                dropped_names = [
-                    predictor_names[j] if predictor_names is not None else j
-                    for j in dropped
-                ]
-                print(
-                    "MixedLM converged after pruning random effects for: "
-                    + ", ".join(str(x) for x in dropped_names)
-                )
-            return best_result
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            idata = pm.sample(
+                draws=draws,
+                tune=tune,
+                chains=chains,
+                target_accept=target_accept,
+                max_treedepth=max_treedepth,
+                random_seed=seed,
+                progressbar=False,
+            )
 
-        if len(active_re) == 1:
-            break
-
-        re_var = np.diag(np.asarray(result.cov_re, dtype=float))
-        min_pos = int(np.argmin(re_var))
-        min_var = float(re_var[min_pos])
-        dropped_idx = active_re[min_pos]
-        dropped_name = (
-            predictor_names[dropped_idx]
-            if predictor_names is not None
-            else dropped_idx
-        )
+    result = _BayesianRandomCoefResult(idata, predictor_names, group_keys)
+    if not result.converged:
         print(
-            f"MixedLM not converged; pruning random effect for {dropped_name} "
-            f"(estimated variance={min_var:.2e}) and refitting."
+            f"WARNING: Bayesian random-coefficient fit did not cleanly converge "
+            f"(divergences={result.n_divergences}, max_rhat={result.max_rhat:.4f}); "
+            "consider raising target_accept/tune or reparameterizing."
         )
-        active_re.pop(min_pos)
-        re_var = np.delete(re_var, min_pos)
-        start = MixedLMParams.from_components(
-            fe_params=np.asarray(result.fe_params, dtype=float),
-            cov_re=np.diag(np.maximum(re_var, var_floor)),
-        )
+    return result
 
-    raise RuntimeError(
-        "MixedLM did not converge. "
-        f"Remaining random-effect columns: {active_re}. "
-        "The random-coefficient CAE specification may be too flexible for this sample."
-    )
 
 def get_user_random_effect(result, userid, p):
     """
-    Extract b_i from a fitted MixedLM result.
+    Extract b_i from a fitted random-coefficient model result (MixedLM- or
+    Bayesian-backed; both expose a ``.random_effects`` dict).
     If a user is missing from random_effects, return zeros.
     """
     keys_to_try = [userid, int(userid), str(userid)]
@@ -329,8 +318,11 @@ def build_cae_mixedlm_data(df, userid_all, K=14):
         CAE_avg ~ intercept
                   + CAE_avg_lastweek
                   + week
-                  + 14 FourSC decision-slot summaries
-                  + 7 anticipated-affect daily summaries
+                  + EWMA of 14 FourSC decision-slot summaries
+                  + EWMA of 7 anticipated-affect daily summaries
+
+    The two EWMA terms use the same ``gamma=6/7`` normalized discount as
+    ``1_data_extraction._ewm_prior_rows`` (most recent observation last).
 
     Output columns:
         ParticipantIdentifier
@@ -387,13 +379,22 @@ def build_cae_mixedlm_data(df, userid_all, K=14):
         antic_wk = af.reshape(-1, 7, 2).mean(axis=2)
         antic_wk = np.where(np.isnan(antic_wk), mu_antic, antic_wk)
 
-        X = np.hstack(
+        foursc_e = np.array(
+            [within_week_ewma(row) for row in foursc_wk],
+            dtype=float,
+        )
+        antic_e = np.array(
+            [within_week_ewma(row) for row in antic_wk],
+            dtype=float,
+        )
+
+        X = np.column_stack(
             [
-                Intercept_sw[:, None],
-                CAE_avg_lastweek_sw[:, None],
-                week_sw[:, None],
-                foursc_wk,
-                antic_wk,
+                Intercept_sw,
+                CAE_avg_lastweek_sw,
+                week_sw,
+                foursc_e,
+                antic_e,
             ]
         )
 
@@ -473,6 +474,174 @@ def build_cae_short_mixedlm_data(df, userid_all, K=14):
 
     return pd.DataFrame(rows)
 
+
+def build_fourSC_bayes_data(df, userid_all):
+    """One row per decision slot with an observed FourSC, for the pooled
+    Bayesian FourSC random-coefficient model.
+
+    Mirrors the per-user ``fourSC_cond`` construction in the main fitting
+    loop exactly (same column reads, same NaN-filling, same column order
+    matching ``THETA_FOURSC_NAMES``), just pooled across all users with a
+    ``ParticipantIdentifier`` column for grouping instead of looping+fitting
+    per user.
+    """
+    rows = []
+    for userid in userid_all:
+        dat_user = (
+            df[df["ParticipantIdentifier"] == userid]
+            .copy()
+            .sort_values(["Date", "DecisionTime"], na_position="last")
+            .reset_index(drop=True)
+        )
+        if len(dat_user) == 0:
+            continue
+
+        fourSC = dat_user["4hour_step_norm"].to_numpy()
+        fourSC_lag1 = fill_nan_with_mean(dat_user["FourSC_lag1"].to_numpy())
+        yesterday_step_count = fill_nan_with_mean(dat_user["YesterdayStepCount_norm"].to_numpy())
+        seven_day_step_count_avg = fill_nan_with_mean(dat_user["EMA_StepCount_norm"].to_numpy())
+        prior2hour_step_count_filled = fill_nan_with_mean(dat_user["prior2hour_step_norm"].to_numpy())
+        recent_burden = fill_nan_with_mean(dat_user["recent_burden_norm"].to_numpy())
+        seven_day_pageview_count = fill_nan_with_mean(dat_user["Past7DaysPageviewEMA_norm"].to_numpy())
+        past7days_morning_wearing = fill_nan_with_mean(dat_user["past7days_morning_wearing"].to_numpy())
+        Interacted_7d_walk = fill_nan_with_mean(dat_user["Interacted_7d_walk"].to_numpy())
+        anticipated_affect_yesterday = fill_nan_with_mean(
+            dat_user["anticipated_affect_yesterday_norm"].to_numpy()
+        )
+        active_status_fraction_7days = fill_nan_with_mean(
+            dat_user["active_status_fraction_7days"].to_numpy()
+        )
+        is_weekend = dat_user["is_weekend"].to_numpy(dtype=float)
+        decision_time = dat_user["DecisionTime"].to_numpy()
+        perceived_utility_lastweek = dat_user["perceived_utility_lastweek"].to_numpy(dtype=float)
+        perceived_utility_lastweek = np.where(
+            np.isnan(perceived_utility_lastweek),
+            np.nanmean(perceived_utility_lastweek),
+            perceived_utility_lastweek,
+        )
+        CAE_avg_lastweek = fill_nan_with_mean(dat_user["CAE_avg_lastweek_norm"].to_numpy())
+        WalkingSuggestion = dat_user["WalkingSuggestion"].to_numpy()
+        Intercept = np.ones(len(fourSC))
+
+        cond = np.stack(
+            [
+                Intercept,
+                fourSC_lag1,
+                yesterday_step_count,
+                seven_day_step_count_avg,
+                prior2hour_step_count_filled,
+                recent_burden,
+                seven_day_pageview_count,
+                past7days_morning_wearing,
+                Interacted_7d_walk,
+                anticipated_affect_yesterday,
+                active_status_fraction_7days,
+                is_weekend,
+                decision_time,
+                perceived_utility_lastweek,
+                CAE_avg_lastweek,
+                WalkingSuggestion,
+                WalkingSuggestion * yesterday_step_count,
+                WalkingSuggestion * prior2hour_step_count_filled,
+                WalkingSuggestion * recent_burden,
+                WalkingSuggestion * seven_day_pageview_count,
+                WalkingSuggestion * past7days_morning_wearing,
+                WalkingSuggestion * Interacted_7d_walk,
+                WalkingSuggestion * anticipated_affect_yesterday,
+                WalkingSuggestion * is_weekend,
+                WalkingSuggestion * decision_time,
+                WalkingSuggestion * perceived_utility_lastweek,
+                WalkingSuggestion * CAE_avg_lastweek,
+            ],
+            axis=1,
+        )
+
+        idx_obs = ~np.isnan(fourSC)
+        for j in np.flatnonzero(idx_obs):
+            row = {"ParticipantIdentifier": int(userid), "FourSC": float(fourSC[j])}
+            for k, name in enumerate(THETA_FOURSC_NAMES):
+                row[name] = cond[j, k]
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_antic_bayes_data(df, userid_all):
+    """One row per calendar day with an observed anticipated-affect value,
+    for the pooled Bayesian anticipated-affect random-coefficient model.
+
+    Mirrors the per-user ``anticipated_affect_cond_day`` construction in the
+    main fitting loop exactly, pooled across all users.
+    """
+    rows = []
+    for userid in userid_all:
+        dat_user = (
+            df[df["ParticipantIdentifier"] == userid]
+            .copy()
+            .sort_values(["Date", "DecisionTime"], na_position="last")
+            .reset_index(drop=True)
+        )
+        if len(dat_user) == 0:
+            continue
+
+        anticipated_affect = dat_user["anticipated_affect_norm"].to_numpy()
+        anticipated_affect_yesterday = fill_nan_with_mean(
+            dat_user["anticipated_affect_yesterday_norm"].to_numpy()
+        )
+        active_status_filled = fill_nan_with_mean(dat_user["active_status"].to_numpy())
+        is_weekend = dat_user["is_weekend"].to_numpy(dtype=float)
+        perceived_utility_lastweek = dat_user["perceived_utility_lastweek"].to_numpy(dtype=float)
+        perceived_utility_lastweek = np.where(
+            np.isnan(perceived_utility_lastweek),
+            np.nanmean(perceived_utility_lastweek),
+            perceived_utility_lastweek,
+        )
+        CAE_avg_lastweek = fill_nan_with_mean(dat_user["CAE_avg_lastweek_norm"].to_numpy())
+        recent_burden = fill_nan_with_mean(dat_user["recent_burden_norm"].to_numpy())
+        decision_time = dat_user["DecisionTime"].to_numpy()
+        WalkingSuggestion = dat_user["WalkingSuggestion"].to_numpy()
+        Intercept = np.ones(len(anticipated_affect))
+
+        idx_morning = decision_time == 0
+        _am = idx_morning
+        Walking_pair = WalkingSuggestion.reshape(-1, 2)
+        ws_morning_day = Walking_pair[:, 0]
+        ws_afternoon_day = Walking_pair[:, 1]
+
+        cond = np.stack(
+            [
+                Intercept[_am],
+                anticipated_affect_yesterday[_am],
+                active_status_filled[_am],
+                is_weekend[_am],
+                perceived_utility_lastweek[_am],
+                CAE_avg_lastweek[_am],
+                recent_burden[_am],
+                ws_morning_day,
+                ws_afternoon_day,
+                ws_morning_day * is_weekend[_am],
+                ws_afternoon_day * is_weekend[_am],
+                ws_morning_day * perceived_utility_lastweek[_am],
+                ws_afternoon_day * perceived_utility_lastweek[_am],
+                ws_morning_day * CAE_avg_lastweek[_am],
+                ws_afternoon_day * CAE_avg_lastweek[_am],
+                ws_morning_day * recent_burden[_am],
+                ws_afternoon_day * recent_burden[_am],
+            ],
+            axis=1,
+        )
+
+        y_antic_day = anticipated_affect[_am]
+        idx_obs = ~np.isnan(y_antic_day)
+        for j in np.flatnonzero(idx_obs):
+            row = {"ParticipantIdentifier": int(userid), "AnticipatedAffect": float(y_antic_day[j])}
+            for k, name in enumerate(THETA_ANTIC_NAMES):
+                row[name] = cond[j, k]
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 THETA_PRIOR2HOUR_STEP_COUNT_NAMES = [
     "intercept",
     "EMA_Prior2HourStepCount",
@@ -532,6 +701,7 @@ THETA_ANTIC_NAMES = [
     "is_weekend",
     "perceived_utility_lastweek",
     "CAE_avg_lastweek",
+    "recent_burden",
     "A0_morning",
     "A1_afternoon",
     "A0_morning_by_is_weekend",
@@ -540,13 +710,17 @@ THETA_ANTIC_NAMES = [
     "A1_afternoon_by_perceived_utility_lastweek",
     "A0_morning_by_CAE_avg_lastweek",
     "A1_afternoon_by_CAE_avg_lastweek",
+    "A0_morning_by_recent_burden",
+    "A1_afternoon_by_recent_burden",
 ]
 
-THETA_CAE_NAMES = (
-    ["intercept", "CAE_avg_lastweek", "week"]
-    + [f"fourSC_slot_{j}" for j in range(14)]
-    + [f"anticipated_affect_day_{j}" for j in range(7)]
-)
+THETA_CAE_NAMES = [
+    "intercept",
+    "CAE_avg_lastweek",
+    "week",
+    "fourSC_ewma",
+    "anticipated_affect_ewma",
+]
 
 THETA_CAE_SHORT_AVG_NAMES = [
     "intercept",
@@ -584,8 +758,38 @@ if userid_all.size == 0:
     raise ValueError("No users with observed CAE values remain after filtering.")
 
 # ============================================================
-# Fit CAE MixedLM with random coefficient for every CAE variable
+# Fit CAE random-coefficient model as one joint Bayesian hierarchical fit
 # ============================================================
+# Every column gets a Normal(mu, sd) prior on its population slope (beta) and
+# a Gamma(shape=2, mode) prior on its between-user SD (sigma_re); see
+# fit_bayesian_random_coef_model's docstring. Two of these are substantively
+# informative, not just "weak regularization defaults":
+#   - CAE_avg_lastweek (a1): a week-to-week autoregression coefficient for a
+#     bounded, mean-reverting activity measure should plausibly sit well
+#     below 1 (a loop gain >= 1 makes the simulated trajectory unstable), so
+#     it's centered at 0.4 instead of 0.
+#   - anticipated_affect_ewma: corr(anticipated_affect_ewma, CAE_avg_lastweek)
+#     = 0.90 in the training data, so an unregularized fit can't tell these
+#     two apart and dumps an implausible amount of signal (~1.5-1.6) onto
+#     whichever one is least constrained. Centering it at a similarly modest
+#     0.3 keeps the *joint* fit from re-inflating it once a1 is pinned down.
+#   - fourSC_ewma: this and anticipated_affect_ewma are the two "M^Y ->
+#     Y_{w+1} nonnegative" terms that used to be sign-flipped
+#     post-hoc. A flat/uninformative prior here let the population mean land
+#     essentially at zero (slightly negative) with a between-user SD (~0.17)
+#     much larger than that mean, so a large fraction of users came back
+#     negative pre-flip — and post-hoc flipping *reflects* whatever noisy
+#     magnitude those users happened to get instead of shrinking it, which
+#     was inflating STE. A mild positive prior (weaker than
+#     anticipated_affect_ewma's, since the raw data doesn't support as large
+#     an effect) asserts "this should help on average" at the *population*
+#     level while leaving each user's random effect free to land negative if
+#     their own data supports it — real heterogeneity, not reflection.
+# week and the intercept have no such prior belief, so they get
+# wide/uninformative priors and are essentially estimated by the data alone.
+CAE_BETA_PRIOR_MU = np.array([0.0, 0.4, 0.0, 0.15, 0.3])
+CAE_BETA_PRIOR_SD = np.array([5.0, 0.15, 1.0, 0.15, 0.15])
+CAE_RE_SD_PRIOR_MODE = np.array([0.1, 0.15, 0.1, 0.15, 0.15])
 
 cae_ml_df = build_cae_mixedlm_data(df_fit, userid_all, K=14)
 
@@ -595,21 +799,24 @@ X_cae_obs = cae_ml_obs[THETA_CAE_NAMES].to_numpy(dtype=float)
 y_cae_obs = cae_ml_obs["CAE_avg"].to_numpy(dtype=float)
 groups_cae_obs = cae_ml_obs["ParticipantIdentifier"].to_numpy()
 
-mixedlm_CAE = fit_diag_random_coef_mixedlm(
+mixedlm_CAE = fit_bayesian_random_coef_model(
     y=y_cae_obs,
     X=X_cae_obs,
     groups=groups_cae_obs,
-    reml=True,
     predictor_names=list(THETA_CAE_NAMES),
+    beta_prior_mu=CAE_BETA_PRIOR_MU,
+    beta_prior_sd=CAE_BETA_PRIOR_SD,
+    re_sd_prior_mode=CAE_RE_SD_PRIOR_MODE,
 )
 
 print(mixedlm_CAE.summary())
-print(f"CAE MixedLM converged: {mixedlm_CAE.converged}")
+print(f"CAE Bayesian fit converged: {mixedlm_CAE.converged}")
 
 cae_random_effect_cols = list(range(len(THETA_CAE_NAMES)))
 
 # ============================================================
-# Fit short-CAE MixedLM with random coefficient for every variable
+# Fit short-CAE random-coefficient model the same way, with weak/uninformative
+# priors throughout (no collinearity or stability concerns for this model).
 # ============================================================
 
 cae_short_ml_df = build_cae_short_mixedlm_data(df_fit, userid_all, K=14)
@@ -620,22 +827,169 @@ X_cae_short_obs = cae_short_ml_obs[THETA_CAE_SHORT_AVG_NAMES].to_numpy(dtype=flo
 y_cae_short_obs = cae_short_ml_obs["CAE_short_avg"].to_numpy(dtype=float)
 groups_cae_short_obs = cae_short_ml_obs["ParticipantIdentifier"].to_numpy()
 
-mixedlm_CAE_short = fit_diag_random_coef_mixedlm(
+mixedlm_CAE_short = fit_bayesian_random_coef_model(
     y=y_cae_short_obs,
     X=X_cae_short_obs,
     groups=groups_cae_short_obs,
-    reml=True,
     predictor_names=list(THETA_CAE_SHORT_AVG_NAMES),
 )
 
 print(mixedlm_CAE_short.summary())
-print(f"CAE_short MixedLM converged: {mixedlm_CAE_short.converged}")
+print(f"CAE_short Bayesian fit converged: {mixedlm_CAE_short.converged}")
 
 cae_short_random_effect_cols = list(range(len(THETA_CAE_SHORT_AVG_NAMES)))
+
+# ============================================================
+# Fit the anticipated-affect and FourSC random-coefficient models the same
+# way. These were previously 31 independent single-user Ridge fits with zero
+# cross-user information sharing — unlike CAE/CAE_short, nothing regularized
+# their action-effect or ``recent_burden`` (habituation) coefficients. With
+# only a few dozen observations against a 17-27 column design, per-user
+# noise routinely flipped ``recent_burden``'s sign: 18/31 users came back
+# with recent_burden >= 0 (no habituation, sometimes literally backwards),
+# which let a constant-suggestion policy compound CAE gains unchecked for
+# those users and was the single largest driver of outlier STE values.
+#
+# ``recent_burden`` (and FourSC's WalkingSuggestion-by-recent_burden
+# interaction) get a mildly-informative negative-centered prior; every other
+# column keeps a wide, weakly-informative prior and is essentially estimated
+# by the data. The main fix isn't forcing the population mean negative (the
+# data can and does push back on that, see FourSC's interaction term below)
+# — it's that partial pooling shrinks each user's *own* noisy estimate
+# toward a shared, precisely-estimated population value, so a handful of
+# training rows can no longer single-handedly flip the sign for one person.
+#
+# The coefficients below are also the ones that used to be
+# sign-flipped post-hoc (E_w/Y_w/A -> M^Y "should help" assumptions). A mild
+# positive prior on the *population* mean asserts that assumption where the
+# post-hoc flip used to, but — unlike the flip — it doesn't touch individual
+# users' random effects, so a person whose own data genuinely shows no
+# effect (or a negative one) stays that way instead of being reflected into
+# an inflated positive value.
+# Habituation columns (recent_burden and its action interactions) also get a
+# *tighter* between-user random-effect SD (default is 0.15 everywhere else).
+# With the wide default, individual posteriors could still land solidly on
+# the "wrong" (reinforcing, i.e. no habituation) side of a negative
+# population mean -- e.g. one user's WalkingSuggestion_by_recent_burden came
+# back +0.057 against a population mean of -0.05 -- which let a
+# constant-suggestion policy compound unchecked for that person over 36
+# weeks and was the dominant remaining driver of outlier STE values. Tighter
+# beta_prior_sd (more confident about the population mean) plus tighter
+# re_sd_prior_mode (less between-user spread allowed) both push toward this
+# fix; individuals can still deviate, just less drastically.
+ANTIC_RE_SD_PRIOR_MODE = np.full(len(THETA_ANTIC_NAMES), 0.15)
+ANTIC_BETA_PRIOR_SD = np.full(len(THETA_ANTIC_NAMES), 3.0)
+ANTIC_BETA_PRIOR_MU = np.zeros(len(THETA_ANTIC_NAMES))
+for _name in ("A0_morning_by_recent_burden", "A1_afternoon_by_recent_burden"):
+    ANTIC_BETA_PRIOR_MU[THETA_ANTIC_NAMES.index(_name)] = -0.05
+    ANTIC_BETA_PRIOR_SD[THETA_ANTIC_NAMES.index(_name)] = 0.04
+    ANTIC_RE_SD_PRIOR_MODE[THETA_ANTIC_NAMES.index(_name)] = 0.05
+ANTIC_BETA_PRIOR_MU[THETA_ANTIC_NAMES.index("recent_burden")] = -0.05
+ANTIC_BETA_PRIOR_SD[THETA_ANTIC_NAMES.index("recent_burden")] = 0.03
+ANTIC_RE_SD_PRIOR_MODE[THETA_ANTIC_NAMES.index("recent_burden")] = 0.05
+for _name in (
+    "perceived_utility_lastweek",
+    "CAE_avg_lastweek",
+    "A0_morning",
+    "A1_afternoon",
+    "A0_morning_by_perceived_utility_lastweek",
+    "A1_afternoon_by_perceived_utility_lastweek",
+    "A0_morning_by_CAE_avg_lastweek",
+    "A1_afternoon_by_CAE_avg_lastweek",
+):
+    ANTIC_BETA_PRIOR_MU[THETA_ANTIC_NAMES.index(_name)] = 0.03
+    ANTIC_BETA_PRIOR_SD[THETA_ANTIC_NAMES.index(_name)] = 0.08
+
+antic_bayes_df = build_antic_bayes_data(df_fit, userid_all)
+X_antic_obs = antic_bayes_df[THETA_ANTIC_NAMES].to_numpy(dtype=float)
+y_antic_obs = antic_bayes_df["AnticipatedAffect"].to_numpy(dtype=float)
+groups_antic_obs = antic_bayes_df["ParticipantIdentifier"].to_numpy()
+
+mixedlm_antic = fit_bayesian_random_coef_model(
+    y=y_antic_obs,
+    X=X_antic_obs,
+    groups=groups_antic_obs,
+    predictor_names=list(THETA_ANTIC_NAMES),
+    beta_prior_mu=ANTIC_BETA_PRIOR_MU,
+    beta_prior_sd=ANTIC_BETA_PRIOR_SD,
+    re_sd_prior_mode=ANTIC_RE_SD_PRIOR_MODE,
+    draws=1000,
+    tune=1500,
+    target_accept=0.95,
+)
+
+print(mixedlm_antic.summary())
+print(f"Anticipated-affect Bayesian fit converged: {mixedlm_antic.converged}")
+
+FOURSC_RE_SD_PRIOR_MODE = np.full(len(THETA_FOURSC_NAMES), 0.15)
+FOURSC_BETA_PRIOR_SD = np.full(len(THETA_FOURSC_NAMES), 3.0)
+FOURSC_BETA_PRIOR_MU = np.zeros(len(THETA_FOURSC_NAMES))
+FOURSC_BETA_PRIOR_MU[THETA_FOURSC_NAMES.index("recent_burden")] = -0.05
+FOURSC_BETA_PRIOR_SD[THETA_FOURSC_NAMES.index("recent_burden")] = 0.03
+FOURSC_RE_SD_PRIOR_MODE[THETA_FOURSC_NAMES.index("recent_burden")] = 0.05
+# This interaction is the one that most directly let a constant-suggestion
+# policy compound unchecked for a couple of outlier users: one came back at
+# +0.057 against this -0.05 population mean under the old wide re_sd prior
+# (mode=0.15), i.e. that person's fitted dynamics said each additional
+# suggestion got *more* effective as burden accumulated. Tighter beta_sd and
+# re_sd_prior_mode here don't rule that out, but make it harder for a
+# handful of noisy per-user rows to produce it.
+FOURSC_BETA_PRIOR_MU[THETA_FOURSC_NAMES.index("WalkingSuggestion_by_recent_burden")] = -0.05
+FOURSC_BETA_PRIOR_SD[THETA_FOURSC_NAMES.index("WalkingSuggestion_by_recent_burden")] = 0.04
+FOURSC_RE_SD_PRIOR_MODE[THETA_FOURSC_NAMES.index("WalkingSuggestion_by_recent_burden")] = 0.05
+# Same "assert the population mean, leave individuals free" treatment as
+# theta_antic above, for the E_w/Y_w/A -> M^Y terms that used to be
+# sign-flipped post-hoc.
+for _name in (
+    "perceived_utility_lastweek",
+    "CAE_avg_lastweek",
+    "WalkingSuggestion",
+    "WalkingSuggestion_by_perceived_utility_lastweek",
+    "WalkingSuggestion_by_CAE_avg_lastweek",
+):
+    FOURSC_BETA_PRIOR_MU[THETA_FOURSC_NAMES.index(_name)] = 0.03
+    FOURSC_BETA_PRIOR_SD[THETA_FOURSC_NAMES.index(_name)] = 0.08
+
+fourSC_bayes_df = build_fourSC_bayes_data(df_fit, userid_all)
+X_fourSC_obs = fourSC_bayes_df[THETA_FOURSC_NAMES].to_numpy(dtype=float)
+y_fourSC_obs = fourSC_bayes_df["FourSC"].to_numpy(dtype=float)
+groups_fourSC_obs = fourSC_bayes_df["ParticipantIdentifier"].to_numpy()
+
+mixedlm_fourSC = fit_bayesian_random_coef_model(
+    y=y_fourSC_obs,
+    X=X_fourSC_obs,
+    groups=groups_fourSC_obs,
+    predictor_names=list(THETA_FOURSC_NAMES),
+    beta_prior_mu=FOURSC_BETA_PRIOR_MU,
+    beta_prior_sd=FOURSC_BETA_PRIOR_SD,
+    re_sd_prior_mode=FOURSC_RE_SD_PRIOR_MODE,
+    draws=1000,
+    tune=2000,
+    target_accept=0.97,
+)
+
+print(mixedlm_fourSC.summary())
+print(f"FourSC Bayesian fit converged: {mixedlm_fourSC.converged}")
 
 theta_pageview_list = []
 theta_fitbitwearing_list = []
 theta_eodcomplete_list = []
+
+# Population-level residual pools (observed values only, across all users) for
+# the streams that feed the STE outcome most directly: CAE, CAE_short, antic,
+# fourSC. Users with very few of their own observations (e.g. n_obs_CAE == 1)
+# have a degenerate own residual pool — there's nothing to resample from, so
+# every noise mode (sequential/random/ar1) collapses to "replay that one
+# value" for them. ``vani_env.Env`` blends in these population pools (see
+# ``POPULATION_FALLBACK_MIN_OBS``) so sparse-data users still get plausible
+# simulated variability instead of an artificially smooth trajectory.
+population_resid_pools = {
+    "resid_CAE_population": [],
+    "resid_CAE_short_population": [],
+    "resid_antic_population": [],
+    "resid_fourSC_population": [],
+}
+
 for i, userid in enumerate(userid_all):
     dat_user = df_fit[df_fit['ParticipantIdentifier'] == userid].copy()
     dat_user = dat_user.sort_values(['Date', 'DecisionTime'], na_position='last').reset_index(drop=True)
@@ -1005,40 +1359,27 @@ for i, userid in enumerate(userid_all):
 
     # filter out rows where FourSC is NaN
     idx_obs_fourSC = ~np.isnan(fourSC)
-    fourSC_cond_obs = fourSC_cond[idx_obs_fourSC, :]
     FourSC_obs = fourSC[idx_obs_fourSC]
-    n_obs_fourSC = int(idx_obs_fourSC.sum())
-    
-    if n_obs_fourSC >= 2:
-        cv_fourSC = min(5, n_obs_fourSC)
-        model_fourSC = RidgeCV(
-            alphas=alpha_l2_list,
-            fit_intercept=False,
-            cv=cv_fourSC,
-            scoring="neg_mean_squared_error",
-        )
-        model_fourSC.fit(fourSC_cond_obs, FourSC_obs)
-        alpha_fourSC_l2 = model_fourSC.alpha_
-        theta_fourSC_mean = model_fourSC.coef_
-        pred_fourSC = model_fourSC.predict(fourSC_cond)
-    elif n_obs_fourSC == 1:
-        print(f"fallback to fixed alpha for fourSC model for user {userid}")
-        alpha_fourSC_l2 = 1.0
-        model_fourSC = Ridge(alpha=alpha_fourSC_l2, fit_intercept=False)
-        model_fourSC.fit(fourSC_cond_obs, FourSC_obs)
-        theta_fourSC_mean = model_fourSC.coef_
-        pred_fourSC = model_fourSC.predict(fourSC_cond)
-    else:
-        print(f"no observed fourSC values for user {userid}; using zero fallback")
-        alpha_fourSC_l2 = float(alpha_l2_list[0])
-        theta_fourSC_mean = np.zeros(fourSC_cond.shape[1], dtype=float)
-        pred_fourSC = np.zeros(len(fourSC), dtype=float)
+
+    # theta_fourSC_mean = population beta + this user's posterior random
+    # effect from the pooled Bayesian fit above (mixedlm_fourSC), instead of
+    # an unregularized per-user RidgeCV. No ridge alpha to report anymore.
+    alpha_fourSC_l2 = None
+    beta_fourSC = np.asarray(mixedlm_fourSC.fe_params, dtype=float)
+    b_fourSC = get_user_random_effect(
+        result=mixedlm_fourSC,
+        userid=int(userid),
+        p=len(THETA_FOURSC_NAMES),
+    )
+    theta_fourSC_mean = beta_fourSC + b_fourSC
+    pred_fourSC = fourSC_cond @ theta_fourSC_mean
 
     resid_obs_fourSC = FourSC_obs - pred_fourSC[idx_obs_fourSC]
     # fill in the full residual array with NaN for unobserved
     resid_fourSC = np.full_like(fourSC, np.nan, dtype=float)
     resid_fourSC[idx_obs_fourSC] = resid_obs_fourSC
     sigma2_fourSC_mean = np.var(resid_obs_fourSC) if resid_obs_fourSC.size > 0 else 0.0
+    population_resid_pools["resid_fourSC_population"].extend(resid_obs_fourSC.tolist())
 
     print(f"The fit of fourSC is good for user {userid}")
 
@@ -1056,6 +1397,7 @@ for i, userid in enumerate(userid_all):
         is_weekend[_am],
         perceived_utility_lastweek[_am],
         CAE_avg_lastweek[_am],
+        recent_burden[_am],
         ws_morning_day,
         ws_afternoon_day,
         ws_morning_day * is_weekend[_am],
@@ -1064,70 +1406,45 @@ for i, userid in enumerate(userid_all):
         ws_afternoon_day * perceived_utility_lastweek[_am],
         ws_morning_day * CAE_avg_lastweek[_am],
         ws_afternoon_day * CAE_avg_lastweek[_am],
+        ws_morning_day * recent_burden[_am],
+        ws_afternoon_day * recent_burden[_am],
     ], axis=1)
 
     y_antic_day = anticipated_affect[_am]
     idx_daily_antic = ~np.isnan(y_antic_day)
-    n_obs_anticipated_affect = int(idx_daily_antic.sum())
 
-    if n_obs_anticipated_affect >= 2:
-        cv_anticipated_affect = min(5, n_obs_anticipated_affect)
-        model_anticipated_affect = RidgeCV(
-            alphas=alpha_l2_list,
-            fit_intercept=False,
-            cv=cv_anticipated_affect,
-            scoring="neg_mean_squared_error",
-        )
-        model_anticipated_affect.fit(
-            anticipated_affect_cond_day[idx_daily_antic],
-            y_antic_day[idx_daily_antic],
-        )
-        alpha_anticipated_affect_l2 = model_anticipated_affect.alpha_
-        theta_anticipated_affect_mean = model_anticipated_affect.coef_
-        pred_anticipated_affect = model_anticipated_affect.predict(
-            anticipated_affect_cond_day
-        )
-        resid_obs_anticipated_affect = (
-            y_antic_day[idx_daily_antic]
-            - pred_anticipated_affect[idx_daily_antic]
-        )
-        resid_anticipated_affect = np.full_like(y_antic_day, np.nan, dtype=float)
-        resid_anticipated_affect[idx_daily_antic] = resid_obs_anticipated_affect
-        sigma2_anticipated_affect_mean = np.var(resid_obs_anticipated_affect)
-    elif n_obs_anticipated_affect == 1:
-        print(f"fallback to fixed alpha for anticipated_affect model for user {userid}")
+    # theta_anticipated_affect_mean = population beta + this user's posterior
+    # random effect from the pooled Bayesian fit above (mixedlm_antic),
+    # instead of an unregularized per-user Ridge/RidgeCV. No ridge alpha to
+    # report anymore, and no separate n_obs branching needed: the population
+    # prior already gives a sane fallback for users with very few days.
+    alpha_anticipated_affect_l2 = None
+    beta_antic = np.asarray(mixedlm_antic.fe_params, dtype=float)
+    b_antic = get_user_random_effect(
+        result=mixedlm_antic,
+        userid=int(userid),
+        p=len(THETA_ANTIC_NAMES),
+    )
+    theta_anticipated_affect_mean = beta_antic + b_antic
+    pred_anticipated_affect = anticipated_affect_cond_day @ theta_anticipated_affect_mean
 
-        alpha_anticipated_affect_l2 = 1.0
-        model_anticipated_affect = Ridge(alpha=alpha_anticipated_affect_l2, fit_intercept=False)
-        model_anticipated_affect.fit(
-            anticipated_affect_cond_day[idx_daily_antic],
-            y_antic_day[idx_daily_antic],
-        )
-        theta_anticipated_affect_mean = model_anticipated_affect.coef_
-        pred_anticipated_affect = model_anticipated_affect.predict(
-            anticipated_affect_cond_day
-        )
-        resid_obs_anticipated_affect = (
-            y_antic_day[idx_daily_antic]
-            - pred_anticipated_affect[idx_daily_antic]
-        )
-        resid_anticipated_affect = np.full_like(y_antic_day, np.nan, dtype=float)
-        resid_anticipated_affect[idx_daily_antic] = resid_obs_anticipated_affect
-        sigma2_anticipated_affect_mean = np.var(resid_obs_anticipated_affect)
-    else:
-        print(f"no observed anticipated_affect values for user {userid}; using zero fallback")
+    resid_obs_anticipated_affect = (
+        y_antic_day[idx_daily_antic] - pred_anticipated_affect[idx_daily_antic]
+    )
+    resid_anticipated_affect = np.full_like(y_antic_day, np.nan, dtype=float)
+    resid_anticipated_affect[idx_daily_antic] = resid_obs_anticipated_affect
+    sigma2_anticipated_affect_mean = (
+        np.var(resid_obs_anticipated_affect) if resid_obs_anticipated_affect.size > 0 else 0.0
+    )
 
-        alpha_anticipated_affect_l2 = 1.0
-        theta_anticipated_affect_mean = np.zeros(anticipated_affect_cond_day.shape[1], dtype=float)
-        pred_anticipated_affect = np.zeros(len(y_antic_day), dtype=float)
-        resid_anticipated_affect = np.full_like(y_antic_day, np.nan, dtype=float)
-        sigma2_anticipated_affect_mean = 0.0
+    _obs_antic = resid_anticipated_affect[~np.isnan(resid_anticipated_affect)]
+    population_resid_pools["resid_antic_population"].extend(_obs_antic.tolist())
 
     print(f"The fit of anticipated_affect is good for user {userid}")
 
 
     #### Model 10: CAE model #### 
-#### Model 10: CAE model, MixedLM with b_i for every variable ####
+#### Model 10: CAE model, Bayesian random coefficient b_i for every variable ####
 
     K = 14
 
@@ -1147,13 +1464,27 @@ for i, userid in enumerate(userid_all):
     antic_wk = _af.reshape(-1, 7, 2).mean(axis=2)
     antic_wk = np.where(np.isnan(antic_wk), _mu_antic, antic_wk)
 
-    CAE_cond = np.hstack([
-        Intercept_sw[:, None],
-        CAE_avg_lastweek_sw[:, None],
-        week_sw[:, None],
-        foursc_wk,
-        antic_wk,
+    foursc_e = np.array(
+        [within_week_ewma(row) for row in foursc_wk],
+        dtype=float,
+    )
+    antic_e = np.array(
+        [within_week_ewma(row) for row in antic_wk],
+        dtype=float,
+    )
+
+    CAE_cond = np.column_stack([
+        Intercept_sw,
+        CAE_avg_lastweek_sw,
+        week_sw,
+        foursc_e,
+        antic_e,
     ])
+    if CAE_cond.shape[1] != len(THETA_CAE_NAMES):
+        raise RuntimeError(
+            f"User {userid}: CAE_cond has {CAE_cond.shape[1]} columns, "
+            f"but THETA_CAE_NAMES has {len(THETA_CAE_NAMES)} names."
+        )
 
     beta_CAE = np.asarray(mixedlm_CAE.fe_params, dtype=float)
 
@@ -1179,9 +1510,15 @@ for i, userid in enumerate(userid_all):
     if not np.isfinite(sigma2_CAE_mean) or sigma2_CAE_mean <= 0:
         sigma2_CAE_mean = float(mixedlm_CAE.scale)
 
+    # No separate ridge alpha anymore: shrinkage is baked into the Bayesian
+    # priors used for the joint fit (see CAE_BETA_PRIOR_SD above).
     alpha_CAE_l2 = None
 
-    print(f"The full random-coefficient MixedLM CAE fit is ready for user {userid}")
+    population_resid_pools["resid_CAE_population"].extend(
+        resid_CAE[~np.isnan(resid_CAE)].tolist()
+    )
+
+    print(f"The full random-coefficient Bayesian CAE fit is ready for user {userid}")
 
 
 
@@ -1307,7 +1644,11 @@ for i, userid in enumerate(userid_all):
 
     alpha_CAE_short_avg_l2 = None
 
-    print(f"The full random-coefficient MixedLM CAE_short_avg fit is ready for user {userid}")
+    population_resid_pools["resid_CAE_short_population"].extend(
+        resid_CAE_short_avg[~np.isnan(resid_CAE_short_avg)].tolist()
+    )
+
+    print(f"The full random-coefficient Bayesian CAE_short_avg fit is ready for user {userid}")
 
     # if j = 1, then the emission is 3 questions from CAE
     # CAE_short_avg_sw = CAE_short_avg.reshape(-1, K)[:, 0]
@@ -1472,5 +1813,18 @@ df_fit.loc[df_fit["ParticipantIdentifier"].isin(userid_all)].to_csv(
     work_folder / "df_fit_11week.csv",
     index=False,
 )
+
+# Population-level residual pools, shared across users (see comment above the
+# accumulator init). ``vani_env.EnvConfig`` loads this once per user to give
+# sparse-data users a non-degenerate fallback noise distribution.
+digits = 3
+population_residuals_out = {
+    key: json_float_list(np.asarray(vals, dtype=float), digits)
+    for key, vals in population_resid_pools.items()
+}
+with open(work_folder / "population_residuals.json", "w", encoding="utf-8") as f:
+    json.dump(population_residuals_out, f, allow_nan=False)
+for key, vals in population_resid_pools.items():
+    print(f"{key}: n={len(vals)}")
 
 # %%

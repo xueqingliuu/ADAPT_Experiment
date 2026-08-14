@@ -4,6 +4,7 @@ __pycache__/
 .ipynb_checkpoints/
 .env
 .venv/
+.venv-*/
 venv/
 
 # macOS
@@ -22,6 +23,10 @@ aggregate_*.err
 # Runtime caches
 .matplotlib/
 d3rlpy_logs/
+tensorboard_logs/
+logs/
+# tune_ste.py scratch / smoke-test parameter directories
+.ste_*/
 
 # Data artifacts
 *.npz

@@ -1,15 +1,13 @@
 """
-Plot Variant-1 direction-corrected coefficients for visual sign checks.
+Plot fitted environment coefficients from ``env_para_vanilla/``.
 
-Loads every ``theta_*`` coefficient vector from post-correction
-``params_env_*.json`` (CAE, mediators, engagement, check-in, covariates, etc.)
-and merges ``direction_correction_audit.csv`` from ``7_check_direction.py`` so
-constrained vs unconstrained coefficients can be compared in the same panels.
+Loads every ``theta_*`` coefficient vector from ``params_env_*.json``
+(CAE, mediators, engagement, check-in, covariates, etc.) and writes
+per-block boxplots plus an overview scatter.
 """
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 from collections import defaultdict
@@ -25,15 +23,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.lines import Line2D
 
 
 PROJECT_ROOT = Path(
     os.getenv("ADAPR_PROJECT_ROOT", str(Path(__file__).resolve().parent))
 ).expanduser().resolve()
 
-DEFAULT_PARAMS_DIR = PROJECT_ROOT / "env_para_variant1_signflip"
-DEFAULT_AUDIT_CSV = DEFAULT_PARAMS_DIR / "direction_correction_audit.csv"
+DEFAULT_PARAMS_DIR = PROJECT_ROOT / "env_para_vanilla"
 DEFAULT_OUTPUT_DIR = DEFAULT_PARAMS_DIR / "coeff_plots"
 
 # Preferred display order / titles for known blocks. Any other theta_*_names
@@ -80,8 +76,8 @@ SHORT_LABELS = {
     "A1_afternoon_by_perceived_utility_lastweek": "A1×E_w",
     "A0_morning_by_CAE_avg_lastweek": "A0×Y_w",
     "A1_afternoon_by_CAE_avg_lastweek": "A1×Y_w",
-    "A0_morning_by_is_weekend": "A0×wknd",
-    "A1_afternoon_by_is_weekend": "A1×wknd",
+    "fourSC_ewma": "fourSC EWMA",
+    "anticipated_affect_ewma": "antic EWMA",
     "a0": "a0",
     "a1": "a1 (E AR)",
     "a2_PV_lag_week": "PV→E",
@@ -189,35 +185,10 @@ def _load_user_ids(params_dir: Path) -> list[str]:
     return user_ids
 
 
-def _load_audit(path: Path) -> dict[tuple[str, str, str], dict]:
-    """Key: (user_id, theta_key, coefficient_name) -> audit row."""
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Missing audit CSV: {path}\nRun 7_check_direction.py first."
-        )
-    out = {}
-    with path.open(newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            key = (
-                str(r["ParticipantIdentifier"]),
-                str(r["theta_key"]),
-                str(r["coefficient_name"]),
-            )
-            out[key] = {
-                "before": float(r["before"]),
-                "after": float(r["after"]),
-                "target_sign": r["target_sign"],
-                "action": r["action"],
-                "index": int(r["index"]),
-            }
-    return out
-
-
 def _load_all_coefficients(
     params_dir: Path,
-    audit: dict[tuple[str, str, str], dict],
 ) -> tuple[list[dict], dict[str, list[str]], list[tuple[str, str]]]:
-    """One row per user × coefficient from params JSON, merged with audit."""
+    """One row per user × coefficient from params JSON."""
     user_ids = _load_user_ids(params_dir)
     rows: list[dict] = []
     name_orders: dict[str, list[str]] = {}
@@ -250,29 +221,13 @@ def _load_all_coefficients(
             for idx, name in enumerate(names):
                 if _skip_name(name):
                     continue
-                value = float(values[idx])
-                audit_row = audit.get((user_id, theta_key, name))
-                if audit_row is None:
-                    status = "unconstrained"
-                    target_sign = "none"
-                    action = "unconstrained"
-                else:
-                    status = "constrained"
-                    target_sign = audit_row["target_sign"]
-                    action = audit_row["action"]
-                    # Prefer audit after (should match params).
-                    value = float(audit_row["after"])
-
                 rows.append(
                     {
                         "ParticipantIdentifier": user_id,
                         "theta_key": theta_key,
                         "index": idx,
                         "coefficient_name": name,
-                        "value": value,
-                        "status": status,
-                        "target_sign": target_sign,
-                        "action": action,
+                        "value": float(values[idx]),
                     }
                 )
 
@@ -281,31 +236,8 @@ def _load_all_coefficients(
     return rows, name_orders, theta_blocks
 
 
-def _point_color(row: dict) -> str:
-    if row["status"] == "unconstrained":
-        return "#7f7f7f"
-    if row["action"] == "flipped":
-        return "#f4a582"
-    if row["target_sign"] == "nonnegative":
-        return "#2c7bb6"
-    if row["target_sign"] == "nonpositive":
-        return "#d7191c"
-    return "#7f7f7f"
-
-
-def _box_color(rows_for_name: list[dict]) -> str:
-    """Box face color from constraint status of that coefficient name."""
-    if all(r["status"] == "unconstrained" for r in rows_for_name):
-        return "#bdbdbd"
-    sign = next(
-        (r["target_sign"] for r in rows_for_name if r["status"] == "constrained"),
-        "none",
-    )
-    if sign == "nonnegative":
-        return "#2c7bb6"
-    if sign == "nonpositive":
-        return "#d7191c"
-    return "#bdbdbd"
+_POINT_COLOR = "#2c7bb6"
+_BOX_COLOR = "#2c7bb6"
 
 
 def _plot_panel(
@@ -330,7 +262,6 @@ def _plot_panel(
 
     positions = np.arange(1, len(names) + 1)
     box_data = [[r["value"] for r in by_name[n]] for n in names]
-    box_colors = [_box_color(by_name[n]) for n in names]
 
     bp = ax.boxplot(
         box_data,
@@ -342,20 +273,19 @@ def _plot_panel(
         whiskerprops={"linewidth": 1.0},
         capprops={"linewidth": 1.0},
     )
-    for patch, color in zip(bp["boxes"], box_colors):
-        patch.set_facecolor(color)
+    for patch in bp["boxes"]:
+        patch.set_facecolor(_BOX_COLOR)
         patch.set_alpha(0.22)
-        patch.set_edgecolor(color)
+        patch.set_edgecolor(_BOX_COLOR)
 
     rng = np.random.default_rng(0)
     for i, name in enumerate(names):
         vals = np.asarray([r["value"] for r in by_name[name]], dtype=float)
         jitter = rng.uniform(-0.15, 0.15, size=vals.size)
-        colors = [_point_color(r) for r in by_name[name]]
         ax.scatter(
             np.full(vals.size, positions[i]) + jitter,
             vals,
-            c=colors,
+            c=_POINT_COLOR,
             s=18,
             alpha=0.85,
             edgecolors="none",
@@ -365,46 +295,22 @@ def _plot_panel(
     ax.axhline(0.0, color="0.35", linewidth=1.0, linestyle="--", zorder=1)
     ax.set_xticks(positions)
     ax.set_xticklabels([_short_label(n) for n in names], rotation=55, ha="right")
-    ax.set_ylabel("coefficient (after sign correction)")
+    ax.set_ylabel("coefficient")
     ax.set_title(title)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    n_con = sum(1 for n in names for r in by_name[n] if r["status"] == "constrained")
-    n_unc = sum(1 for n in names for r in by_name[n] if r["status"] == "unconstrained")
-    n_bad = 0
-    for name in names:
-        for r in by_name[name]:
-            if r["status"] != "constrained":
-                continue
-            if r["target_sign"] == "nonnegative" and r["value"] < 0:
-                n_bad += 1
-            elif r["target_sign"] == "nonpositive" and r["value"] > 0:
-                n_bad += 1
-
+    n_pts = sum(len(by_name[n]) for n in names)
     ax.text(
         0.01,
         0.99,
-        f"constrained pts={n_con}  unconstrained pts={n_unc}  "
-        f"sign violations={n_bad}",
+        f"n users × coeffs = {n_pts}",
         transform=ax.transAxes,
         va="top",
         ha="left",
         fontsize=9,
         color="0.25",
     )
-
-    legend = [
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#7f7f7f",
-               markersize=7, label="unconstrained"),
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#2c7bb6",
-               markersize=7, label="nonnegative (kept)"),
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#d7191c",
-               markersize=7, label="nonpositive (kept)"),
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#f4a582",
-               markersize=7, label="flipped"),
-    ]
-    ax.legend(handles=legend, loc="upper right", frameon=False, fontsize=8)
 
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -437,15 +343,12 @@ def _plot_overview(
             ax.set_visible(False)
             continue
         vals = np.asarray([r["value"] for r in block_rows], dtype=float)
-        colors = [_point_color(r) for r in block_rows]
         jitter = np.random.default_rng(1).uniform(-0.28, 0.28, size=vals.size)
-        ax.scatter(jitter, vals, c=colors, s=12, alpha=0.7, edgecolors="none")
+        ax.scatter(jitter, vals, c=_POINT_COLOR, s=12, alpha=0.7, edgecolors="none")
         ax.axhline(0.0, color="0.35", linewidth=1.0, linestyle="--")
         ax.set_xticks([])
         short = theta_key.replace("theta_", "").replace("penalized_", "")
-        n_c = sum(1 for r in block_rows if r["status"] == "constrained")
-        n_u = len(block_rows) - n_c
-        ax.set_title(f"{short}\n(c={n_c}, u={n_u})", fontsize=8)
+        ax.set_title(f"{short}\n(n={len(block_rows)})", fontsize=8)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         ax.spines["bottom"].set_visible(False)
@@ -453,10 +356,9 @@ def _plot_overview(
     for j in range(n, len(axes_flat)):
         axes_flat[j].set_visible(False)
 
-    axes_flat[0].set_ylabel("coefficient (after sign correction)")
+    axes_flat[0].set_ylabel("coefficient")
     fig.suptitle(
-        "All environment coefficients after sign correction "
-        "(gray=unconstrained, blue/red=constrained kept, orange=flipped)",
+        "All environment coefficients",
         y=1.02,
         fontsize=11,
     )
@@ -468,12 +370,10 @@ def _plot_overview(
 
 def plot_coefficients(
     params_dir: Path = DEFAULT_PARAMS_DIR,
-    audit_csv: Path = DEFAULT_AUDIT_CSV,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
 ) -> list[Path]:
     params_dir = params_dir.expanduser().resolve()
-    audit = _load_audit(audit_csv.expanduser().resolve())
-    rows, name_orders, theta_blocks = _load_all_coefficients(params_dir, audit)
+    rows, name_orders, theta_blocks = _load_all_coefficients(params_dir)
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -499,19 +399,14 @@ def plot_coefficients(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "Plot all coefficients from direction-corrected params, "
-            "highlighting constrained vs unconstrained."
-        )
+        description="Plot all fitted coefficients from env_para_vanilla/."
     )
     parser.add_argument("--params-dir", type=Path, default=DEFAULT_PARAMS_DIR)
-    parser.add_argument("--audit-csv", type=Path, default=DEFAULT_AUDIT_CSV)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     args = parser.parse_args()
 
     written = plot_coefficients(
         params_dir=args.params_dir,
-        audit_csv=args.audit_csv,
         output_dir=args.output_dir,
     )
     print(f"Wrote {len(written)} figures to {args.output_dir.resolve()}")

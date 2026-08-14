@@ -19,7 +19,7 @@
 #
 # Optional overrides (sbatch --export=...):
 #   STE_PHASE=train|eval|all|aggregate   default all
-#   STE_EXP=1  STE_NOISE=sequential  STE_N_TRAIN=5000  STE_N_EVAL=500  STE_N_STEPS=100000
+#   STE_EXP=1  STE_NOISE=ar1  STE_N_TRAIN=5000  STE_N_EVAL=500  STE_N_STEPS=100000
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")}"
@@ -36,7 +36,7 @@ export MPLCONFIGDIR="${SLURM_SUBMIT_DIR:-$PWD}/.matplotlib"
 
 STE_EXP="${STE_EXP:-1}"
 STE_PHASE="${STE_PHASE:-all}"
-STE_NOISE="${STE_NOISE:-sequential}"
+STE_NOISE="${STE_NOISE:-ar1}"
 STE_N_TRAIN="${STE_N_TRAIN:-5000}"
 STE_N_EVAL="${STE_N_EVAL:-500}"
 STE_N_STEPS="${STE_N_STEPS:-100000}"

@@ -1,18 +1,10 @@
 # %% [markdown]
-# # Combine extracted CSVs into analysis panel (`df_merged.csv`)
+# # Merge extraction CSVs into one decision-time panel
 #
-# Notebook-style script (`# %%` cells). Reads outputs from `1_data_extraction.py`.
-#
-# ## Pipeline
-# 1. Load CSVs and parse dates
-# 2. Build decision-time panel from `hourly_step_counts` (2 rows / day)
-# 3. Merge wearables, pageviews, weekly/daily surveys, interventions
-# 4. Rename duplicate columns from overlapping merges
-# 5. Drop burn-in (first 7 calendar days), add `day` / `week` / `dow`
-# 6. Derive CAE summaries; filter weeks 0 and 13
-#
-# ## Output
-# - `df_merged.csv` → input to `3_standardization.py`
+# Reads the tables from `1_data_extraction.py`, builds two rows per day
+# (morning / afternoon), merges surveys, wear, page views, and interventions,
+# drops burn-in and weeks 0/13, and writes `df_merged.csv`.
+# Next: `3_standardization.py`.
 
 # %% [markdown]
 # ## 0. Setup
@@ -42,10 +34,42 @@ DAILY_SURVEY_COLS = [
     "active_status_fraction_7days",
 ]
 
+# These questionnaire responses use a 1--7 scale. A small number of extracted
+# records encode the minimum response as 0; correct those records before
+# constructing weekly/daily lags or summary scores. Binary presence/status
+# indicators are intentionally excluded because zero is valid for them.
+WEEKLY_ONE_TO_SEVEN_COLS = [
+    "AffectiveValuation",
+    "Exp-tool-1",
+    "Exp-tool-2",
+    *[f"CAE-{i}" for i in range(1, 13)],
+]
+DAILY_ONE_TO_SEVEN_COLS = [
+    "affective_reflection",
+    "anticipated_affect",
+]
+
 
 def _as_str_id(df, col="ParticipantIdentifier"):
     if col in df.columns:
         df[col] = df[col].astype(str)
+    return df
+
+
+def _correct_one_to_seven_zeros(df, columns, *, source):
+    """Replace invalid zero responses with the minimum valid response, one."""
+    corrected = {}
+    for col in columns:
+        if col not in df.columns:
+            continue
+        zero_mask = df[col].eq(0)
+        count = int(zero_mask.sum())
+        if count:
+            df.loc[zero_mask, col] = 1
+            corrected[col] = count
+    if corrected:
+        details = ", ".join(f"{col}={count}" for col, count in corrected.items())
+        print(f"Corrected zero-valued 1--7 responses in {source}: {details}")
     return df
 
 
@@ -59,6 +83,16 @@ df_prior2hours_step = _as_str_id(pd.read_csv(folder / "prior_2hours_step_counts.
 
 df_weekly = _as_str_id(pd.read_csv(folder / "df_weekly_filled.csv"))
 df_daily = _as_str_id(pd.read_csv(folder / "df_daily_filled.csv"))
+df_weekly = _correct_one_to_seven_zeros(
+    df_weekly,
+    WEEKLY_ONE_TO_SEVEN_COLS,
+    source="df_weekly_filled.csv",
+)
+df_daily = _correct_one_to_seven_zeros(
+    df_daily,
+    DAILY_ONE_TO_SEVEN_COLS,
+    source="df_daily_filled.csv",
+)
 
 df_daily_pageview = _as_str_id(pd.read_csv(folder / "df_daily_pageview.csv"))
 df_hourly_pageview = _as_str_id(pd.read_csv(folder / "hourly_pageview.csv"))

@@ -1,15 +1,10 @@
 # %% [markdown]
-# # Standardize `df_merged` → `df_fit.csv` + `std_params.json`
+# # Standardize the merged panel
 #
-# Reads `df_merged.csv` from `2_combine_data_frame.py`.
-#
-# ## Pipeline
-# 1. Select analysis columns
-# 2. Calendar covariates → `*_norm` in [-1, 1]
-# 3. Log-transform count outcomes / pageviews
-# 4. Z-score continuous features; ordinal 0–7 surveys → [-1, 1]
-# 5. Write `std_params.json` (shifts, scales, limits) to `env_para_vanilla/`
-# 6. Add decision-slot lags; save `df_fit.csv`
+# Reads `df_merged.csv`, log-transforms counts, z-scores continuous features,
+# maps Likert items to [-1, 1], and writes `df_fit.csv` plus `std_params.json`
+# (shifts, scales, clip limits) under `env_para_vanilla/`.
+# Next: `4_perceived_utility.py`.
 
 # %% [markdown]
 # ## 0. Setup
@@ -33,8 +28,9 @@ DIGITS = 3
 DAY_RANGE = 84
 WEEK_RANGE = 12
 
-# Ordinal survey items treated as 0..7 (raw export includes occasional 0s).
-LIKERT_MIN = 0
+# Ordinal survey items use a 1..7 scale. Script 2 corrects invalid zeros to one
+# before this standardization step.
+LIKERT_MIN = 1
 LIKERT_MAX = 7
 
 # Columns expected in df_merged (missing cols are skipped with a warning)
@@ -166,10 +162,10 @@ def _likert_norm(
     hi=LIKERT_MAX,
 ):
     """
-    Map ordinal Likert responses on {lo,...,hi} (default 0..7) to [-1, 1].
+    Map ordinal Likert responses on {lo,...,hi} (default 1..7) to [-1, 1].
 
     Uses:  2 * (x - lo) / (hi - lo) - 1
-    so 0 → -1, midpoint 3.5 → 0, 7 → 1.
+    so 1 → -1, midpoint 4 → 0, and 7 → 1.
     Values outside [lo, hi] are set to NaN.
     """
     vals = pd.to_numeric(series, errors="coerce")

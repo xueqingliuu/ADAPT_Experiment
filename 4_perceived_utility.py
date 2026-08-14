@@ -1,67 +1,17 @@
-# %%
-"""
-Joint state-space model for perceived utility E_w with weekly AR dynamics and
-within-week outcomes (J_week, U1, U2, hourly PV, daily FW, daily PJ).
+"""Fit latent weekly perceived utility E_w for each participant.
 
-Likelihood for latent E_2,...,E_W is approximated by 1D quadrature (trapezoid
-over the support of E) with prediction / filtering recursion as on the slides.
-With ``e1_known``, E_1 is the fixed baseline (= week-1 ``perceived_utility_lastweek``);
-E_2 is the state at end of week 1 / start of week 2. Otherwise a Gaussian prior
-on E_1 is estimated.
+E_w is not observed. This script treats it as a 1-D state, approximates the
+likelihood by quadrature, and jointly models the weekly check-in (J, U1, U2)
+and the within-week mediators (page views, Fitbit wear, daily check-in).
+Each participant is fit separately after a pooled initialization.
 
-Study weeks w = 1,...,12 index observation blocks; latent E_w is the state at
-the start of week w (week-w outcomes are conditional on E_w). The AR transition
-after week w yields E_{w+1}; with 12 weeks this produces E_1,...,E_12 in the
-likelihood and a terminal E_13 at end of week 12 (predictive only, no week-13
-data). On each ``df_fit`` row at study week w (1..12), the exported columns are
-``perceived_utility`` = \\hat E_{w+1} (spans E_2,...,E_13; week 12 uses the
-predictive terminal E_13) and ``perceived_utility_lastweek`` = \\hat E_w (spans
-E_1,...,E_12); by construction ``perceived_utility_lastweek`` is the literal
-weekly lag of ``perceived_utility``. ``pred_penalized_filtered_Ew`` in the JSON
-export stores the same E_2,...,E_13 series (one entry per study week 1..12).
+Writes, under ``env_para_vanilla/``:
+    params_env_<uid>.json     E_w / PV / FW / PJ coefficients
+    pred_<uid>.json           filtered E_w trajectory
+    df_fit.csv columns        perceived_utility, perceived_utility_lastweek
 
-Observation models (conditional on latent E_w for that study week). Weekly survey outcomes:
-
-  - J_week (``week_present``): Bernoulli, \\mathrm{logit}(p) = b_0 + b_1 E_w.
-  - U1, U2 (``Exp-tool-1_norm``, ``Exp-tool-2_norm``; only if J_week = 1):
-        U1 \\sim \\mathcal{N}(c_0 + c_1 E_w, \\sigma_{U1}^2),
-        U2 \\sim \\mathcal{N}(d_0 + d_1 E_w, \\sigma_{U2}^2).
-
-Within-week intensive measures:
-
-  - PV (hourly ``HourlyPageviewCount_norm``):  Gaussian,
-        \\mu = \\alpha_0 + \\alpha_1 E_w
-             + \\alpha_{2,\\mathrm{we}}\\,\\mathrm{is\\_weekend}
-             + \\alpha_{2,\\mathrm{dt}}\\,\\mathrm{dt}
-             + \\alpha_{2,\\mathrm{rb}}\\,\\mathrm{recent\\_burden}
-             + \\alpha_{\\mathrm{AR}}\\, z^{\\mathrm{PV,lag1}}
-             + A(\\alpha_3 + \\alpha_4 E_w),
-        where z^{\\mathrm{PV,lag1}} is ``hourly_pageview_count_lag1`` (same row);
-        (is_weekend, dt, recent_burden) from ``is_weekend``, ``DecisionTime``,
-        ``recent_burden_norm``; A = hourly ``WalkingSuggestion``; noise
-        \\sigma_{\\mathrm{PV}}.
-
-  - FW (daily outcome ``nextday_wearing``):  Bernoulli,
-        \\eta = \\beta_0 + \\beta_1 E_w
-             + \\beta_{2,\\mathrm{we}}\\,\\mathrm{is\\_weekend}
-             + \\beta_{2,\\mathrm{rb}}\\,\\mathrm{recent\\_burden}
-             + \\beta_{\\mathrm{AR}}\\, z^{\\mathrm{FW,lag}}
-             + A_0(\\beta_3 + \\beta_4 E_w) + A_1(\\beta_5 + \\beta_6 E_w),
-        where z^{\\mathrm{FW,lag}} is ``morning_wearing`` on the morning row;
-        (is_weekend, recent_burden) from that row; A_0, A_1 from morning/afternoon
-        ``WalkingSuggestion`` .
-
-  - PJ (daily ``daily_present``):  Bernoulli,
-        \\eta = \\theta_0 + \\theta_1 E_w
-             + \\theta_{2,\\mathrm{we}}\\,\\mathrm{is\\_weekend}
-             + \\theta_{2,\\mathrm{rb}}\\,\\mathrm{recent\\_burden}
-             + \\theta_{\\mathrm{AR}}\\, z^{\\mathrm{PJ,lag}}
-             + A_0(\\theta_3 + \\theta_4 E_w) + A_1(\\theta_5 + \\theta_6 E_w),
-        where z^{\\mathrm{PJ,lag}} is ``daily_present_yesterday`` on the morning row;
-        same (is_weekend, burden, A_0, A_1) construction as FW.
-
-Lag covariates are read from ``df_fit`` (aligned per hour or per day); missing
-values are treated as 0 in the linear predictor.
+Query-effect coefficients are *not* fit here; run ``impute_query_effect.py``.
+Next: ``5_fit_vanilla_testbed.py``.
 """
 from __future__ import annotations
 
@@ -80,6 +30,8 @@ import pandas as pd
 from scipy.optimize import minimize
 from scipy.special import logsumexp
 import json
+
+from impute_query_effect import impute_query_action_interaction_effects
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +311,53 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         out["sigma0"] = np.exp(theta[i])
         i += 1
     return out
+
+
+def build_penalized_prior_center(*, e1_known: bool) -> np.ndarray:
+    """Non-zero centers for the per-participant ridge penalty in
+    ``neg_loglik_blocks`` / ``fit_one_user``.
+
+    This replaces an earlier post-hoc sign-flip for
+    theta_penalized_Ew/PV/FW/PJ (M^E -> E_{w+1}; E_w -> M^E; A -> M^E;
+    A*E_w -> M^E). Instead of fitting each participant freely and then
+    reflecting a negative coefficient into a positive one afterwards (which
+    preserves whatever noisy *magnitude* a small per-participant sample
+    happened to produce), the same "should help on average" assumption is
+    asserted directly as the ridge penalty's shrinkage target: each
+    participant's own L-BFGS-B fit is still free to land anywhere the
+    likelihood supports, but sampling noise now gets pulled toward a small
+    plausible value in the expected direction instead of toward 0 (and, on
+    the old approach, potentially reflected to a large value of the wrong
+    sign). Every coefficient not listed here keeps the original zero-centered
+    penalty (nudge = 0).
+
+    Indices are recovered by unpacking a probe vector of its own positions
+    through ``unpack_theta``, so this stays correct if that function's field
+    order ever changes -- except for the log-sigma fields (exponentiated in
+    ``unpack_theta``), which are intentionally left untouched (no
+    informative prior on noise scales).
+    """
+    n = theta_dim(e1_known=e1_known)
+    idx = unpack_theta(np.arange(n, dtype=float), e1_known=e1_known)
+
+    center = np.zeros(n, dtype=float)
+    nudge = 0.05
+    # M^E -> E_{w+1}: more PV/FW/PJ engagement last week shouldn't lower
+    # next week's perceived utility.
+    for name in ("a2", "a3", "a4"):
+        center[int(round(idx[name]))] = nudge
+    # E_w -> M^E: higher perceived utility -> more engagement.
+    for name in ("alpha1", "beta1", "theta1"):
+        center[int(round(idx[name]))] = nudge
+    # A -> M^E (intercept-only): sending a suggestion is a direct
+    # engagement/attention cost, absent any offsetting utility.
+    for name in ("alpha3", "beta3", "beta5", "theta3", "theta5"):
+        center[int(round(idx[name]))] = -nudge
+    # A * E_w -> M^E: that cost should be offset for participants who find
+    # the app more useful.
+    for name in ("alpha4", "beta4", "beta6", "theta4", "theta6"):
+        center[int(round(idx[name]))] = nudge
+    return center
 
 
 def log_pooled_theta(
@@ -1421,278 +1420,6 @@ def write_joint_penalized_into_vanilla_json_files(
         json.dump(pred_penalized, f, allow_nan=False)
 
 
-# Indices into the perceived-utility fitted parameter vectors used for empirical-Bayes imputation.
-# These are based on theta_penalized_PV/FW/PJ.
-
-PV_QUERY_IMPUTE_IDX = np.array([0, 1, 2, 3, 4], dtype=int)
-FB_QUERY_IMPUTE_IDX = np.array([0, 1, 2, 3], dtype=int)
-PJ_QUERY_IMPUTE_IDX = np.array([0, 1, 2, 3], dtype=int)
-
-PV_IMPUTE_K = int(PV_QUERY_IMPUTE_IDX.size)
-FB_IMPUTE_K = int(FB_QUERY_IMPUTE_IDX.size)
-PJ_IMPUTE_K = int(PJ_QUERY_IMPUTE_IDX.size)
-
-PV_STAT_LEN = int(PV_QUERY_IMPUTE_IDX.max() + 1)
-FB_STAT_LEN = int(FB_QUERY_IMPUTE_IDX.max() + 1)
-PJ_STAT_LEN = int(PJ_QUERY_IMPUTE_IDX.max() + 1)
-
-_META_KEY = "_query_interaction_impute"
-
-
-def impute_query_action_interaction_effects(
-    user_ids,
-    *,
-    work_dir: Optional[Path] = None,
-    xi: float = 1.0 / 8.0,
-    digits: int = 3,
-    rng: Optional[np.random.Generator] = None,
-    min_users_for_empirical: int = 2,
-) -> None:
-    """
-    Impute coefficients for an unavailable query/action type using the fitted
-    perceived-utility model parameters.
-
-    This appends imputed coefficients to:
-
-      theta_penalized_PV
-      theta_penalized_FW
-      theta_penalized_PJ
-
-    The function is idempotent: if it was previously run, it removes the previously
-    appended suffix before appending a fresh imputed suffix.
-    """
-    wd = WORK_DIR if work_dir is None else Path(work_dir)
-    wd.mkdir(parents=True, exist_ok=True)
-
-    gen = rng if rng is not None else np.random.default_rng()
-
-    uid_list = [
-        int(u) if isinstance(u, (int, np.integer)) else u
-        for u in np.asarray(user_ids).ravel()
-    ]
-
-    def _strip_imputed_suffix(values: np.ndarray, names: list) -> tuple[np.ndarray, list]:
-        """Strip any trailing ``query_imputed_*`` columns based on the names array.
-
-        This is the source of truth for "is the imputed suffix already present?" —
-        ``_META_KEY`` is treated as advisory only, since merge/overwrite operations
-        elsewhere can desync it from the actual array length.
-        """
-        n_strip = 0
-        for nm in reversed(names):
-            if isinstance(nm, str) and nm.startswith("query_imputed_"):
-                n_strip += 1
-            else:
-                break
-        if n_strip == 0:
-            return values, names
-        if values.size >= n_strip:
-            values = values[:-n_strip]
-        return values, names[:-n_strip]
-
-    def collect_rows(key: str, stat_len: int) -> np.ndarray:
-        rows = []
-
-        for uid in uid_list:
-            p = wd / f"params_env_{uid}.json"
-            if not p.is_file():
-                continue
-
-            with open(p, encoding="utf-8") as f:
-                env = json.load(f)
-
-            t = env.get(key)
-            if t is None:
-                continue
-
-            v = np.asarray(t, dtype=float).ravel()
-            names = list(env.get(f"{key}_names", []))
-            v, _ = _strip_imputed_suffix(v, names)
-
-            if v.size < stat_len:
-                continue
-
-            rows.append(v[:stat_len].copy())
-
-        if not rows:
-            return np.zeros((0, stat_len), dtype=float)
-
-        return np.stack(rows, axis=0)
-
-    def population_sample(
-        rows: np.ndarray,
-        idx: np.ndarray,
-        stat_len: int,
-        n_user: int,
-    ) -> np.ndarray:
-        if rows.shape[0] < min_users_for_empirical:
-            mean_full = np.zeros(stat_len, dtype=float)
-            var_full = np.full(stat_len, (0.05 * xi) ** 2, dtype=float)
-        else:
-            x = np.abs(rows)
-
-            mean_full = np.mean(x, axis=0) * xi
-            if stat_len > 1:
-                mean_full[0] = 2.0 * np.mean(mean_full[1:])
-
-            x = x * xi
-            var_full = np.var(x, axis=0)
-            if stat_len > 1:
-                var_full[0] = 4.0 * np.mean(var_full[1:])
-
-        var_full = np.maximum(var_full, 1e-12)
-
-        draws = gen.normal(
-            mean_full,
-            np.sqrt(var_full),
-            size=(n_user, stat_len),
-        )
-
-        sub = draws[:, idx]
-        return np.round(sub, digits)
-
-    # Use perceived-utility model keys, not old vanilla keys.
-    pv_rows = collect_rows("theta_penalized_PV", PV_STAT_LEN)
-    fb_rows = collect_rows("theta_penalized_FW", FB_STAT_LEN)
-    pj_rows = collect_rows("theta_penalized_PJ", PJ_STAT_LEN)
-
-    pv_s = population_sample(
-        pv_rows,
-        PV_QUERY_IMPUTE_IDX,
-        PV_STAT_LEN,
-        len(uid_list),
-    )
-    fb_s = population_sample(
-        fb_rows,
-        FB_QUERY_IMPUTE_IDX,
-        FB_STAT_LEN,
-        len(uid_list),
-    )
-    pj_s = population_sample(
-        pj_rows,
-        PJ_QUERY_IMPUTE_IDX,
-        PJ_STAT_LEN,
-        len(uid_list),
-    )
-
-    for i, uid in enumerate(uid_list):
-        p_env = wd / f"params_env_{uid}.json"
-        if not p_env.is_file():
-            continue
-
-        with open(p_env, encoding="utf-8") as f:
-            env_para = json.load(f)
-
-        meta_root = env_para.get(_META_KEY)
-        if not isinstance(meta_root, dict):
-            meta_root = {}
-
-        def load_base(key: str) -> tuple[np.ndarray, list]:
-            t = np.asarray(env_para.get(key, []), dtype=float).ravel()
-            nm = list(env_para.get(f"{key}_names", []))
-            t_stripped, nm_stripped = _strip_imputed_suffix(t, nm)
-            return t_stripped, nm_stripped
-
-        old_pv, old_pv_names = load_base("theta_penalized_PV")
-        old_fb, old_fb_names = load_base("theta_penalized_FW")
-        old_pj, old_pj_names = load_base("theta_penalized_PJ")
-
-        new_pv = pv_s[i].astype(float, copy=True)
-        new_fb = fb_s[i].astype(float, copy=True)
-        new_pj = pj_s[i].astype(float, copy=True)
-
-        # Sign rules for the imputed query/action coefficients.
-        # Current lengths:
-        #   new_pv: 5 entries, valid indices 0..4
-        #   new_fb: 4 entries, valid indices 0..3
-        #   new_pj: 4 entries, valid indices 0..3
-
-        # PV imputed suffix:
-        # [query_intercept_like, query_Ew_like, query_weekend_like,
-        #  query_decision_time_like, query_recent_burden_like]
-        new_pv[0] = -np.abs(new_pv[0])
-        new_pv[1] = np.abs(new_pv[1])
-        new_pv[2] = -np.abs(new_pv[2])
-        new_pv[3] = -np.abs(new_pv[3])
-        new_pv[4] = -np.abs(new_pv[4])
-
-        # FW imputed suffix:
-        # [query_intercept_like, query_Ew_like, query_weekend_like,
-        #  query_recent_burden_like]
-        new_fb[0] = -np.abs(new_fb[0])
-        new_fb[1] = np.abs(new_fb[1])
-        new_fb[2] = -np.abs(new_fb[2])
-        new_fb[3] = -np.abs(new_fb[3])
-
-        # PJ imputed suffix:
-        # [query_intercept_like, query_Ew_like, query_weekend_like,
-        #  query_recent_burden_like]
-        new_pj[0] = -np.abs(new_pj[0])
-        new_pj[1] = np.abs(new_pj[1])
-        new_pj[2] = -np.abs(new_pj[2])
-        new_pj[3] = -np.abs(new_pj[3])
-
-        env_para["theta_penalized_PV"] = np.round(
-            np.concatenate([old_pv, new_pv]),
-            digits,
-        ).tolist()
-
-        env_para["theta_penalized_FW"] = np.round(
-            np.concatenate([old_fb, new_fb]),
-            digits,
-        ).tolist()
-
-        env_para["theta_penalized_PJ"] = np.round(
-            np.concatenate([old_pj, new_pj]),
-            digits,
-        ).tolist()
-
-        env_para["theta_penalized_PV_names"] = old_pv_names + [
-            "query_imputed_intercept_like",
-            "query_imputed_Ew_like",
-            "query_imputed_weekend_like",
-            "query_imputed_decision_time_like",
-            "query_imputed_recent_burden_like",
-        ]
-
-        env_para["theta_penalized_FW_names"] = old_fb_names + [
-            "query_imputed_intercept_like",
-            "query_imputed_Ew_like",
-            "query_imputed_weekend_like",
-            "query_imputed_recent_burden_like",
-        ]
-
-        env_para["theta_penalized_PJ_names"] = old_pj_names + [
-            "query_imputed_intercept_like",
-            "query_imputed_Ew_like",
-            "query_imputed_weekend_like",
-            "query_imputed_recent_burden_like",
-        ]
-
-        # Sanity-check that array lengths line up with the names arrays.
-        for key, expected_k in (
-            ("theta_penalized_PV", PV_IMPUTE_K),
-            ("theta_penalized_FW", FB_IMPUTE_K),
-            ("theta_penalized_PJ", PJ_IMPUTE_K),
-        ):
-            arr_len = len(env_para[key])
-            nm_len = len(env_para[f"{key}_names"])
-            if arr_len != nm_len:
-                raise RuntimeError(
-                    f"Participant {uid}: {key} length {arr_len} != "
-                    f"{key}_names length {nm_len} after imputation "
-                    f"(expected suffix k={expected_k})."
-                )
-
-        meta_root["theta_penalized_PV"] = {"k": PV_IMPUTE_K}
-        meta_root["theta_penalized_FW"] = {"k": FB_IMPUTE_K}
-        meta_root["theta_penalized_PJ"] = {"k": PJ_IMPUTE_K}
-        env_para[_META_KEY] = meta_root
-
-        with open(p_env, "w", encoding="utf-8") as f:
-            json.dump(env_para, f, allow_nan=False)
-
-
 def _terminal_predicted_mean(
     grid: np.ndarray,
     weights: np.ndarray,
@@ -1915,12 +1642,125 @@ def quadrature_loglik(
 
 
 
-def neg_loglik_blocks(theta, blocks, grid, weights, e1_known, lam=0.5):
+# ``a1`` (theta[1]) is E_w's own week-to-week persistence, box-constrained to
+# (-0.98, 0.98) in ``make_bounds``. That bound alone is not sufficient for
+# stability, though: E_w also feeds back into E_{w+1} indirectly through
+# PV/FW/PJ: E_w -> M^E (this week's mediators, via alpha1/beta1/theta1 and
+# their action interactions) -> PV_w/FW_w/PJ_w -> E_{w+1} (via a2/a3/a4).
+# Linearizing that whole path (including a1 itself) gives a *compound* loop
+# gain
+#   g = a1 + a2 * dPV_w/dE_w + a3 * dFW_w/dE_w + a4 * dPJ_w/dE_w.
+# A gain >= 1 produces a saturating-random-walk failure mode: once E_w drifts
+# to its clip floor/ceiling it stays there under any policy for the rest of
+# the horizon, silencing the M^E -> E_w -> M^E/CAE feedback pathway that
+# should otherwise counterbalance a persistently-applied action.
+#
+# The weekly summaries feeding a2/a3/a4 are fixed-denominator *averages*, not
+# sums: ``build_user_blocks`` forms ``nansum(pv)/14`` and ``nansum(FW|PJ)/7``,
+# and ``vani_env._week_means_from_arrays`` uses the identical convention at
+# simulation time. A unit shift in E_w shifts every slot (day) of the week by
+# the same per-slot slope, so the weekly average shifts by exactly that slope
+# -- there is no 14x or 7x accumulation. dFW_w/dE_w and dPJ_w/dE_w additionally
+# carry the logistic slope pi*(1-pi), fixed at its largest-magnitude value 0.25
+# at pi=0.5, so the penalty errs toward extra stability rather than needing a
+# nested per-user prevalence estimate solved inside the optimizer. Both a
+# "never suggest" (A=0) and "always suggest" (A=1) week are penalized, since g
+# is close to affine in the fraction of slots suggested and these two bracket
+# the range seen in simulation.
+#
+# The conservative pi=0.5 proxy can still be fooled: for a participant whose
+# real FW/PJ prevalence is far from 50/50 (e.g. uid 151, who empirically wears
+# the Fitbit ~87% of days but completes the daily check-in on only ~4%), the
+# true pi*(1-pi) is much smaller than 0.25, so the real FW/PJ->E_w feedback is
+# weaker than what the conservative g sees. The fit can then satisfy the
+# barrier by letting a2/a3/a4 (poorly identified from only 12 weekly
+# observations, especially when FW/PJ are themselves near-constant) cancel a1
+# in the *conservative* g, while a1 itself still sits pinned at the +-0.98
+# boundary -- unsafe in its own right, just masked by an over-generous proxy
+# for the mediator path. The secondary barrier below re-adds a direct, much
+# weaker penalty on a1 alone (on top of, not instead of, the compound-g
+# barrier) so a1 cannot coast to the boundary by exploiting that gap.
+LOGISTIC_SLOPE_PROXY = 0.25  # pi*(1-pi) at pi=0.5 (conservative upper bound)
+LOOP_GAIN_BARRIER_WEIGHT = 3.0
+LOOP_GAIN_DENOM_FLOOR = 1e-3  # keeps the barrier finite (no NaNs) even if |g| overshoots 1 mid-optimization
+A1_INDEX = 1
+A1_LIGHT_BARRIER_WEIGHT = 1.0  # weaker than the compound barrier's effective weight; a secondary guard, not the primary defense
+
+
+def _loop_gain_barrier_term(g: float) -> float:
+    """Smooth barrier that is ~0 for small |g|, grows sharply as |g| -> 1,
+    and stays finite (still large, still pushing back) for |g| >= 1 -- unlike
+    arctanh(g)^2, this never hits a domain error, which matters here because
+    g (unlike a1) is not box-constrained and can transiently leave (-1, 1)
+    during optimization.
+    """
+    g2 = g * g
+    denom = max(1.0 - g2, LOOP_GAIN_DENOM_FLOOR)
+    return LOOP_GAIN_BARRIER_WEIGHT * g2 / denom
+
+
+def _a1_light_barrier_penalty(theta: np.ndarray) -> float:
+    """Light-touch Fisher-z barrier on a1 alone, ~3x weaker than the barrier
+    that used to be the sole guard on a1 before the compound-g barrier was
+    added. See the comment above for why a1-only safety is still needed even
+    with the compound barrier in place.
+    """
+    a1 = float(np.asarray(theta, dtype=float)[A1_INDEX])
+    return A1_LIGHT_BARRIER_WEIGHT * float(np.arctanh(a1) ** 2)
+
+
+def _loop_gain_penalty(theta: np.ndarray, e1_known: bool) -> float:
+    p = unpack_theta(theta, e1_known=e1_known)
+    a1, a2, a3, a4 = p["a1"], p["a2"], p["a3"], p["a4"]
+    alpha1, alpha4 = p["alpha1"], p["alpha4"]
+    beta1, beta4, beta6 = p["beta1"], p["beta4"], p["beta6"]
+    theta1, theta4, theta6 = p["theta1"], p["theta4"], p["theta6"]
+
+    # Weekly summaries are fixed-denominator averages, so each derivative is the
+    # per-slot (per-day) slope itself; see the note above the constants.
+    dPV_zero = alpha1
+    dPV_always = alpha1 + alpha4
+    dFW_zero = LOGISTIC_SLOPE_PROXY * beta1
+    dFW_always = LOGISTIC_SLOPE_PROXY * (beta1 + beta4 + beta6)
+    dPJ_zero = LOGISTIC_SLOPE_PROXY * theta1
+    dPJ_always = LOGISTIC_SLOPE_PROXY * (theta1 + theta4 + theta6)
+
+    g_zero = a1 + a2 * dPV_zero + a3 * dFW_zero + a4 * dPJ_zero
+    g_always = a1 + a2 * dPV_always + a3 * dFW_always + a4 * dPJ_always
+    return (
+        _loop_gain_barrier_term(g_zero)
+        + _loop_gain_barrier_term(g_always)
+        + _a1_light_barrier_penalty(theta)
+    )
+
+
+def neg_loglik_blocks(theta, blocks, grid, weights, e1_known, lam=0.5, prior_center=None):
+    """Per-participant penalized negative log-likelihood.
+
+    ``prior_center`` (default all-zero, i.e. the original behavior) lets the
+    L2 penalty shrink toward a non-zero target for specific coefficients
+    instead of toward 0. This is used to assert theory-driven monotonicity
+    assumptions (e.g. "an intervention should not increase burden-adjusted
+    engagement") as a *population-level nudge* baked into every participant's
+    own ridge penalty, rather than fitting freely and sign-flipping the
+    result post-hoc. See PENALIZED_PRIOR_CENTER.
+
+    In addition to that per-coefficient ridge, the *compound* loop gain
+    through E_w's own persistence (a1) and its indirect PV/FW/PJ feedback
+    path gets a barrier penalty, plus a lighter secondary barrier directly
+    on a1 alone (as a backstop for participants whose real FW/PJ
+    prevalence is far enough from 50/50 that the compound barrier's
+    conservative proxy under-penalizes it); see ``_loop_gain_penalty``.
+    """
     try:
         out = quadrature_loglik(blocks, theta, grid, weights, e1_known=e1_known)
         if not np.isfinite(out["loglik"]):
             return 1e100
-        penalty = lam * np.sum(theta ** 2)
+        center = 0.0 if prior_center is None else prior_center
+        penalty = (
+            lam * np.sum((theta - center) ** 2)
+            + _loop_gain_penalty(theta, e1_known)
+        )
         return -out["loglik"] + penalty
     except FloatingPointError:
         return 1e100
@@ -2329,6 +2169,7 @@ def fit_one_user(
     hourly_pv=True,
     x0: Optional[np.ndarray] = None,
     lam: float = 0.5,
+    prior_center: Optional[np.ndarray] = None,
     uid: Optional[str] = None,
 ):
     blocks = build_user_blocks(
@@ -2364,7 +2205,7 @@ def fit_one_user(
     res, restarts = _minimize_with_restarts(
         neg_loglik_blocks,
         x0,
-        args=(blocks, grid, weights, e1_known, lam),
+        args=(blocks, grid, weights, e1_known, lam, prior_center),
         bounds=make_bounds(e1_known=e1_fixed),
         maxiter=maxiter,
         maxfun=300000,
@@ -2432,6 +2273,7 @@ def fit_all_users(
     hourly_pv=True,
     pooled_x0: Optional[np.ndarray] = None,
     lam: float = 0.5,
+    prior_center: Optional[np.ndarray] = None,
     merge_into_vanilla_json: bool = False,
     vanilla_work_dir: Optional[Path] = None,
     json_digits: int = 3,
@@ -2478,6 +2320,7 @@ def fit_all_users(
         "hourly_pv": hourly_pv,
         "x0": pooled_x0,
         "lam": lam,
+        "prior_center": prior_center,
     }
     results = {}
     filtered_states = {}
@@ -2882,7 +2725,10 @@ if __name__ == "__main__":
     else:
         print("Pooled fit did not converge; consider adjusting bounds / maxfun / ftol.")
 
-    # Stage 2: user-specific fits initialized at pooled estimate
+    # Stage 2: user-specific fits initialized at pooled estimate. prior_center
+    # bakes the "should help on average" monotonicity assumptions into
+    # each participant's own ridge penalty, instead of shrinking every
+    # coefficient toward 0 and reflecting negative outcomes afterwards.
     _e1_known = 2.0
     results, filtered_states, blocks_by_user = fit_all_users(
         df_fit,
@@ -2891,6 +2737,7 @@ if __name__ == "__main__":
         maxiter=500,
         pooled_x0=pooled_x0,
         lam=0.5,
+        prior_center=build_penalized_prior_center(e1_known=(_e1_known is not None)),
         merge_into_vanilla_json=True,
         vanilla_work_dir=WORK_DIR,
         json_digits=3,

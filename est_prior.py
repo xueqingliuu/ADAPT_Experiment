@@ -34,8 +34,9 @@ PF features differ from the env generative model in three respects (see
   1. fourSC / antic regressions are restricted to RL-controlled rows
      (Mon–Sat only — 12 slots / 6 days per week; Sunday is dropped).
   2. The fourSC PF model drops the ``stepCountNext4HourLag1`` AR-1 term
-     entirely, and ``dailyAnticipatedAffectYesterday`` is cleared at the first
-     day (Monday), matching the PF's week-boundary lag clearing.
+     entirely (plus pageview-EMA and anticipated-affect predictors). The
+     antic PF model matches ``gen_antic_mean`` column-for-column, except
+     ``anticipated_affect_yesterday`` is cleared at Monday.
   3. ``caeAverageLastWeek`` (in fourSC/antic/CAE) and ``perceivedUtilityLastWeek``
      (in fourSC/antic) are substituted at runtime with per-particle
      belief / agent E_w. This is a feature-substitution mechanism and does
@@ -96,6 +97,11 @@ from algorithm_helpers import (
     build_phi_action,
     build_phi_action_rewardshaping,
     build_phi_bottleneck,
+)
+from vani_env import (
+    THETA_ANTIC_NAMES,
+    THETA_CAE_NAMES,
+    within_week_ewma,
 )
 
 
@@ -560,24 +566,6 @@ THETA_FOURSC_NAMES = [
     "Ah*perceivedUtilityLastWeek", "Ah*caeAverageLastWeek",
 ]
 
-THETA_ANTIC_NAMES = [
-    "intercept", "dailyAnticipatedAffectYesterday", "todayStepCount",
-    "activityStatusToday", "salienceMessageSentToday", "isWeekend",
-    "perceivedUtilityLastWeek", "caeAverageLastWeek",
-    "ws_morning", "ws_afternoon",
-    "ws_morning*salienceMessageSentToday", "ws_afternoon*salienceMessageSentToday",
-    "ws_morning*isWeekend", "ws_afternoon*isWeekend",
-    "ws_morning*perceivedUtilityLastWeek",
-    "ws_afternoon*perceivedUtilityLastWeek",
-    "ws_morning*caeAverageLastWeek", "ws_afternoon*caeAverageLastWeek",
-]
-
-THETA_CAE_NAMES = (
-    ["intercept", "caeAverageLastWeek", "week_norm"]
-    + [f"fourSC_slot_{j}" for j in range(14)]
-    + [f"antic_day_{j}" for j in range(7)]
-)
-
 THETA_CAE_SHORT_NAMES = ["intercept", "caeAverage"]
 
 
@@ -650,10 +638,11 @@ def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
 def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """Antic PF design matrix and target (one row per day, morning row).
 
-    Differs from ``gen_antic_mean`` in two PF-specific ways:
+    Matches ``vani_env.gen_antic_mean`` / ``algorithm_helpers.build_antic_features``,
+    with two PF-specific shapings:
       * Only 6 RL-controlled days per week (Mon–Sat) are kept; Sunday is
         dropped.
-      * ``dailyAnticipatedAffectYesterday`` (the antic AR-1 column) is set to
+      * ``anticipated_affect_yesterday`` (the antic AR-1 column) is set to
         0 on the first day of each week (Monday), matching the PF's
         week-boundary lag clearing.
 
@@ -666,12 +655,17 @@ def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     n = len(dat_am)
     int_ = np.ones(n)
     antic_yest = _fill_nan(dat_am["anticipated_affect_yesterday_norm"].to_numpy())
-    todayStepCount = _fill_nan(dat_am["TodayStepCount_norm"].to_numpy())
     act = _fill_nan(dat_am["active_status"].to_numpy())
-    sal_msg = _fill_nan(dat_am["SalienceMessage"].to_numpy())
     is_weekend = dat_am["is_weekend"].to_numpy()
     pu = _fill_nan(dat_am["perceived_utility_lastweek"].to_numpy())
     cae = _fill_nan(dat_am["CAE_avg_lastweek_norm"].to_numpy())
+    rb = _fill_nan(
+        dat_am[
+            "recent_burden_norm"
+            if "recent_burden_norm" in dat_am.columns
+            else "recentBurdenEma_norm"
+        ].to_numpy()
+    )
 
     # Per-day WS pair (rows of dat alternate AM, PM for each Date).
     WS_all = dat["WalkingSuggestion"].to_numpy().astype(float)
@@ -680,12 +674,12 @@ def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     ws_a = pair[:n, 1]
 
     X = np.column_stack([
-        int_, antic_yest, todayStepCount, act, sal_msg, is_weekend, pu, cae,
+        int_, antic_yest, act, is_weekend, pu, cae, rb,
         ws_m, ws_a,
-        ws_m * sal_msg, ws_a * sal_msg,
         ws_m * is_weekend, ws_a * is_weekend,
         ws_m * pu, ws_a * pu,
         ws_m * cae, ws_a * cae,
+        ws_m * rb, ws_a * rb,
     ])
     y = dat_am["anticipated_affect_norm"].to_numpy(dtype=float)
     assert X.shape[1] == len(THETA_ANTIC_NAMES)
@@ -706,7 +700,7 @@ def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _build_CAE_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """Weekly CAE design (24 features = [1, CAE_lw, week, 14 fourSC slots, 7 antic days])."""
+    """Weekly CAE design: [1, CAE_lw, week, fourSC_ewma, antic_ewma]."""
     n_w = len(dat) // K_SLOTS_WEEK
     dat = dat.iloc[: n_w * K_SLOTS_WEEK]
     cae_y = dat["CAE_avg_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)[:, 0]
@@ -721,8 +715,17 @@ def _build_CAE_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     antic = dat["anticipated_affect_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)
     antic = np.where(np.isnan(antic), mu_antic, antic).reshape(-1, 7, 2).mean(axis=2)
 
-    X = np.hstack([
-        np.ones((n_w, 1)), cae_lw[:, None], week[:, None], foursc, antic,
+    foursc_e = np.array(
+        [within_week_ewma(row) for row in foursc],
+        dtype=float,
+    )
+    antic_e = np.array(
+        [within_week_ewma(row) for row in antic],
+        dtype=float,
+    )
+
+    X = np.column_stack([
+        np.ones(n_w), cae_lw, week, foursc_e, antic_e,
     ])
     assert X.shape[1] == len(THETA_CAE_NAMES)
     return X, cae_y
