@@ -27,21 +27,21 @@ NOISY_FIELD = "cae_runs"         # realized (with noise)
 CAE_YLIM = (0, 7)                # raw CAE scale used in overview plots
 
 markers = {
-    "micro_g0":   "o:",
-    "micro_g05":  "o-",
-    "mtd_g0":     "^:",
-    "mtd_g05":    "^-",
-    "rs_g0":      "s:",
-    "rs_g05":     "s-",
-    "rs_mtd_g0":  "d:",
-    "rs_mtd_g05": "d-",
+    "micro_g05":  "o:",
+    "micro_g09":  "o-",
+    "mtd_g05":    "^:",
+    "mtd_g09":    "^-",
+    "rs_g05":     "s:",
+    "rs_g09":     "s-",
+    "rs_mtd_g05": "d:",
+    "rs_mtd_g09": "d-",
     "never_send":  "x-",
     "always_send": "*-",
     "random_send": "+-",
 }
 
-# γ̄=0.5 RL policies only (exclude always_send / random_send baselines).
-GAMMA05_ALGOS = ("micro_g05", "mtd_g05", "rs_g05", "rs_mtd_g05")
+# γ̄=0.9 RL policies only (exclude always_send / random_send baselines).
+GAMMA09_ALGOS = ("micro_g09", "mtd_g09", "rs_g09", "rs_mtd_g09")
 NEVER_SEND_BASELINE = "never_send"
 
 
@@ -294,19 +294,19 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks)
     plt.close(fig)
 
 
-def make_gamma05_minus_never_plot(all_cae_full, kind, suffix, *, out, labels, weeks):
-    """Plot paired CAE difference: each γ̄=0.5 policy minus never_send."""
+def make_gamma09_minus_never_plot(all_cae_full, kind, suffix, *, out, labels, weeks):
+    """Plot paired CAE difference: each γ̄=0.9 policy minus never_send."""
     if NEVER_SEND_BASELINE not in all_cae_full:
         print(
             f"\nWARNING: '{NEVER_SEND_BASELINE}' missing; "
-            f"skipping γ̄=0.5 minus-never plot ({suffix})."
+            f"skipping γ̄=0.9 minus-never plot ({suffix})."
         )
         return
 
     baseline = all_cae_full[NEVER_SEND_BASELINE][..., 1:]
-    names = [n for n in GAMMA05_ALGOS if n in all_cae_full]
+    names = [n for n in GAMMA09_ALGOS if n in all_cae_full]
     if not names:
-        print(f"\nWARNING: no γ̄=0.5 algorithms found; skipping minus-never plot ({suffix}).")
+        print(f"\nWARNING: no γ̄=0.9 algorithms found; skipping minus-never plot ({suffix}).")
         return
 
     diffs = {n: all_cae_full[n][..., 1:] - baseline for n in names}
@@ -333,7 +333,7 @@ def make_gamma05_minus_never_plot(all_cae_full, kind, suffix, *, out, labels, we
     ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
     ax.set_xlabel("Week")
     ax.set_ylabel("CAE difference (raw scale)")
-    ax.set_title(f"γ̄=0.5 CAE − never_send (± SE) — {kind}, raw scale")
+    ax.set_title(f"γ̄=0.9 CAE − never_send (± SE) — {kind}, raw scale")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
@@ -346,13 +346,13 @@ def make_gamma05_minus_never_plot(all_cae_full, kind, suffix, *, out, labels, we
     ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
     ax.set_xlabel("Week")
     ax.set_ylabel("Cumulative-average CAE difference (raw scale)")
-    ax.set_title(f"Average-over-time γ̄=0.5 CAE − never_send — {kind}, raw scale")
+    ax.set_title(f"Average-over-time γ̄=0.9 CAE − never_send — {kind}, raw scale")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(out / f"gamma05_minus_never_{suffix}.png", dpi=150, bbox_inches="tight")
-    fig.savefig(out / f"gamma05_minus_never_{suffix}.pdf", bbox_inches="tight")
+    fig.savefig(out / f"gamma09_minus_never_{suffix}.png", dpi=150, bbox_inches="tight")
+    fig.savefig(out / f"gamma09_minus_never_{suffix}.pdf", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -486,7 +486,7 @@ def main() -> None:
             out=out, labels=labels, all_piA=all_piA, weeks=weeks, rl_weeks=rl_weeks,
         )
         write_summary(stats, kind, suffix, out=out)
-        make_gamma05_minus_never_plot(
+        make_gamma09_minus_never_plot(
             all_cae_full, kind, suffix, out=out, labels=labels, weeks=weeks,
         )
 

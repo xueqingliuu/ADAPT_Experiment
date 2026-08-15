@@ -2,9 +2,9 @@
 
 STE is the same quantity as ``ste_vanilla.py``: for each participant, never-suggest
 vs a treatment policy, then ``(mean_G_treat - mean_G_control) / sd(G_control)``,
-averaged over users. This script does **not** train DQNs. It multiplies a small
-set of coefficients by a scalar ``kappa`` and simulates cheap policies until the
-proxy STE hits the target.
+averaged over users. This script does **not** train DiscreteCQL. It multiplies a
+small set of coefficients by a scalar ``kappa`` and simulates cheap policies
+until the proxy STE hits the target.
 
 Commands
     diagnose    E_w and CAE loop gains (no simulation)
@@ -14,9 +14,9 @@ Commands
 
 How STE is measured here
     Treatment arms are constant suggestion rates (``--policy-grid``, default
-    0.5 and 1.0). Optionally add a already-trained DQN with ``--dqn-exp``;
-    that network is only evaluated, not retrained. The reported STE is a
-    lower bound on a DQN trained inside the tuned environment.
+    0.5 and 1.0). Optionally add an already-trained DiscreteCQL policy with
+    ``--dqn-exp``; that network is only evaluated, not retrained. The reported
+    STE is a lower bound on DiscreteCQL trained inside the tuned environment.
 
 Which coefficients are scaled (``--knob``, default ``action``)
     action    walking-suggestion effects on both benefit (step-count /
@@ -33,7 +33,7 @@ Stability
 
 Cluster
     ``sbatch run_tune_ste.sh`` runs calibrate, then submits ``run_ste.sh`` in
-    each written folder so a fresh DQN measures the true STE.
+    each written folder so a fresh DiscreteCQL policy measures the true STE.
 
 Use a tuned folder instead of vanilla::
 
@@ -53,7 +53,13 @@ from typing import Callable, Sequence
 
 import numpy as np
 
-from ste_vanilla import _model_metadata_path, rollout_total_cae
+from ste_vanilla import (
+    ADVANTAGE_MARGIN,
+    STE_ALGO,
+    STE_OBSERVATION_SCALER,
+    _model_metadata_path,
+    rollout_total_cae,
+)
 from vani_env import (
     PARAMS_DIR,
     THETA_ANTIC_NAMES,
@@ -312,8 +318,8 @@ class ProxySpec:
     arms buy a tighter lower bound at the cost of more bias and more compute.
 
     ``dqn_model_dir`` points at a directory of ``ste_vanilla.py`` checkpoints
-    (``user<uid>_model.d3``); when set, each participant's trained DQN is added
-    as one more treatment arm.
+    (``user<uid>_model.d3``); when set, each participant's trained DiscreteCQL
+    policy is added as one more treatment arm.
     """
 
     episodes: int = 100
@@ -328,12 +334,12 @@ _DQN_CACHE: dict[str, object] = {}
 
 
 def load_dqn(model_dir: Path, uid: int, *, nweek: int, noise: str):
-    """Load a ``ste_vanilla.py`` DQN checkpoint, validating what must match.
+    """Load a ``ste_vanilla.py`` DiscreteCQL checkpoint, validating what must match.
 
-    ``userid``/``nweek``/``noise`` have to agree or the policy is being applied
-    to a different problem than it was trained on. The fitted parameters are
-    deliberately *not* checked: evaluating a baseline-trained policy in a
-    rescaled environment is the entire point.
+    ``userid``/``nweek``/``noise``/``algo`` have to agree or the policy is being
+    applied to a different problem than it was trained on. The fitted
+    parameters are deliberately *not* checked: evaluating a baseline-trained
+    policy in a rescaled environment is the entire point.
     """
     cache_key = f"{model_dir}|{uid}"
     if cache_key in _DQN_CACHE:
@@ -350,10 +356,18 @@ def load_dqn(model_dir: Path, uid: int, *, nweek: int, noise: str):
         raise FileNotFoundError(f"{meta_path} missing; retrain the STE model.")
     with open(meta_path, encoding="utf-8") as f:
         meta = json.load(f)
-    for name, expected in (("userid", uid), ("nweek", nweek), ("noise", noise)):
+    expected_meta = {
+        "userid": uid,
+        "nweek": nweek,
+        "noise": noise,
+        "algo": STE_ALGO,
+        "advantage_margin": ADVANTAGE_MARGIN,
+        "observation_scaler": STE_OBSERVATION_SCALER,
+    }
+    for name, expected in expected_meta.items():
         if meta.get(name) != expected:
             raise ValueError(
-                f"DQN checkpoint {path.name} mismatch on {name}: "
+                f"DiscreteCQL checkpoint {path.name} mismatch on {name}: "
                 f"trained={meta.get(name)!r}, evaluating={expected!r}"
             )
 
@@ -827,7 +841,7 @@ def require_fitted_blocks(params_dir: Path, user_ids: Sequence[int]) -> None:
 
 
 def require_dqn_checkpoints(spec: ProxySpec, user_ids: Sequence[int]) -> None:
-    """Fail before any rollouts if the DQN arm cannot be served for every user."""
+    """Fail before any rollouts if the DiscreteCQL arm cannot be served."""
     if not spec.dqn_model_dir:
         return
     try:
@@ -847,7 +861,22 @@ def require_dqn_checkpoints(spec: ProxySpec, user_ids: Sequence[int]) -> None:
             f"participants: {missing}\nTrain them with `python ste_vanilla.py train "
             "<jobid> --exp <exp>` (one job per user_ids.txt index)."
         )
-    print(f"DQN arm: {len(user_ids)} checkpoints from {model_dir}")
+    wrong_algo = []
+    for uid in user_ids:
+        meta_path = _model_metadata_path(model_dir / f"user{uid}_model.d3")
+        if not meta_path.is_file():
+            raise SystemExit(f"{meta_path} missing; retrain the STE model.")
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        if meta.get("algo") != STE_ALGO:
+            wrong_algo.append((int(uid), meta.get("algo")))
+    if wrong_algo:
+        raise SystemExit(
+            f"{model_dir} checkpoints are not {STE_ALGO} "
+            f"(found {wrong_algo[:5]}{'...' if len(wrong_algo) > 5 else ''}). "
+            "Retrain with the current ste_vanilla.py DiscreteCQL trainer."
+        )
+    print(f"DiscreteCQL arm: {len(user_ids)} checkpoints from {model_dir}")
 
 
 def summarise(result: dict, label: str = "") -> None:
@@ -863,7 +892,7 @@ def summarise(result: dict, label: str = "") -> None:
         )
     won = [r["best_policy"] for r in users]
     if "dqn" in won:
-        print(f"  DQN arm won for {won.count('dqn')} of {len(won)} participants")
+        print(f"  DiscreteCQL arm won for {won.count('dqn')} of {len(won)} participants")
 
 
 def _json_safe(obj):
@@ -977,7 +1006,7 @@ def cmd_calibrate(args) -> None:
     print(f"knob '{knob.name}': {knob.doc}")
     arms = [f"Bernoulli p in {spec.policy_grid}"]
     if spec.dqn_model_dir:
-        arms.append(f"DQN from {Path(spec.dqn_model_dir).name}")
+        arms.append(f"DiscreteCQL from {Path(spec.dqn_model_dir).name}")
     print(f"proxy: max over [{', '.join(arms)}] vs never-suggest, "
           f"{spec.episodes} paired episodes/arm, {len(user_ids)} participants")
     if args.proxy_to_true != 1.0:
@@ -1128,7 +1157,7 @@ def cmd_calibrate(args) -> None:
         raise SystemExit(code)
     final = solutions[-1][3].name
     print(
-        "\nNext: run_tune_ste.sh submits a full DQN train+eval in each folder "
+        "\nNext: run_tune_ste.sh submits a full DiscreteCQL train+eval in each folder "
         "(TUNE_VALIDATE=1, the default). To do it by hand:\n"
         f"    ADAPR_PARAMS_DIR={final} python ste_vanilla.py train ... / eval ... / aggregate ..."
     )
@@ -1177,9 +1206,10 @@ def build_parser() -> argparse.ArgumentParser:
             "--dqn-exp",
             default=None,
             help=(
-                "Add each participant's trained DQN as a treatment arm, reading "
-                "d3rlpy_logs/ste_exp_<EXP>/user<uid>_model.d3 (the --exp value "
-                "used with ste_vanilla.py train)"
+                "Add each participant's trained DiscreteCQL policy as a "
+                "treatment arm, reading d3rlpy_logs/ste_exp_<EXP>/"
+                "user<uid>_model.d3 (the --exp value used with "
+                "ste_vanilla.py train)"
             ),
         )
         sp.add_argument(

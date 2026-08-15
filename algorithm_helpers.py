@@ -1170,6 +1170,43 @@ def empirical_bayes_sigma2_bottleneck_td(
     return float(np.mean(vals)) if vals else float(fallback)
 
 
+def reward_shaping_week_targets(k_cur, b_hat_hist, get_state, gamma_bar,
+                                Delta_terminal):
+    """Burden-aware weekly targets for the return-decomposition RS regression.
+
+    This is **not** Ng–Harada–Russell potential-based shaping
+    ``F = γ Φ(s') − Φ(s)``. It is the same linear weekly decomposition as
+    before, with a delayed-engagement term added to the target:
+
+        y_w = Delta_terminal * Y_w + gamma_bar * E_{w+1}
+
+    ``Y_w`` is the agent's CAE belief ``b_hat[w+1]``. ``E_{w+1}`` is the
+    agent-visible engagement at the next week-start (``E_known``, not latent
+    ``E_w``). Because ``E_w`` is constant inside a week, a potential on
+    ``E_w`` alone would give zero within-week shaping; the delayed cost has
+    to enter as a week-level target so ``η`` can assign it onto this week's
+    ``M^E`` features (pageview / wear / survey).
+
+    The Q-function's terminal compensation still equates the week return to
+    ``Y_w``, so the objective remains discounted CAE. The extra ``E_{w+1}``
+    term only changes how credit is allocated inside the week.
+    """
+    k_cur = int(k_cur)
+    y = np.zeros(k_cur, dtype=float)
+    gb = float(gamma_bar)
+    dt = float(Delta_terminal)
+    for kp in range(k_cur):
+        Y_w = float(b_hat_hist[kp + 1]) if np.isfinite(b_hat_hist[kp + 1]) else 0.0
+        try:
+            E_next = float(get_state(kp + 1, QUERY_D, QUERY_T)["E_w"])
+        except (KeyError, IndexError, TypeError):
+            E_next = 0.0
+        if not np.isfinite(E_next):
+            E_next = 0.0
+        y[kp] = dt * Y_w + gb * E_next
+    return y
+
+
 def compute_reward_shaping_eta(Phi, b_hat_hist, mu_0, Sigma_0, sigma2):
     """
     Compute the reward shaping parameter eta for the reward shaping function.
@@ -2268,11 +2305,14 @@ def build_reward_shaping_training_data(k_cur, b_hat_hist, b_tilde_hist,
 
         Phi_week(k') = sum_{d=0..5, t=0..1}  Delta_{d,t} * psi(S_{k',d,t})
 
-    Together with the target ``Delta_{5,1} * Y_{k'+1}``, this implements
-    the discount-corrected reward-shaping regression
+    Together with the burden-aware target
+    ``Delta_{5,1} * Y_{k'+1} + gamma_bar * E_{k'+1}`` (see
+    :func:`reward_shaping_week_targets`), this implements the
+    discount-corrected reward-shaping regression
 
         L(eta) = sum_ell ( sum_{d,t} Delta_{d,t} psi(.)^T eta
-                          - Delta_{5,1} Y_ell )^2  +  prior,
+                          - Delta_{5,1} Y_ell
+                          - gamma_bar E_{ell+1} )^2  +  prior,
 
     which (in conjunction with the per-week compensation reward
     ``R_{w,add} = Y_w - (1/Delta_{5,1}) sum_{d,t} Delta_{d,t} r_{d,t}``

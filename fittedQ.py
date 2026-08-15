@@ -53,6 +53,7 @@ The per-slot discount matrix ``gamma_dt`` (shape ``(6, 2)``) mirrors
   * Only the terminal transition ``(6, 2)`` (Sat afternoon) uses
     ``gamma = gamma_bar``, which discounts into the next week.
   * ``gamma_bar = 0.5`` (default): weekly continuation discount 0.5.
+  * ``gamma_bar = 0.9``: longer-horizon weekly continuation.
   * ``gamma_bar = 0.0`` (myopic): no cross-week bootstrap.
   * ``gamma_bar = 1.0``: undiscounted (all entries 1).
 

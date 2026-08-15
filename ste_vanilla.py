@@ -1,4 +1,4 @@
-"""Train and evaluate a per-participant DQN; report average user STE.
+"""Train and evaluate a per-participant DiscreteCQL policy; report average user STE.
 
 Commands (``jobid`` is a row of ``user_ids.txt``)::
 
@@ -6,11 +6,21 @@ Commands (``jobid`` is a row of ``user_ids.txt``)::
     python ste_vanilla.py eval <jobid>
     python ste_vanilla.py aggregate
 
-STE for user i is (mean total CAE under greedy DQN minus never-suggest)
+STE for user i is (mean total CAE under DiscreteCQL minus never-suggest)
 divided by the never-suggest SD; ``aggregate`` averages that over users.
+The policy treats only when ``Q(s,1) - Q(s,0) > ADVANTAGE_MARGIN``.
 Training data are simulated under a random walking policy. Discount is 1
 within the week and 0.5 only at Saturday afternoon. Default residual noise
 is AR(1) bootstrap (``--noise ar1``).
+
+Seed split (do not overlap these ranges)::
+
+    train env seeds     ``2024 + jobid + episode``
+    validation seeds    ``VAL_SEED0 .. VAL_SEED0 + N_VAL_EPISODES - 1``
+    test / STE seeds    ``TEST_SEED0 .. TEST_SEED0 + n_test - 1``
+
+The saved checkpoint is the one with the largest validation ``mean(G_pi - G_0)``,
+not the network at the final training step.
 
 Checkpoints: ``d3rlpy_logs/ste_exp_<EXP>/user<uid>_model.d3``
 Eval rows:   ``results_ste/exp<EXP>/res<EXP>_<uid>.txt``
@@ -48,6 +58,17 @@ DQN_WEEKLY_GAMMA = 0.5
 DQN_WITHIN_WEEK_GAMMA = 1.0
 DQN_WEEK_TERMINAL_INTERVAL = 1
 DQN_WITHIN_WEEK_INTERVAL = 0
+STE_ALGO = "discrete_cql"
+CQL_ALPHA = 0.1
+STE_HIDDEN_UNITS = [128, 64]
+STE_TARGET_UPDATE_INTERVAL = 500
+STE_N_STEPS = 100_000
+ADVANTAGE_MARGIN = 0.1
+VAL_SEED0 = 100_000
+N_VAL_EPISODES = 200
+VAL_EVERY_STEPS = 10_000
+TEST_SEED0 = 200_000
+STE_OBSERVATION_SCALER = "none"
 
 try:
     import d3rlpy
@@ -61,7 +82,7 @@ else:
 def _require_d3():
     if d3rlpy is None:
         raise ImportError(
-            "d3rlpy is required for STE DQN training/eval. Install with: pip install d3rlpy"
+            "d3rlpy is required for STE DiscreteCQL training/eval. Install with: pip install d3rlpy"
         ) from _D3_IMPORT_ERROR
 
 
@@ -259,6 +280,67 @@ def build_offline_buffer(
     return out
 
 
+def ste_policy_action(dqn, s_vec, margin: float = ADVANTAGE_MARGIN) -> int:
+    """Treat only when ``Q(s, 1) - Q(s, 0) > margin`` via ``predict_value``."""
+    _require_d3()
+    obs = np.repeat(np.asarray(s_vec, dtype=np.float64).reshape(1, -1), 2, axis=0)
+    q = np.asarray(
+        dqn.predict_value(obs, np.asarray([0, 1], dtype=np.int64)),
+        dtype=np.float64,
+    ).reshape(-1)
+    return int(q[1] - q[0] > float(margin))
+
+
+def _val_seeds(n_val: int = N_VAL_EPISODES) -> np.ndarray:
+    return np.arange(VAL_SEED0, VAL_SEED0 + int(n_val), dtype=int)
+
+
+def rollout_totals_for_seeds(
+    userid: int,
+    *,
+    nweek: int,
+    seeds: np.ndarray,
+    policy: str,
+    noise: str,
+    dqn=None,
+    params_dir: Path | None = None,
+) -> np.ndarray:
+    totals = np.empty(len(seeds), dtype=np.float64)
+    for i, seed in enumerate(seeds):
+        totals[i] = rollout_total_cae(
+            userid,
+            nweek=nweek,
+            seed=int(seed),
+            policy=policy,
+            dqn=dqn,
+            noise=noise,
+            params_dir=params_dir,
+        )
+    return totals
+
+
+def mean_delta_vs_zero(
+    userid: int,
+    *,
+    nweek: int,
+    noise: str,
+    dqn,
+    seeds: np.ndarray,
+    g_zero: np.ndarray,
+    params_dir: Path | None = None,
+) -> float:
+    g_pi = rollout_totals_for_seeds(
+        userid,
+        nweek=nweek,
+        seeds=seeds,
+        policy="dqn_greedy",
+        noise=noise,
+        dqn=dqn,
+        params_dir=params_dir,
+    )
+    return float(np.mean(g_pi) - np.mean(g_zero))
+
+
 def train_dqn_ste(
     buffer: dict,
     *,
@@ -266,11 +348,18 @@ def train_dqn_ste(
     logger_dir: Path,
     tensorboard_dir: Path,
     experiment_name: str,
-    n_steps: int = 100_000,
+    userid: int,
+    nweek: int,
+    noise: str,
+    n_steps: int = STE_N_STEPS,
     batch_size: int = 256,
     learning_rate: float = 1e-4,
+    alpha: float = CQL_ALPHA,
     seed: int = 2024,
-) -> None:
+    n_val: int = N_VAL_EPISODES,
+    val_every: int = VAL_EVERY_STEPS,
+    params_dir: Path | None = None,
+) -> dict:
     _require_d3()
     d3rlpy.seed(seed)
     model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -288,40 +377,84 @@ def train_dqn_ste(
         action_size=2,
     )
 
-    test_episodes = dataset.episodes[: min(100, len(dataset.episodes))]
-    encoder_factory = d3rlpy.models.VectorEncoderFactory(hidden_units=[256, 128, 64, 32])
+    encoder_factory = d3rlpy.models.VectorEncoderFactory(hidden_units=STE_HIDDEN_UNITS)
     logger_adapter = d3rlpy.logging.CombineAdapterFactory(
         [
             d3rlpy.logging.FileAdapterFactory(root_dir=str(logger_dir)),
             d3rlpy.logging.TensorboardAdapterFactory(root_dir=str(tensorboard_dir)),
         ]
     )
-    evaluators = {
-        "td_error": d3rlpy.metrics.TDErrorEvaluator(test_episodes),
-        "value_scale": d3rlpy.metrics.AverageValueEstimationEvaluator(test_episodes),
-    }
 
-    dqn = d3rlpy.algos.DQNConfig(
+    dqn = d3rlpy.algos.DiscreteCQLConfig(
         batch_size=batch_size,
         # Effective per-transition discount is ``gamma ** interval`` with
         # ``interval`` from ``WeeklyDiscountTransitionPicker``.
         gamma=DQN_WEEKLY_GAMMA,
         learning_rate=learning_rate,
-        target_update_interval=10000,
+        target_update_interval=STE_TARGET_UPDATE_INTERVAL,
         encoder_factory=encoder_factory,
+        alpha=alpha,
     ).create(device=_dqn_fit_device())
 
+    seeds = _val_seeds(n_val)
+    g_zero = rollout_totals_for_seeds(
+        userid,
+        nweek=nweek,
+        seeds=seeds,
+        policy="zero",
+        noise=noise,
+        params_dir=params_dir,
+    )
+    best: dict = {"delta": -np.inf, "step": None}
+    history: list[dict] = []
+
+    def on_epoch(algo, epoch: int, total_step: int) -> None:
+        delta = mean_delta_vs_zero(
+            userid,
+            nweek=nweek,
+            noise=noise,
+            dqn=algo,
+            seeds=seeds,
+            g_zero=g_zero,
+            params_dir=params_dir,
+        )
+        history.append(
+            {"epoch": int(epoch), "step": int(total_step), "val_delta": float(delta)}
+        )
+        print(
+            f"val  user={userid}  step={total_step}  "
+            f"delta={delta:.6f}  best={best['delta']:.6f}",
+            flush=True,
+        )
+        if delta > best["delta"]:
+            best["delta"] = float(delta)
+            best["step"] = int(total_step)
+            algo.save(str(model_path))
+
+    n_steps_per_epoch = min(int(val_every), int(n_steps))
     dqn.fit(
         dataset,
         n_steps=n_steps,
-        n_steps_per_epoch=1000,
+        n_steps_per_epoch=n_steps_per_epoch,
         experiment_name=experiment_name,
         logger_adapter=logger_adapter,
-        evaluators=evaluators,
-        save_interval=1000,
+        callback=None,
+        epoch_callback=on_epoch,
+        save_interval=10**9,
         show_progress=False,
     )
-    dqn.save(str(model_path))
+    if best["step"] is None:
+        dqn.save(str(model_path))
+        best["step"] = int(n_steps)
+        best["delta"] = float("nan")
+    return {
+        "best_step": best["step"],
+        "best_val_delta": best["delta"],
+        "val_history": history,
+        "val_seed0": VAL_SEED0,
+        "n_val": int(n_val),
+        "val_every": int(n_steps_per_epoch),
+    }
 
 
 def rollout_total_cae(
@@ -341,6 +474,7 @@ def rollout_total_cae(
     Run one episode; return ``sum_k CAE_k`` (primary outcome total).
 
     ``policy`` is ``"zero"``, ``"bernoulli"``, or ``"dqn_greedy"``.
+    ``dqn_greedy`` uses ``ste_policy_action`` (advantage margin), not argmax.
     ``params_dir`` defaults to ``vani_env.PARAMS_DIR``; ``tune_ste.py`` passes a
     rescaled copy to evaluate alternative effect sizes.  With ``return_weekly``
     the per-week CAE vector is returned alongside the total.
@@ -374,10 +508,8 @@ def rollout_total_cae(
                 elif policy == "bernoulli":
                     a = int(rng.random() < walk_prob)
                 elif policy == "dqn_greedy":
-                    _require_d3()
-                    s_vec = prepare_ste_state_vector(oenv, k, d, t_slot).reshape(1, -1)
-                    pred = dqn.predict(s_vec)
-                    a = int(np.asarray(pred, dtype=np.int64).reshape(-1)[0])
+                    s_vec = prepare_ste_state_vector(oenv, k, d, t_slot)
+                    a = ste_policy_action(dqn, s_vec)
                 else:
                     raise ValueError(policy)
                 if policy != "dqn_greedy":
@@ -415,7 +547,6 @@ def eval_ste_job(
     uid_path = Path(userid_path) if userid_path else PARAMS_DIR / "user_ids.txt"
     userid_all = np.loadtxt(uid_path, dtype=int)
     userid = _userid_from_job(jobid, userid_all)
-    seed = 2024 + int(jobid)
 
     if nweek is None:
         nweek = int(EnvConfig(userid).nweek)
@@ -435,6 +566,9 @@ def eval_ste_job(
         "userid": userid,
         "nweek": nweek,
         "noise": noise,
+        "algo": STE_ALGO,
+        "advantage_margin": ADVANTAGE_MARGIN,
+        "observation_scaler": STE_OBSERVATION_SCALER,
         "gamma_weekly": DQN_WEEKLY_GAMMA,
         "gamma_within_week": DQN_WITHIN_WEEK_GAMMA,
         "gamma_scheme": "terminal_only",
@@ -452,15 +586,16 @@ def eval_ste_job(
 
     out = np.zeros((n_test, 2))
     for n in range(n_test):
-        rd.seed(seed + n)
+        test_seed = TEST_SEED0 + n
+        rd.seed(test_seed)
         out[n, 0] = rollout_total_cae(
-            userid, nweek=nweek, seed=seed + n, policy="zero", noise=noise
+            userid, nweek=nweek, seed=test_seed, policy="zero", noise=noise
         )
-        rd.seed(seed + n)
+        rd.seed(test_seed)
         out[n, 1] = rollout_total_cae(
             userid,
             nweek=nweek,
-            seed=seed + n,
+            seed=test_seed,
             policy="dqn_greedy",
             dqn=dqn,
             noise=noise,
@@ -481,10 +616,13 @@ def train_ste_job(
     n_train_episodes: int = 10000,
     nweek: int | None = None,
     walk_prob: float = 0.5,
-    n_steps: int = 100_000,
+    n_steps: int = STE_N_STEPS,
     noise: str = "ar1",
+    cql_alpha: float = CQL_ALPHA,
+    n_val: int = N_VAL_EPISODES,
+    val_every: int = VAL_EVERY_STEPS,
 ) -> None:
-    """Train DQN for ``userid = user_ids[jobid]``."""
+    """Train DiscreteCQL for ``userid = user_ids[jobid]``."""
     _require_d3()
     uid_path = Path(userid_path) if userid_path else PARAMS_DIR / "user_ids.txt"
     userid_all = np.loadtxt(uid_path, dtype=int)
@@ -509,19 +647,31 @@ def train_ste_job(
     experiment_name = f"user{userid}"
     model_dir = logger_dir / f"{experiment_name}_model.d3"
 
-    train_dqn_ste(
+    selection = train_dqn_ste(
         buffer,
         model_path=model_dir,
         logger_dir=logger_dir,
         tensorboard_dir=tb_dir,
         experiment_name=experiment_name,
+        userid=userid,
+        nweek=nweek,
+        noise=noise,
         n_steps=n_steps,
+        alpha=cql_alpha,
         seed=seed,
+        n_val=n_val,
+        val_every=val_every,
     )
     metadata = {
         "userid": userid,
         "nweek": int(nweek),
         "noise": noise,
+        "algo": STE_ALGO,
+        "cql_alpha": float(cql_alpha),
+        "advantage_margin": ADVANTAGE_MARGIN,
+        "observation_scaler": STE_OBSERVATION_SCALER,
+        "hidden_units": list(STE_HIDDEN_UNITS),
+        "target_update_interval": STE_TARGET_UPDATE_INTERVAL,
         "state_dim": int(buffer["states"].shape[1]),
         "gamma_weekly": DQN_WEEKLY_GAMMA,
         "gamma_within_week": DQN_WITHIN_WEEK_GAMMA,
@@ -531,6 +681,9 @@ def train_ste_job(
         "i_w_fixed": 1,
         "j_w_fixed": 1,
         "seed": seed,
+        "val_seed0": VAL_SEED0,
+        "test_seed0": TEST_SEED0,
+        **selection,
     }
     with open(_model_metadata_path(model_dir), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -594,22 +747,30 @@ def aggregate_ste(
 
 
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(description="Vanilla testbed STE (DQN vs zero policy)")
+    p = argparse.ArgumentParser(description="Vanilla testbed STE (DiscreteCQL vs zero policy)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pt = sub.add_parser("train", help="Train DQN for user_ids[jobid]")
+    pt = sub.add_parser("train", help="Train DiscreteCQL for user_ids[jobid]")
     pt.add_argument("jobid", type=int)
     pt.add_argument("--exp", type=str, default="1")
     pt.add_argument("--user-ids", type=str, default=None, help="Path to user_ids.txt")
     pt.add_argument("--n-train-episodes", type=int, default=10000)
     pt.add_argument("--nweek", type=int, default=None)
     pt.add_argument("--walk-prob", type=float, default=0.5)
-    pt.add_argument("--n-steps", type=int, default=100_000)
+    pt.add_argument("--n-steps", type=int, default=STE_N_STEPS)
+    pt.add_argument(
+        "--cql-alpha",
+        type=float,
+        default=CQL_ALPHA,
+        help="DiscreteCQL conservative penalty weight (default 0.1)",
+    )
+    pt.add_argument("--n-val", type=int, default=N_VAL_EPISODES)
+    pt.add_argument("--val-every", type=int, default=VAL_EVERY_STEPS)
     pt.add_argument(
         "--noise", type=str, default="ar1", choices=("random", "sequential", "ar1")
     )
 
-    pe = sub.add_parser("eval", help="Evaluate zero vs DQN for user_ids[jobid]")
+    pe = sub.add_parser("eval", help="Evaluate zero vs DiscreteCQL for user_ids[jobid]")
     pe.add_argument("jobid", type=int)
     pe.add_argument("--exp", type=str, default="1")
     pe.add_argument("--user-ids", type=str, default=None)
@@ -637,6 +798,9 @@ def main(argv: list[str] | None = None) -> None:
             walk_prob=args.walk_prob,
             n_steps=args.n_steps,
             noise=args.noise,
+            cql_alpha=args.cql_alpha,
+            n_val=args.n_val,
+            val_every=args.val_every,
         )
     elif args.cmd == "eval":
         eval_ste_job(

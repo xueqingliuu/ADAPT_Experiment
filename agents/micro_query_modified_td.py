@@ -82,7 +82,7 @@ class MicroQueryAgent_ModifiedTDLoss:
         self.rng = np.random.default_rng() if rng is None else rng
         self.dataset = None
 
-    def reset(self, dataset):
+    def reset(self, dataset, week0_actions=None):
         self.dataset = dataset
         self.get_state = dataset.get_state
         p = self.mu_0_joint.size
@@ -94,10 +94,9 @@ class MicroQueryAgent_ModifiedTDLoss:
         self.alphas_store = {}
         self.z_store = {}                          # single joint AR(1) chain
 
-        dataset.bootstrap_week0(
-            self.rng.integers(0, 2, size=(N_RL_DAYS, N_RL_SLOTS)),
-            self.rng,
-        )
+        if week0_actions is None:
+            week0_actions = self.rng.integers(0, 2, size=(N_RL_DAYS, N_RL_SLOTS))
+        dataset.bootstrap_week0(np.asarray(week0_actions, dtype=int), self.rng)
         self.b_hat_hist[0] = self.Y_1
         self.b_tilde_hist[0] = 0.0
 
@@ -117,14 +116,7 @@ class MicroQueryAgent_ModifiedTDLoss:
         self._current_betas_rest = None
 
     def begin_week(self, k, packet):
-        if k == 0:
-            # Force the baseline query so Y_1 is revealed to the agent.
-            return 1
-
-        # Force week 1 query so the agent observes the Y_1 to Y_2 transition.
-        I_w = 1 if k == 1 else self.rng.binomial(1, 0.5)
-        self.dataset.I_hist[k] = I_w
-        return I_w
+        return int(self.dataset.I_hist[k])
 
     def prepare_week(self, k):
         """Post-belief setup: day-0 walking policy uses last week's beta."""

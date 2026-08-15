@@ -45,11 +45,11 @@ PF features differ from the env generative model in three respects (see
 RL reward shaping               -> mu_0_reward, Sigma_0_reward, sigma2_reward
    (build_phi_action_rewardshaping;
     sum_{d,t} Delta_{d,t} psi on
-    Delta_{6,2} * Y_w)
+    Delta_{6,2} * Y_w + gamma_bar * E_{w+1})
 RL Q (no TD modify, beta)       -> mu_0_micro, Sigma_0_micro, sigma2_rl_micro
    (build_phi_action, fitted Q
     bootstrapping next-week Q;
-    used by micro_g0 / micro_g05 / rs_g0 / rs_g05)
+    used by micro_g05 / micro_g09 / rs_g05 / rs_g09)
 
 RL Q joint (eta, beta) for      -> mu_0_micro_mtd_joint,
    modified-TD-loss RLSVI          Sigma_0_micro_mtd_joint (FULL cov),
@@ -57,7 +57,7 @@ RL Q joint (eta, beta) for      -> mu_0_micro_mtd_joint,
     stacked bottleneck-state        sigma2_Q_mtd_joint
     TD loss; Sigma = full cov
     of per-user theta=(eta,beta))
-   Used by mtd_g0 / mtd_g05 / rs_mtd_g0 / rs_mtd_g05 in experiment.py.
+   Used by mtd_g05 / mtd_g09 / rs_mtd_g05 / rs_mtd_g09 in experiment.py.
 
 The no-TD-modify Q prior is fit by fitted-Q iteration (FQI):
 
@@ -993,11 +993,12 @@ def fit_reward_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
     Replicates ``build_reward_shaping_training_data`` / ``compute_reward_shaping_eta``:
 
         feature  = sum_{d,t} Delta_{d,t} * psi(S_{k,d,t})
-        target   = Delta_{6,2} * Y_w
+        target   = Delta_{6,2} * Y_w + GAMMA_BAR * E_{w+1}
 
-    where ``Y_w`` is the weekly CAE (``caeAverage_norm``). Shaped intermediate
-    rewards and the terminal compensation ``R_{w,add}`` are *not* included
-    here — those enter only the Q-function FQI targets at runtime.
+    where ``Y_w`` is the weekly CAE (``caeAverage_norm``) and ``E_{w+1}`` is
+    next week's start-of-week engagement. Shaped intermediate rewards and
+    the terminal compensation ``R_{w,add}`` are *not* included here — those
+    enter only the Q-function FQI targets at runtime.
 
     Prior mean is the pooled fit across all users' weeks; diagonal prior
     covariance comes from per-user fits.
@@ -1014,7 +1015,10 @@ def fit_reward_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
             sigma2s.append(None)
             continue
         Phi = np.stack([_phi_rs_week_discounted(td, k) for k in range(n_w)])
-        y = DELTA_TERMINAL * td["R_week"]
+        E_next = np.zeros(n_w, dtype=float)
+        if n_w > 1:
+            E_next[:-1] = td["E_w_start"][1:]
+        y = DELTA_TERMINAL * td["R_week"] + GAMMA_BAR * E_next
         Phi_all.append(Phi); y_all.append(y)
         theta, s2 = _ridge_fit(Phi, y, alpha=RIDGE_ALPHA_RL)
         thetas.append(theta)

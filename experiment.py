@@ -223,10 +223,10 @@ class EpisodeDataset:
 #
 # State dict ``self.s`` (beyond ``Env.gen_*`` outputs)
 # ----------------------------------------------------
-# ``self.s`` is the latent simulator state used by vani_env.Env.  Algorithm
-# inputs should come from logged arrays: observed arrays keep NaN missingness
-# for likelihood/learning, while ``*AgentAll`` arrays contain agent-visible
-# observed-or-imputed values for feature construction.
+# ``self.s`` is the latent simulator state used by vani_env.Env.  Step
+# outcomes (4-hour, prior-2-hour, daily sums) are never gated on Fitbit
+# wear: latent / observed / agent-visible copies are the same draw.
+# Anticipated affect is still gated on daily-survey completion.
 # ──────────────────────────────────────────────────────────────────
 
 class OnlineEnv:
@@ -262,8 +262,8 @@ class OnlineEnv:
         self.start_dow = start_dow
 
         self.stepCountNext4HourAll = np.zeros(self.T) # latent draw (used by gen_CAE)
-        self.stepCountNext4HourObsAll = np.full(self.T, np.nan) # observed by the agent
-        self.stepCountNext4HourAgentAll = np.zeros(self.T) # agent-visible (model-imputed if fitbit not wear)
+        self.stepCountNext4HourObsAll = np.full(self.T, np.nan) # same as latent; not Fitbit-gated
+        self.stepCountNext4HourAgentAll = np.zeros(self.T) # same as latent; not Fitbit-gated
         self.pageViewNext4HourAll = np.zeros(self.T)
         self.action_all = np.zeros(self.T)
         self.activitySuggestionsSentLast7DaysAll = np.full(self.T, np.nan)
@@ -324,7 +324,6 @@ class OnlineEnv:
         )
         self._stepCountLast7DaysEma_initial = float(self.s.get("stepCountLast7DaysEma", 0.0))
         self._hist_foursc_by_slot: dict[int, list[float]] = {0: [], 1: []}
-        # Slot-specific (AM/PM) same-slot EMA, mirroring ``_hist_foursc_by_slot``.
         self._stepCountLast7DaysEma_by_slot: dict[int, float] = {
             0: self._stepCountLast7DaysEma_initial,
             1: self._stepCountLast7DaysEma_initial,
@@ -510,37 +509,6 @@ class OnlineEnv:
             J_w=jw,
         )
 
-    def _morning_fitbit_worn(self, d_global: int) -> bool:
-        """Whether Fitbit was worn on the morning that starts calendar day ``d_global``.
-
-        ``morningFitbitWearAll[d-1]`` is realised at end of day ``d-1`` and matches df_fit:
-        that row's morning-wearing flag governs observability of day ``d``'s
-        prior-2-hour and 4-hour step counts.
-        """
-        if d_global <= 0:
-            return float(self.s.get("morningFitbitWearYesterday", 0.0)) >= 0.5
-        return float(self.morningFitbitWearAll[d_global - 1]) >= 0.5 # means that the fitbit was worn on the morning of the day before
-
-    def _impute_prior2hour_7day_mean(self) -> float:
-        """Impute missing prior-2-hour step count with the mean of the last 7 observed values."""
-        if not self._hist_prior2hour_observed:
-            return float(self.s.get("prior2HourStepCountEma7d", 0.0))
-        return float(np.mean(self._hist_prior2hour_observed[-7:]))
-
-    def _agent_prior2hour(self, d_global: int, prior2hour_latent: float, step_idx: int):
-        """Return (observed, agent-visible) prior-2-hour values for one slot.
-
-        When Fitbit was not worn on the morning starting ``d_global``, the
-        observed value is ``NaN`` and the agent-visible value is model-imputed.
-        """
-        if self._morning_fitbit_worn(d_global):
-            val = float(prior2hour_latent)
-            if not np.isfinite(self.prior2HourStepCountObsAll[step_idx]):
-                self._hist_prior2hour_observed.append(val)
-            return val, val
-        imputed = self._impute_prior2hour_7day_mean()
-        return np.nan, imputed
-
     def _ensure_day_started(self, sim_w, d_w, d_global):
         """Run morning-day setup once per simulated calendar day."""
         if (sim_w, d_w) not in self._day_started:
@@ -569,14 +537,11 @@ class OnlineEnv:
             )
 
         prior2HourStepCount = self.env.gen_prior2hour_step_count(self.s, step_idx)
-        p2h_obs, p2h_agent = self._agent_prior2hour(
-            d_global, prior2HourStepCount, step_idx
-        )
         self.prior2HourStepCountAll[step_idx] = prior2HourStepCount
-        self.prior2HourStepCountObsAll[step_idx] = p2h_obs
-        self.prior2HourStepCountAgentAll[step_idx] = p2h_agent
+        self.prior2HourStepCountObsAll[step_idx] = prior2HourStepCount
+        self.prior2HourStepCountAgentAll[step_idx] = prior2HourStepCount
         self.s["prior2HourStepCount"] = prior2HourStepCount
-        self.s["prior2HourStepCountAgent"] = p2h_agent
+        self.s["prior2HourStepCountAgent"] = prior2HourStepCount
 
     def _active_particle_state(self):
         """Return the current particle CAE paths and weights for mediator imputation."""
@@ -642,17 +607,6 @@ class OnlineEnv:
         pred = float(np.average(preds, weights=weights))
         return pred if np.isfinite(pred) else 0.0
 
-    def _agent_fourSC(self, step_idx: int, d_global: int, Ah: float, fourSC_latent: float):
-        """Return (observed, agent-visible) four-hour step counts for one slot."""
-        if self._morning_fitbit_worn(d_global):
-            val = float(fourSC_latent)
-            return val, val
-        x_base = self._pf_foursc_row(int(step_idx))
-        imputed = self._posterior_predictive_my_mean(
-            0, x_base, fourSC_cae_delta(x_base)
-        )
-        return np.nan, imputed
-
     def _agent_antic(self, d_global: int, ws_m: float, ws_a: float,
                      antic_latent: float, survey_present: bool):
         """Return (observed, agent-visible) anticipated affect for one day."""
@@ -683,7 +637,6 @@ class OnlineEnv:
         self._hist_morning_wear = [self._wear7_initial] * 7
         self._hist_active_days = [self._active_days7_initial] * ACTIVE_STATUS_ROLLING_WINDOW
 
-        self._hist_prior2hour_observed = []
         self._hist_prior2hour_by_slot = {0: [], 1: []}
         self._hist_foursc_by_slot = {0: [], 1: []}
         self._stepCountLast7DaysEma_by_slot = {
@@ -692,8 +645,6 @@ class OnlineEnv:
         }
         self.s["stepCountLast7DaysEma"] = self._stepCountLast7DaysEma_initial
         p2h0 = float(self.s.get("prior2HourStepCount", 0.0))
-        if np.isfinite(p2h0):
-            self._hist_prior2hour_observed.append(p2h0)
         self.prior2HourStepCountAgentAll[0] = float(self.s.get("prior2HourStepCountAgent", p2h0))
 
         self.logYesterdayStepCount[0] = float(self.s["yesterdayStepCount"])
@@ -706,8 +657,10 @@ class OnlineEnv:
         self.logIsWeekend[0] = float(self.s["isWeekend"])
         self.logActiveDaysLast7Days[0] = float(self.s.get("activeDaysLast7Days", 0.0))
 
-    def run_episode(self, agent, dataset):
-        agent.reset(dataset)
+    def run_episode(self, agent, dataset, week0_actions=None, I_hist=None):
+        if I_hist is not None:
+            dataset.I_hist[:] = np.asarray(I_hist, dtype=int).reshape(-1)
+        agent.reset(dataset, week0_actions=week0_actions)
         # Adaptive agents need the PF/RLSVI machinery. Agents can opt out with
         # ``needs_belief = False``; the fixed baselines use a faster dedicated
         # path in ``_run_fixed_policy_fast`` and normally do not enter here.
@@ -750,9 +703,9 @@ class OnlineEnv:
 
             self._finalize_week(k)
 
-            # Record the full realized weekly mediators for reward shaping
-            # (post-action decision-time/daily mediators). Skipped for
-            # fixed-policy baselines, which do no learning.
+            # Record Mon–Sat realized mediators for reward shaping
+            # (post-action, not used as decision-time state). Sunday is
+            # generated for weekly CAE / E_w but is not an RL feature.
             if needs_belief:
                 full_ctx = self.get_context(k, N_RL_DAYS, 0)
                 dataset.record_full_week_mediators(
@@ -800,11 +753,9 @@ class OnlineEnv:
         # ``ws_interaction`` has been generated.
         ws_interaction = self.env.gen_ws_interaction(self.s, step_idx)
 
-        sc_obs, sc_agent = self._agent_fourSC(step_idx, d_global, Ah, fourSC)
-
         self.stepCountNext4HourAll[step_idx] = fourSC
-        self.stepCountNext4HourObsAll[step_idx] = sc_obs
-        self.stepCountNext4HourAgentAll[step_idx] = sc_agent
+        self.stepCountNext4HourObsAll[step_idx] = fourSC
+        self.stepCountNext4HourAgentAll[step_idx] = fourSC
         self.pageViewNext4HourAll[step_idx] = pv
         self.ws_interaction_all[step_idx] = ws_interaction
 
@@ -822,7 +773,7 @@ class OnlineEnv:
         self.s["prior2HourStepCount"] = prior2HourStepCount
         self.s["prior2HourStepCountAgent"] = p2h_agent
         self._hist_prior2hour_by_slot[slot].append(float(p2h_agent))
-        self._hist_foursc_by_slot[slot].append(float(sc_agent))
+        self._hist_foursc_by_slot[slot].append(float(fourSC))
         self._stepCountLast7DaysEma_by_slot[slot] = self._stepCountLast7DaysEma_for_slot(slot)
 
         # Update rolling 7-day interaction fractions after observing current slot.
@@ -1002,10 +953,9 @@ class OnlineEnv:
             fourSC = self.env.gen_fourSC(self.s, Ah, step_idx)
             pv = self.env.gen_pageview(self.s, Ah, Iw*self.wp_all[sim_w], step_idx)
 
-            sc_obs, sc_agent = self._agent_fourSC(step_idx, d_global, Ah, fourSC)
             self.stepCountNext4HourAll[step_idx] = fourSC
-            self.stepCountNext4HourObsAll[step_idx] = sc_obs
-            self.stepCountNext4HourAgentAll[step_idx] = sc_agent
+            self.stepCountNext4HourObsAll[step_idx] = fourSC
+            self.stepCountNext4HourAgentAll[step_idx] = fourSC
             self.pageViewNext4HourAll[step_idx] = pv
             self._today_fourSC[t_sim] = fourSC
             self._today_pageview[t_sim] = pv
@@ -1016,7 +966,7 @@ class OnlineEnv:
 
             self.s["stepCountNext4HourLag1"] = fourSC
             self.s["pageViewNext4HourLag1"] = pv
-            self._hist_foursc_by_slot[int(t_sim)].append(float(sc_agent))
+            self._hist_foursc_by_slot[int(t_sim)].append(float(fourSC))
             self._stepCountLast7DaysEma_by_slot[int(t_sim)] = (
                 self._stepCountLast7DaysEma_for_slot(int(t_sim))
             )
@@ -1297,7 +1247,7 @@ P_RL_BOTTLENECK = int(
 
 # ── RL hyperparameters (shared) ──
 # Weekly discount used by micro-query agents. Algorithms below are registered
-# at gamma_bar=0.0 and gamma_bar=0.5 via functools.partial; the per-slot matrix
+# at gamma_bar=0.5 and gamma_bar=0.9 via functools.partial; the per-slot matrix
 # is built by _gamma_dt_micro (1 within week, gamma_bar on the terminal slot).
 GAMMA_BAR = 0.5
 TARGET_C     = 1
@@ -1508,12 +1458,35 @@ def _gamma_dt_micro(gamma_bar):
     use discount 1 so value flows undiscounted within the week. Only the
     terminal controlled slot ``(TERMINAL_D, TERMINAL_T)`` (Sat afternoon)
     applies the weekly discount ``gamma_bar`` into the next week. In
-    particular ``gamma_bar=0`` is the myopic special case (no cross-week
-    bootstrap) and ``gamma_bar=1`` is undiscounted.
+    particular ``gamma_bar=0.5`` is the more myopic weekly continuation
+    and ``gamma_bar=0.9`` is the longer-horizon weekly continuation.
     """
     gamma_dt = np.ones((N_RL_DAYS, N_RL_SLOTS), dtype=float)
     gamma_dt[TERMINAL_D, TERMINAL_T] = float(gamma_bar)
     return gamma_dt
+
+
+# Independent of agent-RNG consumption so every variant sees the same
+# week-0 walking grid and the same weekly query path.
+_SHARED_EXOGENOUS_SALT = 904201
+
+
+def shared_episode_exogenous(seed, nweek):
+    """Week-0 actions and query indicators shared across algorithm variants.
+
+    Drawn from ``SeedSequence([seed, salt])``, not from the agent RNG, so
+    Micro / RS / MTD comparisons are not confounded by different prior
+    draws consuming different amounts of randomness before ``begin_week``.
+    ``I_0 = I_1 = 1``; later weeks are i.i.d. Bernoulli(0.5).
+    """
+    rng = np.random.default_rng(
+        np.random.SeedSequence([int(seed), _SHARED_EXOGENOUS_SALT])
+    )
+    week0_actions = rng.integers(0, 2, size=(N_RL_DAYS, N_RL_SLOTS))
+    I_hist = np.ones(int(nweek), dtype=int)
+    if nweek > 2:
+        I_hist[2:] = rng.binomial(1, 0.5, size=int(nweek) - 2)
+    return week0_actions, I_hist
 
 
 def _episode_seed(exp_seed: int, draw_idx: int) -> int:
@@ -1540,6 +1513,7 @@ def run_micro_query(uid, seed=42, gamma_bar=0.5, params_dir=None):
     cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
     nweek = cfg.nweek
 
+    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
     dataset = EpisodeDataset(nweek)
     agent = MicroQueryAgent(
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
@@ -1555,7 +1529,9 @@ def run_micro_query(uid, seed=42, gamma_bar=0.5, params_dir=None):
     )
     # agent.update_sigma2_online = False
 
-    result = oenv.run_episode(agent, dataset)
+    result = oenv.run_episode(
+        agent, dataset, week0_actions=week0_actions, I_hist=I_hist
+    )
     return result, oenv
 
 
@@ -1578,10 +1554,13 @@ def run_micro_query_rs(uid, seed=42, gamma_bar=0.5, params_dir=None):
         sigma2_reward=sigma2_reward,
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
-    )       
+    )
     # agent.update_sigma2_online = False
+    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
     dataset = EpisodeDataset(nweek)
-    result = oenv.run_episode(agent, dataset)
+    result = oenv.run_episode(
+        agent, dataset, week0_actions=week0_actions, I_hist=I_hist
+    )
     return result, oenv
 
 
@@ -1606,8 +1585,11 @@ def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5, params_dir=None):
         rng=np.random.default_rng(seed),
     )
     # agent.update_sigma2_online = False
+    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
     dataset = EpisodeDataset(nweek)
-    result = oenv.run_episode(agent, dataset)
+    result = oenv.run_episode(
+        agent, dataset, week0_actions=week0_actions, I_hist=I_hist
+    )
     return result, oenv
 
 
@@ -1634,8 +1616,11 @@ def run_micro_query_rs_mtd(uid, seed=42, gamma_bar=0.5, params_dir=None):
         rng=np.random.default_rng(seed),
     )
     # agent.update_sigma2_online = False
+    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
     dataset = EpisodeDataset(nweek)
-    result = oenv.run_episode(agent, dataset)
+    result = oenv.run_episode(
+        agent, dataset, week0_actions=week0_actions, I_hist=I_hist
+    )
     return result, oenv
 
 
@@ -1655,14 +1640,6 @@ def _fixed_policy_rng_after_legacy_reset(seed: int):
     return rng
 
 
-def _fixed_policy_begin_week(k: int, rng) -> int:
-    if k == 0:
-        return 1
-    if k == 1:
-        return 1
-    return int(rng.binomial(1, 0.5))
-
-
 def _run_fixed_policy_fast(policy: str, uid, seed=42, params_dir=None):
     """Run fixed baselines without PF/RLSVI/state-feature bookkeeping."""
     _ensure_priors_configured(params_dir)
@@ -1673,7 +1650,7 @@ def _run_fixed_policy_fast(policy: str, uid, seed=42, params_dir=None):
         raise ValueError(f"unknown fixed policy {policy!r}")
 
     rng = _fixed_policy_rng_after_legacy_reset(seed)
-    I_hist = np.zeros(nweek, dtype=int)
+    _week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
     A_hist = np.zeros((nweek, N_RL_DAYS, N_RL_SLOTS), dtype=int)
     pi_A_hist = np.full((nweek, N_RL_DAYS, N_RL_SLOTS), np.nan)
     b_hat_hist = np.full(nweek, np.nan)
@@ -1684,8 +1661,7 @@ def _run_fixed_policy_fast(policy: str, uid, seed=42, params_dir=None):
     oenv._reset_episode_state()
 
     for k in range(nweek):
-        I_w = _fixed_policy_begin_week(k, rng)
-        I_hist[k] = I_w
+        I_w = int(I_hist[k])
         oenv.start_week(k, I_w)
 
         for d in range(N_RL_DAYS):
@@ -1745,20 +1721,17 @@ def run_random_send(uid, seed=42, params_dir=None):
 
 
 # Algorithm registry: name -> (runner, display label).
-# Every algorithm is run at both gamma_bar = 0 and gamma_bar = 0.5
-# (γ̄=0 ⇒ γ_{d,t}=0 ⇒ no within-week / bottleneck bootstrapping; the agent
-# is myopic w.r.t. future slots and relies only on the immediate reward
-# signal — for plain micro/mtd this is the strict-myopic baseline; for the
-# reward-shaping variants the per-slot shaping does all the work).
+# Every RL algorithm is run at gamma_bar = 0.5 and gamma_bar = 0.9.
+# Within-week discounts stay 1; only the Saturday-afternoon slot uses γ̄.
 ALGORITHMS = {
-    "micro_g0":     (partial(run_micro_query,        gamma_bar=0.0), "Micro-query (γ̄=0)"),
     "micro_g05":    (partial(run_micro_query,        gamma_bar=0.5), "Micro-query (γ̄=0.5)"),
-    "mtd_g0":       (partial(run_micro_query_mtd,    gamma_bar=0.0), "Micro-query + MTD (γ̄=0)"),
+    "micro_g09":    (partial(run_micro_query,        gamma_bar=0.9), "Micro-query (γ̄=0.9)"),
     "mtd_g05":      (partial(run_micro_query_mtd,    gamma_bar=0.5), "Micro-query + MTD (γ̄=0.5)"),
-    "rs_g0":        (partial(run_micro_query_rs,     gamma_bar=0.0), "Micro-query + RS (γ̄=0)"),
+    "mtd_g09":      (partial(run_micro_query_mtd,    gamma_bar=0.9), "Micro-query + MTD (γ̄=0.9)"),
     "rs_g05":       (partial(run_micro_query_rs,     gamma_bar=0.5), "Micro-query + RS (γ̄=0.5)"),
-    "rs_mtd_g0":    (partial(run_micro_query_rs_mtd, gamma_bar=0.0), "Micro-query + RS + MTD (γ̄=0)"),
+    "rs_g09":       (partial(run_micro_query_rs,     gamma_bar=0.9), "Micro-query + RS (γ̄=0.9)"),
     "rs_mtd_g05":   (partial(run_micro_query_rs_mtd, gamma_bar=0.5), "Micro-query + RS + MTD (γ̄=0.5)"),
+    "rs_mtd_g09":   (partial(run_micro_query_rs_mtd, gamma_bar=0.9), "Micro-query + RS + MTD (γ̄=0.9)"),
     "never_send":   (run_never_send,  "Never send (A=0)"),
     "always_send":  (run_always_send, "Always send (A=1)"),
     "random_send":  (run_random_send, "Random send (π_A=0.5)"),
@@ -1804,9 +1777,10 @@ def _snapshot_oenv(oenv):
         "dailyAnticipatedAffectAgentAll":        oenv.dailyAnticipatedAffectAgentAll.copy(), # model-imputed if survey missed
         "morningFitbitWearAll":             oenv.morningFitbitWearAll.copy(),
         "dailySurveyCompleteAll":              oenv.dailySurveyCompleteAll.copy(),       # daily-survey present
+        "activityStatusTodayAll":           oenv.activityStatusTodayAll.copy(),
         # ── slot-level ────────────────────────────────────────────
         "stepCountNext4HourAll":             oenv.stepCountNext4HourAll.copy(),      # latent
-        "stepCountNext4HourObsAll":         oenv.stepCountNext4HourObsAll.copy(),  # NaN if Fitbit not worn
+        "stepCountNext4HourObsAll":         oenv.stepCountNext4HourObsAll.copy(),
         "stepCountNext4HourAgentAll":       oenv.stepCountNext4HourAgentAll.copy(),
         "pageViewNext4HourAll":           oenv.pageViewNext4HourAll.copy(),
         "action_all":             oenv.action_all.copy(),
@@ -2008,7 +1982,7 @@ if __name__ == "__main__":
             "seeds":          list(SEEDS),
             "algorithms":     list(ALGORITHMS.keys()),
             "labels":         {n: ALGORITHMS[n][1] for n in ALGORITHMS},
-            "gamma_bars":     [0.0, 0.5],
+            "gamma_bars":     [0.5, 0.9],
             "epsilon_0":      EPSILON_0,
             "J_particles":    J_PARTICLES,
             "B_ensembles":    B_ENSEMBLES,
