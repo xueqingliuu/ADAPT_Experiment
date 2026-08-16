@@ -14,8 +14,10 @@
 # inside each evaluation (-c controls that width).
 #
 #   mkdir -p logs
-#   sbatch run_tune_ste.sh                                   # calibrate 0.2/0.5/0.8, then
+#   sbatch run_tune_ste.sh                                   # action knob → 0.2/0.5/0.8, then
 #                                                            # auto-submit true-STE DQN jobs
+#   sbatch --export=ALL,TUNE_KNOB=foursc_to_y,TUNE_TARGETS=0.8,TUNE_OUT_PREFIX=env_para_foursc \
+#          run_tune_ste.sh                                   # fourSC_ewma→CAE → 0.8
 #   sbatch --export=ALL,TUNE_PHASE=diagnose run_tune_ste.sh  # E_w + CAE loop gains, ~seconds
 #   sbatch --export=ALL,TUNE_PHASE=eval run_tune_ste.sh      # STE of the untouched fit
 #   sbatch --export=ALL,TUNE_PHASE=scan run_tune_ste.sh      # STE vs knob value
@@ -152,12 +154,17 @@ submit_validation_jobs() {
       continue
     fi
     local jid
+    # STE_EXP is the folder name with a leading ``env_para_`` stripped, so
+    # env_para_ste0.8 → ste0.8 and env_para_foursc0.8 → foursc0.8.
+    local exp_name
+    exp_name="$(basename "${dir}")"
+    exp_name="${exp_name#env_para_}"
     jid=$(sbatch --parsable \
-      --job-name="ste_${target}" \
+      --job-name="ste_${exp_name}" \
       --array="0-$(( $(wc -l < "${dir}/user_ids.txt") - 1 ))" \
-      --export="ALL,ADAPR_PARAMS_DIR=${dir},STE_EXP=ste${target},STE_USER_IDS=${dir}/user_ids.txt,STE_PHASE=all" \
+      --export="ALL,ADAPR_PARAMS_DIR=${dir},STE_EXP=${exp_name},STE_USER_IDS=${dir}/user_ids.txt,STE_PHASE=all" \
       "${SLURM_SUBMIT_DIR:-$PWD}/run_ste.sh")
-    echo "Submitted ${jid}: full DQN train+eval in ${dir} (results_ste/expste${target})"
+    echo "Submitted ${jid}: full DQN train+eval in ${dir} (results_ste/exp${exp_name})"
     submitted=$((submitted + 1))
   done
   if [[ "${submitted}" -eq 0 ]]; then
