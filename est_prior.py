@@ -93,10 +93,12 @@ from statsmodels.genmod.generalized_estimating_equations import GEE
 # We import directly from algorithm.py to guarantee the prior dimensions stay
 # synchronised with the agent's runtime phi.
 from algorithm_helpers import (
+    N_RL_CONTEXT,
     _cumulative_discount,
     build_phi_action,
     build_phi_action_rewardshaping,
     build_phi_bottleneck,
+    build_rl_context_vector,
 )
 from vani_env import (
     THETA_ANTIC_NAMES,
@@ -825,14 +827,19 @@ def fit_pf_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────
 def _build_rl_context_vector_from_row(row) -> np.ndarray:
     """Match ``experiment.build_rl_context_vector``."""
-    return np.array([
-        float(row["YesterdayStepCount_norm"]),
-        float(row["prior2hour_step_norm"]),
-        float(row["active_status_fraction_7days"]),
-        float(row["recent_burden_norm" if "recent_burden_norm" in row.index else "recentBurdenEma_norm"]),
-        float(row["yesterday_SalienceMessage"]),
-        float(row["Interacted_7d_walk"]),
-    ], dtype=float)
+    wp = row["week_present"] if "week_present" in row.index else 0.0
+    return build_rl_context_vector(
+        yesterdayStepCount=float(row["YesterdayStepCount_norm"]),
+        prior2HourStepCountAgent=float(row["prior2hour_step_norm"]),
+        activeDaysLast7Days=float(row["active_status_fraction_7days"]),
+        activitySuggestionsSentLast7Days=float(
+            row["recent_burden_norm" if "recent_burden_norm" in row.index else "recentBurdenEma_norm"]
+        ),
+        salienceMessageSentYesterday=float(row["yesterday_SalienceMessage"]),
+        activitySuggestionInteractLast7Days=float(row["Interacted_7d_walk"]),
+        query_sent=1.0,
+        weekly_present=float(wp) if np.isfinite(wp) else 0.0,
+    )
 
 
 def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
@@ -859,9 +866,17 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
     ]
     for c in cols:
         dat[c] = _fill_nan(dat[c].to_numpy())
+    if "week_present" not in dat.columns:
+        dat["week_present"] = 0.0
+    else:
+        dat["week_present"] = np.where(
+            np.isfinite(dat["week_present"].to_numpy(dtype=float)),
+            dat["week_present"].to_numpy(dtype=float),
+            0.0,
+        )
 
     n_rl = N_RL_SLOTS_WEEK   # 12 slots Mon-Sat
-    p_C = 6                  # build_rl_context_vector dim
+    p_C = N_RL_CONTEXT
 
     # Per-slot quantities for d in 1..6 (Mon-Sat).
     C_slot = np.zeros((n_w, n_rl, p_C))
@@ -1489,6 +1504,7 @@ def _rl_context_names() -> list[str]:
         "recent_burden",
         "salience_yesterday",
         "walk_interaction_7d",
+        "query_x_weekly_present",
     ]
 
 

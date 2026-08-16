@@ -23,8 +23,11 @@ Which coefficients are scaled (``--knob``, default ``action``)
               anticipated affect) and burden (engagement) mediators
     benefit   benefit path only
     burden    burden path only
-    my_to_y / me_to_e / e_to_my   structural paths; these also change the
-              control arm, so they are not the recommended dial
+    my_to_y / foursc_to_y / me_to_e / e_to_my   structural paths; these
+              also change the control arm, so they are not the recommended
+              STE dial. ``foursc_to_y`` is the one that makes CAE more
+              state-dependent, because the fourSC CATE varies with wear /
+              interact / steps while the antic CATE is nearly constant.
 
 Stability
     ``calibrate`` writes a folder only if every participant has |loop gain| < 1
@@ -106,8 +109,11 @@ PATHWAYS: dict[str, dict[str, tuple[str, ...]]] = {
             n for n in THETA_ANTIC_NAMES if n.startswith(_ACTION_PREFIXES_ANTIC)
         ),
     },
-    "MY_to_Y": {
-        "theta_CAE": ("fourSC_ewma", "anticipated_affect_ewma"),
+    "FOURSC_to_Y": {
+        "theta_CAE": ("fourSC_ewma",),
+    },
+    "ANTIC_to_Y": {
+        "theta_CAE": ("anticipated_affect_ewma",),
     },
     "A_to_ME": {
         "theta_penalized_PV": ("alpha3_action", "alpha4_action_by_Ew"),
@@ -191,10 +197,24 @@ KNOBS: dict[str, KnobSpec] = {
     ),
     "my_to_y": KnobSpec(
         "my_to_y",
-        lambda k: {"MY_to_Y": k},
+        lambda k: {"FOURSC_to_Y": k, "ANTIC_to_Y": k},
         zero_is_null=False,
         sigma_invariant=False,
-        doc="Structural: mediator -> CAE loading. Moves sigma_i as well as Delta_i.",
+        doc="Structural: both mediator -> CAE loadings. Moves sigma_i as well as Delta_i.",
+    ),
+    "foursc_to_y": KnobSpec(
+        "foursc_to_y",
+        lambda k: {"FOURSC_to_Y": k},
+        zero_is_null=False,
+        sigma_invariant=False,
+        doc=(
+            "Structural: fourSC_ewma -> CAE only, holding the antic loading "
+            "fixed. Fitted fourSC_ewma is small (~0.01 on average) while the "
+            "fourSC CATE is the state-dependent one (A x interact / wear / "
+            "steps), so kappa >> 1 is typical. Also moves sigma_i and the "
+            "CAE loop gain. Users with a negative fitted loading get a more "
+            "negative one."
+        ),
     ),
     "me_to_e": KnobSpec(
         "me_to_e",

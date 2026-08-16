@@ -94,7 +94,6 @@ THETA_FOURSC_NAMES = [
     "WalkingSuggestion_by_past7days_morning_wearing",
     "WalkingSuggestion_by_Interacted_7d_walk",
     "WalkingSuggestion_by_anticipated_affect_yesterday",
-    "WalkingSuggestion_by_is_weekend",
     "WalkingSuggestion_by_decision_time",
     "WalkingSuggestion_by_perceived_utility_lastweek",
     "WalkingSuggestion_by_CAE_avg_lastweek",
@@ -103,21 +102,21 @@ THETA_FOURSC_NAMES = [
 THETA_ANTIC_NAMES = [
     "intercept",
     "anticipated_affect_yesterday",
-    "active_status",
+    "active_status_fraction_7days",
     "is_weekend",
     "perceived_utility_lastweek",
     "CAE_avg_lastweek",
     "recent_burden",
     "A0_morning",
     "A1_afternoon",
-    "A0_morning_by_is_weekend",
-    "A1_afternoon_by_is_weekend",
     "A0_morning_by_perceived_utility_lastweek",
     "A1_afternoon_by_perceived_utility_lastweek",
     "A0_morning_by_CAE_avg_lastweek",
     "A1_afternoon_by_CAE_avg_lastweek",
     "A0_morning_by_recent_burden",
     "A1_afternoon_by_recent_burden",
+    "A0_morning_by_active_status_fraction_7days",
+    "A1_afternoon_by_active_status_fraction_7days",
 ]
 
 THETA_CAE_NAMES = [
@@ -140,14 +139,25 @@ THETA_CAE_SHORT_AVG_NAMES = [
 P_FOURSC = len(THETA_FOURSC_NAMES)
 _LEGACY_INTERACT_DROP = (2,)  # removed legacy salience-history covariate
 _LEGACY_FOURSC_SALIENCE_DROP = (8, 21)
+# Layout immediately before dropping WalkingSuggestion × is_weekend.
+_P_FOURSC_WITH_WEEKEND = 27
+_FOURSC_WEEKEND_INTERACT_IDX = 23
+_P_FOURSC_WITH_WEEKEND_AND_SALIENCE = 29
 # Legacy antic vectors (relative to the pre-recent-burden 14-column layout):
 # +1 = includes today_step_count; +4 = that plus salience terms.
 _LEGACY_ANTIC_TODAY_STEP_DROP = (2,)
 _LEGACY_ANTIC_SALIENCE_AND_TODAY_STEP_DROP = (2, 4, 10, 11)
 P_ANTIC = len(THETA_ANTIC_NAMES)
-# Pre-recent-burden fits lack the recent_burden main effect (new index 6) and
+# Layout immediately before adding A0/A1 × 7-day active fraction.
+_P_ANTIC_NO_ACT7 = 15
+# Layout immediately before dropping A0/A1 × is_weekend (still 17 columns,
+# but those two were weekend interactions, not the active-fraction terms).
+_P_ANTIC_WITH_WEEKEND = 17
+_ANTIC_WEEKEND_INTERACT_IDX = (9, 10)
+# Pre-recent-burden fits lack the recent_burden main effect (index 6) and
 # the two trailing A0/A1 x recent_burden interactions; they are zero-padded.
-_P_ANTIC_NO_BURDEN = P_ANTIC - 3
+# Length is hardcoded so it does not drift when later columns are dropped.
+_P_ANTIC_NO_BURDEN = 14
 _ANTIC_BURDEN_MAIN_IDX = THETA_ANTIC_NAMES.index("recent_burden")
 P_ACTIVE_STATUS = len(THETA_ACTIVE_STATUS_NAMES)
 P_PRIOR2HOUR = len(THETA_PRIOR2HOUR_STEP_COUNT_NAMES)
@@ -286,14 +296,19 @@ def trim_theta_interaction(theta, *, name: str = "theta") -> np.ndarray:
 
 
 def trim_theta_foursc(theta) -> np.ndarray:
-    """Accept current fits or trim legacy salience predictors."""
+    """Accept current fits or trim legacy salience / weekend-interaction columns."""
     a = np.asarray(theta, dtype=float).ravel()
     if a.size == P_FOURSC:
         return a
-    if a.size == P_FOURSC + 2:
-        return np.delete(a, _LEGACY_FOURSC_SALIENCE_DROP)
+    if a.size == _P_FOURSC_WITH_WEEKEND:
+        return np.delete(a, _FOURSC_WEEKEND_INTERACT_IDX)
+    if a.size == _P_FOURSC_WITH_WEEKEND_AND_SALIENCE:
+        a = np.delete(a, _LEGACY_FOURSC_SALIENCE_DROP)
+        return np.delete(a, _FOURSC_WEEKEND_INTERACT_IDX)
     raise ValueError(
-        f"theta_fourSC length {a.size}; expected {P_FOURSC} or legacy {P_FOURSC + 2}"
+        f"theta_fourSC length {a.size}; expected {P_FOURSC}, "
+        f"legacy {_P_FOURSC_WITH_WEEKEND}, or legacy "
+        f"{_P_FOURSC_WITH_WEEKEND_AND_SALIENCE}"
     )
 
 
@@ -303,22 +318,53 @@ def _pad_theta_antic_burden(a: np.ndarray) -> np.ndarray:
     return np.concatenate([a, np.zeros(2)])
 
 
-def trim_theta_antic(theta) -> np.ndarray:
-    """Accept current fits; trim legacy today_step / salience predictors and
-    zero-pad pre-recent-burden fits."""
+def _drop_antic_weekend_interact(a: np.ndarray) -> np.ndarray:
+    """Drop A0/A1 × is_weekend from a 17-column (with-weekend) vector."""
+    return np.delete(a, _ANTIC_WEEKEND_INTERACT_IDX)
+
+
+def _pad_antic_act7(a: np.ndarray) -> np.ndarray:
+    """Append zero A0/A1 × 7-day active-fraction interactions."""
+    return np.concatenate([np.asarray(a, dtype=float).ravel(), np.zeros(2)])
+
+
+def trim_theta_antic(theta, names=None) -> np.ndarray:
+    """Accept current fits; trim legacy today_step / salience / weekend
+    interactions and zero-pad pre-recent-burden / pre-act7 fits."""
     a = np.asarray(theta, dtype=float).ravel()
+    name_list = [str(x) for x in names] if names is not None else None
+    if name_list == list(THETA_ANTIC_NAMES) and a.size == P_ANTIC:
+        return a
+    if name_list is not None and "A0_morning_by_is_weekend" in name_list:
+        if a.size >= _P_ANTIC_WITH_WEEKEND:
+            a = _drop_antic_weekend_interact(a)
+        if a.size == _P_ANTIC_NO_ACT7:
+            a = _pad_antic_act7(a)
+        if a.size == P_ANTIC:
+            return a
     if a.size == P_ANTIC:
         return a
+    if a.size == _P_ANTIC_NO_ACT7:
+        return _pad_antic_act7(a)
     if a.size == _P_ANTIC_NO_BURDEN:
-        return _pad_theta_antic_burden(a)
+        return _pad_antic_act7(_drop_antic_weekend_interact(_pad_theta_antic_burden(a)))
     if a.size == _P_ANTIC_NO_BURDEN + 1:
-        return _pad_theta_antic_burden(np.delete(a, _LEGACY_ANTIC_TODAY_STEP_DROP))
+        return _pad_antic_act7(
+            _drop_antic_weekend_interact(
+                _pad_theta_antic_burden(np.delete(a, _LEGACY_ANTIC_TODAY_STEP_DROP))
+            )
+        )
     if a.size == _P_ANTIC_NO_BURDEN + 4:
-        return _pad_theta_antic_burden(
-            np.delete(a, _LEGACY_ANTIC_SALIENCE_AND_TODAY_STEP_DROP)
+        return _pad_antic_act7(
+            _drop_antic_weekend_interact(
+                _pad_theta_antic_burden(
+                    np.delete(a, _LEGACY_ANTIC_SALIENCE_AND_TODAY_STEP_DROP)
+                )
+            )
         )
     raise ValueError(
         f"theta_antic length {a.size}; expected {P_ANTIC}, "
+        f"legacy {_P_ANTIC_NO_ACT7}, legacy {_P_ANTIC_WITH_WEEKEND}, "
         f"pre-recent-burden {_P_ANTIC_NO_BURDEN}, "
         f"legacy {_P_ANTIC_NO_BURDEN + 1}, or legacy {_P_ANTIC_NO_BURDEN + 4}"
     )
@@ -461,13 +507,19 @@ class EnvConfig:
             "theta_fourSC_names",
             p,
             THETA_FOURSC_NAMES,
-            legacy_lengths=(P_FOURSC + 2,),
+            legacy_lengths=(
+                _P_FOURSC_WITH_WEEKEND,
+                _P_FOURSC_WITH_WEEKEND_AND_SALIENCE,
+            ),
         )
         _validate_json_names(
             "theta_antic_names",
             p,
             THETA_ANTIC_NAMES,
             legacy_lengths=(
+                P_ANTIC,
+                _P_ANTIC_NO_ACT7,
+                _P_ANTIC_WITH_WEEKEND,
                 _P_ANTIC_NO_BURDEN,
                 _P_ANTIC_NO_BURDEN + 1,
                 _P_ANTIC_NO_BURDEN + 4,
@@ -485,7 +537,10 @@ class EnvConfig:
             _json_float_list("theta_ws_interaction", p), name="theta_ws_interaction"
         )
         self.theta_fourSC = trim_theta_foursc(_json_float_list("theta_fourSC", p))
-        self.theta_antic = trim_theta_antic(_json_float_list("theta_antic", p))
+        self.theta_antic = trim_theta_antic(
+            _json_float_list("theta_antic", p),
+            names=p.get("theta_antic_names"),
+        )
         self.theta_CAE = _json_float_list("theta_CAE", p)
         self.theta_CAE_short = _json_float_list("theta_CAE_short_avg", p)
 
@@ -820,7 +875,6 @@ class Env:
                 Ah * wear7,
                 Ah * s["activitySuggestionInteractLast7Days"],
                 Ah * antic_y,
-                Ah * s["isWeekend"],
                 Ah * s["decisionTimeSlot"],
                 Ah * pu,
                 Ah * cae,
@@ -887,9 +941,10 @@ class Env:
         ``5_fit_vanilla_testbed`` ``anticipated_affect_cond_day``
         (no ``today_step_count`` / ``planning_prompt``; includes
         ``perceivedUtilityLastWeek`` and ``recent_burden`` mains and
-        AM/PM interactions).
+        AM/PM interactions). Uses the prior 7-day active fraction, not
+        today's binary active status.
         """
-        act = float(s["activityStatusToday"])
+        act = float(s["activeDaysLast7Days"])
         is_weekend = float(s["isWeekend"])
         pu = float(s["perceivedUtilityLastWeek"])
         cae = float(s["caeAverageLastWeek"])
@@ -905,14 +960,14 @@ class Env:
                 rb,
                 ws_morning,
                 ws_afternoon,
-                ws_morning * is_weekend,
-                ws_afternoon * is_weekend,
                 ws_morning * pu,
                 ws_afternoon * pu,
                 ws_morning * cae,
                 ws_afternoon * cae,
                 ws_morning * rb,
                 ws_afternoon * rb,
+                ws_morning * act,
+                ws_afternoon * act,
             ],
             dtype=float,
         )

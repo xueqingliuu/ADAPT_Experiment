@@ -1080,7 +1080,7 @@ class OnlineEnv:
             rb = float(self.s.get("activitySuggestionsSentLast7Days", 0.0))
         return build_antic_features(
             dailyAnticipatedAffectYesterday=self.logDailyAnticipatedAffectYesterday[d_global],
-            activityStatusToday=self.activityStatusTodayAll[d_global],
+            activeDaysLast7Days=self.logActiveDaysLast7Days[d_global],
             isWeekend=self.logIsWeekend[d_global],
             perceivedUtility=self.E_known_all[sim_w],
             caeAverageLastWeek=0.0,
@@ -1100,6 +1100,16 @@ class OnlineEnv:
         antic_wk = self.dailyAnticipatedAffectAgentAll[day_start:day_stop]
         return build_CAE_features(0.0, self._week_norm(sim_w), foursc_wk, antic_wk)
 
+    def _query_x_weekly_present(self, k):
+        """Current-week ``I_w * J_w``."""
+        iw = float(self._Iw_per_week[k]) if 0 <= k < self._Iw_per_week.size else 0.0
+        wp = float(self.wp_all[k]) if 0 <= k < self.wp_all.size else 0.0
+        if not np.isfinite(iw):
+            iw = 0.0
+        if not np.isfinite(wp):
+            wp = 0.0
+        return iw, wp
+
     def _rl_context_vector(self, k, d, t):
         d_global = self._day_idx(k, d)
         step_idx = self._step_idx(k, d, t)
@@ -1107,6 +1117,7 @@ class OnlineEnv:
             p2h = float(self.prior2HourStepCountAgentAll[step_idx])
         else:
             p2h = float(self.s.get("prior2HourStepCountAgent", self._initial_prior2hour))
+        query_sent, weekly_present = self._query_x_weekly_present(k)
         return build_rl_context_vector(
             yesterdayStepCount=self.logYesterdayStepCount[d_global],
             prior2HourStepCountAgent=p2h,
@@ -1116,6 +1127,8 @@ class OnlineEnv:
             activitySuggestionInteractLast7Days=float(
                 self.s["activitySuggestionInteractLast7Days"]
             ),
+            query_sent=query_sent,
+            weekly_present=weekly_present,
         )
 
     def get_pf_data(self, k):
@@ -1209,7 +1222,7 @@ P_MY_FOURSC = int(
 P_MY_ANTIC = int(
     build_antic_features(
         dailyAnticipatedAffectYesterday=0.0,
-        activityStatusToday=0.0,
+        activeDaysLast7Days=0.0,
         isWeekend=0.0,
         perceivedUtility=0.0,
         caeAverageLastWeek=0.0,

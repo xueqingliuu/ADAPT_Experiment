@@ -25,7 +25,7 @@
 # Overrides (sbatch --export=ALL,VAR=value,...):
 #   TUNE_PHASE        diagnose|eval|scan|calibrate|validate    default calibrate
 #   TUNE_PARAMS_DIR   source fit to rescale                    default env_para_vanilla
-#   TUNE_KNOB         action|benefit|burden|my_to_y|...        default action
+#   TUNE_KNOB         action|benefit|burden|my_to_y|foursc_to_y|...  default action
 #   TUNE_TARGETS      target mean STE values                   default "0.2 0.5 0.8"
 #   TUNE_KAPPAS       scan grid                                default "0.25 0.5 1 2 4"
 #   TUNE_EPISODES     paired episodes per arm                  default 100

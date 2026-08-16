@@ -1305,26 +1305,26 @@ try:
         build_CAE_short_features,
     )
 except ImportError:  # pragma: no cover
-    P_FOURSC = 29
+    P_FOURSC = 26
     P_ANTIC = 17
     THETA_ANTIC_NAMES = [
         "intercept",
         "anticipated_affect_yesterday",
-        "active_status",
+        "active_status_fraction_7days",
         "is_weekend",
         "perceived_utility_lastweek",
         "CAE_avg_lastweek",
         "recent_burden",
         "A0_morning",
         "A1_afternoon",
-        "A0_morning_by_is_weekend",
-        "A1_afternoon_by_is_weekend",
         "A0_morning_by_perceived_utility_lastweek",
         "A1_afternoon_by_perceived_utility_lastweek",
         "A0_morning_by_CAE_avg_lastweek",
         "A1_afternoon_by_CAE_avg_lastweek",
         "A0_morning_by_recent_burden",
         "A1_afternoon_by_recent_burden",
+        "A0_morning_by_active_status_fraction_7days",
+        "A1_afternoon_by_active_status_fraction_7days",
     ]
 
     def make_initial_state(participant_id=118):  # type: ignore[misc]
@@ -1397,18 +1397,26 @@ def build_rl_context_vector(
     activitySuggestionsSentLast7Days,
     salienceMessageSentYesterday,
     activitySuggestionInteractLast7Days,
+    query_sent=0.0,
+    weekly_present=0.0,
 ):
-    """Per-decision context ``C`` for RLSVI (length 6)."""
+    """Per-decision context ``C`` for RLSVI / STE DQN (length 7).
+
+    The last coordinate is ``I_w * J_w`` (weekly query sent × week present).
+    """
+    iw = float(query_sent) if np.isfinite(query_sent) else 0.0
+    wp = float(weekly_present) if np.isfinite(weekly_present) else 0.0
     return np.array([
         float(yesterdayStepCount),
         float(prior2HourStepCountAgent), float(activeDaysLast7Days),
         float(activitySuggestionsSentLast7Days),
         float(salienceMessageSentYesterday),
         float(activitySuggestionInteractLast7Days),
+        iw * wp,
     ], dtype=float)
 
 
-N_RL_CONTEXT = 6
+N_RL_CONTEXT = 7
 
 RL_MY_SHAPE = (6, 3)
 RL_ME_SHAPE = (6, 4)
@@ -1458,7 +1466,7 @@ def antic_cae_delta(x):
 def build_antic_features(
     *,
     dailyAnticipatedAffectYesterday,
-    activityStatusToday,
+    activeDaysLast7Days=None,
     isWeekend,
     perceivedUtility,
     caeAverageLastWeek,
@@ -1467,16 +1475,25 @@ def build_antic_features(
     ws_afternoon,
     pu=None,
     cae=None,
+    activityStatusToday=None,
 ):
     """Feature vector matching ``vani_env.gen_antic_mean`` (length ``P_ANTIC``).
 
     Pass ``cae=0.0`` for PF base rows; per-particle CAE is added via
     :func:`build_pf_data`.  ``pu`` / ``cae`` override ``perceivedUtility`` /
     ``caeAverageLastWeek`` when supplied.
+
+    ``activityStatusToday`` is accepted only as a deprecated alias for
+    ``activeDaysLast7Days``.
     """
     _pu = float(perceivedUtility) if pu is None else float(pu)
     _cae = float(caeAverageLastWeek) if cae is None else float(cae)
-    act = float(activityStatusToday)
+    if activeDaysLast7Days is None and activityStatusToday is None:
+        raise TypeError("build_antic_features requires activeDaysLast7Days")
+    if activityStatusToday is not None and activeDaysLast7Days is None:
+        act = float(activityStatusToday)
+    else:
+        act = float(activeDaysLast7Days)
     is_weekend = float(isWeekend)
     rb = float(activitySuggestionsSentLast7Days)
     ws_morning = float(ws_morning)
@@ -1492,14 +1509,14 @@ def build_antic_features(
             rb,
             ws_morning,
             ws_afternoon,
-            ws_morning * is_weekend,
-            ws_afternoon * is_weekend,
             ws_morning * _pu,
             ws_afternoon * _pu,
             ws_morning * _cae,
             ws_afternoon * _cae,
             ws_morning * rb,
             ws_afternoon * rb,
+            ws_morning * act,
+            ws_afternoon * act,
         ],
         dtype=float,
     )

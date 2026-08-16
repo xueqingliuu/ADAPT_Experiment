@@ -15,12 +15,27 @@ is AR(1) bootstrap (``--noise ar1``).
 
 Seed split (do not overlap these ranges)::
 
-    train env seeds     ``2024 + jobid + episode``
-    validation seeds    ``VAL_SEED0 .. VAL_SEED0 + N_VAL_EPISODES - 1``
-    test / STE seeds    ``TEST_SEED0 .. TEST_SEED0 + n_test - 1``
+    train env seeds              ``2024 + jobid + episode``
+    checkpoint-selection seeds   ``100000 .. 100199``
+    deployment-gate seeds        ``150000 .. 150199``
+    test / STE seeds             ``300000 ..``
 
-The saved checkpoint is the one with the largest validation ``mean(G_pi - G_0)``,
-not the network at the final training step.
+The saved checkpoint is the one with the largest selection-set
+``mean(G_pi - G_0)``, not the network at the final training step. After
+that, deploy CQL only if
+
+    gate_Δ - VAL_FALLBACK_C * SE(gate_Δ) > 0
+
+on the independent gate seeds. ``SE`` is the paired Monte Carlo SE of
+``D_b = G_{π,b} - G_{0,b}`` (same gate seeds for CQL and zero), not a
+two-sample SE. The gate is not scored on the seeds that chose the
+checkpoint, so it does not inherit that winner's-curse bias.
+
+``c = 1`` is a performance-oriented safety heuristic (~84% one-sided
+normal), not a 95% test; do not retune ``c`` against test STE.
+
+Test STE uses ``TEST_SEED0 = 300000`` so the fallback rule is not scored
+on the old 200000+ seeds that identified the negative users.
 
 Checkpoints: ``d3rlpy_logs/ste_exp_<EXP>/user<uid>_model.d3``
 Eval rows:   ``results_ste/exp<EXP>/res<EXP>_<uid>.txt``
@@ -34,6 +49,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -67,7 +83,14 @@ ADVANTAGE_MARGIN = 0.0
 VAL_SEED0 = 100_000
 N_VAL_EPISODES = 200
 VAL_EVERY_STEPS = 10_000
-TEST_SEED0 = 200_000
+# Independent of checkpoint selection (100000–100199). 100200–149999 unused.
+GATE_SEED0 = 150_000
+N_GATE_EPISODES = 200
+# Fresh test range after the val-Δ fallback was introduced (old evals used 200000).
+TEST_SEED0 = 300_000
+# Deploy CQL iff paired gate_Δ - c * SE > 0. c=1 is ~84% one-sided normal,
+# a performance heuristic, not a 95% test (that would be c≈1.645).
+VAL_FALLBACK_C = 1.0
 STE_OBSERVATION_SCALER = "none"
 
 try:
@@ -291,8 +314,41 @@ def ste_policy_action(dqn, s_vec, margin: float = ADVANTAGE_MARGIN) -> int:
     return int(q[1] - q[0] > float(margin))
 
 
+def _seed_range(start: int, n: int) -> np.ndarray:
+    return np.arange(int(start), int(start) + int(n), dtype=int)
+
+
+@contextmanager
+def _preserve_numpy_rng():
+    """Keep evaluation from mutating NumPy's global RNG (used inside ``fit``)."""
+    rng_state = rd.get_state()
+    try:
+        yield
+    finally:
+        rd.set_state(rng_state)
+
+
 def _val_seeds(n_val: int = N_VAL_EPISODES) -> np.ndarray:
-    return np.arange(VAL_SEED0, VAL_SEED0 + int(n_val), dtype=int)
+    return _seed_range(VAL_SEED0, n_val)
+
+
+def _gate_seeds(n_gate: int = N_GATE_EPISODES) -> np.ndarray:
+    return _seed_range(GATE_SEED0, n_gate)
+
+
+def _assert_seed_ranges_disjoint(n_val: int, n_gate: int, n_test: int = 1) -> None:
+    ranges = {
+        "selection": (VAL_SEED0, VAL_SEED0 + int(n_val)),
+        "gate": (GATE_SEED0, GATE_SEED0 + int(n_gate)),
+        "test": (TEST_SEED0, TEST_SEED0 + int(n_test)),
+    }
+    names = list(ranges)
+    for i, a in enumerate(names):
+        a0, a1 = ranges[a]
+        for b in names[i + 1 :]:
+            b0, b1 = ranges[b]
+            if a0 < b1 and b0 < a1:
+                raise ValueError(f"seed ranges overlap: {a}[{a0},{a1}) vs {b}[{b0},{b1})")
 
 
 def rollout_totals_for_seeds(
@@ -317,6 +373,65 @@ def rollout_totals_for_seeds(
             params_dir=params_dir,
         )
     return totals
+
+
+def _paired_delta_stats(
+    g_pi: np.ndarray,
+    g_zero: np.ndarray,
+    *,
+    prefix: str,
+) -> dict:
+    """Paired ``D_b = G_{π,b} - G_{0,b}``; SE is ``sd(D) / sqrt(n)``, not two-sample."""
+    diff = np.asarray(g_pi, dtype=float) - np.asarray(g_zero, dtype=float)
+    n = int(diff.size)
+    delta = float(np.mean(diff))
+    se = float(np.std(diff, ddof=1) / np.sqrt(n)) if n > 1 else float("nan")
+    z = float(delta / se) if np.isfinite(se) and se > 0 else float("nan")
+    return {f"{prefix}_delta": delta, f"{prefix}_se": se, f"{prefix}_z": z, f"n_{prefix}": n}
+
+
+def decide_deploy_cql(
+    delta: float,
+    se: float,
+    *,
+    c: float = VAL_FALLBACK_C,
+) -> bool:
+    """Deploy CQL iff ``Δ - c * SE(Δ) > 0`` on the independent gate seeds."""
+    if not np.isfinite(delta) or not np.isfinite(se):
+        return False
+    return float(delta) - float(c) * float(se) > 0.0
+
+
+def summarize_paired_policy(
+    userid: int,
+    *,
+    nweek: int,
+    noise: str,
+    dqn,
+    seeds: np.ndarray,
+    g_zero: np.ndarray,
+    prefix: str,
+    params_dir: Path | None = None,
+) -> dict:
+    """Paired Δ / SE and treat rate for a frozen checkpoint on ``seeds``."""
+    g_pi = np.empty(len(seeds), dtype=np.float64)
+    rates = np.empty(len(seeds), dtype=np.float64)
+    for i, seed in enumerate(seeds):
+        tot, rate = rollout_total_cae(
+            userid,
+            nweek=nweek,
+            seed=int(seed),
+            policy="dqn_greedy",
+            dqn=dqn,
+            noise=noise,
+            params_dir=params_dir,
+            return_stats=True,
+        )
+        g_pi[i] = tot
+        rates[i] = rate
+    stats = _paired_delta_stats(g_pi, g_zero, prefix=prefix)
+    stats["action1_rate"] = float(np.mean(rates))
+    return stats
 
 
 def mean_delta_vs_zero(
@@ -397,27 +512,29 @@ def train_dqn_ste(
     ).create(device=_dqn_fit_device())
 
     seeds = _val_seeds(n_val)
-    g_zero = rollout_totals_for_seeds(
-        userid,
-        nweek=nweek,
-        seeds=seeds,
-        policy="zero",
-        noise=noise,
-        params_dir=params_dir,
-    )
+    with _preserve_numpy_rng():
+        g_zero = rollout_totals_for_seeds(
+            userid,
+            nweek=nweek,
+            seeds=seeds,
+            policy="zero",
+            noise=noise,
+            params_dir=params_dir,
+        )
     best: dict = {"delta": -np.inf, "step": None}
     history: list[dict] = []
 
     def on_epoch(algo, epoch: int, total_step: int) -> None:
-        delta = mean_delta_vs_zero(
-            userid,
-            nweek=nweek,
-            noise=noise,
-            dqn=algo,
-            seeds=seeds,
-            g_zero=g_zero,
-            params_dir=params_dir,
-        )
+        with _preserve_numpy_rng():
+            delta = mean_delta_vs_zero(
+                userid,
+                nweek=nweek,
+                noise=noise,
+                dqn=algo,
+                seeds=seeds,
+                g_zero=g_zero,
+                params_dir=params_dir,
+            )
         history.append(
             {"epoch": int(epoch), "step": int(total_step), "val_delta": float(delta)}
         )
@@ -454,6 +571,7 @@ def train_dqn_ste(
         "val_seed0": VAL_SEED0,
         "n_val": int(n_val),
         "val_every": int(n_steps_per_epoch),
+        "g_zero": g_zero,
     }
 
 
@@ -469,6 +587,7 @@ def rollout_total_cae(
     walk_prob: float = 0.5,
     params_dir: Path | None = None,
     return_weekly: bool = False,
+    return_stats: bool = False,
 ):
     """
     Run one episode; return ``sum_k CAE_k`` (primary outcome total).
@@ -477,7 +596,8 @@ def rollout_total_cae(
     ``dqn_greedy`` uses ``ste_policy_action`` (advantage margin), not argmax.
     ``params_dir`` defaults to ``vani_env.PARAMS_DIR``; ``tune_ste.py`` passes a
     rescaled copy to evaluate alternative effect sizes.  With ``return_weekly``
-    the per-week CAE vector is returned alongside the total.
+    the per-week CAE vector is returned alongside the total.  With
+    ``return_stats`` the walking-suggestion rate is also returned.
     """
     rd.seed(seed)
     cfg = (
@@ -493,6 +613,8 @@ def rollout_total_cae(
     oenv.s["activitySuggestionsSentLast7Days"] = (
         oenv._activitySuggestionsSentLast7Days_initial
     )
+    n_decisions = 0
+    n_treat = 0
 
     for k in range(oenv.nweek):
         packet = oenv.get_week_packet(k)
@@ -514,13 +636,22 @@ def rollout_total_cae(
                     raise ValueError(policy)
                 if policy != "dqn_greedy":
                     prepare_ste_state_vector(oenv, k, d, t_slot)
+                n_decisions += 1
+                n_treat += int(a)
                 oenv.step_action(k, d, t_slot, float(a), i_w)
         oenv._finalize_week(k)
 
     # Index 0 is the pre-RL baseline; STE outcomes include simulated weeks only.
     weekly = np.asarray(oenv.CAE_all[1 : oenv.nweek + 1], dtype=float)
     total = float(np.nansum(weekly))
-    return (total, weekly) if return_weekly else total
+    treat_rate = float(n_treat / n_decisions) if n_decisions else 0.0
+    if return_weekly and return_stats:
+        return total, weekly, treat_rate
+    if return_weekly:
+        return total, weekly
+    if return_stats:
+        return total, treat_rate
+    return total
 
 
 def _userid_from_job(jobid: int, userid_all: np.ndarray) -> int:
@@ -582,7 +713,15 @@ def eval_ste_job(
                 f"trained={metadata.get(key)!r}, evaluation={value!r}"
             )
 
-    dqn = d3rlpy.load_learnable(str(model_dir))
+    selected_policy = str(metadata.get("selected_policy", "cql"))
+    print(
+        f"eval user={userid}  selected_policy={selected_policy}  "
+        f"test_seed0={TEST_SEED0}  n_test={n_test}",
+        flush=True,
+    )
+    dqn = None
+    if selected_policy != "zero":
+        dqn = d3rlpy.load_learnable(str(model_dir))
 
     out = np.zeros((n_test, 2))
     for n in range(n_test):
@@ -591,15 +730,18 @@ def eval_ste_job(
         out[n, 0] = rollout_total_cae(
             userid, nweek=nweek, seed=test_seed, policy="zero", noise=noise
         )
-        rd.seed(test_seed)
-        out[n, 1] = rollout_total_cae(
-            userid,
-            nweek=nweek,
-            seed=test_seed,
-            policy="dqn_greedy",
-            dqn=dqn,
-            noise=noise,
-        )
+        if selected_policy == "zero":
+            out[n, 1] = out[n, 0]
+        else:
+            rd.seed(test_seed)
+            out[n, 1] = rollout_total_cae(
+                userid,
+                nweek=nweek,
+                seed=test_seed,
+                policy="dqn_greedy",
+                dqn=dqn,
+                noise=noise,
+            )
 
     path = Path("results_ste") / f"exp{exp}"
     path.mkdir(parents=True, exist_ok=True)
@@ -620,7 +762,9 @@ def train_ste_job(
     noise: str = "ar1",
     cql_alpha: float = CQL_ALPHA,
     n_val: int = N_VAL_EPISODES,
+    n_gate: int = N_GATE_EPISODES,
     val_every: int = VAL_EVERY_STEPS,
+    val_fallback_c: float = VAL_FALLBACK_C,
 ) -> None:
     """Train DiscreteCQL for ``userid = user_ids[jobid]``."""
     _require_d3()
@@ -631,6 +775,7 @@ def train_ste_job(
 
     if nweek is None:
         nweek = int(EnvConfig(userid).nweek)
+    _assert_seed_ranges_disjoint(n_val, n_gate)
 
     rd.seed(seed)
     buffer = build_offline_buffer(
@@ -662,6 +807,41 @@ def train_ste_job(
         n_val=n_val,
         val_every=val_every,
     )
+    dqn = d3rlpy.load_learnable(str(model_dir))
+    selection.pop("g_zero", None)
+    gate_seeds = _gate_seeds(n_gate)
+    g_zero_gate = rollout_totals_for_seeds(
+        userid,
+        nweek=nweek,
+        seeds=gate_seeds,
+        policy="zero",
+        noise=noise,
+    )
+    gate_stats = summarize_paired_policy(
+        userid,
+        nweek=nweek,
+        noise=noise,
+        dqn=dqn,
+        seeds=gate_seeds,
+        g_zero=g_zero_gate,
+        prefix="gate",
+    )
+    deploy_cql = decide_deploy_cql(
+        gate_stats["gate_delta"],
+        gate_stats["gate_se"],
+        c=val_fallback_c,
+    )
+    selected_policy = "cql" if deploy_cql else "zero"
+    print(
+        f"gate user={userid}  sel_Δ={float(selection.get('best_val_delta', float('nan'))):.6f}  "
+        f"gate_Δ={gate_stats['gate_delta']:.6f}  "
+        f"gate_SE={gate_stats['gate_se']:.6f}  "
+        f"z={gate_stats['gate_z']:.3f}  "
+        f"threshold={val_fallback_c}*SE  "
+        f"action1_rate={gate_stats['action1_rate']:.3f}  "
+        f"policy={selected_policy}",
+        flush=True,
+    )
     metadata = {
         "userid": userid,
         "nweek": int(nweek),
@@ -682,7 +862,13 @@ def train_ste_job(
         "j_w_fixed": 1,
         "seed": seed,
         "val_seed0": VAL_SEED0,
+        "gate_seed0": GATE_SEED0,
+        "n_gate": int(n_gate),
         "test_seed0": TEST_SEED0,
+        "val_fallback_c": float(val_fallback_c),
+        "selected_policy": selected_policy,
+        "selected_step": selection.get("best_step"),
+        **gate_stats,
         **selection,
     }
     with open(_model_metadata_path(model_dir), "w", encoding="utf-8") as f:
@@ -746,6 +932,107 @@ def aggregate_ste(
     return float(np.mean(user_ste))
 
 
+def _fmt_num(value, *, signed: bool = False, digits: int = 3, missing: str = "NA"):
+    if value is None:
+        return missing
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return missing
+    if not np.isfinite(x):
+        return missing
+    return f"{x:+.{digits}f}" if signed else f"{x:.{digits}f}"
+
+
+def report_ste(
+    exp: str = "1",
+    *,
+    userid_path: Path | None = None,
+    only_negative: bool = False,
+    users: list[int] | None = None,
+    val_curve: bool = False,
+    burn_in_rows: int = 0,
+) -> None:
+    """Print per-user val Δ / SE / z, selected checkpoint, treat rate, and test STE."""
+    uid_path = Path(userid_path) if userid_path else PARAMS_DIR / "user_ids.txt"
+    userid_all = np.loadtxt(uid_path, dtype=int)
+    path = Path("results_ste") / f"exp{exp}"
+    logger_dir = Path("d3rlpy_logs") / f"ste_exp_{exp}"
+    want = set(int(u) for u in users) if users else None
+
+    header = (
+        f"{'user':>5}  {'sel_delta':>9}  {'gate_delta':>10}  {'gate_se':>7}  "
+        f"{'z=d/se':>7}  {'selected_step':>13}  {'action1%':>8}  "
+        f"{'policy':>6}  {'test_STE':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    n_pos = 0
+    n_users = 0
+    for userid in userid_all:
+        uid = int(userid)
+        if want is not None and uid not in want:
+            continue
+        fp = path / f"res{exp}_{uid}.txt"
+        ste = None
+        if fp.is_file():
+            reward = np.loadtxt(fp)
+            if reward.ndim == 1:
+                reward = reward.reshape(1, -1)
+            if burn_in_rows:
+                reward = reward[burn_in_rows:]
+            g_zero = reward[:, 0]
+            g_opt = reward[:, 1]
+            d = g_opt - g_zero
+            ste = float(np.mean(d) / np.std(g_zero, ddof=1))
+            n_users += 1
+            n_pos += int(ste > 0)
+            if only_negative and ste >= 0:
+                continue
+        elif want is None:
+            continue
+
+        meta_path = _model_metadata_path(logger_dir / f"user{uid}_model.d3")
+        meta = {}
+        if meta_path.is_file():
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+        sel_delta = meta.get("best_val_delta")
+        gate_delta = meta.get("gate_delta", meta.get("val_delta"))
+        gate_se = meta.get("gate_se", meta.get("val_se"))
+        gate_z = meta.get("gate_z", meta.get("val_z"))
+        if gate_z is None and gate_delta is not None and gate_se not in (None, 0, 0.0):
+            try:
+                gate_z = float(gate_delta) / float(gate_se)
+            except (TypeError, ValueError, ZeroDivisionError):
+                gate_z = None
+        rate = meta.get("action1_rate")
+        action1_pct = None if rate is None else 100.0 * float(rate)
+        print(
+            f"{uid:5d}  {_fmt_num(sel_delta, signed=True):>9}  "
+            f"{_fmt_num(gate_delta, signed=True):>10}  "
+            f"{_fmt_num(gate_se):>7}  {_fmt_num(gate_z, signed=True):>7}  "
+            f"{str(meta.get('selected_step', meta.get('best_step', 'NA'))):>13}  "
+            f"{_fmt_num(action1_pct, digits=1):>8}  "
+            f"{str(meta.get('selected_policy', 'NA')):>6}  "
+            f"{_fmt_num(ste, signed=True):>8}"
+        )
+        if val_curve:
+            history = meta.get("val_history") or []
+            if not history:
+                print("        (no val_history in metadata)")
+            else:
+                print("        step     val Δ")
+                for row in history:
+                    print(
+                        f"        {int(row.get('step', -1)):<8} "
+                        f"{_fmt_num(row.get('val_delta'), signed=True)}"
+                    )
+    if n_users:
+        print(f"\npositive {n_pos}/{n_users}  (files in {path})")
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Vanilla testbed STE (DiscreteCQL vs zero policy)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -765,9 +1052,21 @@ def main(argv: list[str] | None = None) -> None:
         help="DiscreteCQL conservative penalty weight (default 0.1)",
     )
     pt.add_argument("--n-val", type=int, default=N_VAL_EPISODES)
+    pt.add_argument(
+        "--n-gate",
+        type=int,
+        default=N_GATE_EPISODES,
+        help="Independent deployment-gate episodes (seeds GATE_SEED0+)",
+    )
     pt.add_argument("--val-every", type=int, default=VAL_EVERY_STEPS)
     pt.add_argument(
         "--noise", type=str, default="ar1", choices=("random", "sequential", "ar1")
+    )
+    pt.add_argument(
+        "--val-fallback-c",
+        type=float,
+        default=VAL_FALLBACK_C,
+        help="Deploy CQL only if gate_Δ - c*SE(gate_Δ) > 0 (default 1.0)",
     )
 
     pe = sub.add_parser("eval", help="Evaluate zero vs DiscreteCQL for user_ids[jobid]")
@@ -785,6 +1084,30 @@ def main(argv: list[str] | None = None) -> None:
     pa.add_argument("--user-ids", type=str, default=None)
     pa.add_argument("--burn-in-rows", type=int, default=0)
 
+    pr = sub.add_parser(
+        "report",
+        help="Print val Δ/SE/z, selected step, treat rate, and test STE",
+    )
+    pr.add_argument("--exp", type=str, default="1")
+    pr.add_argument("--user-ids", type=str, default=None)
+    pr.add_argument("--burn-in-rows", type=int, default=0)
+    pr.add_argument(
+        "--only-negative",
+        action="store_true",
+        help="Print only users with test STE < 0",
+    )
+    pr.add_argument(
+        "--users",
+        type=str,
+        default=None,
+        help="Comma-separated user ids (e.g. 18,33)",
+    )
+    pr.add_argument(
+        "--val-curve",
+        action="store_true",
+        help="Print checkpoint val_Δ history from metadata",
+    )
+
     args = p.parse_args(argv)
     uid_path = Path(args.user_ids) if getattr(args, "user_ids", None) else None
 
@@ -800,7 +1123,9 @@ def main(argv: list[str] | None = None) -> None:
             noise=args.noise,
             cql_alpha=args.cql_alpha,
             n_val=args.n_val,
+            n_gate=args.n_gate,
             val_every=args.val_every,
+            val_fallback_c=args.val_fallback_c,
         )
     elif args.cmd == "eval":
         eval_ste_job(
@@ -810,6 +1135,18 @@ def main(argv: list[str] | None = None) -> None:
             n_test=args.n_test,
             nweek=args.nweek,
             noise=args.noise,
+        )
+    elif args.cmd == "report":
+        users = None
+        if args.users:
+            users = [int(x) for x in args.users.split(",") if x.strip()]
+        report_ste(
+            args.exp,
+            userid_path=uid_path,
+            only_negative=args.only_negative,
+            users=users,
+            val_curve=args.val_curve,
+            burn_in_rows=args.burn_in_rows,
         )
     else:
         ste = aggregate_ste(args.exp, userid_path=uid_path, burn_in_rows=args.burn_in_rows)

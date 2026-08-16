@@ -548,7 +548,6 @@ def build_fourSC_bayes_data(df, userid_all):
                 WalkingSuggestion * past7days_morning_wearing,
                 WalkingSuggestion * Interacted_7d_walk,
                 WalkingSuggestion * anticipated_affect_yesterday,
-                WalkingSuggestion * is_weekend,
                 WalkingSuggestion * decision_time,
                 WalkingSuggestion * perceived_utility_lastweek,
                 WalkingSuggestion * CAE_avg_lastweek,
@@ -588,7 +587,9 @@ def build_antic_bayes_data(df, userid_all):
         anticipated_affect_yesterday = fill_nan_with_mean(
             dat_user["anticipated_affect_yesterday_norm"].to_numpy()
         )
-        active_status_filled = fill_nan_with_mean(dat_user["active_status"].to_numpy())
+        active_status_fraction_7days = fill_nan_with_mean(
+            dat_user["active_status_fraction_7days"].to_numpy()
+        )
         is_weekend = dat_user["is_weekend"].to_numpy(dtype=float)
         perceived_utility_lastweek = dat_user["perceived_utility_lastweek"].to_numpy(dtype=float)
         perceived_utility_lastweek = np.where(
@@ -612,21 +613,21 @@ def build_antic_bayes_data(df, userid_all):
             [
                 Intercept[_am],
                 anticipated_affect_yesterday[_am],
-                active_status_filled[_am],
+                active_status_fraction_7days[_am],
                 is_weekend[_am],
                 perceived_utility_lastweek[_am],
                 CAE_avg_lastweek[_am],
                 recent_burden[_am],
                 ws_morning_day,
                 ws_afternoon_day,
-                ws_morning_day * is_weekend[_am],
-                ws_afternoon_day * is_weekend[_am],
                 ws_morning_day * perceived_utility_lastweek[_am],
                 ws_afternoon_day * perceived_utility_lastweek[_am],
                 ws_morning_day * CAE_avg_lastweek[_am],
                 ws_afternoon_day * CAE_avg_lastweek[_am],
                 ws_morning_day * recent_burden[_am],
                 ws_afternoon_day * recent_burden[_am],
+                ws_morning_day * active_status_fraction_7days[_am],
+                ws_afternoon_day * active_status_fraction_7days[_am],
             ],
             axis=1,
         )
@@ -688,7 +689,6 @@ THETA_FOURSC_NAMES = [
     "WalkingSuggestion_by_past7days_morning_wearing",
     "WalkingSuggestion_by_Interacted_7d_walk",
     "WalkingSuggestion_by_anticipated_affect_yesterday",
-    "WalkingSuggestion_by_is_weekend",
     "WalkingSuggestion_by_decision_time",
     "WalkingSuggestion_by_perceived_utility_lastweek",
     "WalkingSuggestion_by_CAE_avg_lastweek",
@@ -697,21 +697,21 @@ THETA_FOURSC_NAMES = [
 THETA_ANTIC_NAMES = [
     "intercept",
     "anticipated_affect_yesterday",
-    "active_status",
+    "active_status_fraction_7days",
     "is_weekend",
     "perceived_utility_lastweek",
     "CAE_avg_lastweek",
     "recent_burden",
     "A0_morning",
     "A1_afternoon",
-    "A0_morning_by_is_weekend",
-    "A1_afternoon_by_is_weekend",
     "A0_morning_by_perceived_utility_lastweek",
     "A1_afternoon_by_perceived_utility_lastweek",
     "A0_morning_by_CAE_avg_lastweek",
     "A1_afternoon_by_CAE_avg_lastweek",
     "A0_morning_by_recent_burden",
     "A1_afternoon_by_recent_burden",
+    "A0_morning_by_active_status_fraction_7days",
+    "A1_afternoon_by_active_status_fraction_7days",
 ]
 
 THETA_CAE_NAMES = [
@@ -896,6 +896,8 @@ for _name in (
     "A1_afternoon_by_perceived_utility_lastweek",
     "A0_morning_by_CAE_avg_lastweek",
     "A1_afternoon_by_CAE_avg_lastweek",
+    "A0_morning_by_active_status_fraction_7days",
+    "A1_afternoon_by_active_status_fraction_7days",
 ):
     ANTIC_BETA_PRIOR_MU[THETA_ANTIC_NAMES.index(_name)] = 0.03
     ANTIC_BETA_PRIOR_SD[THETA_ANTIC_NAMES.index(_name)] = 0.08
@@ -1346,7 +1348,6 @@ for i, userid in enumerate(userid_all):
         WalkingSuggestion * past7days_morning_wearing,
         WalkingSuggestion * Interacted_7d_walk,
         WalkingSuggestion * anticipated_affect_yesterday,
-        WalkingSuggestion * is_weekend,
         WalkingSuggestion * decision_time,
         WalkingSuggestion * perceived_utility_lastweek,
         WalkingSuggestion * CAE_avg_lastweek
@@ -1387,27 +1388,26 @@ for i, userid in enumerate(userid_all):
     #### Model 5: Anticipated affect model ####
     # Daily outcome: one row per calendar day (morning row). Predictors from that row except treatment,
     # which enters as both ws_morning_day and ws_afternoon_day for that day.
-    active_status_filled = fill_nan_with_mean(active_status)
     # planning_prompt_filled = np.where(np.isnan(planning_prompt), 0, planning_prompt)
     _am = idx_morning
     anticipated_affect_cond_day = np.stack([
         Intercept[_am],
         anticipated_affect_yesterday[_am],
-        active_status_filled[_am],
+        active_status_fraction_7days[_am],
         is_weekend[_am],
         perceived_utility_lastweek[_am],
         CAE_avg_lastweek[_am],
         recent_burden[_am],
         ws_morning_day,
         ws_afternoon_day,
-        ws_morning_day * is_weekend[_am],
-        ws_afternoon_day * is_weekend[_am],
         ws_morning_day * perceived_utility_lastweek[_am],
         ws_afternoon_day * perceived_utility_lastweek[_am],
         ws_morning_day * CAE_avg_lastweek[_am],
         ws_afternoon_day * CAE_avg_lastweek[_am],
         ws_morning_day * recent_burden[_am],
         ws_afternoon_day * recent_burden[_am],
+        ws_morning_day * active_status_fraction_7days[_am],
+        ws_afternoon_day * active_status_fraction_7days[_am],
     ], axis=1)
 
     y_antic_day = anticipated_affect[_am]
