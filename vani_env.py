@@ -33,6 +33,20 @@ PARAMS_DIR = (
 ).expanduser().resolve()
 
 
+def _load_json(path: Path):
+    """Load JSON and name the file if it is empty or truncated."""
+    path = Path(path)
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"empty JSON file: {path} ({path.stat().st_size} bytes)")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid JSON in {path} ({path.stat().st_size} bytes): {exc}"
+        ) from exc
+
+
 def load_CAE_norm_params(params_dir=PARAMS_DIR):
     """Return ``(shift, scale)`` used to z-score raw weekly CAE into ``CAE_avg_norm``.
 
@@ -464,8 +478,7 @@ class EnvConfig:
 
         params_path = Path(params_dir).expanduser().resolve()
         self.params_dir = params_path
-        with open(params_path / "std_params.json", encoding="utf-8") as f:
-            std = json.load(f)
+        std = _load_json(params_path / "std_params.json")
         self.limits_fourSC = std["4hour_step_count_limit"]
         self.limits_pageview = std["HourlyPageviewCount_limit"]
         self.limits_CAE = std["CAE_avg_limit"]
@@ -488,8 +501,7 @@ class EnvConfig:
         # Tool surveys are normalized from the raw 1..7 scale to [-1, 1].
         self.limits_exp1 = [-1.0, 1.0]
         self.limits_exp2 = [-1.0, 1.0]
-        with open(params_path / f"params_env_{userid}.json", encoding="utf-8") as f:
-            p = json.load(f)
+        p = _load_json(params_path / f"params_env_{userid}.json")
 
         _validate_json_names(
             "theta_prior2hour_step_count_names",

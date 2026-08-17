@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -295,6 +296,18 @@ def scale_params(
     return out, audit
 
 
+def _write_json_atomic(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, allow_nan=False)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+    with open(path, encoding="utf-8") as f:
+        json.load(f)
+
+
 def write_scaled_params(
     src_dir: Path,
     dst_dir: Path,
@@ -317,8 +330,7 @@ def write_scaled_params(
         for r in rows:
             r["userid"] = int(uid)
         audit.extend(rows)
-        with open(dst_dir / f"params_env_{uid}.json", "w", encoding="utf-8") as f:
-            json.dump(scaled, f, allow_nan=False)
+        _write_json_atomic(dst_dir / f"params_env_{uid}.json", scaled)
     return audit
 
 
@@ -1022,6 +1034,7 @@ def cmd_calibrate(args) -> None:
     knob = KNOBS[args.knob]
     scratch = Path(args.scratch).expanduser().resolve()
     require_stable = bool(args.require_stable)
+    print(f"scratch: {scratch}", flush=True)
 
     print(f"knob '{knob.name}': {knob.doc}")
     arms = [f"Bernoulli p in {spec.policy_grid}"]
@@ -1061,9 +1074,10 @@ def cmd_calibrate(args) -> None:
         nonlocal zero_cache
         if float(kappa) in last:  # the response curve is shared across targets
             return last[float(kappa)]["mean_ste"]
-        write_scaled_params(base_dir, scratch, user_ids, knob.build(float(kappa)))
+        kappa_dir = scratch / f"k{float(kappa):.8g}"
+        write_scaled_params(base_dir, kappa_dir, user_ids, knob.build(float(kappa)))
         result = evaluate(
-            scratch,
+            kappa_dir,
             user_ids,
             spec,
             zero_cache=zero_cache,
@@ -1241,7 +1255,9 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--knob", default="action", choices=sorted(KNOBS))
             sp.add_argument(
                 "--scratch",
-                default=str(PROJECT_ROOT / ".ste_tune_scratch"),
+                default=str(
+                    PROJECT_ROOT / f".ste_tune_scratch_{os.getpid()}_{time.time_ns()}"
+                ),
                 help="Working directory for candidate parameter sets",
             )
 

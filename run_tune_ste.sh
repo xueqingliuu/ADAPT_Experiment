@@ -39,6 +39,8 @@
 #   TUNE_VALIDATE     1 to submit true-STE jobs after calibrate (default 1)
 #   TUNE_REQUIRE_STABLE  1 to refuse unstable folders (default 1)
 #   TUNE_TOL  TUNE_MAX_ITER  TUNE_SEED  TUNE_PROXY_TO_TRUE  TUNE_JOBS
+#   TUNE_SCRATCH      working dir for candidate params     default
+#                     .ste_tune_scratch_<knob>_<jobid>
 #
 # Calibration writes env_para_ste0.2/, env_para_ste0.5/, env_para_ste0.8/ only
 # when every participant's E_w and CAE loops are stable and the proxy STE is
@@ -84,6 +86,7 @@ TUNE_PROXY_TO_TRUE="${TUNE_PROXY_TO_TRUE:-1.0}"
 TUNE_JOBS="${TUNE_JOBS:-${SLURM_CPUS_PER_TASK:-4}}"
 TUNE_VALIDATE="${TUNE_VALIDATE:-1}"
 TUNE_REQUIRE_STABLE="${TUNE_REQUIRE_STABLE:-1}"
+TUNE_SCRATCH="${TUNE_SCRATCH:-.ste_tune_scratch_${TUNE_KNOB}_${SLURM_JOB_ID:-$$}}"
 
 mkdir -p logs
 
@@ -97,6 +100,7 @@ echo "Host: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "TUNE_PHASE=${TUNE_PHASE}  TUNE_PARAMS_DIR=${TUNE_PARAMS_DIR}  (${NUM_USERS} participants)"
 echo "TUNE_KNOB=${TUNE_KNOB}  TUNE_EPISODES=${TUNE_EPISODES}  TUNE_JOBS=${TUNE_JOBS}"
+echo "TUNE_SCRATCH=${TUNE_SCRATCH}  TUNE_OUT_PREFIX=${TUNE_OUT_PREFIX}"
 
 # The DQN arm is optional. Requiring every checkpoint keeps the comparison
 # across participants apples-to-apples; a partial set silently mixes arms.
@@ -186,6 +190,7 @@ case "${TUNE_PHASE}" in
     "${PY}" tune_ste.py scan "${COMMON_ARGS[@]}" \
       --knob "${TUNE_KNOB}" \
       --kappas ${TUNE_KAPPAS} \
+      --scratch "${TUNE_SCRATCH}" \
       --report "logs/tune_ste_scan_${TUNE_KNOB}_${SLURM_JOB_ID:-local}.json"
     ;;
   calibrate)
@@ -198,6 +203,7 @@ case "${TUNE_PHASE}" in
       --knob "${TUNE_KNOB}" \
       --targets ${TUNE_TARGETS} \
       --out-prefix "${TUNE_OUT_PREFIX}" \
+      --scratch "${TUNE_SCRATCH}" \
       --tol "${TUNE_TOL}" \
       --max-iter "${TUNE_MAX_ITER}" \
       "${STABLE_FLAG[@]}"
