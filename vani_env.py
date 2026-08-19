@@ -140,6 +140,12 @@ THETA_CAE_NAMES = [
     "fourSC_ewma",
     "anticipated_affect_ewma",
 ]
+PF_THETA_CAE_NAMES = [
+    "intercept",
+    "CAE_avg_lastweek",
+    "fourSC_ewma",
+    "anticipated_affect_ewma",
+]
 
 THETA_CAE_SHORT_AVG_NAMES = [
     "intercept",
@@ -176,9 +182,13 @@ _ANTIC_BURDEN_MAIN_IDX = THETA_ANTIC_NAMES.index("recent_burden")
 P_ACTIVE_STATUS = len(THETA_ACTIVE_STATUS_NAMES)
 P_PRIOR2HOUR = len(THETA_PRIOR2HOUR_STEP_COUNT_NAMES)
 P_CAE = len(THETA_CAE_NAMES)
+P_PF_CAE = len(PF_THETA_CAE_NAMES)
 P_CAE_SHORT = len(THETA_CAE_SHORT_AVG_NAMES)
 CAE_FOURSC_SLOTS = 14
+CAE_FOURSC_SLOTS_RL = 12
 CAE_ANTIC_DAYS = 7
+CAE_ANTIC_DAYS_RL = 6
+_CAE_WEEK_IDX = THETA_CAE_NAMES.index("week")
 PV_ML_BASE = 9
 FW_ML_BASE = 9
 PJ_ML_BASE = 9
@@ -255,22 +265,33 @@ def _antic_daily_from_week(antic_wk) -> np.ndarray:
     antic = np.asarray(antic_wk, dtype=float).ravel()
     if antic.size == 14:
         return antic.reshape(7, 2).mean(axis=1)
-    if antic.size == 7:
+    if antic.size == 12:
+        return antic.reshape(6, 2).mean(axis=1)
+    if antic.size in (7, 6):
         return antic
     raise ValueError(
-        f"antic_wk must have 7 daily values or 14 AM/PM slots, got {antic.size}"
+        f"antic_wk must have 6/7 daily values or 12/14 AM/PM slots, got {antic.size}"
     )
 
 
 def cae_mediator_ewmas(foursc_wk, antic_wk) -> tuple[float, float]:
-    """Compress one week's fourSC slots and antic days to EWMA scalars."""
+    """Compress one week's fourSC slots and antic days to EWMA scalars.
+
+    Accepts a full calendar week (14 slots / 7 days) or RL Mon–Sat
+    (12 slots / 6 days). Decay follows ``gamma_from_n`` of the window length.
+    """
     foursc = _fill_nan_with_finite_mean(np.asarray(foursc_wk, dtype=float).ravel())
-    if foursc.size != CAE_FOURSC_SLOTS:
+    if foursc.size not in (CAE_FOURSC_SLOTS, CAE_FOURSC_SLOTS_RL):
         raise ValueError(
-            f"foursc_wk must have {CAE_FOURSC_SLOTS} weekly decision slots, "
-            f"got {foursc.size}"
+            f"foursc_wk must have {CAE_FOURSC_SLOTS_RL} or {CAE_FOURSC_SLOTS} "
+            f"decision slots, got {foursc.size}"
         )
     antic = _fill_nan_with_finite_mean(_antic_daily_from_week(antic_wk))
+    if antic.size not in (CAE_ANTIC_DAYS, CAE_ANTIC_DAYS_RL):
+        raise ValueError(
+            f"antic_wk must have {CAE_ANTIC_DAYS_RL} or {CAE_ANTIC_DAYS} "
+            f"daily values, got {antic.size}"
+        )
     return (
         within_week_ewma(foursc),
         within_week_ewma(antic),
@@ -278,11 +299,11 @@ def cae_mediator_ewmas(foursc_wk, antic_wk) -> tuple[float, float]:
 
 
 def build_CAE_features(CAE_lastweek, week_norm, foursc_wk, antic_wk) -> np.ndarray:
-    """Feature vector matching ``THETA_CAE_NAMES`` in ``5_fit_vanilla_testbed.py``.
+    """Env generative CAE features matching ``THETA_CAE_NAMES``.
 
-    fourSC (14 slots) and anticipated affect (7 days) enter as EWMA summaries
-    rather than additive slot/day terms, using the same ``gamma=6/7``
-    normalized discount as ``1_data_extraction._ewm_prior_rows``.
+    fourSC and anticipated affect enter as EWMA summaries of the full calendar
+    week (14 slots / 7 days). ``week_norm`` is a predictor here; the PF
+    transition uses :func:`build_pf_CAE_features`, which drops it.
     """
     foursc_e, antic_e = cae_mediator_ewmas(foursc_wk, antic_wk)
     x = np.array(
@@ -291,6 +312,22 @@ def build_CAE_features(CAE_lastweek, week_norm, foursc_wk, antic_wk) -> np.ndarr
     )
     if x.size != P_CAE:
         raise RuntimeError(f"CAE feature length {x.size} != {P_CAE}")
+    return x
+
+
+def build_pf_CAE_features(CAE_lastweek, foursc_wk, antic_wk) -> np.ndarray:
+    """PF CAE transition features matching ``PF_THETA_CAE_NAMES``.
+
+    Same EWMA mediator summaries as the env model, but without ``week``.
+    Callers should pass Mon–Sat mediators (12 slots / 6 days).
+    """
+    foursc_e, antic_e = cae_mediator_ewmas(foursc_wk, antic_wk)
+    x = np.array(
+        [1.0, float(CAE_lastweek), foursc_e, antic_e],
+        dtype=float,
+    )
+    if x.size != P_PF_CAE:
+        raise RuntimeError(f"PF CAE feature length {x.size} != {P_PF_CAE}")
     return x
 
 
@@ -323,6 +360,34 @@ def trim_theta_foursc(theta) -> np.ndarray:
         f"theta_fourSC length {a.size}; expected {P_FOURSC}, "
         f"legacy {_P_FOURSC_WITH_WEEKEND}, or legacy "
         f"{_P_FOURSC_WITH_WEEKEND_AND_SALIENCE}"
+    )
+
+
+def trim_pf_cae_prior(nu, Gamma=None):
+    """Map env 5-dim CAE prior (with ``week``) to the PF 4-dim prior (no ``week``)."""
+    nu = np.asarray(nu, dtype=float).ravel()
+    if nu.size == P_PF_CAE:
+        if Gamma is None:
+            return nu
+        G = np.asarray(Gamma, dtype=float)
+        if G.shape == (P_PF_CAE, P_PF_CAE):
+            return nu, G
+        raise ValueError(
+            f"PF CAE prior covariance shape {G.shape}; expected {(P_PF_CAE, P_PF_CAE)}"
+        )
+    if nu.size == P_CAE:
+        nu = np.delete(nu, _CAE_WEEK_IDX)
+        if Gamma is None:
+            return nu
+        G = np.asarray(Gamma, dtype=float)
+        if G.shape != (P_CAE, P_CAE):
+            raise ValueError(
+                f"CAE prior covariance shape {G.shape}; expected {(P_CAE, P_CAE)}"
+            )
+        keep = [i for i in range(P_CAE) if i != _CAE_WEEK_IDX]
+        return nu, G[np.ix_(keep, keep)]
+    raise ValueError(
+        f"CAE prior mean length {nu.size}; expected {P_PF_CAE} or env {P_CAE}"
     )
 
 
@@ -1318,7 +1383,6 @@ _STATE_FROM_DF_FIT_ROW = (
     ("caeAverageLastWeek", ("caeAverageLastWeek_norm", "caeAverageLastWeek")),
     ("morningFitbitWearYesterday", ("morning_wearing",)),
     ("dailySurveyCompleteYesterday", ("dailySurveyComplete_yesterday",)),
-    ("salienceMessageSentYesterday", ("yesterday_SalienceMessage",)),
     ("activityStatusToday", ("active_status",)),
 )
 
@@ -1389,8 +1453,6 @@ def make_initial_state(df_fit_11week_csv=None, participant_id=None):
         "activeDaysLast7Days": 0.0,
         "activitySuggestionsSentLast7Days": 0.0,
         "activityStatusToday": 0.0,
-        "salienceMessageSentToday": 0.0,
-        "salienceMessageSentYesterday": 0.0,
         "activitySuggestionInteractLast7Days": 0.0,
         "expTool1": float("nan"),
         "expTool2": float("nan"),

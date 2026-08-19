@@ -22,9 +22,6 @@ STATE_PAGE_VIEW_LAST7_DAYS_EMA = "pageViewLast7DaysEma"
 STATE_ACTIVE_DAYS_LAST7_DAYS = "activeDaysLast7Days"
 STATE_ACTIVITY_SUGGESTION_INTERACT_LAST7_DAYS = "activitySuggestionInteractLast7Days"
 
-STATE_SALIENCE_MESSAGE_SENT_YESTERDAY = "salienceMessageSentYesterday"
-STATE_SALIENCE_MESSAGE_SENT_TODAY = "salienceMessageSentToday"
-
 STATE_MORNING_FITBIT_WEAR = "morningFitbitWear"
 STATE_MORNING_FITBIT_WEAR_YESTERDAY = "morningFitbitWearYesterday"
 STATE_MORNING_FITBIT_WEAR_LAST7_DAYS = "morningFitbitWearLast7Days"
@@ -72,8 +69,6 @@ TRAJ_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS = "activitySuggestionsSentLast7DaysAll
 
 # Per-day covariate logs (PF / RL; not in ``s`` at use time)
 LOG_DAY_OF_WEEK_NORM = "logDayOfWeekNorm"
-LOG_SALIENCE_MESSAGE_SENT_TODAY = "logSalienceMessageSentToday"
-LOG_SALIENCE_MESSAGE_SENT_YESTERDAY = "logSalienceMessageSentYesterday"
 LOG_YESTERDAY_STEP_COUNT = "logYesterdayStepCount"
 LOG_STEP_COUNT_LAST7_DAYS_EMA = "logStepCountLast7DaysEma"
 LOG_PAGE_VIEW_LAST7_DAYS_EMA = "logPageViewLast7DaysEma"
@@ -91,7 +86,6 @@ LEGACY_TO_CANONICAL = [
     ("prior2hour_step_agent_all", TRAJ_PRIOR2HOUR_STEP_COUNT_AGENT),
     ("prior2hour_step_agent", STATE_PRIOR2HOUR_STEP_COUNT_AGENT),
     ("yesterday_fitbitwearing_morning", STATE_MORNING_FITBIT_WEAR_YESTERDAY),
-    ("yesterday_salience_message", STATE_SALIENCE_MESSAGE_SENT_YESTERDAY),
     ("yesterday_pageview_afternoon", STATE_PAGE_VIEW_AFTERNOON_YESTERDAY),
     ("yesterday_pageview_morning", STATE_PAGE_VIEW_MORNING_YESTERDAY),
     ("active_status", STATE_ACTIVITY_STATUS_TODAY),
@@ -120,13 +114,11 @@ LEGACY_TO_CANONICAL = [
     ("recent_burden_all", TRAJ_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS),
     ("activitySuggestionsSentLast7DaysAll", TRAJ_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS),
     ("log_antic_yesterday_latent", LOG_DAILY_ANTICIPATED_AFFECT_YESTERDAY),
-    ("log_yesterday_salience", LOG_SALIENCE_MESSAGE_SENT_YESTERDAY),
     ("log_seven_day_pageview", LOG_PAGE_VIEW_LAST7_DAYS_EMA),
     ("log_yesterday_step", LOG_YESTERDAY_STEP_COUNT),
     ("log_seven_day_step", LOG_STEP_COUNT_LAST7_DAYS_EMA),
     ("log_past7_wear", LOG_MORNING_FITBIT_WEAR_LAST7_DAYS),
     ("log_today_step", LOG_TODAY_STEP_COUNT),
-    ("log_salience", LOG_SALIENCE_MESSAGE_SENT_TODAY),
     ("log_dow", LOG_DAY_OF_WEEK_NORM),
     ("prior2hour_step", STATE_PRIOR2HOUR_STEP_COUNT),
     ("yesterday_step", STATE_YESTERDAY_STEP_COUNT),
@@ -138,7 +130,6 @@ LEGACY_TO_CANONICAL = [
     ("anticipated_affect", STATE_DAILY_ANTICIPATED_AFFECT),
     ("recent_burden", STATE_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS),
     ("activitySuggestionsSentLast7Days", STATE_ACTIVITY_SUGGESTIONS_SENT_LAST7_DAYS),
-    ("salience_message", STATE_SALIENCE_MESSAGE_SENT_TODAY),
     ("decision_time", STATE_DECISION_TIME_SLOT),
     ("perceived_utility", STATE_PERCEIVED_UTILITY),
     ("CAE_avg_lastweek", STATE_CAE_AVERAGE_LAST_WEEK),
@@ -157,9 +148,7 @@ KW_PRIOR2HOUR_AGENT = "prior2HourStepCountAgent"
 KW_ACTIVITY_SUGGESTIONS_SENT_LAST7 = "activitySuggestionsSentLast7Days"
 KW_PAGE_VIEW_LAST7 = "pageViewLast7DaysEma"
 KW_MORNING_FITBIT_LAST7 = "morningFitbitWearLast7Days"
-KW_SALIENCE_YESTERDAY = "salienceMessageSentYesterday"
 KW_ACTIVITY_SUGGEST_INTERACT = "activitySuggestionInteractLast7Days"
-KW_SALIENCE_INTERACT = "salienceMessageInteractLast7Days"
 KW_ANTIC_YESTERDAY = "dailyAnticipatedAffectYesterday"
 KW_ANTIC_YESTERDAY_AGENT = "dailyAnticipatedAffectYesterdayAgent"
 KW_DAY_OF_WEEK = "dayOfWeekNorm"

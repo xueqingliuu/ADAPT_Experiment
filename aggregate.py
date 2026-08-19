@@ -11,8 +11,8 @@ import matplotlib.pyplot as plt
 
 from vani_env import denormalize_CAE
 
-# Must match experiment.py's RESULTS_ROOT (env-overridable, same default).
-DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_positivedirection"))
+# Must match run_array.sh RESULTS_ROOT (env-overridable).
+DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla"))
 
 # ── CAE reporting conventions ────────────────────────────────────────────
 # We build the 4-panel overview for BOTH weekly-CAE variants, on the *raw*
@@ -27,21 +27,20 @@ NOISY_FIELD = "cae_runs"         # realized (with noise)
 CAE_YLIM = (0, 7)                # raw CAE scale used in overview plots
 
 markers = {
-    "micro_g05":  "o:",
-    "micro_g09":  "o-",
-    "mtd_g05":    "^:",
-    "mtd_g09":    "^-",
-    "rs_g05":     "s:",
-    "rs_g09":     "s-",
-    "rs_mtd_g05": "d:",
-    "rs_mtd_g09": "d-",
-    "never_send":  "x-",
+    "rl_v1_base_g05": "o:",
+    "rl_v2_mtd_g05": "^:",
+    "rl_v3_biased_weekly": "s:",
+    "rl_v4_biased_redistributed": "s-",
+    "rl_v5_invariant_weekly": "d:",
+    "rl_v6_invariant_redistributed": "d-",
+    "rl_v7_base_g09": "o-",
+    "never_send": "x-",
     "always_send": "*-",
     "random_send": "+-",
 }
 
-# γ̄=0.9 RL policies only (exclude always_send / random_send baselines).
-GAMMA09_ALGOS = ("micro_g09", "mtd_g09", "rs_g09", "rs_mtd_g09")
+# γ̄=0.9 RL policy (variant 7; the only sensitivity rerun of the base).
+GAMMA09_ALGOS = ("rl_v7_base_g09",)
 NEVER_SEND_BASELINE = "never_send"
 
 
@@ -356,12 +355,21 @@ def make_gamma09_minus_never_plot(all_cae_full, kind, suffix, *, out, labels, we
     plt.close(fig)
 
 
+def _se_clustered_by_user(arr):
+    """SE of the grand mean, clustered by participant (axis 1)."""
+    per_user = np.nanmean(arr, axis=(0, 2))
+    n_eff = int(np.sum(~np.isnan(per_user)))
+    if n_eff <= 1:
+        return float("nan")
+    return float(np.nanstd(per_user, ddof=1) / np.sqrt(n_eff))
+
+
 def write_summary(stats, kind, suffix, *, out):
     """Raw-scale summary table for one CAE variant."""
     names = list(stats["all_cae"].keys())
     all_cae = stats["all_cae"]
     headers = ["Metric"] + names
-    col_w = 18
+    col_w = max(28, max(len(h) for h in headers) + 2)
     sep_w = col_w * len(headers)
 
     lines = []
@@ -371,12 +379,16 @@ def write_summary(stats, kind, suffix, *, out):
     lines.append("-" * sep_w)
     lines.append("".join([f"{'Mean CAE (all weeks)':>{col_w}}"] +
                  [f"{np.nanmean(all_cae[n]):>{col_w}.4f}" for n in names]))
+    lines.append("".join([f"{'SE CAE (clustered)':>{col_w}}"] +
+                 [f"{_se_clustered_by_user(all_cae[n]):>{col_w}.4f}" for n in names]))
     lines.append("".join([f"{'Mean CAE (week 3+)':>{col_w}}"] +
                  [f"{np.nanmean(all_cae[n][..., 2:]):>{col_w}.4f}" for n in names]))
     lines.append("".join([f"{'Median CAE (all wks)':>{col_w}}"] +
                  [f"{np.nanmedian(all_cae[n]):>{col_w}.4f}" for n in names]))
     lines.append("".join([f"{'25th pct CAE':>{col_w}}"] +
                  [f"{np.nanpercentile(all_cae[n], 25):>{col_w}.4f}" for n in names]))
+    lines.append("".join([f"{'75th pct CAE':>{col_w}}"] +
+                 [f"{np.nanpercentile(all_cae[n], 75):>{col_w}.4f}" for n in names]))
     lines.append("".join([f"{'Final cum-avg CAE':>{col_w}}"] +
                  [f"{stats['cumavg'][n][-1]:>{col_w}.4f}" for n in names]))
     lines.append("=" * sep_w)
@@ -423,6 +435,9 @@ def main() -> None:
     algorithms = cfg["algorithms"]
     labels = cfg["labels"]
     nweek = cfg["nweek"]
+    params_dir = cfg.get("params_dir")
+    if params_dir:
+        print(f"Denormalizing CAE with params_dir={params_dir}")
 
     weeks = np.arange(1, nweek + 1)
     rl_weeks = np.arange(2, nweek + 1)
@@ -444,11 +459,10 @@ def main() -> None:
                 continue
 
             data = np.load(f)
-            # Realized (noisy) CAE is always present.
-            noisy_parts.append(denormalize_CAE(data[NOISY_FIELD]))   # (1, n_users, NWEEK+1)
-            # Latent (noise-free) CAE only if recorded by experiment.py.
+            denorm_kw = {"params_dir": params_dir} if params_dir else {}
+            noisy_parts.append(denormalize_CAE(data[NOISY_FIELD], **denorm_kw))
             if LATENT_FIELD in data:
-                latent_parts.append(denormalize_CAE(data[LATENT_FIELD]))
+                latent_parts.append(denormalize_CAE(data[LATENT_FIELD], **denorm_kw))
             else:
                 latent_available = False
             piA_parts.append(data["piA_runs"])                       # (1, n_users, W, 6, 2)

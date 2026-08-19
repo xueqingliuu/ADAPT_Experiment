@@ -1615,13 +1615,12 @@ df_hourly_pageview.to_csv(folder / 'hourly_pageview.csv', index=False)
 # ## 6. Interventions (push notifications & survey display)
 # - twice daily walking suggestions map to hourly, twice-daily, daily, and weekly
 # - daily planning prompts map to hourly, twice-daily, daily, and weekly
-# - daily salience message map to hourly, twice-daily, daily, and weekly
 # 
 # 
 # - Time zone: timestamp minus 4 hours for now!!!
 # 
 # ## Notes on click data
-# - for walking suggestions/salience messages, an important variable is whether the user opens the notification
+# - for walking suggestions, an important variable is whether the user opens the notification
 # - for planning prompts, an important variable is whether the user fills in the survey!
 # 
 # - maybe the users saw the notifictaion but didn't open it... so perhaps we can also ignore this for now!!!!!!!
@@ -1657,24 +1656,19 @@ push_open = convert_utc_columns_to_user_local(
 # %%
 gif_rows      = push_sent.loc[push_sent['Properties.NotificationIdentifier'].str.startswith('gif', na=False)].copy()
 end_rows      = push_sent.loc[push_sent['Properties.NotificationIdentifier'].str.startswith('endOfDay', na=False)].copy()
-salience_rows = push_sent.loc[push_sent['Properties.NotificationIdentifier'].str.startswith('salience', na=False)].copy()
 
 # delete repeated rows
 gif_rows = gif_rows.drop_duplicates()
 end_rows = end_rows.drop_duplicates()
-salience_rows = salience_rows.drop_duplicates()
 
 # print(end_rows[end_rows['ParticipantIdentifier'] == "117"])
 # print(end_rows.head())
-# print(salience_rows.head())
 
 
 gif_rows_open      = push_open.loc[push_open['Properties.NotificationIdentifier'].str.startswith('gif', na=False)].copy()
 # end_rows_open      = push_open.loc[push_open['notification_id'].str.startswith('endOfDay', na=False)].copy()
-salience_rows_open = push_open.loc[push_open['Properties.NotificationIdentifier'].str.startswith('salience', na=False)].copy()
 
 # print(gif_rows_open[gif_rows_open['participantidentifier'] == 75])
-# print(salience_rows_open.head())
 
 
 # %%
@@ -2051,106 +2045,6 @@ print(df_gif_all.Interacted.value_counts())
 # print(df_gif_all[df_gif_all['participantidentifier'] == 75].head(50))
 # save the dataframe
 df_gif_all.to_csv(os.path.join(folder, 'df_gif_all.csv'), index=False)
-
-
-# %%
-# second, complete salience messages
-questions = ["Salience Message Display"]
-
-tmp = (
-    survey_results_flat
-    .loc[survey_results_flat["ResultIdentifier"].isin(questions)]
-    .copy()
-)
-
-
-tmp["datetime"] = pd.to_datetime(tmp["QuestionStartDate"], errors="coerce", utc=True)
-s = tmp["QuestionStartDate"].astype(str).str.replace(
-    r"([+-]\d{2}:\d{2}|Z)$", "", regex=True
-)
-tmp["datetime_local"] = pd.to_datetime(s, errors="coerce")
-
-
-# Local date from original offset timestamp string (YYYY-MM-DD part)
-tmp["date"] = tmp["datetime_local"].dt.date
-
-tmp['time'] = tmp["datetime_local"].dt.time
-print(len(tmp))
-df_salience_all = []
-# check the date range of the salience messages
-for n in range(len(complete_participant_ids)):
-    participant_id = complete_participant_ids[n]
-    salience_rows_participant = salience_rows.loc[salience_rows['ParticipantIdentifier'] == participant_id].copy()
-    salience_rows_participant['Timestamp'] = pd.to_datetime(salience_rows_participant['Timestamp'])
-    # salience_rows_open_participant = salience_rows_open.loc[salience_rows_open['ParticipantIdentifier'] == participant_id].copy()
-    # salience_rows_open_participant['Timestamp'] = pd.to_datetime(salience_rows_open_participant['Timestamp'])
-    # print(f"Participant {participant_id} salience messages date range: {salience_rows_participant['timestamp'].min()} to {salience_rows_participant['timestamp'].max()}")
-    tmp_participant = tmp.loc[tmp['ParticipantIdentifier'] == participant_id].copy()
-    # extract the date and time from the timestamp
-    salience_rows_participant['date'] = salience_rows_participant['Timestamp'].dt.date
-    salience_rows_participant['time'] = salience_rows_participant['Timestamp'].dt.time
-    # salience_rows_open_participant['date'] = salience_rows_open_participant['timestamp'].dt.date
-    # salience_rows_open_participant['time'] = salience_rows_open_participant['timestamp'].dt.time
-
-    min_date = summary_surveytask.loc[summary_surveytask['ParticipantIdentifier'] == participant_id, 'date_min'].iloc[0]
-    min_date = pd.to_datetime(min_date).date()
-
-    date_range_length = 85
-    # date_range_length_list[n]
-
-    for i in range(date_range_length):
-        date = min_date + pd.Timedelta(days=i)
-        salience_row = salience_rows_participant.loc[(salience_rows_participant['date'] == date)]
-        tmp_par_date = tmp_participant.loc[(tmp_participant['date'] == date)].copy()
-        # salience_row_open = salience_rows_open_participant.loc[(salience_rows_open_participant['date'] == date)]
-
-        # open_status = 0
-        # for open_timestamp in salience_row_open['timestamp'].values:
-        #     time_diff = abs((pd.to_datetime(open_timestamp) - pd.to_datetime(salience_row['timestamp'].values[0])).total_seconds() / 60)
-        #     if time_diff <= 60:  # Within 60 minutes
-        #         open_status = 1
-        #         break
-
-        if len(tmp_par_date['datetime_local'].values) >= 1:
-            interacted = 1
-        else:
-            interacted = 0
-
-        if salience_row.shape[0] == 1:
-            df_salience_all.append({
-                'ParticipantIdentifier': participant_id,
-                'Date': date,
-                'Time': salience_row['time'].iloc[0],
-                'SalienceMessage': 1,
-                'Interacted': interacted
-                # 'open': open_status
-            })
-        else:
-            df_salience_all.append({
-                'ParticipantIdentifier': participant_id,
-                'Date': date,
-                'Time': (pd.Timestamp('2000-01-01') + pd.Timedelta(hours=11, minutes=45)).time(),
-                'SalienceMessage': 0,
-                'Interacted': interacted
-                # 'open': 0
-            })
-
-df_salience_all = pd.DataFrame(df_salience_all)
-print(df_salience_all)
-print(df_salience_all.Interacted.value_counts())
-
-# Fraction interacted over prior 7 calendar days; excludes today
-df_salience_all = df_salience_all.sort_values(['ParticipantIdentifier', 'Date'], kind='mergesort')
-df_salience_all['Interacted_7d'] = (
-    df_salience_all.groupby('ParticipantIdentifier', sort=False)['Interacted']
-    .transform(lambda s: _mean_prior_rows(s, window=7, min_periods=7))
-)
-
-# print(df_salience_all.head(85))
-# print(df_salience_all.open.value_counts())
-
-# save the dataframe
-df_salience_all.to_csv(os.path.join(folder, 'df_salience_all.csv'), index=False)
 
 
 # %% [markdown]
@@ -3170,7 +3064,6 @@ _cohort_csv_names = [
     "hourly_pageview.csv",
     "df_end_all.csv",
     "df_gif_all.csv",
-    "df_salience_all.csv",
     "wear_day.csv",
 ]
 for _name in _cohort_csv_names:

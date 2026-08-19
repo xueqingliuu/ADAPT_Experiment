@@ -297,8 +297,8 @@ def _strip_unused_phi_columns(phi: np.ndarray) -> np.ndarray:
     """Drop structurally unused columns from the shared RL ``phi_action`` map.
 
     Removed columns:
-      * ``b_tilde`` (always 0 offline: we use imputed ``CAE_avg_lastweek``, not
-        particle-filter belief uncertainty)
+      * ``b_tilde`` and ``A*b_tilde`` (always 0 offline: we use imputed
+        ``CAE_avg_lastweek``, not particle-filter belief uncertainty)
 
     The lagged CAE value is still supplied through the shared builder's
     ``b_hat`` argument (that is how ``est_prior._phi_action`` wires
@@ -306,13 +306,15 @@ def _strip_unused_phi_columns(phi: np.ndarray) -> np.ndarray:
     ``CAE_avg_lastweek`` after stripping.
     """
     arr = np.asarray(phi, dtype=float)
-    b_tilde_idx = 9
-    unused_values = arr[..., b_tilde_idx]
+    names = _phi_action_names()
+    drop = [i for i, name in enumerate(names) if name in ("b_tilde", "A*b_tilde")]
+    unused_values = arr[..., drop]
     if not np.allclose(unused_values, 0.0):
         raise ValueError(
-            "Expected unused fitted-Q column b_tilde to be identically zero."
+            "Expected unused fitted-Q columns b_tilde / A*b_tilde "
+            "to be identically zero."
         )
-    return np.delete(arr, b_tilde_idx, axis=-1)
+    return np.delete(arr, drop, axis=-1)
 
 
 def _feature_names_for(p: int) -> List[str]:
@@ -324,7 +326,7 @@ def _feature_names_for(p: int) -> List[str]:
     """
     names = []
     for name in _phi_action_names():
-        if name == "b_tilde":
+        if name in ("b_tilde", "A*b_tilde"):
             continue
         names.append(name.replace("b_hat", "CAE_avg_lastweek"))
     if len(names) != p:

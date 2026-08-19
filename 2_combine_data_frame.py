@@ -98,7 +98,6 @@ df_daily_pageview = _as_str_id(pd.read_csv(folder / "df_daily_pageview.csv"))
 df_hourly_pageview = _as_str_id(pd.read_csv(folder / "hourly_pageview.csv"))
 
 df_gif = _as_str_id(pd.read_csv(folder / "df_gif_all.csv"))
-df_salience = _as_str_id(pd.read_csv(folder / "df_salience_all.csv"))
 df_planning = _as_str_id(pd.read_csv(folder / "df_end_all.csv"))
 
 df_notwearing = _as_str_id(pd.read_csv(folder / "missing_days.csv"))
@@ -119,7 +118,6 @@ df_daily_pageview["Date"] = pd.to_datetime(df_daily_pageview["Date"])
 df_hourly_pageview["Date"] = pd.to_datetime(df_hourly_pageview["Date"])
 
 df_gif["Date"] = pd.to_datetime(df_gif["Date"])
-df_salience["Date"] = pd.to_datetime(df_salience["Date"])
 df_planning["Date"] = pd.to_datetime(df_planning["date"])
 
 df_notwearing["Date"] = pd.to_datetime(df_notwearing["Date"])
@@ -232,7 +230,7 @@ df_merged = df_merged.merge(df_daily[daily_merge_cols], on=["ParticipantIdentifi
 df_merged["daily_present"] = df_merged["daily_present"].fillna(0).astype(int)
 
 # %% [markdown]
-# ## 6. Interventions (planning, walking suggestions, salience)
+# ## 6. Interventions (planning, walking suggestions)
 
 # %%
 planning_cols = [
@@ -259,23 +257,6 @@ df_merged = df_merged.merge(
     how="left",
 )
 
-# Salience (daily + yesterday)
-salience_cols = [
-    c for c in df_salience.columns if c not in ["ParticipantIdentifier", "Date", "time"]
-]
-df_merged = df_merged.merge(
-    df_salience[["ParticipantIdentifier", "Date"] + salience_cols],
-    on=["ParticipantIdentifier", "Date"],
-    how="left",
-)
-
-df_salience_yesterday = df_salience[["ParticipantIdentifier", "Date"] + salience_cols].copy()
-df_salience_yesterday["Date"] = df_salience_yesterday["Date"] + pd.Timedelta(days=1)
-df_salience_yesterday.columns = ["ParticipantIdentifier", "Date"] + [
-    f"yesterday_{c}" for c in salience_cols
-]
-df_merged = df_merged.merge(df_salience_yesterday, on=["ParticipantIdentifier", "Date"], how="left")
-
 # %% [markdown]
 # ## 7. Column cleanup after overlapping merges
 
@@ -286,10 +267,10 @@ drop_cols = [c for c in ["date", "Time_x", "Time_y", "iso_week", "iso_year"] if 
 df_merged = df_merged.drop(columns=drop_cols)
 
 rename_map = {
+    "Interacted": "Interacted_walk",
+    "Interacted_7d": "Interacted_7d_walk",
     "Interacted_x": "Interacted_walk",
-    "Interacted_y": "Interacted_salience",
     "Interacted_7d_x": "Interacted_7d_walk",
-    "Interacted_7d_y": "Interacted_7d_salience",
     "StepCount_x": "4hour_step",
     "StepCount_y": "prior2hour_step",
     "CheckStatus_x": "CheckStatus_4hour",

@@ -31,12 +31,17 @@ PF outcome  tY (CAE_short)      -> nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y
 
 PF features differ from the env generative model in three respects (see
 ``experiment.py`` ``get_pf_data``):
-  1. fourSC / antic regressions are restricted to RL-controlled rows
-     (Mon–Sat only — 12 slots / 6 days per week; Sunday is dropped).
-  2. The fourSC PF model drops the ``stepCountNext4HourLag1`` AR-1 term
-     entirely (plus pageview-EMA and anticipated-affect predictors). The
-     antic PF model matches ``gen_antic_mean`` column-for-column, except
-     ``anticipated_affect_yesterday`` is cleared at Monday.
+  1. fourSC / antic regressions *and* the CAE EWMA summaries are restricted
+     to RL-controlled rows (Mon–Sat only — 12 slots / 6 days per week;
+     Sunday is dropped). The PF CAE transition also omits ``week``; the env
+     generative CAE model still uses 14 / 7 and includes ``week``.
+  2. The fourSC PF model includes the ``stepCountNext4HourLag1`` AR-1
+     main effect (no action interaction), and omits pageview-EMA,
+     anticipated-affect, and 7-day Fitbit-wear predictors (and their
+     action interactions). Weekend and AM/PM are main effects only.
+     The antic PF model drops walking-suggestion interactions with
+     weekend and 7-day active fraction; ``anticipated_affect_yesterday``
+     is cleared at Monday.
   3. ``caeAverageLastWeek`` (in fourSC/antic/CAE) and ``perceivedUtilityLastWeek``
      (in fourSC/antic) are substituted at runtime with per-particle
      belief / agent E_w. This is a feature-substitution mechanism and does
@@ -94,6 +99,8 @@ from statsmodels.genmod.generalized_estimating_equations import GEE
 # synchronised with the agent's runtime phi.
 from algorithm_helpers import (
     N_RL_CONTEXT,
+    PF_THETA_ANTIC_NAMES,
+    PF_THETA_FOURSC_NAMES,
     _cumulative_discount,
     build_phi_action,
     build_phi_action_rewardshaping,
@@ -101,8 +108,8 @@ from algorithm_helpers import (
     build_rl_context_vector,
 )
 from vani_env import (
-    THETA_ANTIC_NAMES,
-    THETA_CAE_NAMES,
+    PF_THETA_CAE_NAMES,
+    trim_pf_cae_prior,
     within_week_ewma,
 )
 
@@ -354,9 +361,9 @@ def _pooled_pf_model_specs() -> Tuple[
     Tuple[str, Any, Tuple[str, ...], str], ...
 ]:
     return (
-        ("fourSC", _build_fourSC_design, THETA_FOURSC_NAMES, "4hour_step_norm"),
-        ("antic", _build_antic_design, THETA_ANTIC_NAMES, "anticipated_affect_norm"),
-        ("CAE", _build_CAE_design, THETA_CAE_NAMES, "CAE_avg_norm"),
+        ("fourSC", _build_fourSC_design, PF_THETA_FOURSC_NAMES, "4hour_step_norm"),
+        ("antic", _build_antic_design, PF_THETA_ANTIC_NAMES, "anticipated_affect_norm"),
+        ("CAE", _build_CAE_design, PF_THETA_CAE_NAMES, "CAE_avg_norm"),
     )
 
 
@@ -555,19 +562,6 @@ def _pool_user_fits(
 # ──────────────────────────────────────────────────────────────────
 # 1. PF mediator / Y / tY priors
 # ──────────────────────────────────────────────────────────────────
-THETA_FOURSC_NAMES = [
-    "intercept", "yesterdayStepCount", "stepCountLast7DaysEma",
-    "prior2HourStepCount", "activitySuggestionsSentLast7Days", "morningFitbitWearLast7Days",
-    "salienceMessageSentYesterday", "activitySuggestionInteractLast7Days",
-    "activeDaysLast7Days",
-    "isWeekend", "decisionTimeSlot", "perceivedUtilityLastWeek", "caeAverageLastWeek",
-    "Ah", "Ah*yesterdayStepCount", "Ah*prior2HourStepCount", "Ah*activitySuggestionsSentLast7Days",
-    "Ah*morningFitbitWearLast7Days",
-    "Ah*salienceMessageSentYesterday", "Ah*activitySuggestionInteractLast7Days",
-    "Ah*isWeekend", "Ah*decisionTimeSlot",
-    "Ah*perceivedUtilityLastWeek", "Ah*caeAverageLastWeek",
-]
-
 THETA_CAE_SHORT_NAMES = ["intercept", "caeAverage"]
 
 
@@ -587,11 +581,13 @@ _PF_ANTIC_DAYS_PER_WEEK   = DAYS_PER_WEEK_RL   # 6
 def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """fourSC PF design matrix and target.
 
-    Differs from ``gen_fourSC_mean`` in two PF-specific ways:
+    Differs from ``gen_fourSC_mean`` in PF-specific ways:
       * Only the 12 RL-controlled slots per week (Mon–Sat × AM/PM) are kept;
         Sunday rows are dropped.
-      * The ``stepCountNext4HourLag1`` AR-1 term used by ``gen_fourSC_mean``
-        is dropped from the PF mediator model entirely.
+      * 7-day pageview EMA, yesterday anticipated affect, and 7-day Fitbit
+        wear (and their action interactions) are omitted.
+      * AR-1 lag of 4-hour step count is a main effect only.
+      * Weekend and AM/PM have no action interactions.
 
     Per-particle CAE substitution (``cae=0`` base + ``cae_j`` delta) is a
     runtime substitution mechanism and does **not** change the population
@@ -599,14 +595,13 @@ def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     ``caeAverageLastWeek_norm`` column.
     """
     int_ = np.ones(len(dat))
+    lag1 = _fill_nan(dat["FourSC_lag1"].to_numpy())
     yest_step = _fill_nan(dat["YesterdayStepCount_norm"].to_numpy())
     seven_step = _fill_nan(dat["EMA_StepCount_norm"].to_numpy())
     prior2 = _fill_nan(dat["prior2hour_step_norm"].to_numpy())
     rb = _fill_nan(
         dat["recent_burden_norm" if "recent_burden_norm" in dat.columns else "recentBurdenEma_norm"].to_numpy()
     )
-    past7_wear = _fill_nan(dat["past7days_morning_wearing"].to_numpy())
-    y_sal = _fill_nan(dat["yesterday_SalienceMessage"].to_numpy())
     i7w = _fill_nan(dat["Interacted_7d_walk"].to_numpy())
     act_frac7 = _fill_nan(dat["active_status_fraction_7days"].to_numpy())
     is_weekend = dat["is_weekend"].to_numpy()
@@ -616,14 +611,13 @@ def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     Ah = dat["WalkingSuggestion"].to_numpy().astype(float)
 
     X = np.column_stack([
-        int_, yest_step, seven_step, prior2, rb,
-        past7_wear, y_sal, i7w, act_frac7, is_weekend, dt_, pu, cae,
+        int_, lag1, yest_step, seven_step, prior2, rb,
+        i7w, act_frac7, is_weekend, dt_, pu, cae,
         Ah, Ah * yest_step, Ah * prior2, Ah * rb,
-        Ah * past7_wear, Ah * y_sal, Ah * i7w,
-        Ah * is_weekend, Ah * dt_, Ah * pu, Ah * cae,
+        Ah * i7w, Ah * pu, Ah * cae,
     ])
     y = dat["4hour_step_norm"].to_numpy(dtype=float)
-    assert X.shape[1] == len(THETA_FOURSC_NAMES)
+    assert X.shape[1] == len(PF_THETA_FOURSC_NAMES)
 
     # ── PF-specific shaping ───────────────────────────────────────────
     n_w = len(dat) // K_SLOTS_WEEK
@@ -640,13 +634,16 @@ def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
 def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """Antic PF design matrix and target (one row per day, morning row).
 
-    Matches ``vani_env.gen_antic_mean`` / ``algorithm_helpers.build_antic_features``,
-    with two PF-specific shapings:
+    Matches ``algorithm_helpers.build_antic_features``, with two PF-specific
+    shapings:
       * Only 6 RL-controlled days per week (Mon–Sat) are kept; Sunday is
         dropped.
       * ``anticipated_affect_yesterday`` (the antic AR-1 column) is set to
         0 on the first day of each week (Monday), matching the PF's
         week-boundary lag clearing.
+
+    Walking-suggestion interactions are with \(E_w\), last-week CAE, and
+    recent burden only (no weekend or 7-day active-fraction action terms).
 
     Like for fourSC, the per-particle CAE substitution does not change
     the regression population parameter, so actual ``caeAverageLastWeek_norm``
@@ -678,13 +675,12 @@ def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     X = np.column_stack([
         int_, antic_yest, act, is_weekend, pu, cae, rb,
         ws_m, ws_a,
-        ws_m * is_weekend, ws_a * is_weekend,
         ws_m * pu, ws_a * pu,
         ws_m * cae, ws_a * cae,
         ws_m * rb, ws_a * rb,
     ])
     y = dat_am["anticipated_affect_norm"].to_numpy(dtype=float)
-    assert X.shape[1] == len(THETA_ANTIC_NAMES)
+    assert X.shape[1] == len(PF_THETA_ANTIC_NAMES)
 
     # ── PF-specific shaping ───────────────────────────────────────────
     days_per_week = 7
@@ -702,20 +698,23 @@ def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _build_CAE_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """Weekly CAE design: [1, CAE_lw, week, fourSC_ewma, antic_ewma]."""
+    """Weekly CAE design: [1, CAE_lw, fourSC_ewma, antic_ewma].
+
+    EWMA summaries use RL-controlled Mon–Sat only (12 slots / 6 days).
+    """
     n_w = len(dat) // K_SLOTS_WEEK
     dat = dat.iloc[: n_w * K_SLOTS_WEEK]
     cae_y = dat["CAE_avg_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)[:, 0]
     cae_lw = _fill_nan(dat["CAE_avg_lastweek_norm"].to_numpy()).reshape(-1, K_SLOTS_WEEK)[:, 0]
-    week = dat["week_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)[:, 0]
 
     mu_fSC = float(np.nanmean(dat["4hour_step_norm"])) if dat["4hour_step_norm"].notna().any() else 0.0
     mu_antic = float(np.nanmean(dat["anticipated_affect_norm"])) if dat["anticipated_affect_norm"].notna().any() else 0.0
 
     foursc = dat["4hour_step_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)
-    foursc = np.where(np.isnan(foursc), mu_fSC, foursc)
+    foursc = np.where(np.isnan(foursc), mu_fSC, foursc)[:, :N_RL_SLOTS_WEEK]
     antic = dat["anticipated_affect_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)
     antic = np.where(np.isnan(antic), mu_antic, antic).reshape(-1, 7, 2).mean(axis=2)
+    antic = antic[:, :DAYS_PER_WEEK_RL]
 
     foursc_e = np.array(
         [within_week_ewma(row) for row in foursc],
@@ -727,9 +726,9 @@ def _build_CAE_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     )
 
     X = np.column_stack([
-        np.ones(n_w), cae_lw, week, foursc_e, antic_e,
+        np.ones(n_w), cae_lw, foursc_e, antic_e,
     ])
-    assert X.shape[1] == len(THETA_CAE_NAMES)
+    assert X.shape[1] == len(PF_THETA_CAE_NAMES)
     return X, cae_y
 
 
@@ -812,11 +811,11 @@ def fit_pf_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
 
     return {
         "fourSC":    {"nu_0": nu_fSC, "Gamma_0": G_fSC, "sigma2": s2_fSC,
-                       "names": THETA_FOURSC_NAMES},
+                       "names": PF_THETA_FOURSC_NAMES},
         "antic":     {"nu_0": nu_ant, "Gamma_0": G_ant, "sigma2": s2_ant,
-                       "names": THETA_ANTIC_NAMES},
+                       "names": PF_THETA_ANTIC_NAMES},
         "CAE":       {"nu_0": nu_Y,   "Gamma_0": G_Y,   "sigma2": s2_Y,
-                       "names": THETA_CAE_NAMES},
+                       "names": PF_THETA_CAE_NAMES},
         "CAE_short": {"nu_0": nu_tY,  "Gamma_0": G_tY,  "sigma2": s2_tY,
                        "names": THETA_CAE_SHORT_NAMES},
     }
@@ -826,8 +825,11 @@ def fit_pf_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
 # 2. Per-user phi_action / phi_rs / phi_bottleneck row builders
 # ──────────────────────────────────────────────────────────────────
 def _build_rl_context_vector_from_row(row) -> np.ndarray:
-    """Match ``experiment.build_rl_context_vector``."""
-    wp = row["week_present"] if "week_present" in row.index else 0.0
+    """Match ``experiment.build_rl_context_vector`` (length ``N_RL_CONTEXT``).
+
+    ``I_w * J_w`` is a separate base feature, not part of ``C``. Offline,
+    ``I_w`` is treated as 1 and ``J_w`` is ``week_present``.
+    """
     return build_rl_context_vector(
         yesterdayStepCount=float(row["YesterdayStepCount_norm"]),
         prior2HourStepCountAgent=float(row["prior2hour_step_norm"]),
@@ -835,11 +837,18 @@ def _build_rl_context_vector_from_row(row) -> np.ndarray:
         activitySuggestionsSentLast7Days=float(
             row["recent_burden_norm" if "recent_burden_norm" in row.index else "recentBurdenEma_norm"]
         ),
-        salienceMessageSentYesterday=float(row["yesterday_SalienceMessage"]),
         activitySuggestionInteractLast7Days=float(row["Interacted_7d_walk"]),
-        query_sent=1.0,
-        weekly_present=float(wp) if np.isfinite(wp) else 0.0,
     )
+
+
+def _query_x_weekly_from_row(row) -> float:
+    """Offline ``I_w * J_w``: query always sent, times ``week_present``."""
+    wp = row["week_present"] if "week_present" in row.index else 0.0
+    try:
+        wp = float(wp)
+    except (TypeError, ValueError):
+        return 0.0
+    return wp if np.isfinite(wp) else 0.0
 
 
 def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
@@ -856,7 +865,7 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
     cols = [
         "YesterdayStepCount_norm", "EMA_StepCount_norm", "prior2hour_step_norm",
         "recent_burden_norm", "active_status_fraction_7days",
-        "yesterday_SalienceMessage", "Interacted_7d_walk",
+        "Interacted_7d_walk",
         "anticipated_affect_yesterday_norm",
         "4hour_step_norm", "HourlyPageviewCount_norm",
         "morning_wearing", "daily_present",
@@ -880,6 +889,7 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
 
     # Per-slot quantities for d in 1..6 (Mon-Sat).
     C_slot = np.zeros((n_w, n_rl, p_C))
+    query_x_slot = np.zeros((n_w, n_rl))
     E_w_slot = np.zeros((n_w, n_rl))
     b_hat_slot = np.zeros((n_w, n_rl))
     A_slot = np.zeros((n_w, n_rl), dtype=int)
@@ -908,6 +918,7 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
                 rl_idx = (d - 1) * 2 + (t - 1)
                 row = dat.iloc[slot]
                 C_slot[k, rl_idx] = _build_rl_context_vector_from_row(row)
+                query_x_slot[k, rl_idx] = _query_x_weekly_from_row(row)
                 E_w_slot[k, rl_idx] = float(row["perceived_utility_lastweek"])
                 b_hat_slot[k, rl_idx] = float(row["CAE_avg_lastweek_norm"])
                 A_slot[k, rl_idx] = int(row["WalkingSuggestion"])
@@ -928,6 +939,7 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
     return {
         "n_w":         n_w,
         "C_slot":      C_slot,
+        "query_x_slot": query_x_slot,
         "E_w_slot":    E_w_slot,
         "b_hat_slot":  b_hat_slot,
         "A_slot":      A_slot,
@@ -946,6 +958,7 @@ def _slot_state(t_dict: Dict[str, np.ndarray], k: int, rl_idx: int) -> Dict[str,
         "M_Y": t_dict["M_Y_week"][k],
         "M_E": t_dict["M_E_week"][k],
         "C":   t_dict["C_slot"][k, rl_idx],
+        "query_x_weekly_present": float(t_dict["query_x_slot"][k, rl_idx]),
     }
 
 
@@ -1502,17 +1515,15 @@ def _rl_context_names() -> list[str]:
         "prior2hour_step_count",
         "active_status_fraction_7days",
         "recent_burden",
-        "salience_yesterday",
         "walk_interaction_7d",
-        "query_x_weekly_present",
     ]
 
 
 def _rl_my_names() -> list[str]:
     """Within-week EWMA summaries for M^Y streams (AM/PM pooled for fourSC)."""
     return [
-        "M_Y_fourSC_ewma",
         "M_Y_anticipated_affect_ewma",
+        "M_Y_fourSC_ewma",
     ]
 
 
@@ -1531,12 +1542,9 @@ def _phi_state_names() -> list[str]:
         "weekday_vs_weekend",
         "slot_pm",
         "E_w",
-        "weekday_vs_weekend*E_w",
-        "slot_pm*E_w",
         "b_hat",
-        "weekday_vs_weekend*b_hat",
-        "slot_pm*b_hat",
         "b_tilde",
+        "query_x_weekly_present",
     ] + _rl_my_names() + _rl_me_names() + _rl_context_names()
 
 
@@ -1545,12 +1553,7 @@ def _phi_action_names() -> list[str]:
         "A",
         "A*E_w",
         "A*b_hat",
-        "A*weekday_vs_weekend",
-        "A*slot_pm",
-        "A*weekday_vs_weekend*E_w",
-        "A*slot_pm*E_w",
-        "A*weekday_vs_weekend*b_hat",
-        "A*slot_pm*b_hat",
+        "A*b_tilde",
     ] + [f"A*{name}" for name in _rl_context_names()]
     return _phi_state_names() + action_context
 
@@ -1726,7 +1729,6 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
             _phi_action_names(), beta_n, "beta_coef"
         )]
         names = eta_names + beta_names
-        beta_skip = _placeholder_context_skip_indices(beta_n)
         for i, feature in enumerate(names):
             joint_rows.append({
                 "prior_family": "Joint Modified TD",
@@ -1910,12 +1912,14 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
     qn = raw["q_no_td_modify"]
     qj = raw.get("q_td_modify_joint")
 
+    nu_Y, G_Y = trim_pf_cae_prior(arr(pf["CAE"]["nu_0"]), arr(pf["CAE"]["Gamma_0"]))
+
     out = {
         "nu_0_MY":     [arr(pf["fourSC"]["nu_0"]), arr(pf["antic"]["nu_0"])],
         "Gamma_0_MY":  [arr(pf["fourSC"]["Gamma_0"]), arr(pf["antic"]["Gamma_0"])],
         "sigma2_MY":   [float(pf["fourSC"]["sigma2"]), float(pf["antic"]["sigma2"])],
-        "nu_0_Y":      arr(pf["CAE"]["nu_0"]),
-        "Gamma_0_Y":   arr(pf["CAE"]["Gamma_0"]),
+        "nu_0_Y":      nu_Y,
+        "Gamma_0_Y":   G_Y,
         "sigma2_Y":    float(pf["CAE"]["sigma2"]),
         "nu_0_tilde_Y":     arr(pf["CAE_short"]["nu_0"]),
         "Gamma_0_tilde_Y":  arr(pf["CAE_short"]["Gamma_0"]),

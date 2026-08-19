@@ -5,7 +5,7 @@ arrays, and builds week packets for the particle-filter agents. Sunday is
 generated with no walking suggestion so weekly CAE / E_w see a full 7-day week.
 
 This file also contains the RCT experiment CLI (train / eval loops over
-agents). For the simpler DQN-vs-never-suggest STE, use ``ste_vanilla.py``.
+agents). 
 """
 import argparse
 import os
@@ -70,14 +70,11 @@ from vani_env import (
     EnvConfig,
     make_initial_state,
     PARAMS_DIR as DEFAULT_PARAMS_DIR,
-    P_FOURSC,
-    P_ANTIC,
 )
 from agents import (
     MicroQueryAgent,
-    MicroQueryAgent_rewardshaping,
     MicroQueryAgent_ModifiedTDLoss,
-    MicroQueryAgent_rewardshaping_modifiedTD,
+    MicroQueryRewardDesignAgent,
     NeverSendAgent,
     AlwaysSendAgent,
     RandomSendAgent,
@@ -90,9 +87,7 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     build_phi_bottleneck,
     build_fourSC_features,
     build_antic_features,
-    fourSC_cae_delta,
-    antic_cae_delta,
-    build_CAE_features,
+    build_pf_CAE_features,
     build_CAE_short_features,
     build_pf_data,
     build_rl_context_vector,
@@ -269,7 +264,7 @@ class OnlineEnv:
         self.activitySuggestionsSentLast7DaysAll = np.full(self.T, np.nan)
         self.dailyAnticipatedAffectAll = np.zeros(self.D)            # latent draw (used by gen_CAE)
         self.dailyAnticipatedAffectObsAll = np.full(self.D, np.nan) # observed by the agent
-        self.dailyAnticipatedAffectAgentAll = np.zeros(self.D)      # agent-visible (model-imputed if survey missed)
+        self.dailyAnticipatedAffectAgentAll = np.zeros(self.D)      # agent-visible (last observed if survey missed)
         self.morningFitbitWearAll = np.zeros(self.D)
         self.dailySurveyCompleteAll = np.zeros(self.D)
         # PF-side observed copy of antic: NaN on days where the daily survey was
@@ -298,8 +293,6 @@ class OnlineEnv:
 
         # Per-day covariate logs for PF / RL (not read from self.s at use time).
         self.logIsWeekend = np.zeros(self.D)
-        self.logSalienceMessageSentToday = np.zeros(self.D)
-        self.logSalienceMessageSentYesterday = np.zeros(self.D)
         self.logYesterdayStepCount = np.zeros(self.D)
         self.logStepCountLast7DaysEma = np.zeros(self.T)
         self.logPageViewLast7DaysEma = np.zeros(self.D)
@@ -328,7 +321,6 @@ class OnlineEnv:
             0: self._stepCountLast7DaysEma_initial,
             1: self._stepCountLast7DaysEma_initial,
         }
-        self._prev_day_salience = float(self.s.get("salienceMessageSentYesterday", 0.0))
         self._initial_prior2hour = float(self.s.get("prior2HourStepCount", 0.0))
         self.s["prior2HourStepCountAgent"] = float(self.s.get("prior2HourStepCount", 0.0))
         self.s["dailyAnticipatedAffectYesterdayAgent"] = float(
@@ -384,15 +376,14 @@ class OnlineEnv:
         self.s["isWeekend"] = 1.0 if dayOfWeekNorm_i >= 6 else 0.0
         lag_n, _ = self._day_of_week_norm(-1)
         self.s["dayOfWeekNormLag1"] = lag_n
-        self.s["salienceMessageSentToday"] = float(rd.binomial(1, 0.5))
 
         self._yesterday_morning_WS = 0.0
         self._yesterday_afternoon_WS = 0.0
 
-        # s["dailyAnticipatedAffectYesterday"] is the carry-forward of the last
-        # *observed* anticipated affect (dailySurveyComplete==1 days only).  It is
-        # seeded here from the df_fit baseline row (dailyAnticipatedAffectYesterday_norm)
-        # and updated in _end_day on survey-present days.  It is also used
+        # s["dailyAnticipatedAffectYesterday"] is last-observation-carried-forward
+        # (updated only on dailySurveyComplete==1 days). Seeded from the df_fit
+        # baseline row (dailyAnticipatedAffectYesterday_norm). Agent-visible
+        # anticipated affect uses this same LOCF value when the survey is missed.
         self._today_fourSC = np.zeros(self.K)
         self._today_pageview = np.zeros(self.K)
         self._today_action = np.zeros(self.K)
@@ -429,10 +420,6 @@ class OnlineEnv:
             self.s["activitySuggestionsSentLast7Days"]
         )
         self._hist_daily_suggestions: list[float] = []
-        self._active_agent = None
-        self._active_pf_runtime = None
-        self._active_packet = None
-        self._active_rl_week = 0
 
     def _weekly_idx(self, sim_w: int) -> int:
         """Weekly arrays reserve index 0 for the pre-RL baseline."""
@@ -543,86 +530,22 @@ class OnlineEnv:
         self.s["prior2HourStepCount"] = prior2HourStepCount
         self.s["prior2HourStepCountAgent"] = prior2HourStepCount
 
-    def _active_particle_state(self):
-        """Return the current particle CAE paths and weights for mediator imputation."""
-        pf_runtime = self._active_pf_runtime
-        if pf_runtime is None:
-            return None, None
-        return (
-            np.asarray(pf_runtime.y_hat, dtype=float),
-            np.asarray(pf_runtime.v_hat, dtype=float),
-        )
+    def _agent_antic(self, antic_latent: float, survey_present: bool):
+        """Return (observed, agent-visible) anticipated affect for one day.
 
-    def _particle_cae_for_feature(self, y_hat_j, sim_w):
-        """CAE lag used in mediator rows for simulated week ``sim_w``."""
-        sim_w = int(sim_w)
-        if sim_w <= 0:
-            return float(self._cae_baseline)
-        y_hat_j = np.asarray(y_hat_j, dtype=float).ravel()
-        if sim_w < y_hat_j.size and np.isfinite(y_hat_j[sim_w]):
-            return float(y_hat_j[sim_w])
-        finite = y_hat_j[np.isfinite(y_hat_j)]
-        return float(finite[-1]) if finite.size else float(self._cae_baseline)
-
-    def _posterior_predictive_my_mean(self, mediator_idx, x_base, cae_delta):
-        """Particle-weighted posterior predictive mean for one missing MY value.
-
-        Reuses the per-particle MY posterior means computed during the week's
-        PF update (``ParticleFilterRuntime.theta_MY_mean[m][k, j]``) instead of
-        re-fitting a regression here. Those means are conditioned on each
-        particle's own CAE trajectory through the cumulative complete-case rows,
-        so they are exactly the posterior the PF used to propagate beliefs.
-        Particles with no recorded posterior (e.g. week 0) fall back to the prior.
+        Missed surveys keep the observation as NaN and show the agent the last
+        observed value (LOCF from ``dailyAnticipatedAffectYesterday``).
         """
-        agent = self._active_agent
-        pf_runtime = self._active_pf_runtime
-        y_hat, v_hat = self._active_particle_state()
-        if agent is None or pf_runtime is None or y_hat is None or v_hat is None:
-            return 0.0
-
-        m = int(mediator_idx)
-        k = int(self._active_rl_week)
-        nu0 = np.asarray(agent.nu_0_MY[m], dtype=float).ravel()
-        x_base = np.asarray(x_base, dtype=float).ravel()
-        cae_delta = np.asarray(cae_delta, dtype=float).ravel()
-
-        nu_post_all = np.asarray(pf_runtime.theta_MY_mean[m][k], dtype=float)  # (J, p)
-
-        weights = np.asarray(v_hat, dtype=float).ravel()
-        weights = np.where(np.isfinite(weights) & (weights > 0), weights, 0.0)
-        if weights.size != y_hat.shape[0] or weights.sum() <= 0:
-            weights = np.full(y_hat.shape[0], 1.0 / y_hat.shape[0])
-        else:
-            weights = weights / weights.sum()
-
-        preds = np.empty(y_hat.shape[0], dtype=float)
-        for j in range(y_hat.shape[0]):
-            nu_post = nu_post_all[j]
-            if nu_post.shape != nu0.shape or not np.all(np.isfinite(nu_post)):
-                nu_post = nu0
-            cae_pred = self._particle_cae_for_feature(y_hat[j], k)
-            x_pred = x_base + cae_pred * cae_delta
-            preds[j] = float(x_pred @ nu_post)
-
-        pred = float(np.average(preds, weights=weights))
-        return pred if np.isfinite(pred) else 0.0
-
-    def _agent_antic(self, d_global: int, ws_m: float, ws_a: float,
-                     antic_latent: float, survey_present: bool):
-        """Return (observed, agent-visible) anticipated affect for one day."""
         if survey_present:
             val = float(antic_latent)
             return val, val
-        x_base = self._pf_antic_row(int(d_global))
-        imputed = self._posterior_predictive_my_mean(
-            1, x_base, antic_cae_delta(x_base)
-        )
-        return np.nan, imputed
+        last = float(self.s.get("dailyAnticipatedAffectYesterday", 0.0))
+        if not np.isfinite(last):
+            last = 0.0
+        return np.nan, last
 
-    def _reset_episode_state(self, active_agent=None, active_pf_runtime=None):
+    def _reset_episode_state(self):
         """Reset mutable episode histories before simulating a policy."""
-        self._active_agent = active_agent
-        self._active_pf_runtime = active_pf_runtime
         self._hist_daily_suggestions.clear()
         self.s["activitySuggestionsSentLast7Days"] = (
             self._activitySuggestionsSentLast7Days_initial
@@ -649,7 +572,6 @@ class OnlineEnv:
 
         self.logYesterdayStepCount[0] = float(self.s["yesterdayStepCount"])
         self.logPageViewLast7DaysEma[0] = float(self.s["pageViewLast7DaysEma"])
-        self.logSalienceMessageSentYesterday[0] = float(self.s.get("salienceMessageSentYesterday", 0.0))
         self.logMorningFitbitWearLast7Days[0] = float(self.s.get("morningFitbitWearLast7Days", 0.0))
         self.logDailyAnticipatedAffectYesterday[0] = float(
             self.s.get("dailyAnticipatedAffectYesterdayAgent", 0.0)
@@ -669,7 +591,7 @@ class OnlineEnv:
             ParticleFilterRuntime(agent, dataset, agent.rng)
             if needs_belief else None
         )
-        self._reset_episode_state(agent, pf_runtime)
+        self._reset_episode_state()
 
         for k in range(self.nweek):
             packet = self.get_week_packet(k)
@@ -679,8 +601,6 @@ class OnlineEnv:
             I_w = agent.begin_week(k, packet)
             if needs_belief:
                 pf_runtime.update_standard(k, packet, I_w)
-            self._active_packet = packet
-            self._active_rl_week = k
 
             self.start_week(k, I_w)
             if needs_belief and hasattr(agent, "prepare_week"):
@@ -793,9 +713,6 @@ class OnlineEnv:
         dayOfWeekNorm_n, dayOfWeekNorm_i = self._day_of_week_norm(d_w)
         self.s["dayOfWeekNorm"] = dayOfWeekNorm_n
         self.s["isWeekend"] = 1.0 if dayOfWeekNorm_i >= 6 else 0.0
-        sal = float(rd.binomial(1, 0.5))
-        self.s["salienceMessageSentToday"] = sal
-
         self.s["decisionTimeSlot"] = 0.0
 
         active_status = self.env.gen_active_status(self.s, d_global)
@@ -803,8 +720,6 @@ class OnlineEnv:
         self.activityStatusTodayAll[d_global] = active_status
 
         self.logIsWeekend[d_global] = float(self.s["isWeekend"])
-        self.logSalienceMessageSentToday[d_global] = sal
-        self.logSalienceMessageSentYesterday[d_global] = float(self._prev_day_salience)
         self.logActiveDaysLast7Days[d_global] = float(
             self.s.get("activeDaysLast7Days", 0.0)
         )
@@ -868,13 +783,11 @@ class OnlineEnv:
         self.logTodayStepCount[d_global] = daily_sum_step_agent
 
         survey_present = float(daily_pres) == 1.0
-        antic_obs, antic_agent = self._agent_antic(
-            d_global, ws_m, ws_a, antic, survey_present
-        )
+        antic_obs, antic_agent = self._agent_antic(antic, survey_present)
         self.dailyAnticipatedAffectObsAll[d_global] = antic_obs
         self.dailyAnticipatedAffectAgentAll[d_global] = antic_agent
 
-        # Latent carry-forward for the env generative chain (observed days only).
+        # Last-observed carry-forward; agent lag uses the same LOCF value.
         if survey_present:
             self.s["dailyAnticipatedAffectYesterday"] = antic
         self.s["dailyAnticipatedAffectYesterdayAgent"] = antic_agent
@@ -893,10 +806,8 @@ class OnlineEnv:
         past7_wear = _rolling_mean_last(self._hist_morning_wear, 7)
         self.s["morningFitbitWearLast7Days"] = past7_wear
 
-        self._prev_day_salience = float(self.s["salienceMessageSentToday"])
         if d_global + 1 < self.D:
             self.logYesterdayStepCount[d_global + 1] = daily_sum_step_agent
-            self.logSalienceMessageSentYesterday[d_global + 1] = float(self._prev_day_salience)
             self.logDailyAnticipatedAffectYesterday[d_global + 1] = float(antic_agent)
 
         self._yesterday_morning_WS = self._today_action[0]
@@ -914,9 +825,6 @@ class OnlineEnv:
             self._hist_active_days,
             ACTIVE_STATUS_ROLLING_WINDOW,
         )
-
-        # fourSC / pageview use calendar-yesterday message flags (lagged one day).
-        self.s["salienceMessageSentYesterday"] = self.s["salienceMessageSentToday"]
 
     def _finalize_week(self, sim_w):
         if sim_w < 0 or sim_w >= self.nweek or self._week_finalized[sim_w]:
@@ -1050,6 +958,13 @@ class OnlineEnv:
     def _pf_foursc_row(self, step_idx):
         sim_w, _d_w, t_sim, d_global = self._decode_step_idx(step_idx)
         Ah = float(self.action_all[step_idx])
+        if step_idx > 0:
+            prev = self.stepCountNext4HourAgentAll[step_idx - 1]
+            lag1 = float(prev) if np.isfinite(prev) else 0.0
+        else:
+            lag1 = float(self.s.get("stepCountNext4HourLag1", 0.0))
+            if not np.isfinite(lag1):
+                lag1 = 0.0
         return build_fourSC_features(
             yesterdayStepCount=self.logYesterdayStepCount[d_global],
             stepCountLast7DaysEma=self.logStepCountLast7DaysEma[step_idx],
@@ -1057,8 +972,6 @@ class OnlineEnv:
             activitySuggestionsSentLast7Days=float(
                 self.activitySuggestionsSentLast7DaysAll[step_idx]
             ),
-            morningFitbitWearLast7Days=self.logMorningFitbitWearLast7Days[d_global],
-            salienceMessageSentYesterday=self.logSalienceMessageSentYesterday[d_global],
             activitySuggestionInteractLast7Days=self.logActivitySuggestionInteractLast7Days[step_idx],
             activeDaysLast7Days=self.logActiveDaysLast7Days[d_global],
             isWeekend=self.logIsWeekend[d_global],
@@ -1066,6 +979,7 @@ class OnlineEnv:
             perceivedUtility=self.E_known_all[sim_w],
             caeAverageLastWeek=0.0,
             Ah=Ah,
+            stepCountNext4HourLag1=lag1,
             cae=0.0,
         )
 
@@ -1092,13 +1006,14 @@ class OnlineEnv:
         )
 
     def _pf_cae_row(self, sim_w):
+        """PF CAE transition row: EWMA of Mon–Sat mediators only (12 slots / 6 days)."""
         slot_start = self._step_idx(sim_w, 0, 0)
-        slot_stop = self._step_idx(sim_w + 1, 0, 0)
+        slot_stop = slot_start + N_RL_DAYS * self.K
         day_start = self._day_idx(sim_w, 0)
-        day_stop = self._day_idx(sim_w + 1, 0)
+        day_stop = day_start + N_RL_DAYS
         foursc_wk = self.stepCountNext4HourAgentAll[slot_start:slot_stop]
         antic_wk = self.dailyAnticipatedAffectAgentAll[day_start:day_stop]
-        return build_CAE_features(0.0, self._week_norm(sim_w), foursc_wk, antic_wk)
+        return build_pf_CAE_features(0.0, foursc_wk, antic_wk)
 
     def _query_x_weekly_present(self, k):
         """Current-week ``I_w * J_w``."""
@@ -1117,18 +1032,14 @@ class OnlineEnv:
             p2h = float(self.prior2HourStepCountAgentAll[step_idx])
         else:
             p2h = float(self.s.get("prior2HourStepCountAgent", self._initial_prior2hour))
-        query_sent, weekly_present = self._query_x_weekly_present(k)
         return build_rl_context_vector(
             yesterdayStepCount=self.logYesterdayStepCount[d_global],
             prior2HourStepCountAgent=p2h,
             activeDaysLast7Days=float(self.s["activeDaysLast7Days"]),
             activitySuggestionsSentLast7Days=float(self.s["activitySuggestionsSentLast7Days"]),
-            salienceMessageSentYesterday=self.logSalienceMessageSentYesterday[d_global],
             activitySuggestionInteractLast7Days=float(
                 self.s["activitySuggestionInteractLast7Days"]
             ),
-            query_sent=query_sent,
-            weekly_present=weekly_present,
         )
 
     def get_pf_data(self, k):
@@ -1155,6 +1066,8 @@ class OnlineEnv:
         E_w = self.E_known_all[k] if (
             0 <= k < self.nweek and not np.isnan(self.E_known_all[k])
         ) else 0.0
+        query_sent, weekly_present = self._query_x_weekly_present(k)
+        qxw = float(query_sent) * float(weekly_present)
 
         if d == QUERY_D and t == QUERY_T:
             return {
@@ -1162,6 +1075,7 @@ class OnlineEnv:
                 "M_Y": np.zeros(RL_MY_SHAPE),
                 "M_E": np.zeros(RL_ME_SHAPE),
                 "C": np.zeros(N_RL_CONTEXT),
+                "query_x_weekly_present": qxw,
             }
 
         M_Y = np.zeros(RL_MY_SHAPE)
@@ -1184,6 +1098,7 @@ class OnlineEnv:
             "M_Y": M_Y,
             "M_E": M_E,
             "C": self._rl_context_vector(k, d, t),
+            "query_x_weekly_present": qxw,
         }
 
 _setup_log("OnlineEnv defined.")
@@ -1195,18 +1110,17 @@ _setup_log("OnlineEnv defined.")
 
 # Pooled mediator-model feature dimensions for the particle filter:
 # m=0 is fourSC (all slots share one model), m=1 is antic (all days share one model).
-# The PF fourSC model is a reduced version of the env's generative model: it drops
-# the AR-1 lag, the pageview-EMA, and the anticipated-affect predictors (and their
-# action interactions). Its dimension is therefore taken directly from the PF
-# feature builder rather than from the env's P_FOURSC.
+# The PF fourSC model is a reduced version of the env's generative model: it
+# keeps AR-1 lag as a main effect only, and drops pageview-EMA, anticipated
+# affect, and 7-day Fitbit wear (and their action interactions). Weekend and
+# AM/PM are main effects only. Dimension is taken from the PF feature builder
+# rather than from the env's P_FOURSC.
 P_MY_FOURSC = int(
     build_fourSC_features(
         yesterdayStepCount=0.0,
         stepCountLast7DaysEma=0.0,
         prior2HourStepCount=0.0,
         activitySuggestionsSentLast7Days=0.0,
-        morningFitbitWearLast7Days=0.0,
-        salienceMessageSentYesterday=0.0,
         activitySuggestionInteractLast7Days=0.0,
         activeDaysLast7Days=0.0,
         isWeekend=0.0,
@@ -1214,11 +1128,12 @@ P_MY_FOURSC = int(
         perceivedUtility=0.0,
         caeAverageLastWeek=0.0,
         Ah=0.0,
+        stepCountNext4HourLag1=0.0,
     ).shape[0]
 )
-# Antic PF design matches the env generative model in vani_env / 5_fit
-# (including recent_burden main effect and AM/PM interactions). Dimension is
-# taken from the PF feature builder and checked against env P_ANTIC.
+# Antic PF design matches env main effects but drops A0/A1 interactions
+# with weekend and 7-day active fraction. Dimension is taken from the PF
+# feature builder (may differ from env P_ANTIC).
 P_MY_ANTIC = int(
     build_antic_features(
         dailyAnticipatedAffectYesterday=0.0,
@@ -1231,11 +1146,9 @@ P_MY_ANTIC = int(
         ws_afternoon=0.0,
     ).shape[0]
 )
-if P_MY_ANTIC != P_ANTIC:
-    raise RuntimeError(
-        f"PF antic dim {P_MY_ANTIC} != env P_ANTIC {P_ANTIC}"
-    )
-P_CAE = int(build_CAE_features(0.0, 0.0, np.zeros(FOURSC_SLOTS_PER_WEEK), np.zeros(7)).shape[0])
+P_CAE = int(build_pf_CAE_features(
+    0.0, np.zeros(N_RL_DAYS * N_RL_SLOTS), np.zeros(N_RL_DAYS)
+).shape[0])
 P_TY  = int(build_CAE_short_features(0.0).shape[0])
 
 # Compute phi dimensions directly from the algorithm's feature builders so
@@ -1247,6 +1160,7 @@ _DUMMY_RL_STATE = {
     "M_Y": np.zeros(RL_MY_SHAPE),
     "M_E": np.zeros(RL_ME_SHAPE),
     "C":   np.zeros(N_RL_CONTEXT),
+    "query_x_weekly_present": 0.0,
 }
 P_RL_MICRO = int(
     build_phi_action(0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0).shape[0]
@@ -1268,17 +1182,32 @@ EPSILON_0    = 0.1   # this is the clipping parameter
 J_PARTICLES  = 50
 B_ENSEMBLES  = 50
 NWEEK        = 36
+# V1/V2 bonus weight: λ = ρ · sd(b̂) / sd(ê) from agent-visible histories
+# (default ρ=0.5). Override ρ with ENGAGEMENT_RHO / --engagement-rho, or
+# skip scale-matching and set λ directly with ENGAGEMENT_BONUS /
+# --engagement-bonus.
+ENGAGEMENT_RHO = float(os.getenv("ENGAGEMENT_RHO", "0.5"))
 
-# Result persistence: ``full`` (default) writes pf.pkl and trajectories for every
-# algorithm; ``compact`` skips pf.pkl and writes trajectory arrays in .npz only
-# for TRAJECTORY_REFERENCE_ALGO (for downstream replay / debugging).
+
+def _optional_float_env(name):
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    return float(raw)
+
+
+ENGAGEMENT_BONUS = _optional_float_env("ENGAGEMENT_BONUS")
+
+# Result persistence: ``compact`` (default) skips pf.pkl and writes trajectory
+# arrays in .npz only for TRAJECTORY_REFERENCE_ALGO; ``full`` writes pf.pkl
+# and trajectories for every algorithm.
 SAVE_MODE_FULL = "full"
 SAVE_MODE_COMPACT = "compact"
 TRAJECTORY_REFERENCE_ALGO = "random_send"
 
 
 def _parse_save_mode(raw):
-    mode = (raw or SAVE_MODE_FULL).strip().lower()
+    mode = (raw or SAVE_MODE_COMPACT).strip().lower()
     if mode in (SAVE_MODE_FULL, SAVE_MODE_COMPACT):
         return mode
     raise ValueError(
@@ -1398,7 +1327,7 @@ def _configure_priors(params_dir=None, *, force=False):
         nu_0_tilde_Y   = _priors["nu_0_tilde_Y"]
         Gamma_0_tilde_Y= _priors["Gamma_0_tilde_Y"]
         sigma2_tilde_Y = _priors["sigma2_tilde_Y"]
-        # Q prior used by MicroQueryAgent / MicroQueryAgent_rewardshaping
+        # Q prior used by the base and reward-design RL variants
         # (no TD-modify variant).
         mu_0_micro      = _priors["mu_0_micro"]
         Sigma_0_micro   = _priors["Sigma_0_micro"]
@@ -1548,35 +1477,6 @@ def run_micro_query(uid, seed=42, gamma_bar=0.5, params_dir=None):
     return result, oenv
 
 
-def run_micro_query_rs(uid, seed=42, gamma_bar=0.5, params_dir=None):
-    """Micro-query agent with reward shaping (per-slot R_dt = phi_rs · eta)."""
-    _ensure_priors_configured(params_dir)
-    cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
-    nweek = cfg.nweek
-
-    agent = MicroQueryAgent_rewardshaping(
-        W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
-        mu_0_rl=mu_0_micro, Sigma_0_rl=Sigma_0_micro, sigma2_rl=sigma2_rl_micro,
-        gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
-        target_update_C=TARGET_C,
-        nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
-        nu_0_Y=nu_0_Y, Gamma_0_Y=Gamma_0_Y, sigma2_Y=sigma2_Y,
-        nu_0_tilde_Y=nu_0_tilde_Y, Gamma_0_tilde_Y=Gamma_0_tilde_Y,
-        sigma2_tilde_Y=sigma2_tilde_Y,
-        mu_0_reward=mu_0_reward, Sigma_0_reward=Sigma_0_reward,
-        sigma2_reward=sigma2_reward,
-        Y_1=float(oenv.CAE_all[0]),
-        rng=np.random.default_rng(seed),
-    )
-    # agent.update_sigma2_online = False
-    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
-    dataset = EpisodeDataset(nweek)
-    result = oenv.run_episode(
-        agent, dataset, week0_actions=week0_actions, I_hist=I_hist
-    )
-    return result, oenv
-
-
 def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5, params_dir=None):
     """Micro-query agent with modified TD loss (week-start bottleneck V_alpha)."""
     _ensure_priors_configured(params_dir)
@@ -1606,35 +1506,39 @@ def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5, params_dir=None):
     return result, oenv
 
 
-def run_micro_query_rs_mtd(uid, seed=42, gamma_bar=0.5, params_dir=None):
-    """Micro-query agent with both reward shaping and modified TD loss."""
+def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.5,
+                                   params_dir=None, engagement_bonus=None,
+                                   engagement_rho=None):
+    """Run one of the protocol reward designs V1--V4.
+
+    V1/V2 use the engagement-biased weekly target ``b̂_{w+1} + λ ê_{w+1}``,
+    with ``λ = ρ · sd(b̂) / sd(ê)`` unless ``engagement_bonus`` is set.
+    V3/V4 keep discounted CAE and add the potential ``F = γ̄ ê_{w+1} - ê_w``.
+    V2/V4 additionally redistribute with the two-stage daily-mediator
+    decomposition; V4 matches and compensates to ``b̂_{w+1} + F``.
+    """
     _ensure_priors_configured(params_dir)
     cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
     nweek = cfg.nweek
-
-    agent = MicroQueryAgent_rewardshaping_modifiedTD(
+    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
+    dataset = EpisodeDataset(nweek)
+    if engagement_rho is None:
+        engagement_rho = ENGAGEMENT_RHO
+    if engagement_bonus is None:
+        engagement_bonus = ENGAGEMENT_BONUS
+    agent = MicroQueryRewardDesignAgent(
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
-        mu_0_joint=mu_0_mtd_joint, Sigma_0_joint=Sigma_0_mtd_joint,
-        p_eta=p_eta_mtd_joint,
-        sigma2_Q=sigma2_Q_mtd_joint,
+        mu_0_rl=mu_0_micro, Sigma_0_rl=Sigma_0_micro, sigma2_rl=sigma2_rl_micro,
         gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
         target_update_C=TARGET_C,
         nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
         nu_0_Y=nu_0_Y, Gamma_0_Y=Gamma_0_Y, sigma2_Y=sigma2_Y,
         nu_0_tilde_Y=nu_0_tilde_Y, Gamma_0_tilde_Y=Gamma_0_tilde_Y,
-        sigma2_tilde_Y=sigma2_tilde_Y,
-        mu_0_reward=mu_0_reward, Sigma_0_reward=Sigma_0_reward,
-        sigma2_reward=sigma2_reward,
-        Y_1=float(oenv.CAE_all[0]),
-        rng=np.random.default_rng(seed),
+        sigma2_tilde_Y=sigma2_tilde_Y, Y_1=float(oenv.CAE_all[0]),
+        rng=np.random.default_rng(seed), reward_design=reward_design,
+        engagement_bonus=engagement_bonus, engagement_rho=engagement_rho,
     )
-    # agent.update_sigma2_online = False
-    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
-    dataset = EpisodeDataset(nweek)
-    result = oenv.run_episode(
-        agent, dataset, week0_actions=week0_actions, I_hist=I_hist
-    )
-    return result, oenv
+    return oenv.run_episode(agent, dataset, week0_actions=week0_actions, I_hist=I_hist), oenv
 
 
 def _fixed_policy_rng_after_legacy_reset(seed: int):
@@ -1733,18 +1637,16 @@ def run_random_send(uid, seed=42, params_dir=None):
     return _run_fixed_policy(RandomSendAgent, uid, seed=seed, params_dir=params_dir)
 
 
-# Algorithm registry: name -> (runner, display label).
-# Every RL algorithm is run at gamma_bar = 0.5 and gamma_bar = 0.9.
-# Within-week discounts stay 1; only the Saturday-afternoon slot uses γ̄.
+# Algorithm registry: exactly the seven RL variants in the experiment plan,
+# followed by the three fixed-policy baselines.
 ALGORITHMS = {
-    "micro_g05":    (partial(run_micro_query,        gamma_bar=0.5), "Micro-query (γ̄=0.5)"),
-    "micro_g09":    (partial(run_micro_query,        gamma_bar=0.9), "Micro-query (γ̄=0.9)"),
-    "mtd_g05":      (partial(run_micro_query_mtd,    gamma_bar=0.5), "Micro-query + MTD (γ̄=0.5)"),
-    "mtd_g09":      (partial(run_micro_query_mtd,    gamma_bar=0.9), "Micro-query + MTD (γ̄=0.9)"),
-    "rs_g05":       (partial(run_micro_query_rs,     gamma_bar=0.5), "Micro-query + RS (γ̄=0.5)"),
-    "rs_g09":       (partial(run_micro_query_rs,     gamma_bar=0.9), "Micro-query + RS (γ̄=0.9)"),
-    "rs_mtd_g05":   (partial(run_micro_query_rs_mtd, gamma_bar=0.5), "Micro-query + RS + MTD (γ̄=0.5)"),
-    "rs_mtd_g09":   (partial(run_micro_query_rs_mtd, gamma_bar=0.9), "Micro-query + RS + MTD (γ̄=0.9)"),
+    "rl_v1_base_g05": (partial(run_micro_query, gamma_bar=0.5), "RL base (γ̄=0.5)"),
+    "rl_v2_mtd_g05": (partial(run_micro_query_mtd, gamma_bar=0.5), "RL + bottleneck TD (γ̄=0.5)"),
+    "rl_v3_biased_weekly": (partial(run_micro_query_reward_design, reward_design="v1"), "RL V1: biased weekly reward"),
+    "rl_v4_biased_redistributed": (partial(run_micro_query_reward_design, reward_design="v2"), "RL V2: biased redistributed reward"),
+    "rl_v5_invariant_weekly": (partial(run_micro_query_reward_design, reward_design="v3"), "RL V3: return-invariant weekly reward"),
+    "rl_v6_invariant_redistributed": (partial(run_micro_query_reward_design, reward_design="v4"), "RL V4: return-invariant redistributed reward"),
+    "rl_v7_base_g09": (partial(run_micro_query, gamma_bar=0.9), "RL base (γ̄=0.9 sensitivity)"),
     "never_send":   (run_never_send,  "Never send (A=0)"),
     "always_send":  (run_always_send, "Always send (A=1)"),
     "random_send":  (run_random_send, "Random send (π_A=0.5)"),
@@ -1787,7 +1689,7 @@ def _snapshot_oenv(oenv):
         # ── daily ─────────────────────────────────────────────────
         "dailyAnticipatedAffectAll":              oenv.dailyAnticipatedAffectAll.copy(),       # latent
         "dailyAnticipatedAffectObsAll":          oenv.dailyAnticipatedAffectObsAll.copy(),   # NaN if survey missed
-        "dailyAnticipatedAffectAgentAll":        oenv.dailyAnticipatedAffectAgentAll.copy(), # model-imputed if survey missed
+        "dailyAnticipatedAffectAgentAll":        oenv.dailyAnticipatedAffectAgentAll.copy(), # last observed if survey missed
         "morningFitbitWearAll":             oenv.morningFitbitWearAll.copy(),
         "dailySurveyCompleteAll":              oenv.dailySurveyCompleteAll.copy(),       # daily-survey present
         "activityStatusTodayAll":           oenv.activityStatusTodayAll.copy(),
@@ -1822,10 +1724,10 @@ if __name__ == "__main__":
         choices=[SAVE_MODE_FULL, SAVE_MODE_COMPACT],
         default=None,
         help=(
+            f"{SAVE_MODE_COMPACT} (default): skip pf.pkl and save trajectory "
+            f"arrays only for {TRAJECTORY_REFERENCE_ALGO}; "
             f"{SAVE_MODE_FULL}: save pf.pkl and full trajectories for all "
-            f"algorithms; {SAVE_MODE_COMPACT}: skip pf.pkl and save trajectory "
-            f"arrays only for {TRAJECTORY_REFERENCE_ALGO}. "
-            "Override with SAVE_MODE=<mode>."
+            "algorithms. Override with SAVE_MODE=<mode>."
         ),
     )
     parser.add_argument(
@@ -1838,11 +1740,38 @@ if __name__ == "__main__":
             "Defaults to ADAPR_EXPERIMENT_PARAMS_DIR, then env_para_vanilla."
         ),
     )
+    parser.add_argument(
+        "--engagement-rho",
+        type=float,
+        default=None,
+        help=(
+            "ρ in λ = ρ · sd(b̂) / sd(ê) for V1/V2 (default: ENGAGEMENT_RHO "
+            "env or 0.5). Ignored if --engagement-bonus is set."
+        ),
+    )
+    parser.add_argument(
+        "--engagement-bonus",
+        type=float,
+        default=None,
+        help=(
+            "Fixed λ on ê_{w+1} in V1/V2, skipping scale-matching. "
+            "Default: ENGAGEMENT_BONUS env, else scale-matched λ."
+        ),
+    )
     args = parser.parse_args()
 
     params_dir = resolve_params_dir(args.params_dir)
     _configure_priors(params_dir=params_dir, force=True)
     print(f"Using parameter directory: {params_dir}")
+
+    if args.engagement_rho is not None:
+        ENGAGEMENT_RHO = float(args.engagement_rho)
+    if args.engagement_bonus is not None:
+        ENGAGEMENT_BONUS = float(args.engagement_bonus)
+    if ENGAGEMENT_BONUS is not None:
+        print(f"V1/V2 λ is fixed: ENGAGEMENT_BONUS={ENGAGEMENT_BONUS}")
+    else:
+        print(f"V1/V2 λ = ρ · sd(b̂)/sd(ê) with ENGAGEMENT_RHO={ENGAGEMENT_RHO}")
 
     save_mode = _parse_save_mode(args.save_mode or os.getenv("SAVE_MODE"))
     save_pf = _save_pf_pkl(save_mode)
@@ -1996,6 +1925,8 @@ if __name__ == "__main__":
             "algorithms":     list(ALGORITHMS.keys()),
             "labels":         {n: ALGORITHMS[n][1] for n in ALGORITHMS},
             "gamma_bars":     [0.5, 0.9],
+            "engagement_rho": ENGAGEMENT_RHO,
+            "engagement_bonus": ENGAGEMENT_BONUS,
             "epsilon_0":      EPSILON_0,
             "J_particles":    J_PARTICLES,
             "B_ensembles":    B_ENSEMBLES,
@@ -2042,79 +1973,6 @@ if __name__ == "__main__":
             with open(OUTPUT_DIR / f"{name}_pf.pkl", "wb") as f:
                 pickle.dump(pf_runs[name], f)
 
-    # %%
-    # ──────────────────────────────────────────────────────────────────
-    # Aggregate CAE arrays for the summary table.
-    # (Plots live in aggregate.py — this driver only writes summary.txt.)
-    #   all_cae_full[name] → (N_EXPERIMENTS, n_users, NWEEK + 1)   includes baseline
-    #   all_cae[name]      → (N_EXPERIMENTS, n_users, NWEEK)       drops baseline
-    # ──────────────────────────────────────────────────────────────────
-    all_cae_full = {
-        name: np.stack([np.stack(per_exp) for per_exp in cae_runs[name]])
-        for name in ALGORITHMS
-    }
-    all_cae = {name: arr[..., 1:] for name, arr in all_cae_full.items()}
-
-    mean_cae = {name: np.nanmean(arr, axis=(0, 1)) for name, arr in all_cae.items()}
-    cum_cae = {name: np.cumsum(mean_cae[name]) for name in ALGORITHMS}
-
-    # ── Summary table ──
-    headers = ["Metric"] + [name for name in ALGORITHMS]
-    col_w = 18
-    sep_w = col_w * (len(headers))
-    summary_lines = []
-    summary_lines.append("=" * sep_w)
-    summary_lines.append("".join(f"{h:>{col_w}}" for h in headers))
-    summary_lines.append("-" * sep_w)
-    summary_lines.append(
-        "".join([f"{'Mean CAE (all weeks)':>{col_w}}"]
-        + [f"{np.nanmean(all_cae[n]):>{col_w}.4f}" for n in ALGORITHMS])
-    )
-    # SE of the grand mean, clustered by user (treats each participant as
-    # the unit of randomness — collapse experiments × weeks to a per-user
-    # mean, then take std/sqrt(n_users) across users).
-    def _se_clustered_by_user(arr):
-        per_user = np.nanmean(arr, axis=(0, 2))       # shape (n_users,)
-        n_eff = int(np.sum(~np.isnan(per_user)))
-        if n_eff <= 1:
-            return float("nan")
-        return float(np.nanstd(per_user, ddof=1) / np.sqrt(n_eff))
-    summary_lines.append(
-        "".join([f"{'SE CAE (clustered)':>{col_w}}"]
-        + [f"{_se_clustered_by_user(all_cae[n]):>{col_w}.4f}" for n in ALGORITHMS])
-    )
-    summary_lines.append(
-        "".join([f"{'Mean CAE (week 3+)':>{col_w}}"]
-        + [f"{np.nanmean(all_cae[n][..., 2:]):>{col_w}.4f}" for n in ALGORITHMS])
-    )
-    summary_lines.append(
-        "".join([f"{'Median CAE (all wks)':>{col_w}}"]
-        + [f"{np.nanmedian(all_cae[n]):>{col_w}.4f}" for n in ALGORITHMS])
-    )
-    summary_lines.append(
-        "".join([f"{'25th pct CAE':>{col_w}}"]
-        + [f"{np.nanpercentile(all_cae[n], 25):>{col_w}.4f}" for n in ALGORITHMS])
-    )
-    summary_lines.append(
-        "".join([f"{'75th pct CAE':>{col_w}}"]
-        + [f"{np.nanpercentile(all_cae[n], 75):>{col_w}.4f}" for n in ALGORITHMS])
-    )
-    summary_lines.append(
-        "".join([f"{'Cumulative CAE (total)':>{col_w}}"]
-        + [f"{cum_cae[n][-1]:>{col_w}.4f}" for n in ALGORITHMS])
-    )
-    summary_lines.append("=" * sep_w)
-
-    summary_text = "\n".join(summary_lines)
-    print("\n" + summary_text)
-    (OUTPUT_DIR / "summary.txt").write_text(summary_text + "\n")
     print(f"\nResults saved to {OUTPUT_DIR.resolve()}")
-
-
-# import numpy as np, json, pickle
-# from pathlib import Path
-# RES = Path("results/20260516-...")
-# cfg  = json.loads((RES/"config.json").read_text())
-# uids = np.load(RES/"run_uids.npy")
-# data = np.load(RES/"rs_g05.npz")            # has cae_runs, piA_runs, stepCountNext4HourAll, …
-# cae_by_uid = pickle.load(open(RES/"rs_g05_cae_by_uid.pkl","rb"))
+    print("Plots and pooled summaries: python aggregate.py --results-root "
+          f"{RESULTS_ROOT}")
