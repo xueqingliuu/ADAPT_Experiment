@@ -12,6 +12,18 @@ Commands
     scan        proxy STE vs a grid of ``kappa``
     calibrate   find ``kappa`` for each target and write ``env_para_ste0.2/`` etc.
 
+Burden-only variants (does **not** overwrite the original action-knob folders)::
+
+    python tune_ste.py calibrate --knob burden --targets 0.2 0.5 \\
+        --out-prefix env_para_ste --out-suffix _burden
+
+    writes ``env_para_ste0.2_burden/`` and ``env_para_ste0.5_burden/``
+    (``A→ME`` scaled up, benefit path left at vanilla). Cluster::
+
+    sbatch --export=ALL,TUNE_KNOB=burden,TUNE_TARGETS="0.2 0.5",TUNE_OUT_SUFFIX=_burden \\
+        run_tune_ste.sh
+
+
 How STE is measured here
     Treatment arms are constant suggestion rates (``--policy-grid``, default
     0.5 and 1.0). Optionally add an already-trained DiscreteCQL policy with
@@ -1025,6 +1037,27 @@ def cmd_scan(args) -> None:
         )
 
 
+def calibrated_out_dir(prefix: str, target: float, suffix: str = "") -> Path:
+    """``env_para_ste0.2`` or ``env_para_ste0.2_burden`` depending on suffix."""
+    return PROJECT_ROOT / f"{prefix}{float(target):g}{suffix}"
+
+
+def refuse_knob_overwrite(out_dir: Path, knob_name: str, *, overwrite: bool) -> None:
+    """Block clobbering a folder that was calibrated with a different knob."""
+    report_path = out_dir / "ste_tuning.json"
+    if not report_path.is_file() or overwrite:
+        return
+    prev = json.loads(report_path.read_text(encoding="utf-8"))
+    prev_knob = prev.get("knob")
+    if prev_knob and prev_knob != knob_name:
+        raise SystemExit(
+            f"Refuse to overwrite {out_dir} (existing knob={prev_knob!r}, "
+            f"this run knob={knob_name!r}). Pass --out-suffix _burden "
+            f"(or another name) so the original action-knob folders stay put, "
+            f"or --overwrite if you really mean it."
+        )
+
+
 def cmd_calibrate(args) -> None:
     base_dir = Path(args.params_dir).expanduser().resolve()
     user_ids = load_user_ids(base_dir)
@@ -1149,7 +1182,8 @@ def cmd_calibrate(args) -> None:
             failures.append(f"target {target:g}: {'; '.join(reasons)}")
             continue
 
-        out_dir = PROJECT_ROOT / f"{args.out_prefix}{target:g}"
+        out_dir = calibrated_out_dir(args.out_prefix, target, args.out_suffix)
+        refuse_knob_overwrite(out_dir, knob.name, overwrite=args.overwrite)
         audit = write_scaled_params(base_dir, out_dir, user_ids, knob.build(kappa))
         written = diagnose(out_dir, user_ids)
         if require_stable and unstable_users(written):
@@ -1274,6 +1308,22 @@ def build_parser() -> argparse.ArgumentParser:
     common(sp, needs_knob=True)
     sp.add_argument("--targets", type=float, nargs="+", default=[0.2, 0.5, 0.8])
     sp.add_argument("--out-prefix", default="env_para_ste")
+    sp.add_argument(
+        "--out-suffix",
+        default="",
+        help=(
+            "Appended after the target, e.g. --out-suffix _burden writes "
+            "env_para_ste0.2_burden instead of overwriting env_para_ste0.2."
+        ),
+    )
+    sp.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Allow replacing a folder whose ste_tuning.json was written with "
+            "a different knob. Default: refuse."
+        ),
+    )
     sp.add_argument("--kappa0", type=float, default=1.0)
     sp.add_argument("--tol", type=float, default=0.02)
     sp.add_argument("--max-iter", type=int, default=10)

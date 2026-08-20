@@ -16,8 +16,9 @@
 #   mkdir -p logs
 #   sbatch run_tune_ste.sh                                   # action knob → 0.2/0.5/0.8, then
 #                                                            # auto-submit true-STE DQN jobs
-#   sbatch --export=ALL,TUNE_KNOB=foursc_to_y,TUNE_TARGETS=0.8,TUNE_OUT_PREFIX=env_para_foursc \
-#          run_tune_ste.sh                                   # fourSC_ewma→CAE → 0.8
+#   sbatch --export=ALL,TUNE_KNOB=burden,TUNE_TARGETS="0.2 0.5",TUNE_OUT_SUFFIX=_burden \
+#          run_tune_ste.sh                                   # A→ME only → 0.2/0.5
+#                                                            # writes env_para_ste0.2_burden etc.
 #   sbatch --export=ALL,TUNE_PHASE=diagnose run_tune_ste.sh  # E_w + CAE loop gains, ~seconds
 #   sbatch --export=ALL,TUNE_PHASE=eval run_tune_ste.sh      # STE of the untouched fit
 #   sbatch --export=ALL,TUNE_PHASE=scan run_tune_ste.sh      # STE vs knob value
@@ -35,7 +36,8 @@
 #   TUNE_DQN_EXP      ste_vanilla --exp whose DQNs join as an extra arm, "" to skip
 #                     (auto-skipped if the checkpoints are absent)  default 1
 #   TUNE_NOISE        ar1|random|sequential                    default ar1
-#   TUNE_OUT_PREFIX   tuned dirs are <prefix><target>          default env_para_ste
+#   TUNE_OUT_PREFIX   tuned dirs are <prefix><target><suffix>  default env_para_ste
+#   TUNE_OUT_SUFFIX   e.g. _burden → env_para_ste0.2_burden    default ""
 #   TUNE_VALIDATE     1 to submit true-STE jobs after calibrate (default 1)
 #   TUNE_REQUIRE_STABLE  1 to refuse unstable folders (default 1)
 #   TUNE_TOL  TUNE_MAX_ITER  TUNE_SEED  TUNE_PROXY_TO_TRUE  TUNE_JOBS
@@ -79,6 +81,7 @@ TUNE_POLICY_GRID="${TUNE_POLICY_GRID:-0.5 1.0}"
 TUNE_DQN_EXP="${TUNE_DQN_EXP:-1}"
 TUNE_NOISE="${TUNE_NOISE:-ar1}"
 TUNE_OUT_PREFIX="${TUNE_OUT_PREFIX:-env_para_ste}"
+TUNE_OUT_SUFFIX="${TUNE_OUT_SUFFIX:-}"
 TUNE_TOL="${TUNE_TOL:-0.02}"
 TUNE_MAX_ITER="${TUNE_MAX_ITER:-10}"
 TUNE_SEED="${TUNE_SEED:-20260814}"
@@ -100,7 +103,7 @@ echo "Host: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "TUNE_PHASE=${TUNE_PHASE}  TUNE_PARAMS_DIR=${TUNE_PARAMS_DIR}  (${NUM_USERS} participants)"
 echo "TUNE_KNOB=${TUNE_KNOB}  TUNE_EPISODES=${TUNE_EPISODES}  TUNE_JOBS=${TUNE_JOBS}"
-echo "TUNE_SCRATCH=${TUNE_SCRATCH}  TUNE_OUT_PREFIX=${TUNE_OUT_PREFIX}"
+echo "TUNE_SCRATCH=${TUNE_SCRATCH}  TUNE_OUT_PREFIX=${TUNE_OUT_PREFIX}  TUNE_OUT_SUFFIX=${TUNE_OUT_SUFFIX:-<none>}"
 
 # The DQN arm is optional. Requiring every checkpoint keeps the comparison
 # across participants apples-to-apples; a partial set silently mixes arms.
@@ -152,7 +155,7 @@ submit_validation_jobs() {
     return 1
   fi
   for target in ${TUNE_TARGETS}; do
-    local dir="${TUNE_OUT_PREFIX}${target}"
+    local dir="${TUNE_OUT_PREFIX}${target}${TUNE_OUT_SUFFIX}"
     if ! folder_is_stable "${dir}"; then
       echo "SKIP ${dir}: missing, or ste_tuning.json does not have stable=true." >&2
       continue
@@ -198,11 +201,16 @@ case "${TUNE_PHASE}" in
     if [[ "${TUNE_REQUIRE_STABLE}" == "0" ]]; then
       STABLE_FLAG=(--no-require-stable)
     fi
+    SUFFIX_ARGS=()
+    if [[ -n "${TUNE_OUT_SUFFIX}" ]]; then
+      SUFFIX_ARGS=(--out-suffix "${TUNE_OUT_SUFFIX}")
+    fi
     set +e
     "${PY}" tune_ste.py calibrate "${COMMON_ARGS[@]}" \
       --knob "${TUNE_KNOB}" \
       --targets ${TUNE_TARGETS} \
       --out-prefix "${TUNE_OUT_PREFIX}" \
+      "${SUFFIX_ARGS[@]+"${SUFFIX_ARGS[@]}"}" \
       --scratch "${TUNE_SCRATCH}" \
       --tol "${TUNE_TOL}" \
       --max-iter "${TUNE_MAX_ITER}" \
