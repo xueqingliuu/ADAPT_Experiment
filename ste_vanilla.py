@@ -40,6 +40,10 @@ on the old 200000+ seeds that identified the negative users.
 Checkpoints: ``d3rlpy_logs/ste_exp_<EXP>/user<uid>_model.d3``
 Eval rows:   ``results_ste/exp<EXP>/res<EXP>_<uid>.txt``
 
+The DiscreteCQL observation is frozen at 21 dimensions (see
+``build_ste_phi_state``). It does not follow later RLSVI ``build_phi_state``
+changes.
+
 Point at a tuned parameter folder with ``ADAPR_PARAMS_DIR``. Cluster:
 ``sbatch run_ste.sh``. Requires ``d3rlpy``.
 """
@@ -60,7 +64,10 @@ from algorithm_helpers import (
     N_RL_SLOTS,
     TERMINAL_D,
     TERMINAL_T,
-    build_phi_state,
+    _past_day_stream,
+    _past_slot_stream,
+    _time_features,
+    _within_week_ewma,
     make_state,
 )
 from experiment import OnlineEnv
@@ -92,6 +99,11 @@ TEST_SEED0 = 300_000
 # a performance heuristic, not a 95% test (that would be c≈1.645).
 VAL_FALLBACK_C = 1.0
 STE_OBSERVATION_SCALER = "none"
+# Frozen DiscreteCQL observation (exp 3/4/5). Independent of the RLSVI
+# ``build_phi_state`` rewrite: 10-d interaction base, drop ``b_tilde`` at
+# index 9, 5 mediator EWMAs in the original order, 7-d C.
+STE_BTILDE_INDEX = 9
+STE_OBS_DIM = 21
 
 try:
     import d3rlpy
@@ -155,20 +167,82 @@ def known_weekly_cae(oenv: OnlineEnv, k: int) -> float:
     return 0.0 if np.isnan(val) else float(val)
 
 
-_BTILDE_INDEX = 9  # index of the constant b_tilde slot in build_phi_state's base block
+def _ste_mediator_ewma(M_Y, M_E, d, t) -> np.ndarray:
+    """Mediator block used by DiscreteCQL (order frozen at exp5).
+
+    ``summarize_mediators_ewma`` later swapped AA/SC for RLSVI; STE keeps
+    fourSC, anticipated affect, pageview, wear, survey.
+    """
+    return np.array([
+        _within_week_ewma(_past_slot_stream(M_Y, d, t)),
+        _within_week_ewma(_past_day_stream(M_Y, d, 2)),
+        _within_week_ewma(_past_slot_stream(M_E, d, t)),
+        _within_week_ewma(_past_day_stream(M_E, d, 2)),
+        _within_week_ewma(_past_day_stream(M_E, d, 3)),
+    ], dtype=float)
+
+
+def _ste_context_vector(state) -> np.ndarray:
+    """Length-7 C used by DiscreteCQL.
+
+    ``[yesterday steps, prior-2h, active days, suggestions sent,
+    salience yesterday, interact, I_w J_w]``. RLSVI ``C`` dropped salience
+    and moved ``I_w J_w`` into the Q base; rebuild that 7-vector here.
+    Salience is no longer simulated, so that slot is 0.
+    """
+    C = np.asarray(state["C"], dtype=float).ravel()
+    qxw = float(state.get("query_x_weekly_present", 0.0) or 0.0)
+    if not np.isfinite(qxw):
+        qxw = 0.0
+    salience = float(state.get("salienceMessageSentYesterday", 0.0) or 0.0)
+    if not np.isfinite(salience):
+        salience = 0.0
+    if C.size == 7:
+        return C.astype(float, copy=False)
+    if C.size != 5:
+        raise ValueError(f"unexpected RLSVI C length {C.size}; STE expects 5 or 7")
+    return np.array(
+        [C[0], C[1], C[2], C[3], salience, C[4], qxw],
+        dtype=float,
+    )
+
+
+def build_ste_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0) -> np.ndarray:
+    """Frozen DiscreteCQL ``phi`` (before dropping ``b_tilde``). Length 22.
+
+    ``[1, weekend, t, E, weekend*E, t*E, b_hat, weekend*b_hat, t*b_hat, b_tilde]
+    ⌢ [M_ewma (5)] ⌢ [C (7)]``.
+    Not ``build_phi_state``: that map is for online RLSVI and may change.
+    """
+    E_w = float(state["E_w"])
+    d_feat, t_feat = _time_features(d, t)
+    base = np.array([
+        1.0, d_feat, t_feat, E_w,
+        d_feat * E_w, t_feat * E_w,
+        b_hat, d_feat * b_hat, t_feat * b_hat,
+        b_tilde,
+    ], dtype=float)
+    med = _ste_mediator_ewma(state["M_Y"], state["M_E"], d, t)
+    return np.concatenate([base, med, _ste_context_vector(state)])
+
+
+# ``b_tilde`` is the last coordinate of the 10-d interaction base.
 
 
 def build_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int) -> np.ndarray:
-    """Continuing-task DQN state using the RLSVI state features.
+    """Continuing-task DiscreteCQL state (frozen 21-d map).
 
     Drops ``b_tilde``: with ``I_w = J_w = 1`` there is no CAE measurement
-    uncertainty, so ``build_phi_state`` would only supply a constant zero
-    in that slot.
+    uncertainty, so that slot would only be a constant zero.
     """
     st = make_state(oenv.get_context(k, d, t))
     b_hat = known_weekly_cae(oenv, k)
-    phi = build_phi_state(st, d, t, b_hat=b_hat, b_tilde=0.0)
-    return np.delete(phi, _BTILDE_INDEX)
+    phi = build_ste_phi_state(st, d, t, b_hat=b_hat, b_tilde=0.0)
+    if int(phi.size) != STE_OBS_DIM + 1:
+        raise RuntimeError(
+            f"STE phi has {phi.size} entries, expected {STE_OBS_DIM + 1}"
+        )
+    return np.delete(phi, STE_BTILDE_INDEX)
 
 
 def prepare_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int) -> np.ndarray:
@@ -700,6 +774,7 @@ def eval_ste_job(
         "algo": STE_ALGO,
         "advantage_margin": ADVANTAGE_MARGIN,
         "observation_scaler": STE_OBSERVATION_SCALER,
+        "state_dim": STE_OBS_DIM,
         "gamma_weekly": DQN_WEEKLY_GAMMA,
         "gamma_within_week": DQN_WITHIN_WEEK_GAMMA,
         "gamma_scheme": "terminal_only",

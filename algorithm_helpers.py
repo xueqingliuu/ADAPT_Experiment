@@ -1883,6 +1883,18 @@ def _query_x_weekly_from_state(state) -> float:
     return val if np.isfinite(val) else 0.0
 
 
+PHI_STATE_BASE_NAMES = (
+    "intercept",
+    "weekday_vs_weekend",
+    "slot_pm",
+    "E_w",
+    "b_hat",
+    "b_tilde",
+    "query_x_weekly_present",
+)
+PHI_STATE_BTILDE_INDEX = PHI_STATE_BASE_NAMES.index("b_tilde")
+
+
 def build_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0):
     """
     State-only features shared by RLSVI and DQN (no action cross-terms).
@@ -1902,6 +1914,11 @@ def build_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0):
     base = np.array([
         1.0, d_feat, t_feat, E_w, b_hat, b_tilde, qxw,
     ])
+    if base.size != len(PHI_STATE_BASE_NAMES):
+        raise RuntimeError(
+            f"build_phi_state base has {base.size} entries, "
+            f"PHI_STATE_BASE_NAMES has {len(PHI_STATE_BASE_NAMES)}"
+        )
     med_ctx = np.concatenate([M_ewma, C_dt])
     return np.concatenate([base, med_ctx])
 

@@ -72,6 +72,7 @@ import numpy as np
 from ste_vanilla import (
     ADVANTAGE_MARGIN,
     STE_ALGO,
+    STE_OBS_DIM,
     STE_OBSERVATION_SCALER,
     _model_metadata_path,
     rollout_total_cae,
@@ -380,10 +381,11 @@ _DQN_CACHE: dict[str, object] = {}
 def load_dqn(model_dir: Path, uid: int, *, nweek: int, noise: str):
     """Load a ``ste_vanilla.py`` DiscreteCQL checkpoint, validating what must match.
 
-    ``userid``/``nweek``/``noise``/``algo`` have to agree or the policy is being
-    applied to a different problem than it was trained on. The fitted
-    parameters are deliberately *not* checked: evaluating a baseline-trained
-    policy in a rescaled environment is the entire point.
+    ``userid``/``nweek``/``noise``/``algo``/``state_dim`` have to agree or the
+    policy is being applied to a different observation map than it was trained
+    on. The fitted environment parameters are deliberately *not* checked:
+    evaluating a baseline-trained policy in a rescaled environment is the
+    entire point.
     """
     cache_key = f"{model_dir}|{uid}"
     if cache_key in _DQN_CACHE:
@@ -407,6 +409,7 @@ def load_dqn(model_dir: Path, uid: int, *, nweek: int, noise: str):
         "algo": STE_ALGO,
         "advantage_margin": ADVANTAGE_MARGIN,
         "observation_scaler": STE_OBSERVATION_SCALER,
+        "state_dim": STE_OBS_DIM,
     }
     for name, expected in expected_meta.items():
         if meta.get(name) != expected:
@@ -906,6 +909,7 @@ def require_dqn_checkpoints(spec: ProxySpec, user_ids: Sequence[int]) -> None:
             "<jobid> --exp <exp>` (one job per user_ids.txt index)."
         )
     wrong_algo = []
+    wrong_dim = []
     for uid in user_ids:
         meta_path = _model_metadata_path(model_dir / f"user{uid}_model.d3")
         if not meta_path.is_file():
@@ -914,6 +918,8 @@ def require_dqn_checkpoints(spec: ProxySpec, user_ids: Sequence[int]) -> None:
             meta = json.load(f)
         if meta.get("algo") != STE_ALGO:
             wrong_algo.append((int(uid), meta.get("algo")))
+        if meta.get("state_dim") != STE_OBS_DIM:
+            wrong_dim.append((int(uid), meta.get("state_dim")))
     if wrong_algo:
         raise SystemExit(
             f"{model_dir} checkpoints are not {STE_ALGO} "
@@ -921,6 +927,13 @@ def require_dqn_checkpoints(spec: ProxySpec, user_ids: Sequence[int]) -> None:
             "Retrain with the current ste_vanilla.py DiscreteCQL trainer, or "
             "drop the DiscreteCQL arm (TUNE_DQN_EXP='' / omit --dqn-exp) and "
             "calibrate on the Bernoulli policy grid only."
+        )
+    if wrong_dim:
+        raise SystemExit(
+            f"{model_dir} observation dim is not the frozen STE map "
+            f"(trained state_dim={wrong_dim[0][1]}, STE_OBS_DIM={STE_OBS_DIM}). "
+            "Point TUNE_DQN_EXP at DiscreteCQL trained on this 21-d vector "
+            "(vanilla CQL is exp 5), or set TUNE_DQN_EXP=''."
         )
     print(f"DiscreteCQL arm: {len(user_ids)} checkpoints from {model_dir}")
 
