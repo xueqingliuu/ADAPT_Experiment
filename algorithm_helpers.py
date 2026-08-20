@@ -665,6 +665,12 @@ def clip_prob(pi_hat, epsilon_0):
     return np.clip(pi_hat, epsilon_0, 1.0 - epsilon_0)
 
 
+# Default clip used by RLSVI and by the clipped always/never baselines
+# (π = 1-ε and π = ε). Keep a single constant so those stay in the same
+# policy class as the learning agents.
+EPSILON_0 = 0.1
+
+
 def weekly_pv_sum_for_ew(slot_pv, *, shift=None, scale=None):
     """Weekly pageview summary for E_w.
 

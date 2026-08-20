@@ -103,6 +103,7 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     TERMINAL_D,
     TERMINAL_T,
     ACTION_BLOCK_INCLUDE_C,
+    EPSILON_0,
     set_action_block_include_c,
 )
 from agents.ew_hat import (
@@ -1194,7 +1195,8 @@ def _refresh_phi_dims():
 # is built by _gamma_dt_micro (1 within week, gamma_bar on the terminal slot).
 GAMMA_BAR = 0.5
 TARGET_C     = 1
-EPSILON_0    = 0.1   # this is the clipping parameter
+# EPSILON_0 is defined in algorithm_helpers: RLSVI clips π to [ε, 1-ε],
+# and the always/never baselines send at those same bounds.
 J_PARTICLES  = 50
 B_ENSEMBLES  = 50
 NWEEK        = 36
@@ -1606,9 +1608,11 @@ def _run_fixed_policy_fast(policy: str, uid, seed=42, params_dir=None):
         for d in range(N_RL_DAYS):
             for t in range(N_RL_SLOTS):
                 if policy == "never_send":
-                    action, pi_A = 0, 0.0
+                    pi_A = float(EPSILON_0)
+                    action = int(rng.binomial(1, pi_A))
                 elif policy == "always_send":
-                    action, pi_A = 1, 1.0
+                    pi_A = 1.0 - float(EPSILON_0)
+                    action = int(rng.binomial(1, pi_A))
                 else:
                     pi_A = 0.5
                     action = int(rng.binomial(1, pi_A))
@@ -1645,12 +1649,12 @@ def _run_fixed_policy(agent_cls, uid, seed=42, params_dir=None):
 
 
 def run_never_send(uid, seed=42, params_dir=None):
-    """Baseline: never send a walking suggestion (A = 0 in every slot)."""
+    """Baseline: send with π_A = ε in every slot (clip lower bound)."""
     return _run_fixed_policy(NeverSendAgent, uid, seed=seed, params_dir=params_dir)
 
 
 def run_always_send(uid, seed=42, params_dir=None):
-    """Baseline: always send a walking suggestion (A = 1 in every slot)."""
+    """Baseline: send with π_A = 1-ε in every slot (clip upper bound)."""
     return _run_fixed_policy(AlwaysSendAgent, uid, seed=seed, params_dir=params_dir)
 
 
@@ -1669,8 +1673,8 @@ ALGORITHMS = {
     "rl_v5_invariant_weekly": (partial(run_micro_query_reward_design, reward_design="v3"), "RL V3: return-invariant weekly reward"),
     "rl_v6_invariant_redistributed": (partial(run_micro_query_reward_design, reward_design="v4"), "RL V4: return-invariant redistributed reward"),
     "rl_v7_base_g09": (partial(run_micro_query, gamma_bar=0.9), "RL base (γ̄=0.9 sensitivity)"),
-    "never_send":   (run_never_send,  "Never send (A=0)"),
-    "always_send":  (run_always_send, "Always send (A=1)"),
+    "never_send":   (run_never_send,  "Never send (π_A=0.1)"),
+    "always_send":  (run_always_send, "Always send (π_A=0.9)"),
     "random_send":  (run_random_send, "Random send (π_A=0.5)"),
 }
 
