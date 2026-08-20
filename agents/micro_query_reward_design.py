@@ -8,6 +8,7 @@ from algorithm_helpers import (
     compute_reward_shaping_eta, compute_rlsvi_betas,
     daily_mediator_shares, empirical_bayes_sigma2_ensemble,
     ensemble_action_prob, fit_daily_mediator_decomposition,
+    require_finite_belief,
 )
 
 
@@ -112,9 +113,7 @@ class MicroQueryRewardDesignAgent:
 
     def _week_return_target(self, k):
         """Weekly scalar redistributed (V2/V4) or added at the terminal slot."""
-        y = float(self.b_hat_hist[k + 1])
-        if not np.isfinite(y):
-            y = 0.0
+        y = require_finite_belief(self.b_hat_hist[k + 1], week=k + 1)
         if self.reward_design in {"v1", "v2"}:
             return y + self.engagement_bonus * self._engagement(k + 1)
         if self.reward_design in {"v3", "v4"}:
@@ -220,9 +219,9 @@ class MicroQueryRewardDesignAgent:
                 eval_betas, self.betas_target, self.gamma_dt, self.get_state)
             if self.reward_design in {"v1", "v3"}:
                 for kp in range(k):
-                    bump = self._week_return_target(kp) - (
-                        float(self.b_hat_hist[kp + 1])
-                        if np.isfinite(self.b_hat_hist[kp + 1]) else 0.0
+                    bump = (
+                        self._week_return_target(kp)
+                        - require_finite_belief(self.b_hat_hist[kp + 1], week=kp + 1)
                     )
                     for target in targets:
                         target[(kp + 1) * N_RL_DAYS * N_RL_SLOTS - 1] += bump

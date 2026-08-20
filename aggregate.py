@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import fnmatch
 import json
@@ -9,7 +11,7 @@ from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 
-from vani_env import denormalize_CAE
+from vani_env import PARAMS_DIR, PROJECT_ROOT, denormalize_CAE
 
 # Must match run_array.sh RESULTS_ROOT (env-overridable).
 DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla"))
@@ -60,6 +62,57 @@ def discover_run_dirs(results_root: Path) -> list[Path]:
 
 def _load_config(run_dir: Path) -> dict:
     return json.loads((run_dir / "config.json").read_text())
+
+
+def _has_cae_std(params_dir: Path) -> bool:
+    return (params_dir / "std_params.json").is_file()
+
+
+def resolve_denorm_params_dir(cfg_params_dir, *, cli_params_dir=None) -> Path:
+    """Locate ``std_params.json`` when run configs still point at the cluster.
+
+    Cluster ``config.json`` stores an absolute FASRC path. On a laptop that
+    path is missing; fall back to the same folder name under this repo, then
+    ``ADAPR_PARAMS_DIR`` / ``vani_env.PARAMS_DIR``.
+    """
+    if cli_params_dir is not None:
+        path = Path(cli_params_dir).expanduser().resolve()
+        if not _has_cae_std(path):
+            raise FileNotFoundError(f"No std_params.json in --params-dir {path}")
+        return path
+
+    candidates = []
+    env_raw = os.getenv("ADAPR_PARAMS_DIR")
+    if env_raw:
+        env_path = Path(env_raw).expanduser()
+        candidates.append(
+            env_path if env_path.is_absolute() else PROJECT_ROOT / env_path
+        )
+    if cfg_params_dir:
+        cfg_path = Path(str(cfg_params_dir)).expanduser()
+        candidates.append(cfg_path)
+        candidates.append(PROJECT_ROOT / cfg_path.name)
+    candidates.append(Path(PARAMS_DIR))
+
+    tried = []
+    seen = set()
+    for raw in candidates:
+        try:
+            path = raw.resolve()
+        except OSError:
+            tried.append(str(raw))
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        tried.append(str(path))
+        if _has_cae_std(path):
+            return path
+
+    raise FileNotFoundError(
+        "Could not find std_params.json for CAE denormalization. "
+        f"Tried: {tried}. Pass --params-dir or set ADAPR_PARAMS_DIR."
+    )
 
 
 def _latest_array_job_id(run_dirs: list[Path]) -> str | None:
@@ -202,6 +255,13 @@ def parse_args() -> argparse.Namespace:
         "--all-runs",
         action="store_true",
         help="Aggregate every run folder under --results-root (legacy behavior).",
+    )
+    parser.add_argument(
+        "--params-dir",
+        type=Path,
+        default=None,
+        help="Folder with std_params.json for CAE denormalization "
+             "(default: config.json params_dir, remapped locally if needed).",
     )
     return parser.parse_args()
 
@@ -435,8 +495,16 @@ def main() -> None:
     algorithms = cfg["algorithms"]
     labels = cfg["labels"]
     nweek = cfg["nweek"]
-    params_dir = cfg.get("params_dir")
-    if params_dir:
+    params_dir = resolve_denorm_params_dir(
+        cfg.get("params_dir"), cli_params_dir=args.params_dir
+    )
+    cfg_params = cfg.get("params_dir")
+    if cfg_params and Path(str(cfg_params)).expanduser().resolve() != params_dir:
+        print(
+            f"Denormalizing CAE with params_dir={params_dir} "
+            f"(config had {cfg_params})"
+        )
+    else:
         print(f"Denormalizing CAE with params_dir={params_dir}")
 
     weeks = np.arange(1, nweek + 1)
@@ -459,7 +527,7 @@ def main() -> None:
                 continue
 
             data = np.load(f)
-            denorm_kw = {"params_dir": params_dir} if params_dir else {}
+            denorm_kw = {"params_dir": params_dir}
             noisy_parts.append(denormalize_CAE(data[NOISY_FIELD], **denorm_kw))
             if LATENT_FIELD in data:
                 latent_parts.append(denormalize_CAE(data[LATENT_FIELD], **denorm_kw))

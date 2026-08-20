@@ -1,4 +1,5 @@
 import numpy as np
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -14,6 +15,33 @@ FIRST_D = 0
 FIRST_T = 0
 TERMINAL_D = N_RL_DAYS - 1
 TERMINAL_T = N_RL_SLOTS - 1
+
+
+def _env_flag(name, default=True):
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+# Q action block is ``A * [1, E_w, b_hat, b_tilde, C]`` when True (default).
+# Set ACTION_BLOCK_C=0 to drop ``C`` from that block only (``C`` stays in the
+# state features). Call :func:`set_action_block_include_c` before building
+# phi / priors so the dimension stays consistent.
+ACTION_BLOCK_INCLUDE_C = _env_flag("ACTION_BLOCK_C", True)
+
+
+def set_action_block_include_c(include_c):
+    global ACTION_BLOCK_INCLUDE_C
+    ACTION_BLOCK_INCLUDE_C = bool(include_c)
+
+
+def action_interact_vec(E_w, b_hat, b_tilde, C_dt):
+    """Action-interaction features ``[1, E_w, b_hat, b_tilde]`` (+ ``C``)."""
+    core = np.array([1.0, float(E_w), float(b_hat), float(b_tilde)], dtype=float)
+    if ACTION_BLOCK_INCLUDE_C:
+        return np.concatenate([core, np.asarray(C_dt, dtype=float).ravel()])
+    return core
 
 
 def spd_inverse(A):
@@ -595,6 +623,20 @@ def summarize_belief(y_hat, v_hat):
     b_hat = np.average(y_w, weights=v_hat)
     b_tilde = np.sqrt(np.average((y_w - b_hat) ** 2, weights=v_hat))
     return b_hat, b_tilde
+
+
+def require_finite_belief(value, *, week, name="b_hat"):
+    """Return ``float(value)`` or raise if a weekly belief is missing/non-finite.
+
+    Terminal TD targets and Stage-1/2 weekly returns must not silently treat a
+    missing ``b̂`` as reward 0 (that looks like a real never-send week).
+    """
+    x = float(value)
+    if not np.isfinite(x):
+        raise ValueError(
+            f"{name}[{week}] is {value!r}; refusing to use a missing belief as reward 0"
+        )
+    return x
 
 
 def ensemble_action_prob(phi_1, phi_0, betas):
@@ -1214,7 +1256,7 @@ def reward_shaping_week_targets(k_cur, b_hat_hist, get_state, gamma_bar,
     gb = float(gamma_bar)
     dt = float(Delta_terminal)
     for kp in range(k_cur):
-        Y_w = float(b_hat_hist[kp + 1]) if np.isfinite(b_hat_hist[kp + 1]) else 0.0
+        Y_w = require_finite_belief(b_hat_hist[kp + 1], week=kp + 1)
         try:
             E_next = float(get_state(kp + 1, QUERY_D, QUERY_T)["E_w"])
         except (KeyError, IndexError, TypeError):
@@ -1864,7 +1906,8 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
 
     phi = [1, d_n, t_n, E_w, b_hat, b_tilde, I_w*J_w]
         ⌢ [M_ewma (AA, SC, PV, FW, PJ), C_{w,d,t}]
-        ⌢ A * [1, E_w, b_hat, b_tilde, C_{w,d,t}]
+        ⌢ A * [1, E_w, b_hat, b_tilde]            if ACTION_BLOCK_INCLUDE_C=0
+        ⌢ A * [1, E_w, b_hat, b_tilde, C_{w,d,t}]  otherwise
 
     ``d_n`` / ``t_n`` come from :func:`_time_features`. Raw ``d`` / ``t``
     select which past mediators enter the EWMA.
@@ -1885,13 +1928,12 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
 
     Returns
     -------
-    phi : (p,) array   where  p = 7 + 5 + n_c + (4 + n_c)
+    phi : (p,) array   where  p = 7 + 5 + n_c + (4 + n_c * ACTION_BLOCK_INCLUDE_C)
     """
     E_w = state['E_w']
     C_dt = np.asarray(state['C']).ravel()
     state_part = build_phi_state(state, d, t, b_hat=b_hat, b_tilde=b_tilde)
-    interact_vec = np.concatenate([[1.0, E_w, b_hat, b_tilde], C_dt])
-    action_block = float(action) * interact_vec
+    action_block = float(action) * action_interact_vec(E_w, b_hat, b_tilde, C_dt)
     return np.concatenate([state_part, action_block])
 
 def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
@@ -2207,7 +2249,7 @@ def build_rl_training_data(k_cur, A_hist, b_hat_hist, b_tilde_hist,
                 # terminal slot: reward + bootstrap from next week
                 bh_n = b_hat_hist[kp + 1]
                 bt_n = b_tilde_hist[kp + 1]
-                R_next = float(bh_n) if np.isfinite(bh_n) else 0.0
+                R_next = require_finite_belief(bh_n, week=kp + 1)
                 if include_query:
                     state_n = get_state(kp + 1, QUERY_D, QUERY_T)
                     phi_1 = phi_fn(bh_n, bt_n, state_n,
@@ -2375,7 +2417,7 @@ def build_rl_training_data_with_rewardshaping(k_cur, A_hist, b_hat_hist, b_tilde
                 # terminal slot: r_terminal + compensation + next-week bootstrap.
                 bh_n = b_hat_hist[kp + 1]
                 bt_n = b_tilde_hist[kp + 1]
-                R_week = float(bh_n) if np.isfinite(bh_n) else 0.0
+                R_week = require_finite_belief(bh_n, week=kp + 1)
                 if Delta_terminal > 1e-12:
                     R_add = R_week - R_dt_disc_cumul / Delta_terminal
                 else:
@@ -2617,7 +2659,7 @@ def build_rl_training_data_with_bottleneck(k_cur, A_hist, b_hat_hist, b_tilde_hi
                 state_next0 = get_state(kp + 1, QUERY_D, QUERY_T)
                 Phi_bottleneck_next_rows.append(
                     build_phi_bottleneck(bh_n, bt_n, state_next0))
-                Y_terminal_list.append(float(bh_n) if np.isfinite(bh_n) else 0.0)
+                Y_terminal_list.append(require_finite_belief(bh_n, week=kp + 1))
 
     Phi = (np.asarray(Phi_rows, dtype=float) if Phi_rows
            else np.empty((0, p_beta)))
@@ -2766,7 +2808,7 @@ def build_rl_training_data_with_rewardshaping_bottleneck(
                 state_next0 = get_state(kp + 1, QUERY_D, QUERY_T)
                 Phi_bottleneck_next_rows.append(
                     build_phi_bottleneck(bh_n, bt_n, state_next0))
-                Y_w = float(bh_n) if np.isfinite(bh_n) else 0.0
+                Y_w = require_finite_belief(bh_n, week=kp + 1)
                 if Delta_terminal > 1e-12:
                     Y_terminal_list.append(
                         Y_w - R_dt_nonterminal_disc / Delta_terminal)
@@ -2853,8 +2895,8 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
 
     phi = [1, d_n, t_n, E, b_hat, b_tilde, I_w*J_w]
         ⌢ [M_ewma, C_{w,d,t}]
-        ⌢ [query: 1, E, b_hat, b_tilde, C]
-        ⌢ [walk:  1, E, b_hat, b_tilde, C]
+        ⌢ [query: 1, E, b_hat, b_tilde (, C if ACTION_BLOCK_INCLUDE_C)]
+        ⌢ [walk:  1, E, b_hat, b_tilde (, C if ACTION_BLOCK_INCLUDE_C)]
 
     Parameters
     ----------
@@ -2872,7 +2914,7 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
 
     Returns
     -------
-    phi : (p,) array   where  p = 7 + 5 + n_c + 2*(4+n_c)
+    phi : (p,) array   where  p = 7 + 5 + n_c + 2*(4 + n_c * ACTION_BLOCK_INCLUDE_C)
     """
     E_w = state['E_w']
     C_dt = np.asarray(state['C']).ravel()              # (n_c,)
@@ -2894,7 +2936,7 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
         1.0, d_feat, t_feat, E_w, b_hat, b_tilde, qxw,
     ])
     med_ctx = np.concatenate([M_ewma, C_dt_eff])
-    interact = np.concatenate([[1.0, E_w, b_hat, b_tilde], C_dt_eff])
+    interact = action_interact_vec(E_w, b_hat, b_tilde, C_dt_eff)
     if action == 1:
         query_block = interact if is_query else np.zeros_like(interact)
         walk_block = np.zeros_like(interact) if is_query else interact

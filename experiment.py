@@ -102,6 +102,8 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     QUERY_T,
     TERMINAL_D,
     TERMINAL_T,
+    ACTION_BLOCK_INCLUDE_C,
+    set_action_block_include_c,
 )
 from agents.ew_hat import (
     compute_Ew_hat_from_week,
@@ -1172,6 +1174,20 @@ P_RL_BOTTLENECK = int(
     build_phi_bottleneck(0.0, 0.0, _DUMMY_RL_STATE).shape[0]
 )
 
+
+def _refresh_phi_dims():
+    """Recompute Q dimensions after :func:`set_action_block_include_c`."""
+    global P_RL_MICRO, P_RL_REWARDSHAPING, P_RL_BOTTLENECK
+    P_RL_MICRO = int(
+        build_phi_action(0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0).shape[0]
+    )
+    P_RL_REWARDSHAPING = int(
+        build_phi_action_rewardshaping(0.0, 0.0, _DUMMY_RL_STATE, 0, 0).shape[0]
+    )
+    P_RL_BOTTLENECK = int(
+        build_phi_bottleneck(0.0, 0.0, _DUMMY_RL_STATE).shape[0]
+    )
+
 # ── RL hyperparameters (shared) ──
 # Weekly discount used by micro-query agents. Algorithms below are registered
 # at gamma_bar=0.5 and gamma_bar=0.9 via functools.partial; the per-slot matrix
@@ -1363,7 +1379,13 @@ def _configure_priors(params_dir=None, *, force=False):
     assert nu_0_MY[1].shape == (P_MY_ANTIC,),  f"antic dim {nu_0_MY[1].shape} != {P_MY_ANTIC}"
     assert nu_0_Y.shape       == (P_CAE,),     f"CAE dim {nu_0_Y.shape} != {P_CAE}"
     assert nu_0_tilde_Y.shape == (P_TY,),      f"CAE_short dim {nu_0_tilde_Y.shape} != {P_TY}"
-    assert mu_0_micro.shape       == (P_RL_MICRO,)
+    if mu_0_micro.shape != (P_RL_MICRO,):
+        raise ValueError(
+            f"Q prior dim {mu_0_micro.shape[0]} != phi dim {P_RL_MICRO}. "
+            "If C was dropped from the action block (--no-action-c / "
+            "ACTION_BLOCK_C=0), use USE_ESTIMATED_PRIORS=0 or regenerate "
+            "rl_priors.json for this feature map."
+        )
     assert mu_0_reward.shape      == (P_RL_REWARDSHAPING,)
     _P_MTD_JOINT = P_RL_BOTTLENECK + P_RL_MICRO
     assert mu_0_mtd_joint.shape    == (_P_MTD_JOINT,), \
@@ -1758,7 +1780,34 @@ if __name__ == "__main__":
             "Default: ENGAGEMENT_BONUS env, else scale-matched λ."
         ),
     )
+    parser.add_argument(
+        "--no-action-c",
+        action="store_true",
+        help=(
+            "Drop all C features from the Q action block "
+            "(A*[1, E, b̂, b̃] only). C remains in the state features. "
+            "Also set by ACTION_BLOCK_C=0. Requires matching prior dim "
+            "(default zero priors, or regenerated rl_priors.json)."
+        ),
+    )
+    parser.add_argument(
+        "--results-root",
+        type=Path,
+        default=None,
+        help=(
+            "Parent folder for this run's timestamped output. "
+            "Default: RESULTS_ROOT env, else results_vanilla."
+        ),
+    )
     args = parser.parse_args()
+
+    include_action_c = ACTION_BLOCK_INCLUDE_C and (not args.no_action_c)
+    set_action_block_include_c(include_action_c)
+    _refresh_phi_dims()
+    print(
+        f"Q action block C={'on' if include_action_c else 'off'} "
+        f"(p_rl_micro={P_RL_MICRO})"
+    )
 
     params_dir = resolve_params_dir(args.params_dir)
     _configure_priors(params_dir=params_dir, force=True)
@@ -1909,7 +1958,11 @@ if __name__ == "__main__":
         slurm_suffix = f"_job{slurm_job_id}"
         if slurm_task_id:
             slurm_suffix += f"_task{slurm_task_id}"
-    RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla"))
+    RESULTS_ROOT = Path(
+        args.results_root
+        if args.results_root is not None
+        else os.getenv("RESULTS_ROOT", "results_vanilla")
+    )
     OUTPUT_DIR = RESULTS_ROOT / f"{ts}_{run_tag}{slurm_suffix}"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Saving results to {OUTPUT_DIR.resolve()}")
@@ -1935,6 +1988,8 @@ if __name__ == "__main__":
             "trajectory_reference_algo": TRAJECTORY_REFERENCE_ALGO,
             "params_dir":      str(params_dir),
             "priors_source":   _priors_src,
+            "action_block_include_c": include_action_c,
+            "p_rl_micro":      P_RL_MICRO,
             "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID"),
             "slurm_job_id":       os.getenv("SLURM_JOB_ID"),
         }, f, indent=2)
