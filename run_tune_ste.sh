@@ -16,9 +16,9 @@
 #   mkdir -p logs
 #   sbatch run_tune_ste.sh                                   # action knob → 0.2/0.5/0.8, then
 #                                                            # auto-submit true-STE DQN jobs
-#   sbatch --export=ALL,TUNE_KNOB=burden,TUNE_TARGETS="0.2 0.5",TUNE_OUT_SUFFIX=_burden \
-#          run_tune_ste.sh                                   # A→ME only → 0.2/0.5
-#                                                            # writes env_para_ste0.2_burden etc.
+#   sbatch --export=ALL,TUNE_KNOB=burden_shift,TUNE_TARGETS="0.2 0.5",TUNE_OUT_SUFFIX=_burden_shift \
+#          run_tune_ste.sh                                   # A→ME down, E→MY up; writes
+#                                                            # env_para_ste0.2_burden_shift etc.
 #   sbatch --export=ALL,TUNE_PHASE=diagnose run_tune_ste.sh  # E_w + CAE loop gains, ~seconds
 #   sbatch --export=ALL,TUNE_PHASE=eval run_tune_ste.sh      # STE of the untouched fit
 #   sbatch --export=ALL,TUNE_PHASE=scan run_tune_ste.sh      # STE vs knob value
@@ -28,8 +28,9 @@
 # Overrides (sbatch --export=ALL,VAR=value,...):
 #   TUNE_PHASE        diagnose|eval|scan|calibrate|validate    default calibrate
 #   TUNE_PARAMS_DIR   source fit to rescale                    default env_para_vanilla
-#   TUNE_KNOB         action|benefit|burden|my_to_y|foursc_to_y|...  default action
+#   TUNE_KNOB         action|benefit|burden|burden_shift|...   default action
 #   TUNE_TARGETS      target mean STE values                   default "0.2 0.5 0.8"
+#   TUNE_KAPPA0       calibrate search start                   default 1, or 0.2 for burden_shift
 #   TUNE_KAPPAS       scan grid                                default "0.25 0.5 1 2 4"
 #   TUNE_EPISODES     paired episodes per arm                  default 100
 #   TUNE_POLICY_GRID  Bernoulli suggestion rates               default "0.5 1.0"
@@ -76,6 +77,11 @@ TUNE_PHASE="${TUNE_PHASE:-calibrate}"
 TUNE_PARAMS_DIR="${TUNE_PARAMS_DIR:-env_para_vanilla}"
 TUNE_KNOB="${TUNE_KNOB:-action}"
 TUNE_TARGETS="${TUNE_TARGETS:-0.2 0.5 0.8}"
+if [[ "${TUNE_KNOB}" == "burden_shift" ]]; then
+  TUNE_KAPPA0="${TUNE_KAPPA0:-0.2}"
+else
+  TUNE_KAPPA0="${TUNE_KAPPA0:-1.0}"
+fi
 TUNE_KAPPAS="${TUNE_KAPPAS:-0.25 0.5 1 2 4}"
 TUNE_EPISODES="${TUNE_EPISODES:-100}"
 TUNE_POLICY_GRID="${TUNE_POLICY_GRID:-0.5 1.0}"
@@ -275,6 +281,7 @@ case "${TUNE_PHASE}" in
       --out-prefix "${TUNE_OUT_PREFIX}" \
       "${SUFFIX_ARGS[@]+"${SUFFIX_ARGS[@]}"}" \
       --scratch "${TUNE_SCRATCH}" \
+      --kappa0 "${TUNE_KAPPA0}" \
       --tol "${TUNE_TOL}" \
       --max-iter "${TUNE_MAX_ITER}" \
       "${STABLE_FLAG[@]}"

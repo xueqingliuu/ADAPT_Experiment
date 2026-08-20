@@ -6,6 +6,11 @@ averaged over users. This script does **not** train DiscreteCQL. It multiplies a
 small set of coefficients by a scalar ``kappa`` and simulates cheap policies
 until the proxy STE hits the target.
 
+``burden_shift`` subtracts ``kappa`` from every A→ME action coefficient
+and adds the same ``kappa`` to E_w → fourSC and E_w → anticipated affect,
+so send→engagement→E_w can reach CAE. Typical ``|A→ME|`` is ~0.3; start
+a scan at 0.2–0.5, not 2–4. This also moves the never-suggest arm.
+
 Commands
     diagnose    E_w and CAE loop gains (no simulation)
     eval        measure proxy STE of one parameter folder
@@ -34,7 +39,8 @@ Which coefficients are scaled (``--knob``, default ``action``)
     action    walking-suggestion effects on both benefit (step-count /
               anticipated affect) and burden (engagement) mediators
     benefit   benefit path only
-    burden    burden path only
+    burden    multiply A→ME (does not flip sign)
+    burden_shift  A→ME more negative and E_w→steps / E_w→affect more positive
     my_to_y / foursc_to_y / me_to_e / e_to_my   structural paths; these
               also change the control arm, so they are not the recommended
               STE dial. ``foursc_to_y`` is the one that makes CAE more
@@ -175,6 +181,7 @@ class KnobSpec:
     zero_is_null: bool  # STE(kappa = 0) == 0 holds exactly, for free
     sigma_invariant: bool  # control arm untouched, so sigma_i can be cached
     doc: str
+    apply: str = "multiply"  # "multiply" (θ ← κθ) or "subtract" (θ ← θ − κ)
 
 
 KNOBS: dict[str, KnobSpec] = {
@@ -207,7 +214,25 @@ KNOBS: dict[str, KnobSpec] = {
         lambda k: {"A_to_ME": k},
         zero_is_null=False,
         sigma_invariant=True,
-        doc="Scale action -> engagement mediators only; larger kappa = more burden = lower STE.",
+        doc=(
+            "Multiply action -> engagement coefficients by kappa. Does not "
+            "flip sign: fitted A→ME is often positive, so kappa>1 makes "
+            "sending raise PV/FW/PJ more, not less."
+        ),
+    ),
+    "burden_shift": KnobSpec(
+        "burden_shift",
+        lambda k: {"A_to_ME": k, "E_to_MY": -k},
+        zero_is_null=False,
+        sigma_invariant=False,
+        apply="subtract",
+        doc=(
+            "Coherent fatigue: subtract kappa from every A→ME action "
+            "coefficient and add kappa to E_w → fourSC and E_w → anticipated "
+            "affect (raw units; typical |A→ME| ≈ 0.3, fitted E→MY ≈ 0.02). "
+            "Sending lowers engagement, and a lower E_w then lowers steps and "
+            "affect, so the path can reach CAE. Moves the control arm (E→MY)."
+        ),
     ),
     "my_to_y": KnobSpec(
         "my_to_y",
@@ -260,13 +285,17 @@ def _names_for(key: str, params: dict) -> list[str]:
 
 
 def scale_params(
-    params: dict, multipliers: dict[str, float]
+    params: dict, multipliers: dict[str, float], *, apply: str = "multiply"
 ) -> tuple[dict, list[dict]]:
     """Return a copy of ``params`` with the requested pathways rescaled.
 
     ``multipliers`` maps pathway name -> scale factor; missing pathways are left
-    at 1.0. The audit trail lists every coefficient actually touched.
+    unchanged. ``apply="multiply"`` does ``θ ← κθ`` (skip κ=1).
+    ``apply="subtract"`` does ``θ ← θ − κ`` (skip κ=0), so a positive κ
+    pushes every listed coefficient more negative.
     """
+    if apply not in {"multiply", "subtract"}:
+        raise ValueError(f"unknown apply={apply!r}")
     unknown = set(multipliers) - set(PATHWAYS)
     if unknown:
         raise KeyError(f"Unknown pathway(s): {sorted(unknown)}")
@@ -274,7 +303,10 @@ def scale_params(
     out = dict(params)
     audit: list[dict] = []
     for pathway, factor in multipliers.items():
-        if float(factor) == 1.0:
+        factor = float(factor)
+        if apply == "multiply" and factor == 1.0:
+            continue
+        if apply == "subtract" and factor == 0.0:
             continue
         for key, coef_names in PATHWAYS[pathway].items():
             if key not in out:
@@ -294,13 +326,14 @@ def scale_params(
                         f"{key} has {values.size} values but {coef!r} is at index {idx}"
                     )
                 old = float(values[idx])
-                values[idx] = old * float(factor)
+                values[idx] = old * factor if apply == "multiply" else old - factor
                 audit.append(
                     {
                         "pathway": pathway,
                         "block": key,
                         "coef": coef,
-                        "factor": float(factor),
+                        "apply": apply,
+                        "factor": factor,
                         "old": old,
                         "new": float(values[idx]),
                     }
@@ -326,6 +359,8 @@ def write_scaled_params(
     dst_dir: Path,
     user_ids: Sequence[int],
     multipliers: dict[str, float],
+    *,
+    apply: str = "multiply",
 ) -> list[dict]:
     """Materialise a tuned copy of ``src_dir`` at ``dst_dir``."""
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -339,7 +374,7 @@ def write_scaled_params(
         src = src_dir / f"params_env_{uid}.json"
         with open(src, encoding="utf-8") as f:
             params = json.load(f)
-        scaled, rows = scale_params(params, multipliers)
+        scaled, rows = scale_params(params, multipliers, apply=apply)
         for r in rows:
             r["userid"] = int(uid)
         audit.extend(rows)
@@ -696,13 +731,17 @@ def loop_gains_for(
     src_dir: Path,
     user_ids: Sequence[int],
     multipliers: dict[str, float],
+    *,
+    apply: str = "multiply",
 ) -> list[dict]:
     """E_w and CAE loop gains after applying ``multipliers``, without writing."""
     rows = []
     for uid in user_ids:
         with open(src_dir / f"params_env_{uid}.json", encoding="utf-8") as f:
             params = json.load(f)
-        scaled, _ = scale_params(params, multipliers) if multipliers else (params, [])
+        scaled, _ = (
+            scale_params(params, multipliers, apply=apply) if multipliers else (params, [])
+        )
         rows.append(
             {
                 "userid": int(uid),
@@ -725,7 +764,9 @@ def largest_stable_kappa(
 
     def ok(k: float) -> bool:
         return not unstable_users(
-            loop_gains_for(src_dir, user_ids, knob.build(float(k))), limit=limit
+            loop_gains_for(
+                src_dir, user_ids, knob.build(float(k)), apply=knob.apply
+            ), limit=limit
         )
 
     if not ok(0.0):
@@ -1020,7 +1061,7 @@ def cmd_scan(args) -> None:
     rows = []
     for kappa in args.kappas:
         mult = knob.build(float(kappa))
-        write_scaled_params(base_dir, scratch, user_ids, mult)
+        write_scaled_params(base_dir, scratch, user_ids, mult, apply=knob.apply)
         result = evaluate(
             scratch,
             user_ids,
@@ -1123,7 +1164,9 @@ def cmd_calibrate(args) -> None:
         if float(kappa) in last:  # the response curve is shared across targets
             return last[float(kappa)]["mean_ste"]
         kappa_dir = scratch / f"k{float(kappa):.8g}"
-        write_scaled_params(base_dir, kappa_dir, user_ids, knob.build(float(kappa)))
+        write_scaled_params(
+            base_dir, kappa_dir, user_ids, knob.build(float(kappa)), apply=knob.apply
+        )
         result = evaluate(
             kappa_dir,
             user_ids,
@@ -1164,7 +1207,9 @@ def cmd_calibrate(args) -> None:
         if kappa not in last:  # e.g. the free f(0) endpoint won the search
             f(kappa)
         result = last[kappa]
-        gains = loop_gains_for(base_dir, user_ids, knob.build(kappa))
+        gains = loop_gains_for(
+            base_dir, user_ids, knob.build(kappa), apply=knob.apply
+        )
         bad = unstable_users(gains)
         worst = max(gains, key=max_abs_gain)
         on_target = abs(achieved - float(target)) <= args.tol
@@ -1199,7 +1244,9 @@ def cmd_calibrate(args) -> None:
 
         out_dir = calibrated_out_dir(args.out_prefix, target, args.out_suffix)
         refuse_knob_overwrite(out_dir, knob.name, overwrite=args.overwrite)
-        audit = write_scaled_params(base_dir, out_dir, user_ids, knob.build(kappa))
+        audit = write_scaled_params(
+            base_dir, out_dir, user_ids, knob.build(kappa), apply=knob.apply
+        )
         written = diagnose(out_dir, user_ids)
         if require_stable and unstable_users(written):
             raise SystemExit(
@@ -1214,6 +1261,7 @@ def cmd_calibrate(args) -> None:
             "kappa": float(kappa),
             "kappa_hi": float(kappa_hi),
             "stable": True,
+            "apply": knob.apply,
             "multipliers": knob.build(kappa),
             "search_path": [{"kappa": x, "mean_ste": y} for x, y in hist],
             "spec": asdict(spec),
