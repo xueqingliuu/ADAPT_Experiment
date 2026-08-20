@@ -33,8 +33,10 @@
 #   TUNE_KAPPAS       scan grid                                default "0.25 0.5 1 2 4"
 #   TUNE_EPISODES     paired episodes per arm                  default 100
 #   TUNE_POLICY_GRID  Bernoulli suggestion rates               default "0.5 1.0"
-#   TUNE_DQN_EXP      ste_vanilla --exp whose DQNs join as an extra arm, "" to skip
-#                     (auto-skipped if the checkpoints are absent)  default 1
+#   TUNE_DQN_EXP      ste_vanilla --exp whose DiscreteCQL policies join as an
+#                     extra arm, "" to skip. Vanilla CQL is exp 5 (not 1/2,
+#                     which are old DQN). If the requested folder is not
+#                     discrete_cql, falls back to 5, then 4, then 3.  default 5
 #   TUNE_NOISE        ar1|random|sequential                    default ar1
 #   TUNE_OUT_PREFIX   tuned dirs are <prefix><target><suffix>  default env_para_ste
 #   TUNE_OUT_SUFFIX   e.g. _burden → env_para_ste0.2_burden    default ""
@@ -78,7 +80,7 @@ TUNE_TARGETS="${TUNE_TARGETS:-0.2 0.5 0.8}"
 TUNE_KAPPAS="${TUNE_KAPPAS:-0.25 0.5 1 2 4}"
 TUNE_EPISODES="${TUNE_EPISODES:-100}"
 TUNE_POLICY_GRID="${TUNE_POLICY_GRID:-0.5 1.0}"
-TUNE_DQN_EXP="${TUNE_DQN_EXP:-1}"
+TUNE_DQN_EXP="${TUNE_DQN_EXP:-5}"
 TUNE_NOISE="${TUNE_NOISE:-ar1}"
 TUNE_OUT_PREFIX="${TUNE_OUT_PREFIX:-env_para_ste}"
 TUNE_OUT_SUFFIX="${TUNE_OUT_SUFFIX:-}"
@@ -105,21 +107,67 @@ echo "TUNE_PHASE=${TUNE_PHASE}  TUNE_PARAMS_DIR=${TUNE_PARAMS_DIR}  (${NUM_USERS
 echo "TUNE_KNOB=${TUNE_KNOB}  TUNE_EPISODES=${TUNE_EPISODES}  TUNE_JOBS=${TUNE_JOBS}"
 echo "TUNE_SCRATCH=${TUNE_SCRATCH}  TUNE_OUT_PREFIX=${TUNE_OUT_PREFIX}  TUNE_OUT_SUFFIX=${TUNE_OUT_SUFFIX:-<none>}"
 
-# The DQN arm is optional. Requiring every checkpoint keeps the comparison
-# across participants apples-to-apples; a partial set silently mixes arms.
+# The DiscreteCQL arm is optional. Requiring every checkpoint keeps the
+# comparison across participants apples-to-apples; a partial set silently
+# mixes arms. Presence of *.d3 files is not enough: older DQN checkpoints
+# share that suffix but have algo=null, and tune_ste.py would then abort.
+dqn_ckpts_are_discrete_cql() {
+  local dir="$1"
+  local uids="$2"
+  "${PY}" - "${dir}" "${uids}" <<'PY'
+import json, sys
+from pathlib import Path
+model_dir = Path(sys.argv[1])
+uids = [int(v) for v in Path(sys.argv[2]).read_text().split()]
+for uid in uids:
+    model = model_dir / f"user{uid}_model.d3"
+    meta = model.with_name(f"{model.name}.meta.json")
+    if not model.is_file() or not meta.is_file():
+        sys.exit(1)
+    if json.loads(meta.read_text(encoding="utf-8")).get("algo") != "discrete_cql":
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+try_dqn_exp() {
+  local exp="$1"
+  local dir="d3rlpy_logs/ste_exp_${exp}"
+  local n
+  shopt -s nullglob
+  local ckpts=( "${dir}"/user*_model.d3 )
+  shopt -u nullglob
+  n="${#ckpts[@]}"
+  if [[ "${n}" -ge "${NUM_USERS}" ]] && dqn_ckpts_are_discrete_cql "${dir}" "${USER_IDS}"; then
+    DQN_ARGS=(--dqn-exp "${exp}")
+    echo "DiscreteCQL arm: ${n} checkpoints in ${dir}"
+    return 0
+  fi
+  return 1
+}
+
 DQN_ARGS=()
 if [[ -n "${TUNE_DQN_EXP}" ]]; then
-  DQN_DIR="d3rlpy_logs/ste_exp_${TUNE_DQN_EXP}"
-  shopt -s nullglob
-  CKPTS=( "${DQN_DIR}"/user*_model.d3 )
-  shopt -u nullglob
-  N_CKPT="${#CKPTS[@]}"
-  if [[ "${N_CKPT}" -ge "${NUM_USERS}" ]]; then
-    DQN_ARGS=(--dqn-exp "${TUNE_DQN_EXP}")
-    echo "DQN arm: ${N_CKPT} checkpoints in ${DQN_DIR}"
+  if try_dqn_exp "${TUNE_DQN_EXP}"; then
+    :
   else
-    echo "DQN arm: OFF (${N_CKPT}/${NUM_USERS} checkpoints in ${DQN_DIR});" \
-         "run run_ste.sh with STE_EXP=${TUNE_DQN_EXP} first, or set TUNE_DQN_EXP=''" >&2
+    echo "Requested d3rlpy_logs/ste_exp_${TUNE_DQN_EXP} is missing or not discrete_cql" \
+         "(exp 1/2 are old DQN). Searching vanilla CQL folders 5, 4, 3." >&2
+    used=""
+    for fallback in 5 4 3; do
+      if [[ "${fallback}" == "${TUNE_DQN_EXP}" ]]; then
+        continue
+      fi
+      if try_dqn_exp "${fallback}"; then
+        echo "Using DiscreteCQL from d3rlpy_logs/ste_exp_${fallback} (set TUNE_DQN_EXP=${fallback} to skip this search)." >&2
+        used="${fallback}"
+        break
+      fi
+    done
+    if [[ -z "${used}" ]]; then
+      echo "DiscreteCQL arm: OFF. Proxy STE uses the Bernoulli grid only." \
+           "Point TUNE_DQN_EXP at a discrete_cql folder (vanilla CQL is 5)." >&2
+    fi
   fi
 fi
 

@@ -918,7 +918,9 @@ def require_dqn_checkpoints(spec: ProxySpec, user_ids: Sequence[int]) -> None:
         raise SystemExit(
             f"{model_dir} checkpoints are not {STE_ALGO} "
             f"(found {wrong_algo[:5]}{'...' if len(wrong_algo) > 5 else ''}). "
-            "Retrain with the current ste_vanilla.py DiscreteCQL trainer."
+            "Retrain with the current ste_vanilla.py DiscreteCQL trainer, or "
+            "drop the DiscreteCQL arm (TUNE_DQN_EXP='' / omit --dqn-exp) and "
+            "calibrate on the Bernoulli policy grid only."
         )
     print(f"DiscreteCQL arm: {len(user_ids)} checkpoints from {model_dir}")
 
