@@ -1228,8 +1228,7 @@ def _attach_redistributed_rewards(feats: Dict[str, Any], td: Dict[str, np.ndarra
         phi_slots = np.stack([_redistribution_week_phi_slot(td, k, i, daily)
                               for i in range(N_RL_SLOTS_WEEK)])
         rewards[k] = phi_slots @ eta
-        if variant == "v4":
-            rewards[k, -1] += float(week_targets[k] - rewards[k].sum())
+        rewards[k, -1] += float(week_targets[k] - rewards[k].sum())
     out["rewards"] = rewards
     return out
 

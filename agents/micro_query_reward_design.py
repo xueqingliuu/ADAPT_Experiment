@@ -21,9 +21,10 @@ class MicroQueryRewardDesignAgent:
     (override with a fixed ``engagement_bonus``).  V3/V4 keep the
     discounted-CAE objective and add the week-boundary potential
     ``F = γ̄ ê_{w+1} - ê_w``.  V2/V4 fit Stage 1 daily-mediator
-    decompositions and the Stage 2 within-week redistribution; V4 then
-    adds the exact terminal residual so the shaped week sums to
-    ``b̂_{w+1} + F``.  V2 leaves the biased return uncorrected.
+    decompositions and the Stage 2 within-week redistribution.  Both then
+    add the exact terminal residual so the shaped week sums to the weekly
+    target (V2: ``b̂_{w+1} + λ ê_{w+1}``; V4: ``b̂_{w+1} + F``).
+    ``ê_{w+1}`` enters only that weekly target, not Stage-2 slot features.
     """
     def __init__(self, *args, reward_design, engagement_bonus=None,
                  engagement_rho=0.5, daily_mediator_priors=None,
@@ -184,7 +185,8 @@ class MicroQueryRewardDesignAgent:
         return q
 
     def _redistributed_training_data(self, k_cur, eval_betas, select_betas, daily, eta):
-        """TD rows using the Stage-2 rewards and, for V4, final residuals."""
+        """TD rows using Stage-2 rewards plus a terminal leftover so the
+        week sums to the weekly target (V2 and V4)."""
         rows, targets = [], [[] for _ in range(self.B)]
         for kp in range(k_cur):
             full = self.get_full_mediators(kp)
@@ -192,10 +194,9 @@ class MicroQueryRewardDesignAgent:
             for d in range(N_RL_DAYS):
                 for t in range(N_RL_SLOTS):
                     rewards[d, t] = self._slot_phi(kp, d, t, full, daily) @ eta
-            if self.reward_design == "v4":
-                rewards[TERMINAL_D, TERMINAL_T] += (
-                    self._week_return_target(kp) - rewards.sum()
-                )
+            rewards[TERMINAL_D, TERMINAL_T] += (
+                self._week_return_target(kp) - rewards.sum()
+            )
             for d in range(N_RL_DAYS):
                 for t in range(N_RL_SLOTS):
                     state = self.get_state(kp, d, t)

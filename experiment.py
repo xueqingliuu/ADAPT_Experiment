@@ -1688,7 +1688,9 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
     with ``λ = ρ · sd(b̂) / sd(ê)`` unless ``engagement_bonus`` is set.
     V3/V4 keep discounted CAE and add the potential ``F = γ̄ ê_{w+1} - ê_w``.
     V2/V4 additionally redistribute with the two-stage daily-mediator
-    decomposition; V4 matches and compensates to ``b̂_{w+1} + F``.
+    decomposition, then add a terminal leftover so the week sums to the
+    weekly target. ``ê_{w+1}`` is used only in that target, not in Stage-2
+    slot features.
     """
     _ensure_priors_configured(params_dir)
     cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
