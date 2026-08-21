@@ -1206,8 +1206,8 @@ def _refresh_phi_dims():
 # on the terminal slot).
 GAMMA_BAR = 0.9
 TARGET_C     = 1
-# EPSILON_0 is defined in algorithm_helpers: RLSVI clips π to [ε, 1-ε],
-# and the always/never baselines send at those same bounds.
+# EPSILON_0 is defined in algorithm_helpers: RLSVI clips π to [ε, 1-ε].
+# The always/never baselines are hard 1 / 0 (not the clip bounds).
 J_PARTICLES  = 50
 B_ENSEMBLES  = 50
 NWEEK        = 36
@@ -1768,11 +1768,11 @@ def _run_fixed_policy_fast(policy: str, uid, seed=42, params_dir=None):
         for d in range(N_RL_DAYS):
             for t in range(N_RL_SLOTS):
                 if policy == "never_send":
-                    pi_A = float(EPSILON_0)
-                    action = int(rng.binomial(1, pi_A))
+                    pi_A = 0.0
+                    action = 0
                 elif policy == "always_send":
-                    pi_A = 1.0 - float(EPSILON_0)
-                    action = int(rng.binomial(1, pi_A))
+                    pi_A = 1.0
+                    action = 1
                 else:
                     pi_A = 0.5
                     action = int(rng.binomial(1, pi_A))
@@ -1833,8 +1833,8 @@ ALGORITHMS = {
     "rl_v5_invariant_weekly": (partial(run_micro_query_reward_design, reward_design="v3", gamma_bar=0.9), "RL V3: return-invariant weekly reward (γ̄=0.9)"),
     "rl_v6_invariant_redistributed": (partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9), "RL V4: return-invariant redistributed reward (γ̄=0.9)"),
     "rl_v7_base_g05": (partial(run_micro_query, gamma_bar=0.5), "RL base (γ̄=0.5 sensitivity)"),
-    "never_send":   (run_never_send,  "Never send (π_A=0.1)"),
-    "always_send":  (run_always_send, "Always send (π_A=0.9)"),
+    "never_send":   (run_never_send,  "Never send (π_A=0)"),
+    "always_send":  (run_always_send, "Always send (π_A=1)"),
     "random_send":  (run_random_send, "Random send (π_A=0.5)"),
 }
 

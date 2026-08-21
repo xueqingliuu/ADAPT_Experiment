@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from vani_env import PARAMS_DIR, PROJECT_ROOT, denormalize_CAE
 
 # Must match run_array.sh RESULTS_ROOT (env-overridable).
-DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla"))
+DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla_loo"))
 
 # ── CAE reporting conventions ────────────────────────────────────────────
 # Two separate figures on the *raw* (pre-normalization) scale via
