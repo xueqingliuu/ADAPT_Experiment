@@ -15,6 +15,7 @@ Commands
     diagnose    E_w and CAE loop gains (no simulation)
     eval        measure proxy STE of one parameter folder
     scan        proxy STE vs a grid of ``kappa``
+    apply       write a folder at a fixed ``kappa`` (no STE search)
     calibrate   find ``kappa`` for each target and write ``env_para_ste0.2/`` etc.
 
 Burden-only variants (does **not** overwrite the original action-knob folders)::
@@ -27,6 +28,35 @@ Burden-only variants (does **not** overwrite the original action-knob folders)::
 
     sbatch --export=ALL,TUNE_KNOB=burden,TUNE_TARGETS="0.2 0.5",TUNE_OUT_SUFFIX=_burden \\
         run_tune_ste.sh
+
+Large-fatigue stack (always-send weaker; then STE via fourSC→CAE *shift*)::
+
+    python tune_ste.py apply --knob burden_shift --kappa 0.4 \\
+        --out-dir env_para_burden_shift_large
+
+    python tune_ste.py calibrate --params-dir env_para_burden_shift_large \\
+        --knob foursc_to_y_shift --targets 0.5 0.8 \\
+        --out-prefix env_para_ste --out-suffix _bs_large_foursc
+
+    Cluster: TUNE_PHASE=apply then a second job with
+    TUNE_PARAMS_DIR=env_para_burden_shift_large TUNE_KNOB=foursc_to_y_shift
+    TUNE_TARGETS="0.5 0.8" TUNE_OUT_SUFFIX=_bs_large_foursc.
+    At κ_b=0.4 the proxy STE floor is already ~0.29, so foursc_to_y_shift
+    can raise 0.5 and 0.8 but cannot lower 0.2.
+
+Heavier-fatigue STE ladder (burden_shift calibrated to STE 0.2, then
+fourSC→CAE shift to 0.5 / 0.8; do not use ``action``, which rescales
+A→ME). The 0.2 cell *is* the floor; foursc_to_y_shift only raises STE::
+
+    python tune_ste.py calibrate --knob burden_shift --targets 0.2 \\
+        --out-prefix env_para_ste --out-suffix _floor
+
+    python tune_ste.py calibrate --params-dir env_para_ste0.2_floor \\
+        --knob foursc_to_y_shift --targets 0.5 0.8 \\
+        --out-prefix env_para_ste --out-suffix _floor_foursc
+
+    ``benefit`` (A→MY) is a fallback if 0.8 misses the loop-gain cap;
+    it is not the personalization dial.
 
 
 How STE is measured here
@@ -41,11 +71,14 @@ Which coefficients are scaled (``--knob``, default ``action``)
     benefit   benefit path only
     burden    multiply A→ME (does not flip sign)
     burden_shift  A→ME more negative and E_w→steps / E_w→affect more positive
+    foursc_to_y_shift  add kappa to fourSC_ewma → CAE (does not flip sign)
     my_to_y / foursc_to_y / me_to_e / e_to_my   structural paths; these
               also change the control arm, so they are not the recommended
-              STE dial. ``foursc_to_y`` is the one that makes CAE more
-              state-dependent, because the fourSC CATE varies with wear /
-              interact / steps while the antic CATE is nearly constant.
+              STE dial. ``foursc_to_y`` *multiplies* the loading (negative
+              users get more negative). Prefer ``foursc_to_y_shift`` when
+              stacking on fatigue. The fourSC CATE is the state-dependent
+              one (A x interact / wear / steps); the antic CATE is nearly
+              constant.
 
 Stability
     ``calibrate`` writes a folder only if every participant has |loop gain| < 1
@@ -92,6 +125,13 @@ from vani_env import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Default "large fatigue" shift: enough that always-send is a weaker constant
+# policy than the current STE-0.5 burden_shift folder (κ≈0.11), still below
+# the joint loop-gain cap (κ_hi≈0.65 in vanilla). Proxy STE at this value
+# was ~0.29, so a foursc_to_y_shift ladder on top should target 0.5 / 0.8,
+# not 0.2.
+BURDEN_SHIFT_LARGE_KAPPA = 0.4
 
 # Copied verbatim into every tuned parameter directory so it can be handed to
 # ``ste_vanilla.py`` / ``experiment.py`` as a drop-in replacement.
@@ -247,12 +287,26 @@ KNOBS: dict[str, KnobSpec] = {
         zero_is_null=False,
         sigma_invariant=False,
         doc=(
-            "Structural: fourSC_ewma -> CAE only, holding the antic loading "
-            "fixed. Fitted fourSC_ewma is small (~0.01 on average) while the "
-            "fourSC CATE is the state-dependent one (A x interact / wear / "
-            "steps), so kappa >> 1 is typical. Also moves sigma_i and the "
-            "CAE loop gain. Users with a negative fitted loading get a more "
-            "negative one."
+            "Structural: multiply fourSC_ewma -> CAE, holding the antic "
+            "loading fixed. Fitted fourSC_ewma is small (~0.01 on average) "
+            "while the fourSC CATE is the state-dependent one (A x interact / "
+            "wear / steps), so kappa >> 1 is typical. Also moves sigma_i and "
+            "the CAE loop gain. Users with a negative fitted loading get a "
+            "more negative one — prefer foursc_to_y_shift unless you want "
+            "that sign-preserving scale."
+        ),
+    ),
+    "foursc_to_y_shift": KnobSpec(
+        "foursc_to_y_shift",
+        lambda k: {"FOURSC_to_Y": -k},
+        zero_is_null=False,
+        sigma_invariant=False,
+        apply="subtract",
+        doc=(
+            "Add kappa to every user's fourSC_ewma → CAE loading (raw units; "
+            "typical |loading| ≈ 0.01–0.05). Negative fitted loadings become "
+            "less negative / positive instead of more negative. Moves the "
+            "control arm and the CAE loop gain. Start a scan at 0.02–0.1."
         ),
     ),
     "me_to_e": KnobSpec(
@@ -1098,6 +1152,31 @@ def calibrated_out_dir(prefix: str, target: float, suffix: str = "") -> Path:
     return PROJECT_ROOT / f"{prefix}{float(target):g}{suffix}"
 
 
+def _knob_stack(src_dir: Path, knob: KnobSpec, kappa: float) -> list[dict]:
+    """Record this apply/calibrate step on top of any earlier knobs in ``src_dir``."""
+    stack: list[dict] = []
+    prev_path = Path(src_dir) / "ste_tuning.json"
+    if prev_path.is_file():
+        try:
+            prev = json.loads(prev_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            prev = {}
+        if isinstance(prev.get("stack"), list) and prev["stack"]:
+            stack.extend(prev["stack"])
+        elif prev.get("knob") is not None:
+            stack.append(
+                {
+                    "knob": prev.get("knob"),
+                    "kappa": prev.get("kappa"),
+                    "apply": prev.get("apply"),
+                }
+            )
+    stack.append(
+        {"knob": knob.name, "kappa": float(kappa), "apply": knob.apply}
+    )
+    return stack
+
+
 def refuse_knob_overwrite(out_dir: Path, knob_name: str, *, overwrite: bool) -> None:
     """Block clobbering a folder that was calibrated with a different knob."""
     report_path = out_dir / "ste_tuning.json"
@@ -1268,6 +1347,7 @@ def cmd_calibrate(args) -> None:
             "source_params_dir": str(base_dir),
             "loop_gains": written,
             "n_coefficients_scaled": len(audit),
+            "stack": _knob_stack(base_dir, knob, kappa),
             **result,
         }
         report["params_dir"] = str(out_dir)
@@ -1292,6 +1372,80 @@ def cmd_calibrate(args) -> None:
         "(TUNE_VALIDATE=1, the default). To do it by hand:\n"
         f"    ADAPR_PARAMS_DIR={final} python ste_vanilla.py train ... / eval ... / aggregate ..."
     )
+
+
+def cmd_apply(args) -> None:
+    """Write a parameter folder at a fixed kappa, with no STE root search."""
+    base_dir = Path(args.params_dir).expanduser().resolve()
+    user_ids = load_user_ids(base_dir)
+    require_fitted_blocks(base_dir, user_ids)
+    knob = KNOBS[args.knob]
+    kappa = float(args.kappa)
+    out_dir = Path(args.out_dir).expanduser()
+    if not out_dir.is_absolute():
+        out_dir = PROJECT_ROOT / out_dir
+    require_stable = bool(args.require_stable)
+
+    print(f"knob '{knob.name}': {knob.doc}")
+    print(f"apply kappa={kappa:g}  {base_dir.name} -> {out_dir.name}")
+
+    gains = loop_gains_for(
+        base_dir, user_ids, knob.build(kappa), apply=knob.apply
+    )
+    bad = unstable_users(gains)
+    if require_stable and bad:
+        uids = [int(r["userid"]) for r in bad]
+        raise SystemExit(
+            f"kappa={kappa:g} is loop-unstable for {len(uids)} participants "
+            f"{uids} (|g| >= {GAIN_LIMIT:g})."
+        )
+
+    refuse_knob_overwrite(out_dir, knob.name, overwrite=args.overwrite)
+    audit = write_scaled_params(
+        base_dir, out_dir, user_ids, knob.build(kappa), apply=knob.apply
+    )
+    written = diagnose(out_dir, user_ids)
+    if require_stable and unstable_users(written):
+        raise SystemExit(
+            f"wrote {out_dir} but diagnose reports it unstable -- this is a bug."
+        )
+    print(f"  wrote {out_dir}  ({len(audit)} coefficients)")
+
+    report = {
+        "target_mean_ste": None,
+        "achieved_mean_ste": None,
+        "knob": knob.name,
+        "kappa": float(kappa),
+        "kappa_hi": None,
+        "stable": not bool(unstable_users(written)),
+        "apply": knob.apply,
+        "multipliers": knob.build(kappa),
+        "source_params_dir": str(base_dir),
+        "loop_gains": written,
+        "n_coefficients_scaled": len(audit),
+        "stack": _knob_stack(base_dir, knob, kappa),
+        "params_dir": str(out_dir),
+    }
+
+    if args.eval:
+        spec = make_spec(args)
+        require_dqn_checkpoints(spec, user_ids)
+        t0 = time.perf_counter()
+        result = evaluate(
+            out_dir, user_ids, spec, n_jobs=args.jobs, proxy_to_true=args.proxy_to_true
+        )
+        print(f"  proxy STE ({time.perf_counter() - t0:.1f}s)")
+        summarise(result)
+        report["spec"] = asdict(spec)
+        report["achieved_mean_ste"] = float(result["mean_ste"])
+        for key in (
+            "mean_ste", "median_ste", "min_ste", "max_ste",
+            "n_users", "users", "proxy_to_true",
+        ):
+            if key in result:
+                report[key] = result[key]
+
+    write_report(out_dir / "ste_tuning.json", report)
 
 
 def cmd_diagnose(args) -> None:
@@ -1401,6 +1555,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sp.set_defaults(func=cmd_calibrate)
+
+    sp = sub.add_parser(
+        "apply",
+        help="Write a parameter folder at a fixed kappa (no STE search)",
+    )
+    common(sp, needs_knob=True)
+    sp.add_argument(
+        "--kappa",
+        type=float,
+        default=BURDEN_SHIFT_LARGE_KAPPA,
+        help=(
+            f"Knob value to apply (default {BURDEN_SHIFT_LARGE_KAPPA:g}, the "
+            "large burden_shift shift)"
+        ),
+    )
+    sp.add_argument(
+        "--out-dir",
+        default="env_para_burden_shift_large",
+        help="Destination parameter folder (repo-relative unless absolute)",
+    )
+    sp.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow replacing a folder whose ste_tuning.json used a different knob",
+    )
+    sp.add_argument(
+        "--eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also run the proxy STE Monte-Carlo after writing (default: off)",
+    )
+    sp.add_argument(
+        "--require-stable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Refuse to write if any participant's |loop gain| >= 1 (default: on)",
+    )
+    sp.set_defaults(func=cmd_apply)
 
     sp = sub.add_parser(
         "diagnose", help="E_w and CAE loop gains for a parameter directory"

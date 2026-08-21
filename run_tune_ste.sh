@@ -19,6 +19,16 @@
 #   sbatch --export=ALL,TUNE_KNOB=burden_shift,TUNE_TARGETS="0.2 0.5",TUNE_OUT_SUFFIX=_burden_shift \
 #          run_tune_ste.sh                                   # A→ME down, E→MY up; writes
 #                                                            # env_para_ste0.2_burden_shift etc.
+#   sbatch --export=ALL,TUNE_PHASE=apply,TUNE_KNOB=burden_shift,TUNE_KAPPA=0.4 \
+#          run_tune_ste.sh                                   # env_para_burden_shift_large/
+#   sbatch --export=ALL,TUNE_PARAMS_DIR=env_para_burden_shift_large,\
+#TUNE_KNOB=foursc_to_y_shift,TUNE_TARGETS="0.5 0.8",TUNE_OUT_SUFFIX=_bs_large_foursc \
+#          run_tune_ste.sh                                   # STE 0.5/0.8 on κ_b=0.4
+#   sbatch --export=ALL,TUNE_KNOB=burden_shift,TUNE_TARGETS="0.2",TUNE_OUT_SUFFIX=_floor \
+#          run_tune_ste.sh                                   # heavier fatigue, STE 0.2
+#   sbatch --export=ALL,TUNE_PARAMS_DIR=env_para_ste0.2_floor,TUNE_KNOB=foursc_to_y_shift,\
+#TUNE_TARGETS="0.5 0.8",TUNE_OUT_SUFFIX=_floor_foursc \
+#          run_tune_ste.sh                                   # fourSC→Y ladder, fatigue frozen
 #   sbatch --export=ALL,TUNE_PHASE=diagnose run_tune_ste.sh  # E_w + CAE loop gains, ~seconds
 #   sbatch --export=ALL,TUNE_PHASE=eval run_tune_ste.sh      # STE of the untouched fit
 #   sbatch --export=ALL,TUNE_PHASE=scan run_tune_ste.sh      # STE vs knob value
@@ -26,11 +36,17 @@
 #                                                            # confirmation runs by hand
 #
 # Overrides (sbatch --export=ALL,VAR=value,...):
-#   TUNE_PHASE        diagnose|eval|scan|calibrate|validate    default calibrate
+#   TUNE_PHASE        diagnose|eval|scan|apply|calibrate|validate    default calibrate
 #   TUNE_PARAMS_DIR   source fit to rescale                    default env_para_vanilla
-#   TUNE_KNOB         action|benefit|burden|burden_shift|...   default action
+#   TUNE_KNOB         action|benefit|burden|burden_shift|foursc_to_y_shift|...
 #   TUNE_TARGETS      target mean STE values                   default "0.2 0.5 0.8"
-#   TUNE_KAPPA0       calibrate search start                   default 1, or 0.2 for burden_shift
+#   TUNE_KAPPA        apply-phase knob value                   default 0.4
+#   TUNE_OUT_DIR      apply-phase destination                  default
+#                     env_para_burden_shift_large (burden_shift) or
+#                     env_para_<knob>_<kappa>
+#   TUNE_APPLY_EVAL   1 to run proxy STE after apply           default 0
+#   TUNE_KAPPA0       calibrate search start                   default 1, or 0.2 for
+#                     burden_shift, or 0.05 for foursc_to_y_shift
 #   TUNE_KAPPAS       scan grid                                default "0.25 0.5 1 2 4"
 #   TUNE_EPISODES     paired episodes per arm                  default 100
 #   TUNE_POLICY_GRID  Bernoulli suggestion rates               default "0.5 1.0"
@@ -79,10 +95,19 @@ TUNE_KNOB="${TUNE_KNOB:-action}"
 TUNE_TARGETS="${TUNE_TARGETS:-0.2 0.5 0.8}"
 if [[ "${TUNE_KNOB}" == "burden_shift" ]]; then
   TUNE_KAPPA0="${TUNE_KAPPA0:-0.2}"
+elif [[ "${TUNE_KNOB}" == "foursc_to_y_shift" ]]; then
+  TUNE_KAPPA0="${TUNE_KAPPA0:-0.05}"
 else
   TUNE_KAPPA0="${TUNE_KAPPA0:-1.0}"
 fi
 TUNE_KAPPAS="${TUNE_KAPPAS:-0.25 0.5 1 2 4}"
+TUNE_KAPPA="${TUNE_KAPPA:-0.4}"
+TUNE_APPLY_EVAL="${TUNE_APPLY_EVAL:-0}"
+if [[ "${TUNE_KNOB}" == "burden_shift" ]]; then
+  TUNE_OUT_DIR="${TUNE_OUT_DIR:-env_para_burden_shift_large}"
+else
+  TUNE_OUT_DIR="${TUNE_OUT_DIR:-env_para_${TUNE_KNOB}_${TUNE_KAPPA}}"
+fi
 TUNE_EPISODES="${TUNE_EPISODES:-100}"
 TUNE_POLICY_GRID="${TUNE_POLICY_GRID:-0.5 1.0}"
 TUNE_DQN_EXP="${TUNE_DQN_EXP:-5}"
@@ -111,6 +136,9 @@ echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "TUNE_PHASE=${TUNE_PHASE}  TUNE_PARAMS_DIR=${TUNE_PARAMS_DIR}  (${NUM_USERS} participants)"
 echo "TUNE_KNOB=${TUNE_KNOB}  TUNE_EPISODES=${TUNE_EPISODES}  TUNE_JOBS=${TUNE_JOBS}"
 echo "TUNE_SCRATCH=${TUNE_SCRATCH}  TUNE_OUT_PREFIX=${TUNE_OUT_PREFIX}  TUNE_OUT_SUFFIX=${TUNE_OUT_SUFFIX:-<none>}"
+if [[ "${TUNE_PHASE}" == "apply" ]]; then
+  echo "TUNE_KAPPA=${TUNE_KAPPA}  TUNE_OUT_DIR=${TUNE_OUT_DIR}  TUNE_APPLY_EVAL=${TUNE_APPLY_EVAL}"
+fi
 
 # The DiscreteCQL arm is optional. Requiring every checkpoint keeps the
 # comparison across participants apples-to-apples; a partial set silently
@@ -216,32 +244,46 @@ sys.exit(0 if rep.get("stable") is True else 1)
 PY
 }
 
+submit_one_validation() {
+  local dir="$1"
+  if ! folder_is_stable "${dir}"; then
+    echo "SKIP ${dir}: missing, or ste_tuning.json does not have stable=true." >&2
+    return 1
+  fi
+  local jid exp_name
+  # STE_EXP is the folder name with a leading ``env_para_`` stripped, so
+  # env_para_ste0.8 → ste0.8 and env_para_burden_shift_large → burden_shift_large.
+  exp_name="$(basename "${dir}")"
+  exp_name="${exp_name#env_para_}"
+  jid=$(sbatch --parsable \
+    --job-name="ste_${exp_name}" \
+    --array="0-$(( $(wc -l < "${dir}/user_ids.txt") - 1 ))" \
+    --export="ALL,ADAPR_PARAMS_DIR=${dir},STE_EXP=${exp_name},STE_USER_IDS=${dir}/user_ids.txt,STE_PHASE=all" \
+    "${SLURM_SUBMIT_DIR:-$PWD}/run_ste.sh")
+  echo "Submitted ${jid}: full DQN train+eval in ${dir} (results_ste/exp${exp_name})"
+}
+
+# With no args, validate each calibrate output prefix+target+suffix.
+# Pass folder paths (e.g. after apply) to validate those instead.
 submit_validation_jobs() {
-  local submitted=0
+  local submitted=0 dir
+  local -a dirs=()
   if ! command -v sbatch >/dev/null 2>&1; then
     echo "ERROR: sbatch is not available; cannot submit true-STE jobs." >&2
     echo "On a login node: TUNE_PHASE=validate bash run_tune_ste.sh" >&2
     return 1
   fi
-  for target in ${TUNE_TARGETS}; do
-    local dir="${TUNE_OUT_PREFIX}${target}${TUNE_OUT_SUFFIX}"
-    if ! folder_is_stable "${dir}"; then
-      echo "SKIP ${dir}: missing, or ste_tuning.json does not have stable=true." >&2
-      continue
+  if [[ "$#" -gt 0 ]]; then
+    dirs=("$@")
+  else
+    for target in ${TUNE_TARGETS}; do
+      dirs+=("${TUNE_OUT_PREFIX}${target}${TUNE_OUT_SUFFIX}")
+    done
+  fi
+  for dir in "${dirs[@]}"; do
+    if submit_one_validation "${dir}"; then
+      submitted=$((submitted + 1))
     fi
-    local jid
-    # STE_EXP is the folder name with a leading ``env_para_`` stripped, so
-    # env_para_ste0.8 → ste0.8 and env_para_foursc0.8 → foursc0.8.
-    local exp_name
-    exp_name="$(basename "${dir}")"
-    exp_name="${exp_name#env_para_}"
-    jid=$(sbatch --parsable \
-      --job-name="ste_${exp_name}" \
-      --array="0-$(( $(wc -l < "${dir}/user_ids.txt") - 1 ))" \
-      --export="ALL,ADAPR_PARAMS_DIR=${dir},STE_EXP=${exp_name},STE_USER_IDS=${dir}/user_ids.txt,STE_PHASE=all" \
-      "${SLURM_SUBMIT_DIR:-$PWD}/run_ste.sh")
-    echo "Submitted ${jid}: full DQN train+eval in ${dir} (results_ste/exp${exp_name})"
-    submitted=$((submitted + 1))
   done
   if [[ "${submitted}" -eq 0 ]]; then
     echo "ERROR: nothing to validate." >&2
@@ -264,6 +306,41 @@ case "${TUNE_PHASE}" in
       --kappas ${TUNE_KAPPAS} \
       --scratch "${TUNE_SCRATCH}" \
       --report "logs/tune_ste_scan_${TUNE_KNOB}_${SLURM_JOB_ID:-local}.json"
+    ;;
+  apply)
+    STABLE_FLAG=(--require-stable)
+    if [[ "${TUNE_REQUIRE_STABLE}" == "0" ]]; then
+      STABLE_FLAG=(--no-require-stable)
+    fi
+    EVAL_FLAG=(--no-eval)
+    if [[ "${TUNE_APPLY_EVAL}" == "1" ]]; then
+      EVAL_FLAG=(--eval)
+    fi
+    set +e
+    "${PY}" tune_ste.py apply "${COMMON_ARGS[@]}" \
+      --knob "${TUNE_KNOB}" \
+      --kappa "${TUNE_KAPPA}" \
+      --out-dir "${TUNE_OUT_DIR}" \
+      --scratch "${TUNE_SCRATCH}" \
+      "${EVAL_FLAG[@]}" \
+      "${STABLE_FLAG[@]}"
+    apply_status=$?
+    set -e
+    if [[ "${TUNE_VALIDATE}" != "1" ]]; then
+      echo "TUNE_VALIDATE=0: skipping true-STE jobs. Re-run with TUNE_PHASE=validate TUNE_VALIDATE_DIR=${TUNE_OUT_DIR}."
+      exit "${apply_status}"
+    fi
+    if [[ "${apply_status}" -ne 0 ]]; then
+      echo "Apply failed (exit ${apply_status}); not submitting true-STE jobs." >&2
+      exit "${apply_status}"
+    fi
+    if ! command -v sbatch >/dev/null 2>&1; then
+      echo "WARNING: sbatch is not available here; wrote ${TUNE_OUT_DIR}."
+      echo "From a login node: TUNE_PHASE=validate TUNE_VALIDATE_DIR=${TUNE_OUT_DIR} bash run_tune_ste.sh"
+      exit 0
+    fi
+    echo "Submitting true-STE DQN jobs for ${TUNE_OUT_DIR}."
+    submit_validation_jobs "${TUNE_OUT_DIR}"
     ;;
   calibrate)
     STABLE_FLAG=(--require-stable)
@@ -308,10 +385,14 @@ case "${TUNE_PHASE}" in
     exit "${cal_status}"
     ;;
   validate)
-    submit_validation_jobs
+    if [[ -n "${TUNE_VALIDATE_DIR:-}" ]]; then
+      submit_validation_jobs "${TUNE_VALIDATE_DIR}"
+    else
+      submit_validation_jobs
+    fi
     ;;
   *)
-    echo "ERROR: unknown TUNE_PHASE=${TUNE_PHASE} (use diagnose, eval, scan, calibrate, or validate)" >&2
+    echo "ERROR: unknown TUNE_PHASE=${TUNE_PHASE} (use diagnose, eval, scan, apply, calibrate, or validate)" >&2
     exit 1
     ;;
 esac

@@ -1,0 +1,242 @@
+{
+  "target_mean_ste": null,
+  "achieved_mean_ste": null,
+  "knob": "burden_shift",
+  "kappa": 0.4,
+  "kappa_hi": null,
+  "stable": true,
+  "apply": "subtract",
+  "multipliers": {
+    "A_to_ME": 0.4,
+    "E_to_MY": -0.4
+  },
+  "source_params_dir": "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed/env_para_vanilla",
+  "loop_gains": [
+    {
+      "userid": 13,
+      "g_zero": 0.12551299999999999,
+      "g_always": -0.4253155000000001,
+      "cae_g_zero": 0.6030080000000001,
+      "cae_g_always": 0.6403920000000001
+    },
+    {
+      "userid": 18,
+      "g_zero": 0.18475425,
+      "g_always": -0.36435400000000007,
+      "cae_g_zero": 0.700183,
+      "cae_g_always": 0.708167
+    },
+    {
+      "userid": 22,
+      "g_zero": 0.14059525,
+      "g_always": -0.3486552500000001,
+      "cae_g_zero": 0.7763660000000001,
+      "cae_g_always": 0.7908910000000001
+    },
+    {
+      "userid": 31,
+      "g_zero": 0.08057199999999998,
+      "g_always": 0.58710475,
+      "cae_g_zero": 0.6288279999999999,
+      "cae_g_always": 0.6342629999999999
+    },
+    {
+      "userid": 33,
+      "g_zero": 0.084814,
+      "g_always": -0.17202900000000002,
+      "cae_g_zero": 0.544327,
+      "cae_g_always": 0.528439
+    },
+    {
+      "userid": 37,
+      "g_zero": 0.1469965,
+      "g_always": -0.21181675000000003,
+      "cae_g_zero": 0.7969879999999999,
+      "cae_g_always": 0.806252
+    },
+    {
+      "userid": 72,
+      "g_zero": 0.19396599999999997,
+      "g_always": 0.19841099999999998,
+      "cae_g_zero": 0.473708,
+      "cae_g_always": 0.407521
+    },
+    {
+      "userid": 75,
+      "g_zero": 0.243981,
+      "g_always": 0.17621924999999994,
+      "cae_g_zero": 0.364987,
+      "cae_g_always": 0.474055
+    },
+    {
+      "userid": 86,
+      "g_zero": 0.24085375,
+      "g_always": 0.11875974999999998,
+      "cae_g_zero": 0.663504,
+      "cae_g_always": 0.671458
+    },
+    {
+      "userid": 106,
+      "g_zero": 0.33353675000000005,
+      "g_always": 0.17289175000000007,
+      "cae_g_zero": 0.8589779999999999,
+      "cae_g_always": 0.884998
+    },
+    {
+      "userid": 118,
+      "g_zero": 0.13445200000000002,
+      "g_always": 0.020511000000000015,
+      "cae_g_zero": 0.6166360000000001,
+      "cae_g_always": 0.6205100000000001
+    },
+    {
+      "userid": 128,
+      "g_zero": 0.24411650000000001,
+      "g_always": -0.16218600000000002,
+      "cae_g_zero": 0.5661130000000001,
+      "cae_g_always": 0.5768570000000001
+    },
+    {
+      "userid": 129,
+      "g_zero": 0.3395705,
+      "g_always": 0.237577,
+      "cae_g_zero": 0.5901320000000001,
+      "cae_g_always": 0.6052420000000001
+    },
+    {
+      "userid": 141,
+      "g_zero": 0.11703825000000001,
+      "g_always": 0.03979775,
+      "cae_g_zero": 0.743874,
+      "cae_g_always": 0.726448
+    },
+    {
+      "userid": 143,
+      "g_zero": 0.19856375,
+      "g_always": 0.07046174999999999,
+      "cae_g_zero": 0.535342,
+      "cae_g_always": 0.5275859999999999
+    },
+    {
+      "userid": 151,
+      "g_zero": -0.1586025,
+      "g_always": -0.38624224999999995,
+      "cae_g_zero": 0.7852910000000001,
+      "cae_g_always": 0.798413
+    },
+    {
+      "userid": 160,
+      "g_zero": 0.45122699999999993,
+      "g_always": 0.647155,
+      "cae_g_zero": 0.8227,
+      "cae_g_always": 0.8230999999999999
+    },
+    {
+      "userid": 170,
+      "g_zero": -0.015773000000000002,
+      "g_always": -0.10741400000000001,
+      "cae_g_zero": 0.5225390000000001,
+      "cae_g_always": 0.515528
+    },
+    {
+      "userid": 184,
+      "g_zero": 0.18479475,
+      "g_always": 0.5001945000000001,
+      "cae_g_zero": 0.619939,
+      "cae_g_always": 0.602616
+    },
+    {
+      "userid": 188,
+      "g_zero": 0.16508350000000002,
+      "g_always": 0.1388075,
+      "cae_g_zero": 0.7891539999999999,
+      "cae_g_always": 0.7953629999999999
+    },
+    {
+      "userid": 195,
+      "g_zero": -0.20189049999999997,
+      "g_always": -0.314277,
+      "cae_g_zero": 0.7204360000000001,
+      "cae_g_always": 0.76077
+    },
+    {
+      "userid": 204,
+      "g_zero": 0.10732025,
+      "g_always": -0.54235975,
+      "cae_g_zero": 0.489826,
+      "cae_g_always": 0.505336
+    },
+    {
+      "userid": 225,
+      "g_zero": 0.39077649999999997,
+      "g_always": 0.306353,
+      "cae_g_zero": 0.7030099999999999,
+      "cae_g_always": 0.697818
+    },
+    {
+      "userid": 239,
+      "g_zero": 0.03623575,
+      "g_always": -0.15146200000000004,
+      "cae_g_zero": 0.861208,
+      "cae_g_always": 0.85982
+    },
+    {
+      "userid": 252,
+      "g_zero": 0.17307949999999997,
+      "g_always": -0.17598575000000005,
+      "cae_g_zero": 0.5857100000000001,
+      "cae_g_always": 0.6192789999999999
+    },
+    {
+      "userid": 269,
+      "g_zero": 0.02810099999999999,
+      "g_always": -0.11170624999999999,
+      "cae_g_zero": 0.6683930000000001,
+      "cae_g_always": 0.697546
+    },
+    {
+      "userid": 277,
+      "g_zero": 0.1578375,
+      "g_always": -0.014367999999999992,
+      "cae_g_zero": 0.645894,
+      "cae_g_always": 0.6532349999999999
+    },
+    {
+      "userid": 285,
+      "g_zero": 0.4261165,
+      "g_always": 0.37989125,
+      "cae_g_zero": 0.69892,
+      "cae_g_always": 0.7003199999999999
+    },
+    {
+      "userid": 299,
+      "g_zero": 0.239173,
+      "g_always": 0.33411725,
+      "cae_g_zero": 0.643844,
+      "cae_g_always": 0.6537839999999999
+    },
+    {
+      "userid": 307,
+      "g_zero": 0.20494750000000006,
+      "g_always": 0.6614880000000001,
+      "cae_g_zero": 0.861039,
+      "cae_g_always": 0.800663
+    },
+    {
+      "userid": 333,
+      "g_zero": -0.0440695,
+      "g_always": 0.0006905000000000066,
+      "cae_g_zero": 0.6095809999999999,
+      "cae_g_always": 0.6219810000000001
+    }
+  ],
+  "n_coefficients_scaled": 372,
+  "stack": [
+    {
+      "knob": "burden_shift",
+      "kappa": 0.4,
+      "apply": "subtract"
+    }
+  ],
+  "params_dir": "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed/env_para_burden_shift_large"
+}

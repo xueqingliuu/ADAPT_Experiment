@@ -639,36 +639,69 @@ def require_finite_belief(value, *, week, name="b_hat"):
     return x
 
 
-def ensemble_action_prob(phi_1, phi_0, betas):
-    """
-    Fraction of ensemble models that prefer action 1 over action 0.
+# Default clip used by RLSVI and by the clipped always/never baselines
+# (π = 1-ε and π = ε). Keep a single constant so those stay in the same
+# policy class as the learning agents.
+EPSILON_0 = 0.1
 
-        pi_hat = (1/B) sum_b  I( phi_1^T beta_b  >  phi_0^T beta_b )
+# Boltzmann temperature for the ensemble softmax. Q is on the weekly ``b_hat``
+# / discounted-CAE scale, so advantages are often 0.01–0.1; τ=0.1 lets a
+# 0.05 advantage map to π≈0.62 instead of collapsing to 0.5. Override with
+# ``ADAPR_SOFTMAX_TAU``. ``ADAPR_ENSEMBLE_ACTION=vote`` restores the old
+# hard majority vote.
+SOFTMAX_TAU = float(os.getenv("ADAPR_SOFTMAX_TAU", "0.1"))
+ENSEMBLE_ACTION_MODE = str(os.getenv("ADAPR_ENSEMBLE_ACTION", "softmax")).strip().lower()
+
+
+def _stable_sigmoid(z):
+    z = np.clip(np.asarray(z, dtype=float), -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def ensemble_action_prob(phi_1, phi_0, betas, tau=None):
+    """Randomisation probability from an RLSVI ensemble.
+
+    Default (softmax) averages a Bernoulli probability over posterior draws::
+
+        pi_hat = (1/M) sum_m  σ( (Q_m(s,1) - Q_m(s,0)) / τ )
+
+    with ``Q_m(s,a) = phi_a^T beta_m``. Magnitude of the advantage matters, so
+    a weakly preferred action no longer maps to π≈0.5. Set
+    ``ADAPR_ENSEMBLE_ACTION=vote`` for the old hard majority::
+
+        pi_hat = (1/M) sum_m  I( Q_m(s,1) > Q_m(s,0) )
 
     Parameters
     ----------
     phi_1  : (p,) array – features for action=1
     phi_0  : (p,) array – features for action=0
-    betas  : list of B (p,) arrays – ensemble parameters
+    betas  : list of M (p,) arrays – ensemble parameters
+    tau    : float, optional – softmax temperature (default ``SOFTMAX_TAU``)
 
     Returns
     -------
     pi_hat : float in [0, 1]
     """
-    B = len(betas)
-    votes = sum(1 for beta_b in betas if phi_1 @ beta_b > phi_0 @ beta_b)
-    return votes / B
+    if not betas:
+        raise ValueError("ensemble_action_prob requires at least one draw")
+    B = np.stack([np.asarray(beta, dtype=float) for beta in betas], axis=0)
+    adv = B @ (np.asarray(phi_1, dtype=float) - np.asarray(phi_0, dtype=float))
+    mode = ENSEMBLE_ACTION_MODE
+    if mode in {"vote", "majority", "hard"}:
+        return float(np.mean(adv > 0.0))
+    if mode not in {"softmax", "boltzmann", "sigmoid"}:
+        raise ValueError(
+            f"unknown ADAPR_ENSEMBLE_ACTION={mode!r}; use 'softmax' or 'vote'"
+        )
+    tau = float(SOFTMAX_TAU if tau is None else tau)
+    if not np.isfinite(tau) or tau <= 0.0:
+        raise ValueError(f"softmax temperature must be positive, got {tau!r}")
+    return float(np.mean(_stable_sigmoid(adv / tau)))
 
 
 def clip_prob(pi_hat, epsilon_0):
     """Clip randomisation probability to [epsilon_0, 1 - epsilon_0]."""
     return np.clip(pi_hat, epsilon_0, 1.0 - epsilon_0)
-
-
-# Default clip used by RLSVI and by the clipped always/never baselines
-# (π = 1-ε and π = ε). Keep a single constant so those stay in the same
-# policy class as the learning agents.
-EPSILON_0 = 0.1
 
 
 def weekly_pv_sum_for_ew(slot_pv, *, shift=None, scale=None):

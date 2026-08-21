@@ -107,6 +107,8 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     TERMINAL_T,
     ACTION_BLOCK_INCLUDE_C,
     EPSILON_0,
+    SOFTMAX_TAU,
+    ENSEMBLE_ACTION_MODE,
     set_action_block_include_c,
 )
 from agents.ew_hat import (
@@ -1208,6 +1210,8 @@ GAMMA_BAR = 0.9
 TARGET_C     = 1
 # EPSILON_0 is defined in algorithm_helpers: RLSVI clips π to [ε, 1-ε].
 # The always/never baselines are hard 1 / 0 (not the clip bounds).
+# Default action probability is an average of ensemble softmaxes
+# (ADAPR_ENSEMBLE_ACTION=softmax, temperature ADAPR_SOFTMAX_TAU).
 J_PARTICLES  = 50
 B_ENSEMBLES  = 50
 NWEEK        = 36
@@ -2157,6 +2161,8 @@ if __name__ == "__main__":
             "engagement_rho": ENGAGEMENT_RHO,
             "engagement_bonus": ENGAGEMENT_BONUS,
             "epsilon_0":      EPSILON_0,
+            "ensemble_action": ENSEMBLE_ACTION_MODE,
+            "softmax_tau":    SOFTMAX_TAU,
             "J_particles":    J_PARTICLES,
             "B_ensembles":    B_ENSEMBLES,
             "target_update_C": TARGET_C,
