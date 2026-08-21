@@ -17,32 +17,38 @@ from vani_env import PARAMS_DIR, PROJECT_ROOT, denormalize_CAE
 DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla"))
 
 # ── CAE reporting conventions ────────────────────────────────────────────
-# We build the 4-panel overview for BOTH weekly-CAE variants, on the *raw*
-# (pre-normalization) scale via ``denormalize_CAE`` (raw = shift + scale*norm):
-#   • latent (no noise) — E[CAE_w | realized history], stored as
-#     ``cae_mean_runs`` by experiment.py.
-#   • noisy (realized)  — the drawn CAE incl. residual noise + clipping,
-#     stored as ``cae_runs``.
-# Older result folders that predate ``cae_mean_runs`` only get the noisy plot.
+# Two separate figures on the *raw* (pre-normalization) scale via
+# ``denormalize_CAE`` (raw = shift + scale*norm):
+#   • mean cumulative noisy CAE minus never_send (running sum of weekly
+#     CAE, paired). SE bands average over users within each replicate,
+#     then use sd / sqrt(n_exp) across the 100 seeds.
+#   • mean walking-suggestion probability, averaged over users × replicates
+# Latent (``cae_mean_runs``) is still written to the summary table when present.
 LATENT_FIELD = "cae_mean_runs"   # latent (noise-free)
 NOISY_FIELD = "cae_runs"         # realized (with noise)
-CAE_YLIM = (0, 7)                # raw CAE scale used in overview plots
 
 markers = {
-    "rl_v1_base_g05": "o:",
-    "rl_v2_mtd_g05": "^:",
+    "rl_v1_base_g09": "o:",
+    "rl_v2_mtd_g09": "^:",
     "rl_v3_biased_weekly": "s:",
     "rl_v4_biased_redistributed": "s-",
     "rl_v5_invariant_weekly": "d:",
     "rl_v6_invariant_redistributed": "d-",
-    "rl_v7_base_g09": "o-",
+    "rl_v7_base_g05": "o-",
     "never_send": "x-",
     "always_send": "*-",
     "random_send": "+-",
 }
 
-# γ̄=0.9 RL policy (variant 7; the only sensitivity rerun of the base).
-GAMMA09_ALGOS = ("rl_v7_base_g09",)
+# γ̄=0.9 RL policies (V1--V6). V7 is the γ̄=0.5 sensitivity of the base.
+GAMMA09_ALGOS = (
+    "rl_v1_base_g09",
+    "rl_v2_mtd_g09",
+    "rl_v3_biased_weekly",
+    "rl_v4_biased_redistributed",
+    "rl_v5_invariant_weekly",
+    "rl_v6_invariant_redistributed",
+)
 NEVER_SEND_BASELINE = "never_send"
 
 
@@ -289,54 +295,122 @@ def compute_stats(all_cae_full):
     }
 
 
-def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks):
-    """4-panel overview figure for one CAE variant; saved with ``suffix``."""
+def _per_uid_mean(arr, uids):
+    """Mean of ``arr`` within each unique uid.
+
+    ``arr`` is ``(n_exp, n_slot, ...)`` and ``uids`` is ``(n_exp, n_slot)``.
+    Returns ``(n_uid, ...)``.
+    """
+    uids = np.asarray(uids)
+    unique = np.unique(uids)
+    return np.stack(
+        [np.nanmean(arr[uids == u], axis=0) for u in unique],
+        axis=0,
+    )
+
+
+def _se_across_replications(arr):
+    """Week-wise SE of the grand mean, clustered by experiment.
+
+    ``arr`` is ``(n_exp, n_slot, n_week)``. Users are averaged within each
+    replicate, then ``SE = sd / sqrt(n_exp)``. The 31 testbed users are
+    treated as fixed; uncertainty is Monte Carlo error across seeds.
+    """
+    per_exp = np.nanmean(np.asarray(arr, dtype=float), axis=1)
+    n = int(per_exp.shape[0])
+    if n <= 1:
+        return np.full(arr.shape[-1], np.nan)
+    return np.nanstd(per_exp, axis=0, ddof=1) / np.sqrt(n)
+
+
+def _cumsum_vs_reference(all_cae, uids=None, reference=NEVER_SEND_BASELINE):
+    """Mean and replication-clustered SE of cumulative CAE minus a reference.
+
+    Pairing is aligned on (experiment, user slot). SE averages over users
+    within each seed, then divides by ``sqrt(n_exp)``. If ``reference`` is
+    missing or the shapes do not match, fall back to cumulative CAE minus
+    the cross-policy mean path.
+    """
+    del uids  # pairing uses aligned arrays; SE clusters by experiment
+    cums = {
+        name: np.nancumsum(np.asarray(a, dtype=float), axis=-1)
+        for name, a in all_cae.items()
+    }
+    ref = cums.get(reference)
+    use_ref = (
+        ref is not None
+        and all(c.shape == ref.shape for c in cums.values())
+    )
+    mean, se = {}, {}
+    for name, cum in cums.items():
+        x = cum - ref if use_ref else cum
+        mean[name] = np.nanmean(x, axis=(0, 1))
+        se[name] = _se_across_replications(x)
+    if not use_ref:
+        grand = np.nanmean(np.stack(list(mean.values()), axis=0), axis=0)
+        mean = {n: m - grand for n, m in mean.items()}
+    return mean, se, use_ref
+
+
+def _cae_ylim(mean, se):
+    """Tight y-limits around mean ± SE so nearby policies are distinguishable."""
+    lows, highs = [], []
+    for name in mean:
+        m = np.asarray(mean[name], dtype=float)
+        s = np.asarray(se[name], dtype=float)
+        lows.append(np.nanmin(m - s))
+        highs.append(np.nanmax(m + s))
+    lo = float(np.nanmin(lows))
+    hi = float(np.nanmax(highs))
+    span = max(hi - lo, 0.02)
+    pad = 0.15 * span
+    return lo - pad, hi + pad
+
+
+def _save_fig(fig, out, stem):
+    fig.tight_layout()
+    fig.savefig(out / f"{stem}.png", dpi=150, bbox_inches="tight")
+    fig.savefig(out / f"{stem}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
+                  uids=None):
+    """Write separate CAE and action-probability figures."""
     names = list(stats["all_cae"].keys())
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+    cum_mean, cum_se, vs_never = _cumsum_vs_reference(
+        stats["all_cae"], uids=uids,
+    )
 
-    # (0,0) Mean weekly CAE ± SE
-    ax = axes[0, 0]
-    for name in names:
-        m = stats["mean"][name]
-        s = stats["se"][name]
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    cae_names = (
+        [n for n in names if n != NEVER_SEND_BASELINE] if vs_never else names
+    )
+    for name in cae_names:
+        m = cum_mean[name]
+        s = cum_se[name]
         ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
-        ax.fill_between(weeks, m - s, m + s, alpha=0.15)
+        ax.fill_between(weeks, m - s, m + s, alpha=0.25)
+    if vs_never:
+        ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
+        ax.set_ylabel("Cumulative CAE(policy) − cumulative CAE(never-send)")
+        ax.set_title(
+            f"Cumulative CAE minus never-send (± SE across replications)\n"
+            f"running sum of weekly CAE, paired by user — {kind}"
+        )
+    else:
+        ax.set_ylabel("Cumulative CAE − mean across policies")
+        ax.set_title(f"Mean cumulative CAE, centered (± SE) — {kind}")
     ax.set_xlabel("Week")
-    ax.set_ylabel("CAE (raw scale)")
-    ax.set_title(f"Mean weekly CAE (± SE) — {kind}, raw scale")
-    ax.set_ylim(*CAE_YLIM)
+    ax.set_ylim(*_cae_ylim(
+        {n: cum_mean[n] for n in cae_names},
+        {n: cum_se[n] for n in cae_names},
+    ))
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
+    _save_fig(fig, out, f"cae_{suffix}")
 
-    # (0,1) Median weekly CAE with IQR band
-    ax = axes[0, 1]
-    for name in names:
-        med = stats["median"][name]
-        p25 = stats["p25"][name]
-        p75 = stats["p75"][name]
-        line, = ax.plot(weeks, med, markers.get(name, "o-"), label=labels.get(name, name))
-        ax.fill_between(weeks, p25, p75, color=line.get_color(), alpha=0.12)
-    ax.set_xlabel("Week")
-    ax.set_ylabel("CAE (raw scale)")
-    ax.set_title(f"Median weekly CAE (band = IQR) — {kind}, raw scale")
-    ax.set_ylim(*CAE_YLIM)
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # (1,0) Average-over-time CAE: running cumulative mean
-    ax = axes[1, 0]
-    for name in names:
-        ax.plot(weeks, stats["cumavg"][name], markers.get(name, "o-"),
-                label=labels.get(name, name))
-    ax.set_xlabel("Week")
-    ax.set_ylabel("Cumulative-average CAE (raw scale)")
-    ax.set_title(f"Average-over-time CAE — {kind}, raw scale")
-    ax.set_ylim(*CAE_YLIM)
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # (1,1) Action probability (identical across CAE variants)
-    ax = axes[1, 1]
+    fig, ax = plt.subplots(figsize=(7.5, 5))
     for name in names:
         piA_all = all_piA[name]
         piA_mean = np.nanmean(piA_all[:, :, 1:, :, :], axis=(0, 1, 3, 4))
@@ -344,13 +418,10 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks)
     ax.set_xlabel("Week")
     ax.set_ylabel("Mean P(walking suggestion = 1)")
     ax.set_title("Action probability over time, aggregated")
+    ax.set_ylim(0.0, 1.0)
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(out / f"overview_{suffix}.png", dpi=150, bbox_inches="tight")
-    fig.savefig(out / f"overview_{suffix}.pdf", bbox_inches="tight")
-    plt.close(fig)
+    _save_fig(fig, out, f"action_prob_{suffix}")
 
 
 def make_gamma09_minus_never_plot(all_cae_full, kind, suffix, *, out, labels, weeks):
@@ -415,16 +486,17 @@ def make_gamma09_minus_never_plot(all_cae_full, kind, suffix, *, out, labels, we
     plt.close(fig)
 
 
-def _se_clustered_by_user(arr):
-    """SE of the grand mean, clustered by participant (axis 1)."""
-    per_user = np.nanmean(arr, axis=(0, 2))
-    n_eff = int(np.sum(~np.isnan(per_user)))
+def _se_clustered_by_user(arr, uids=None):
+    """SE of the grand mean of weekly CAE, clustered by experiment."""
+    del uids
+    per_exp = np.nanmean(arr, axis=(1, 2))
+    n_eff = int(np.sum(~np.isnan(per_exp)))
     if n_eff <= 1:
         return float("nan")
-    return float(np.nanstd(per_user, ddof=1) / np.sqrt(n_eff))
+    return float(np.nanstd(per_exp, ddof=1) / np.sqrt(n_eff))
 
 
-def write_summary(stats, kind, suffix, *, out):
+def write_summary(stats, kind, suffix, *, out, uids=None):
     """Raw-scale summary table for one CAE variant."""
     names = list(stats["all_cae"].keys())
     all_cae = stats["all_cae"]
@@ -439,8 +511,9 @@ def write_summary(stats, kind, suffix, *, out):
     lines.append("-" * sep_w)
     lines.append("".join([f"{'Mean CAE (all weeks)':>{col_w}}"] +
                  [f"{np.nanmean(all_cae[n]):>{col_w}.4f}" for n in names]))
-    lines.append("".join([f"{'SE CAE (clustered)':>{col_w}}"] +
-                 [f"{_se_clustered_by_user(all_cae[n]):>{col_w}.4f}" for n in names]))
+    lines.append("".join([f"{'SE CAE (across reps)':>{col_w}}"] +
+                 [f"{_se_clustered_by_user(all_cae[n], uids=uids):>{col_w}.4f}"
+                  for n in names]))
     lines.append("".join([f"{'Mean CAE (week 3+)':>{col_w}}"] +
                  [f"{np.nanmean(all_cae[n][..., 2:]):>{col_w}.4f}" for n in names]))
     lines.append("".join([f"{'Median CAE (all wks)':>{col_w}}"] +
@@ -494,6 +567,7 @@ def main() -> None:
     cfg = _load_config(run_dirs[0])
     algorithms = cfg["algorithms"]
     labels = cfg["labels"]
+    labels["rl_v7_base_g05"] = "RL base (\u03b3\u0304=0.5)"
     nweek = cfg["nweek"]
     params_dir = resolve_denorm_params_dir(
         cfg.get("params_dir"), cli_params_dir=args.params_dir
@@ -513,6 +587,7 @@ def main() -> None:
     all_cae_latent_full = {}   # raw-scale latent CAE incl. baseline
     all_cae_noisy_full = {}    # raw-scale realized CAE incl. baseline
     all_piA = {}
+    uid_parts = []
     latent_available = True    # set False if any run lacks the latent field
 
     for name in algorithms:
@@ -534,6 +609,11 @@ def main() -> None:
             else:
                 latent_available = False
             piA_parts.append(data["piA_runs"])                       # (1, n_users, W, 6, 2)
+            if name == algorithms[0] and "run_uids" in data.files:
+                u = np.asarray(data["run_uids"])
+                if u.ndim == 1:
+                    u = u.reshape(1, -1)
+                uid_parts.append(u)
 
         if not noisy_parts:
             print(f"No {name}.npz found in any run folder; skipping {name}")
@@ -544,6 +624,23 @@ def main() -> None:
             all_cae_latent_full[name] = np.concatenate(latent_parts, axis=0)
 
         print(name, "CAE shape:", all_cae_noisy_full[name].shape)
+
+    all_uids = np.concatenate(uid_parts, axis=0) if uid_parts else None
+    sample = next(iter(all_cae_noisy_full.values()), None)
+    n_exp = int(sample.shape[0]) if sample is not None else 0
+    print(
+        f"SE clustered by experiment: sd / sqrt(n_exp) with n_exp={n_exp} "
+        "(users averaged within each replicate)"
+    )
+    if all_uids is not None and sample is not None:
+        if all_uids.shape[:2] != sample.shape[:2]:
+            print(
+                f"WARNING: run_uids shape {all_uids.shape} does not match "
+                f"CAE {sample.shape}; pairing still uses aligned arrays."
+            )
+            all_uids = None
+        else:
+            print(f"Loaded {len(np.unique(all_uids))} unique user ids.")
 
     # Only keep algorithms that actually had data across the run folders.
     algorithms = [name for name in algorithms if name in all_cae_noisy_full]
@@ -556,20 +653,22 @@ def main() -> None:
             "Re-run experiment.py to record latent CAE."
         )
 
-    # ── Build both overviews (latent / no-noise and noisy / realized) ─────────
-    variants = [("noisy (realized)", "noisy", all_cae_noisy_full)]
-    if all_cae_latent_full:
-        variants.insert(0, ("latent (no noise)", "latent", all_cae_latent_full))
+    # Separate figures: cumulative CAE minus never-send, and weekly action
+    # probability. Latent CAE still gets a summary table when present.
+    noisy_stats = compute_stats(all_cae_noisy_full)
+    make_overview(
+        noisy_stats, "noisy (realized)", "noisy",
+        out=out, labels=labels, all_piA=all_piA, weeks=weeks, rl_weeks=rl_weeks,
+        uids=all_uids,
+    )
+    write_summary(
+        noisy_stats, "noisy (realized)", "noisy", out=out, uids=all_uids,
+    )
 
-    for kind, suffix, all_cae_full in variants:
-        stats = compute_stats(all_cae_full)
-        make_overview(
-            stats, kind, suffix,
-            out=out, labels=labels, all_piA=all_piA, weeks=weeks, rl_weeks=rl_weeks,
-        )
-        write_summary(stats, kind, suffix, out=out)
-        make_gamma09_minus_never_plot(
-            all_cae_full, kind, suffix, out=out, labels=labels, weeks=weeks,
+    if all_cae_latent_full:
+        latent_stats = compute_stats(all_cae_latent_full)
+        write_summary(
+            latent_stats, "latent (no noise)", "latent", out=out, uids=all_uids,
         )
 
     # Save aggregated arrays too (raw scale).

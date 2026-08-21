@@ -70,6 +70,7 @@ from vani_env import (
     EnvConfig,
     make_initial_state,
     PARAMS_DIR as DEFAULT_PARAMS_DIR,
+    trim_pf_cae_prior,
 )
 from agents import (
     MicroQueryAgent,
@@ -84,6 +85,8 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     WeekPacket,
     build_phi_action,
     build_phi_action_rewardshaping,
+    build_daily_mediator_phi,
+    build_redistribution_phi,
     build_phi_bottleneck,
     build_fourSC_features,
     build_antic_features,
@@ -1174,6 +1177,13 @@ P_RL_REWARDSHAPING = int(
 P_RL_BOTTLENECK = int(
     build_phi_bottleneck(0.0, 0.0, _DUMMY_RL_STATE).shape[0]
 )
+P_DAILY_MEDIATOR = {
+    name: int(build_daily_mediator_phi(
+        0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0, name).size)
+    for name in ("AA", "FW", "PJ")
+}
+P_REDISRIBUTION = int(build_redistribution_phi(
+    0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0, np.zeros(3)).size)
 
 
 def _refresh_phi_dims():
@@ -1190,10 +1200,11 @@ def _refresh_phi_dims():
     )
 
 # ── RL hyperparameters (shared) ──
-# Weekly discount used by micro-query agents. Algorithms below are registered
-# at gamma_bar=0.5 and gamma_bar=0.9 via functools.partial; the per-slot matrix
-# is built by _gamma_dt_micro (1 within week, gamma_bar on the terminal slot).
-GAMMA_BAR = 0.5
+# Weekly discount used by micro-query agents. V1--V6 are registered at
+# gamma_bar=0.9; V7 is the gamma_bar=0.5 sensitivity of the base. The
+# per-slot matrix is built by _gamma_dt_micro (1 within week, gamma_bar
+# on the terminal slot).
+GAMMA_BAR = 0.9
 TARGET_C     = 1
 # EPSILON_0 is defined in algorithm_helpers: RLSVI clips π to [ε, 1-ε],
 # and the always/never baselines send at those same bounds.
@@ -1268,6 +1279,26 @@ def _default_rl_priors(p_rl):
     return (np.zeros(p_rl),  np.eye(p_rl), 1.0)
 
 
+def _default_reward_redistribution_priors():
+    daily = {
+        name: {"mu_0": np.zeros(p), "Sigma_0": np.eye(p), "sigma2": 1.0}
+        for name, p in P_DAILY_MEDIATOR.items()
+    }
+    stage2 = {
+        name: {"mu_0": np.zeros(P_REDISRIBUTION),
+               "Sigma_0": np.eye(P_REDISRIBUTION), "sigma2": 1.0}
+        for name in ("v2", "v4")
+    }
+    return daily, stage2
+
+
+def _default_variant_q_priors():
+    return {
+        name: {"mu_0": np.zeros(P_RL_MICRO), "Sigma_0": np.eye(P_RL_MICRO), "sigma2": 1.0}
+        for name in ("g09", "v2", "v4")
+    }
+
+
 def _default_rl_joint_priors(p_eta, p_beta):
     """Fallback joint prior for the modified-TD-loss RLSVI agents.
 
@@ -1282,6 +1313,7 @@ def _default_rl_joint_priors(p_eta, p_beta):
 
 _PRIORS_CONFIGURED_DIR = None
 _priors_src = None
+_LOO_PRIOR_CACHE = {}
 
 
 def _load_priors(params_dir=None):
@@ -1305,7 +1337,9 @@ def _configure_priors(params_dir=None, *, force=False):
     global nu_0_Y, Gamma_0_Y, sigma2_Y
     global nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y
     global mu_0_micro, Sigma_0_micro, sigma2_rl_micro
+    global variant_q_priors
     global mu_0_reward, Sigma_0_reward, sigma2_reward
+    global daily_mediator_priors, redistribution_priors
     global mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint
     global sigma2_Q_mtd_joint, _P_MTD_JOINT
 
@@ -1327,9 +1361,11 @@ def _configure_priors(params_dir=None, *, force=False):
         Gamma_0_tilde_Y= _pf["Gamma_0_tilde_Y"]
         sigma2_tilde_Y = _pf["sigma2_tilde_Y"]
         mu_0_micro, Sigma_0_micro, sigma2_rl_micro = _default_rl_priors(P_RL_MICRO)
+        variant_q_priors = _default_variant_q_priors()
         mu_0_reward, Sigma_0_reward, sigma2_reward = _default_rl_priors(
             P_RL_REWARDSHAPING
         )
+        daily_mediator_priors, redistribution_priors = _default_reward_redistribution_priors()
         # Joint (alpha, beta) prior for the modified-TD-loss RLSVI agents.
         (mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint,
          sigma2_Q_mtd_joint) = _default_rl_joint_priors(
@@ -1350,9 +1386,22 @@ def _configure_priors(params_dir=None, *, force=False):
         mu_0_micro      = _priors["mu_0_micro"]
         Sigma_0_micro   = _priors["Sigma_0_micro"]
         sigma2_rl_micro = _priors["sigma2_rl_micro"]
+        variant_q_priors = _default_variant_q_priors()
+        if "q_no_td_modify_g09" in _priors:
+            variant_q_priors["g09"] = _priors["q_no_td_modify_g09"]
+        if "q_redistribution" in _priors:
+            variant_q_priors.update(_priors["q_redistribution"])
+        else:
+            _setup_log("[priors] variant-specific Q priors missing; V2/V4 and gamma=0.9 use zero/identity fallback (rerun est_prior.py).")
         mu_0_reward     = _priors["mu_0_reward"]
         Sigma_0_reward  = _priors["Sigma_0_reward"]
         sigma2_reward   = _priors["sigma2_reward"]
+        daily_mediator_priors, redistribution_priors = _default_reward_redistribution_priors()
+        if "daily_mediator_priors" in _priors and "redistribution_priors" in _priors:
+            daily_mediator_priors = _priors["daily_mediator_priors"]
+            redistribution_priors = _priors["redistribution_priors"]
+        else:
+            _setup_log("[priors] V2/V4 redistribution priors missing; using zero/identity fallback (rerun est_prior.py).")
         # Joint (alpha, beta) prior for the modified-TD-loss RLSVI agents.
         # Sigma_0 is the FULL joint covariance across users (not block-diagonal).
         # Falls back to the block-diagonal default if the older rl_priors.json
@@ -1389,6 +1438,15 @@ def _configure_priors(params_dir=None, *, force=False):
             "rl_priors.json for this feature map."
         )
     assert mu_0_reward.shape      == (P_RL_REWARDSHAPING,)
+    for name, prior in variant_q_priors.items():
+        assert prior["mu_0"].shape == (P_RL_MICRO,), f"{name} Q mean has wrong dimension"
+        assert prior["Sigma_0"].shape == (P_RL_MICRO, P_RL_MICRO), f"{name} Q covariance has wrong dimension"
+    for name, p in P_DAILY_MEDIATOR.items():
+        assert daily_mediator_priors[name]["mu_0"].shape == (p,)
+        assert daily_mediator_priors[name]["Sigma_0"].shape == (p, p)
+    for name in ("v2", "v4"):
+        assert redistribution_priors[name]["mu_0"].shape == (P_REDISRIBUTION,)
+        assert redistribution_priors[name]["Sigma_0"].shape == (P_REDISRIBUTION, P_REDISRIBUTION)
     _P_MTD_JOINT = P_RL_BOTTLENECK + P_RL_MICRO
     assert mu_0_mtd_joint.shape    == (_P_MTD_JOINT,), \
         f"joint mu_0 dim {mu_0_mtd_joint.shape} != ({_P_MTD_JOINT},)"
@@ -1408,6 +1466,95 @@ def _configure_priors(params_dir=None, *, force=False):
 
 def _ensure_priors_configured(params_dir=None):
     _configure_priors(params_dir=params_dir, force=False)
+
+
+def _apply_fitted_loo_priors(fitted, held_out_uid):
+    """Install an in-memory prior bundle fitted without ``held_out_uid``."""
+    global _priors_src
+    global nu_0_MY, Gamma_0_MY, sigma2_MY, nu_0_Y, Gamma_0_Y, sigma2_Y
+    global nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y
+    global mu_0_micro, Sigma_0_micro, sigma2_rl_micro, variant_q_priors
+    global mu_0_reward, Sigma_0_reward, sigma2_reward
+    global daily_mediator_priors, redistribution_priors
+    global mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint, sigma2_Q_mtd_joint
+
+    pf, rw, qn = fitted["pf"], fitted["reward"], fitted["q_no_td_modify"]
+    nu_0_MY = [np.asarray(pf["fourSC"]["nu_0"], dtype=float),
+               np.asarray(pf["antic"]["nu_0"], dtype=float)]
+    Gamma_0_MY = [np.asarray(pf["fourSC"]["Gamma_0"], dtype=float),
+                  np.asarray(pf["antic"]["Gamma_0"], dtype=float)]
+    sigma2_MY = [float(pf["fourSC"]["sigma2"]), float(pf["antic"]["sigma2"])]
+    nu_0_Y, Gamma_0_Y = trim_pf_cae_prior(
+        np.asarray(pf["CAE"]["nu_0"], dtype=float),
+        np.asarray(pf["CAE"]["Gamma_0"], dtype=float))
+    sigma2_Y = float(pf["CAE"]["sigma2"])
+    nu_0_tilde_Y = np.asarray(pf["CAE_short"]["nu_0"], dtype=float)
+    Gamma_0_tilde_Y = np.asarray(pf["CAE_short"]["Gamma_0"], dtype=float)
+    sigma2_tilde_Y = float(pf["CAE_short"]["sigma2"])
+    mu_0_reward = np.asarray(rw["mu_0"], dtype=float)
+    Sigma_0_reward = np.asarray(rw["Sigma_0"], dtype=float)
+    sigma2_reward = float(rw["sigma2"])
+    mu_0_micro = np.asarray(qn["mu_0"], dtype=float)
+    Sigma_0_micro = np.asarray(qn["Sigma_0"], dtype=float)
+    sigma2_rl_micro = float(qn["sigma2"])
+    variant_q_priors = {
+        "g09": fitted["q_no_td_modify_g09"],
+        **fitted["q_redistribution"],
+    }
+    for prior in variant_q_priors.values():
+        prior["mu_0"] = np.asarray(prior["mu_0"], dtype=float)
+        prior["Sigma_0"] = np.asarray(prior["Sigma_0"], dtype=float)
+        prior["sigma2"] = float(prior["sigma2"])
+    daily_mediator_priors = fitted["reward_redistribution"]["daily_mediators"]
+    redistribution_priors = fitted["reward_redistribution"]["redistribution"]
+    for prior in list(daily_mediator_priors.values()) + list(redistribution_priors.values()):
+        prior["mu_0"] = np.asarray(prior["mu_0"], dtype=float)
+        prior["Sigma_0"] = np.asarray(prior["Sigma_0"], dtype=float)
+        prior["sigma2"] = float(prior["sigma2"])
+    joint = fitted.get("q_td_modify_joint") or {}
+    mu_joint = joint.get("mu_0")
+    joint_ok = (
+        mu_joint is not None
+        and np.asarray(mu_joint, dtype=float).size > 0
+        and joint.get("Sigma_0") is not None
+        and joint.get("p_eta") is not None
+    )
+    if joint_ok:
+        mu_0_mtd_joint = np.asarray(mu_joint, dtype=float)
+        Sigma_0_mtd_joint = np.asarray(joint["Sigma_0"], dtype=float)
+        p_eta_mtd_joint = int(joint["p_eta"])
+        sigma2_Q_mtd_joint = float(joint.get("sigma2_Q", 1.0))
+    else:
+        _setup_log(
+            f"[priors] WARNING: LOO joint MTD prior missing or null for "
+            f"held-out user {int(held_out_uid)}; using default zero/identity "
+            "joint prior (not the previous user's)."
+        )
+        (mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint,
+         sigma2_Q_mtd_joint) = _default_rl_joint_priors(
+            P_RL_BOTTLENECK, P_RL_MICRO)
+    _priors_src = f"leave-one-out fit; held out participant {int(held_out_uid)}"
+
+
+def configure_leave_one_out_priors(held_out_uid, params_dir=None):
+    """Load a precomputed prior bundle fitted without one participant.
+
+    Fitting happens only through ``python est_prior.py --loo``.  The cache is
+    therefore read-only and avoids repeated FQI/PF work during experiments.
+    """
+    params_dir = resolve_params_dir(params_dir)
+    key = (str(params_dir), int(held_out_uid))
+    if key not in _LOO_PRIOR_CACHE:
+        path = params_dir / "loo_priors" / f"held_out_{int(held_out_uid)}.json"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"missing leave-one-out prior bundle for user {held_out_uid}: {path}. "
+                f"Generate it offline with ADAPR_EST_PRIOR_PARAMS_DIR={params_dir} "
+                "python est_prior.py --loo"
+            )
+        with open(path, encoding="utf-8") as f:
+            _LOO_PRIOR_CACHE[key] = json.load(f)
+    _apply_fitted_loo_priors(_LOO_PRIOR_CACHE[key], held_out_uid)
 
 
 _configure_priors()
@@ -1481,9 +1628,11 @@ def run_micro_query(uid, seed=42, gamma_bar=0.5, params_dir=None):
 
     week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
     dataset = EpisodeDataset(nweek)
+    q_prior = variant_q_priors["g09"] if float(gamma_bar) == 0.9 else {
+        "mu_0": mu_0_micro, "Sigma_0": Sigma_0_micro, "sigma2": sigma2_rl_micro}
     agent = MicroQueryAgent(
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
-        mu_0_rl=mu_0_micro, Sigma_0_rl=Sigma_0_micro, sigma2_rl=sigma2_rl_micro,
+        mu_0_rl=q_prior["mu_0"], Sigma_0_rl=q_prior["Sigma_0"], sigma2_rl=q_prior["sigma2"],
         gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
         target_update_C=TARGET_C,
         nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
@@ -1550,9 +1699,16 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
         engagement_rho = ENGAGEMENT_RHO
     if engagement_bonus is None:
         engagement_bonus = ENGAGEMENT_BONUS
+    if reward_design in variant_q_priors:
+        q_prior = variant_q_priors[reward_design]
+    elif float(gamma_bar) == 0.9:
+        q_prior = variant_q_priors["g09"]
+    else:
+        q_prior = {
+            "mu_0": mu_0_micro, "Sigma_0": Sigma_0_micro, "sigma2": sigma2_rl_micro}
     agent = MicroQueryRewardDesignAgent(
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
-        mu_0_rl=mu_0_micro, Sigma_0_rl=Sigma_0_micro, sigma2_rl=sigma2_rl_micro,
+        mu_0_rl=q_prior["mu_0"], Sigma_0_rl=q_prior["Sigma_0"], sigma2_rl=q_prior["sigma2"],
         gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
         target_update_C=TARGET_C,
         nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
@@ -1561,6 +1717,8 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
         sigma2_tilde_Y=sigma2_tilde_Y, Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed), reward_design=reward_design,
         engagement_bonus=engagement_bonus, engagement_rho=engagement_rho,
+        daily_mediator_priors=daily_mediator_priors,
+        redistribution_prior=redistribution_priors.get(reward_design),
     )
     return oenv.run_episode(agent, dataset, week0_actions=week0_actions, I_hist=I_hist), oenv
 
@@ -1666,13 +1824,13 @@ def run_random_send(uid, seed=42, params_dir=None):
 # Algorithm registry: exactly the seven RL variants in the experiment plan,
 # followed by the three fixed-policy baselines.
 ALGORITHMS = {
-    "rl_v1_base_g05": (partial(run_micro_query, gamma_bar=0.5), "RL base (γ̄=0.5)"),
-    "rl_v2_mtd_g05": (partial(run_micro_query_mtd, gamma_bar=0.5), "RL + bottleneck TD (γ̄=0.5)"),
-    "rl_v3_biased_weekly": (partial(run_micro_query_reward_design, reward_design="v1"), "RL V1: biased weekly reward"),
-    "rl_v4_biased_redistributed": (partial(run_micro_query_reward_design, reward_design="v2"), "RL V2: biased redistributed reward"),
-    "rl_v5_invariant_weekly": (partial(run_micro_query_reward_design, reward_design="v3"), "RL V3: return-invariant weekly reward"),
-    "rl_v6_invariant_redistributed": (partial(run_micro_query_reward_design, reward_design="v4"), "RL V4: return-invariant redistributed reward"),
-    "rl_v7_base_g09": (partial(run_micro_query, gamma_bar=0.9), "RL base (γ̄=0.9 sensitivity)"),
+    "rl_v1_base_g09": (partial(run_micro_query, gamma_bar=0.9), "RL base (γ̄=0.9)"),
+    "rl_v2_mtd_g09": (partial(run_micro_query_mtd, gamma_bar=0.9), "RL + bottleneck TD (γ̄=0.9)"),
+    "rl_v3_biased_weekly": (partial(run_micro_query_reward_design, reward_design="v1", gamma_bar=0.9), "RL V1: biased weekly reward (γ̄=0.9)"),
+    "rl_v4_biased_redistributed": (partial(run_micro_query_reward_design, reward_design="v2", gamma_bar=0.9), "RL V2: biased redistributed reward (γ̄=0.9)"),
+    "rl_v5_invariant_weekly": (partial(run_micro_query_reward_design, reward_design="v3", gamma_bar=0.9), "RL V3: return-invariant weekly reward (γ̄=0.9)"),
+    "rl_v6_invariant_redistributed": (partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9), "RL V4: return-invariant redistributed reward (γ̄=0.9)"),
+    "rl_v7_base_g05": (partial(run_micro_query, gamma_bar=0.5), "RL base (γ̄=0.5 sensitivity)"),
     "never_send":   (run_never_send,  "Never send (π_A=0.1)"),
     "always_send":  (run_always_send, "Always send (π_A=0.9)"),
     "random_send":  (run_random_send, "Random send (π_A=0.5)"),
@@ -1803,6 +1961,15 @@ if __name__ == "__main__":
             "Default: RESULTS_ROOT env, else results_vanilla."
         ),
     )
+    parser.add_argument(
+        "--prior-mode",
+        choices=["loo", "saved"],
+        default=os.getenv("ADAPR_PRIOR_MODE", "loo"),
+        help=(
+            "loo (default): refit a warm-start prior bundle excluding each drawn "
+            "participant; saved: use the folder's shared rl_priors.json."
+        ),
+    )
     args = parser.parse_args()
 
     include_action_c = ACTION_BLOCK_INCLUDE_C and (not args.no_action_c)
@@ -1816,6 +1983,7 @@ if __name__ == "__main__":
     params_dir = resolve_params_dir(args.params_dir)
     _configure_priors(params_dir=params_dir, force=True)
     print(f"Using parameter directory: {params_dir}")
+    print(f"Prior mode: {args.prior_mode}")
 
     if args.engagement_rho is not None:
         ENGAGEMENT_RHO = float(args.engagement_rho)
@@ -1897,6 +2065,8 @@ if __name__ == "__main__":
 
         for draw_idx, uid in enumerate(sampled_uids):
             uid = int(uid)
+            if args.prior_mode == "loo":
+                configure_leave_one_out_priors(uid, params_dir=params_dir)
             draw_seed = _episode_seed(seed, draw_idx)
             print(
                 f"  Experiment {exp_idx}, draw {draw_idx + 1}/{n_users}, "
@@ -1992,6 +2162,8 @@ if __name__ == "__main__":
             "trajectory_reference_algo": TRAJECTORY_REFERENCE_ALGO,
             "params_dir":      str(params_dir),
             "priors_source":   _priors_src,
+            "prior_mode":      args.prior_mode,
+            "loo_prior_cache_size": len(_LOO_PRIOR_CACHE) if args.prior_mode == "loo" else 0,
             "action_block_include_c": include_action_c,
             "p_rl_micro":      P_RL_MICRO,
             "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID"),

@@ -26,7 +26,8 @@ class MicroQueryRewardDesignAgent:
     ``b̂_{w+1} + F``.  V2 leaves the biased return uncorrected.
     """
     def __init__(self, *args, reward_design, engagement_bonus=None,
-                 engagement_rho=0.5, **kwargs):
+                 engagement_rho=0.5, daily_mediator_priors=None,
+                 redistribution_prior=None, **kwargs):
         # Keep the constructor compatible with MicroQueryAgent's parameters.
         names = [
             "W", "J", "B", "epsilon_0", "mu_0_rl", "Sigma_0_rl", "sigma2_rl",
@@ -46,6 +47,8 @@ class MicroQueryRewardDesignAgent:
             self.engagement_rho if self._fixed_lambda is None
             else self._fixed_lambda
         )
+        self.daily_mediator_priors = daily_mediator_priors or {}
+        self.redistribution_prior = redistribution_prior or {}
         self.rng = np.random.default_rng() if self.rng is None else self.rng
         self.dataset = None
 
@@ -129,7 +132,8 @@ class MicroQueryRewardDesignAgent:
         if self.reward_design in {"v2", "v4"}:
             daily = fit_daily_mediator_decomposition(
                 k, self.dataset.A_hist, self.b_hat_hist, self.b_tilde_hist,
-                self.get_state, self.get_full_mediators)
+                self.get_state, self.get_full_mediators,
+                priors=self.daily_mediator_priors)
             self.daily_eta_store[k] = daily
             rows, y = [], []
             for kp in range(k):
@@ -141,8 +145,13 @@ class MicroQueryRewardDesignAgent:
                 y.append(self._week_return_target(kp))
             X = np.asarray(rows, dtype=float)
             p = X.shape[1]
+            mu = np.asarray(self.redistribution_prior.get("mu_0", np.zeros(p)), dtype=float)
+            Sigma = np.asarray(self.redistribution_prior.get("Sigma_0", np.eye(p)), dtype=float)
+            sigma2 = float(self.redistribution_prior.get("sigma2", 1.0))
+            if mu.shape != (p,) or Sigma.shape != (p, p) or sigma2 <= 0:
+                raise ValueError("invalid Stage-2 redistribution prior")
             self.eta_store[k], _ = compute_reward_shaping_eta(
-                X, np.asarray(y, dtype=float), np.zeros(p), np.eye(p), 1.0)
+                X, np.asarray(y, dtype=float), mu, Sigma, sigma2)
         self._current_betas_day1 = self.betas_store.get(k - 1, self.betas_store[0])
         self._current_betas_rest = None
 

@@ -12,8 +12,12 @@
 # Fitted environment folder under the repo root. Switch later, e.g.:
 #   ENV_VARIANT=env_para_ste0.5 sbatch run_array.sh
 ENV_VARIANT="${ENV_VARIANT:-env_para_vanilla}"
-# 0 = zero/identity PF+RLSVI priors ("default_prior").
-# 1 = load ${ENV_VARIANT}/rl_priors.json.
+# saved = shared ${ENV_VARIANT}/rl_priors.json, or zeros if USE_ESTIMATED_PRIORS=0.
+# loo   = ${ENV_VARIANT}/loo_priors/held_out_<uid>.json (python est_prior.py --loo first).
+# Keep saved as the cluster default so USE_ESTIMATED_PRIORS=0 still means zeros.
+PRIOR_MODE="${PRIOR_MODE:-saved}"
+# 0 = zero/identity PF+RLSVI priors. Ignored when PRIOR_MODE=loo (those files
+# are estimated). 1 = load ${ENV_VARIANT}/rl_priors.json (PRIOR_MODE=saved).
 USE_ESTIMATED_PRIORS="${USE_ESTIMATED_PRIORS:-0}"
 # 1 = Q action block includes C (default). 0 = A*[1, E, b̂, b̃] only.
 ACTION_BLOCK_C="${ACTION_BLOCK_C:-1}"
@@ -26,16 +30,39 @@ mamba activate budgeted
 export ADAPR_PROJECT_ROOT="$SLURM_SUBMIT_DIR"
 export ADAPR_PARAMS_DIR="$ENV_VARIANT"
 export ADAPR_EXPERIMENT_PARAMS_DIR="${SLURM_SUBMIT_DIR}/${ENV_VARIANT}"
+export ADAPR_PRIOR_MODE="${PRIOR_MODE}"
 export USE_ESTIMATED_PRIORS
 export ACTION_BLOCK_C
 export SAVE_MODE=compact
+
+if [ "${PRIOR_MODE}" != "saved" ] && [ "${PRIOR_MODE}" != "loo" ]; then
+  echo "PRIOR_MODE must be saved or loo (got ${PRIOR_MODE})" >&2
+  exit 1
+fi
+if [ "${PRIOR_MODE}" = "loo" ]; then
+  LOO_DIR="${ADAPR_EXPERIMENT_PARAMS_DIR}/loo_priors"
+  if [ ! -d "${LOO_DIR}" ] || ! ls "${LOO_DIR}"/held_out_*.json >/dev/null 2>&1; then
+    echo "PRIOR_MODE=loo requires leave-one-out prior files in ${LOO_DIR}." >&2
+    echo "Generate them first:" >&2
+    echo "  ADAPR_EST_PRIOR_PARAMS_DIR=${ADAPR_EXPERIMENT_PARAMS_DIR} python est_prior.py --loo" >&2
+    exit 1
+  fi
+  if [ "${USE_ESTIMATED_PRIORS}" = "0" ]; then
+    echo "WARNING: PRIOR_MODE=loo loads estimated per-user priors; USE_ESTIMATED_PRIORS=0 is ignored."
+  fi
+fi
+
 # Keep result folders per environment (vanilla, ste0.5, ...).
 # Override with RESULTS_ROOT=... ; if unset and ACTION_BLOCK_C=0, suffix
 # _no_action_c so this batch does not mix with the default runs.
+# PRIOR_MODE=loo gets _loo so it does not mix with saved/zero-prior batches.
 if [ -z "${RESULTS_ROOT:-}" ]; then
   RESULTS_ROOT="${SLURM_SUBMIT_DIR}/results_${ENV_VARIANT#env_para_}"
   if [ "${ACTION_BLOCK_C}" = "0" ]; then
     RESULTS_ROOT="${RESULTS_ROOT}_no_action_c"
+  fi
+  if [ "${PRIOR_MODE}" = "loo" ]; then
+    RESULTS_ROOT="${RESULTS_ROOT}_loo"
   fi
 fi
 export RESULTS_ROOT
@@ -47,6 +74,7 @@ export NUMEXPR_NUM_THREADS=1
 
 echo "ENV_VARIANT=${ENV_VARIANT}"
 echo "PARAMS_DIR=${ADAPR_EXPERIMENT_PARAMS_DIR}"
+echo "PRIOR_MODE=${PRIOR_MODE}"
 echo "USE_ESTIMATED_PRIORS=${USE_ESTIMATED_PRIORS}"
 echo "ACTION_BLOCK_C=${ACTION_BLOCK_C}"
 echo "RESULTS_ROOT=${RESULTS_ROOT}"
@@ -61,6 +89,7 @@ fi
 python experiment.py \
   --seed-idx "$SLURM_ARRAY_TASK_ID" \
   --params-dir "$ADAPR_EXPERIMENT_PARAMS_DIR" \
+  --prior-mode "$PRIOR_MODE" \
   --save-mode compact \
   --results-root "$RESULTS_ROOT" \
   "${EXTRA_ARGS[@]}"

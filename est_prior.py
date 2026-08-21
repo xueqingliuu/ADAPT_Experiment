@@ -29,40 +29,32 @@ PF mediator m=1 (antic)         -> nu_0_MY[1], Gamma_0_MY[1], sigma2_MY[1]
 PF outcome  Y  (CAE)            -> nu_0_Y, Gamma_0_Y, sigma2_Y
 PF outcome  tY (CAE_short)      -> nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y
 
-PF features differ from the env generative model in three respects (see
-``experiment.py`` ``get_pf_data``):
-  1. fourSC / antic regressions *and* the CAE EWMA summaries are restricted
-     to RL-controlled rows (Mon–Sat only — 12 slots / 6 days per week;
-     Sunday is dropped). The PF CAE transition also omits ``week``; the env
-     generative CAE model still uses 14 / 7 and includes ``week``.
-  2. The fourSC PF model includes the ``stepCountNext4HourLag1`` AR-1
-     main effect (no action interaction), and omits pageview-EMA,
-     anticipated-affect, and 7-day Fitbit-wear predictors (and their
-     action interactions). Weekend and AM/PM are main effects only.
-     The antic PF model drops walking-suggestion interactions with
-     weekend and 7-day active fraction; ``anticipated_affect_yesterday``
-     is cleared at Monday.
-  3. ``caeAverageLastWeek`` (in fourSC/antic/CAE) and ``perceivedUtilityLastWeek``
-     (in fourSC/antic) are substituted at runtime with per-particle
-     belief / agent E_w. This is a feature-substitution mechanism and does
-     not change the population parameter being estimated, so the
-     regressions here use the actual observed values from df_fit.
-RL reward shaping               -> mu_0_reward, Sigma_0_reward, sigma2_reward
+
+RL reward shaping （biased)              -> mu_0_reward, Sigma_0_reward, sigma2_reward
    (build_phi_action_rewardshaping;
     sum_{d,t} Delta_{d,t} psi on
     Delta_{6,2} * Y_w + gamma_bar * E_{w+1})
+
+RL reward shaping （unbiased)              -> mu_0_reward_unbiased, Sigma_0_reward_unbiased, sigma2_reward_unbiased
+
+RL redistribution, Stage 1 (AA/FW/PJ)    -> reward_redistribution.daily_mediators
+RL redistribution, Stage 2 (V2/V4)       -> reward_redistribution.redistribution
+   (the active two-stage models in ``MicroQueryRewardDesignAgent``)
+
 RL Q (no TD modify, beta)       -> mu_0_micro, Sigma_0_micro, sigma2_rl_micro
-   (build_phi_action, fitted Q
-    bootstrapping next-week Q;
-    used by micro_g05 / micro_g09 / rs_g05 / rs_g09)
+   (gamma_terminal=0.5; V7 base sensitivity)
+   q_no_td_modify_g09              (gamma_terminal=0.9; V1/V3/V5)
 
 RL Q joint (eta, beta) for      -> mu_0_micro_mtd_joint,
    modified-TD-loss RLSVI          Sigma_0_micro_mtd_joint (FULL cov),
    (direct joint fit of the         p_eta_micro_mtd_joint,
     stacked bottleneck-state        sigma2_Q_mtd_joint
-    TD loss; Sigma = full cov
-    of per-user theta=(eta,beta))
-   Used by mtd_g05 / mtd_g09 / rs_mtd_g05 / rs_mtd_g09 in experiment.py.
+    TD loss at GAMMA_BAR=0.9)
+   Used by rl_v2_mtd_g09.
+
+RL Q redistribution V2/V4       -> q_redistribution (FQI at GAMMA_BAR=0.9)
+Stage-2 V4 potential F          -> reward_redistribution.redistribution.v4
+   (y = Y + GAMMA_BAR E_{w+1} - E_w; Stage-1 and V2 Stage-2 have no γ̄)
 
 The no-TD-modify Q prior is fit by fitted-Q iteration (FQI):
 
@@ -72,16 +64,13 @@ The no-TD-modify Q prior is fit by fitted-Q iteration (FQI):
 The modified-TD prior is fit by direct joint FQI on the stacked
 bottleneck-state TD loss for ``theta=(eta,beta)``.
 
-with ``R_{k+1} = caeAverage_norm`` of week k and
-``s_{1,1}^{k+1}`` the start-of-week state in df_fit week k+1.  The last
-training week has no successor and is dropped.
-
 Output is written to ``env_para_vanilla/rl_priors.json``; see
 ``load_estimated_priors`` for reading it back into experiment.py.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -104,6 +93,8 @@ from algorithm_helpers import (
     _cumulative_discount,
     build_phi_action,
     build_phi_action_rewardshaping,
+    build_daily_mediator_phi,
+    build_redistribution_phi,
     build_phi_bottleneck,
     build_rl_context_vector,
 )
@@ -126,7 +117,12 @@ COMBINED_DIR = Path(
         "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing",
     )
 ).expanduser().resolve()
-WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
+# Select the parameter set whose ``df_fit_11week.csv`` is used and whose
+# priors are overwritten.  This is essential for tuned STE folders: their
+# rewards/engagement scales need their own V2/V4 priors.
+WORK_DIR = Path(os.getenv(
+    "ADAPR_EST_PRIOR_PARAMS_DIR", str(PROJECT_ROOT / "env_para_vanilla")
+)).expanduser().resolve()
 OUTPUT_PATH = WORK_DIR / "rl_priors.json"
 REWARD_PRIOR_PATH = WORK_DIR / "reward_shaping_prior.json"
 RL_Q_PRIOR_PATH = WORK_DIR / "rl_q_priors.json"
@@ -139,6 +135,7 @@ JOINT_SUMMARY_PATH = WORK_DIR / "prior_summary_joint.csv"
 POOLED_PF_REGRESSION_PATH = WORK_DIR / "prior_summary_pooled_pf_regression.csv"
 POOLED_PF_GEE_PATH = WORK_DIR / "prior_summary_pooled_pf_gee.csv"
 POOLED_RL_Q_PATH = WORK_DIR / "prior_summary_pooled_rl_q.csv"
+LOO_PRIOR_DIR = WORK_DIR / "loo_priors"
 GEE_WORKING_CORR = "exchangeable"
 MIN_FEATURE_STD = 1e-12
 
@@ -150,7 +147,8 @@ N_RL_SLOTS_WEEK = SLOTS_PER_DAY * DAYS_PER_WEEK_RL  # 12
 
 # RL hyperparameters (must match experiment._gamma_dt_micro): discount 1 on
 # non-terminal slots; weekly ``GAMMA_BAR`` only on the terminal slot.
-GAMMA_BAR = 0.5
+# Default 0.9 matches V1--V6; V7's Q prior is fit with gamma_terminal=0.5.
+GAMMA_BAR = 0.9
 GAMMA_DT = np.ones((DAYS_PER_WEEK_RL, SLOTS_PER_DAY), dtype=float)
 GAMMA_DT[DAYS_PER_WEEK_RL - 1, SLOTS_PER_DAY - 1] = GAMMA_BAR
 GAMMA_TERMINAL = float(GAMMA_DT[DAYS_PER_WEEK_RL - 1, SLOTS_PER_DAY - 1])
@@ -201,22 +199,30 @@ def _filter_users_with_cae_obs(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _default_df_fit_path() -> Path:
+    """Prefer the params-dir 11-week file so priors match the simulated cohort.
+
+    ``COMBINED_DIR/df_fit.csv`` is only a fallback (larger RCT extract).
+    """
     candidates = [
-        COMBINED_DIR / "df_fit.csv",
         WORK_DIR / "df_fit_11week.csv",
+        COMBINED_DIR / "df_fit.csv",
     ]
     for p in candidates:
         if p.is_file():
             return p
     searched = "\n  ".join(str(p) for p in candidates)
     raise FileNotFoundError(
-        "Could not find df_fit input. Set ADAPR_COMBINED_DIR or pass a path. "
+        "Could not find df_fit input. Set ADAPR_EST_PRIOR_PARAMS_DIR to a "
+        "folder with df_fit_11week.csv, or set ADAPR_COMBINED_DIR. "
         f"Searched:\n  {searched}"
     )
 
 
 def load_df_fit(path: Optional[Path] = None) -> pd.DataFrame:
     p = Path(path).expanduser().resolve() if path is not None else _default_df_fit_path()
+    if not p.is_file():
+        raise FileNotFoundError(f"df_fit not found: {p}")
+    print(f"Loading df_fit from {p}", flush=True)
     return _filter_users_with_cae_obs(_week_fix_and_filter(pd.read_csv(p)))
 
 
@@ -1063,6 +1069,187 @@ def fit_reward_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────────
+# 3b. Priors for V2/V4 two-stage reward redistribution
+# ──────────────────────────────────────────────────────────────────
+_DAILY_MEDIATORS = {"AA": ("M_Y_week", 2), "FW": ("M_E_week", 2), "PJ": ("M_E_week", 3)}
+
+
+def _phi_daily_mediator(td: Dict[str, np.ndarray], k: int, rl_idx: int,
+                        mediator: str) -> np.ndarray:
+    d, t = divmod(rl_idx, SLOTS_PER_DAY)
+    return build_daily_mediator_phi(
+        float(td["b_hat_slot"][k, rl_idx]), 0.0, _slot_state(td, k, rl_idx),
+        d, t, int(td["A_slot"][k, rl_idx]), mediator=mediator,
+    )
+
+
+def _daily_mediator_design(td: Dict[str, np.ndarray], mediator: str):
+    """Daily sum-of-two-slots design used by the online Stage-1 fit."""
+    matrix_name, col = _DAILY_MEDIATORS[mediator]
+    rows, targets = [], []
+    for k in range(td["n_w"]):
+        for d in range(DAYS_PER_WEEK_RL):
+            i0 = d * SLOTS_PER_DAY
+            rows.append(_phi_daily_mediator(td, k, i0, mediator) +
+                        _phi_daily_mediator(td, k, i0 + 1, mediator))
+            targets.append(float(td[matrix_name][k, d, col]))
+    p = _phi_daily_mediator(td, 0, 0, mediator).size
+    return (np.asarray(rows, dtype=float) if rows else np.empty((0, p)),
+            np.asarray(targets, dtype=float))
+
+
+def _daily_eta_for_tensor(td: Dict[str, np.ndarray], mediator: str) -> np.ndarray:
+    X, y = _daily_mediator_design(td, mediator)
+    return _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)[0]
+
+
+def _redistribution_week_phi(td: Dict[str, np.ndarray], k: int,
+                             daily_etas: Dict[str, np.ndarray]) -> np.ndarray:
+    """Un-discounted weekly Stage-2 row, matching V2/V4 runtime code."""
+    full = (td["M_Y_week"][k], td["M_E_week"][k])
+    out = None
+    for rl_idx in range(N_RL_SLOTS_WEEK):
+        d, t = divmod(rl_idx, SLOTS_PER_DAY)
+        state = _slot_state(td, k, rl_idx)
+        action = int(td["A_slot"][k, rl_idx])
+        shares = np.array([
+            _phi_daily_mediator(td, k, rl_idx, name) @ daily_etas[name]
+            for name in ("AA", "FW", "PJ")
+        ])
+        phi = build_redistribution_phi(
+            float(td["b_hat_slot"][k, rl_idx]), 0.0, state, d, t, action,
+            shares, full_mediators=full,
+        )
+        out = phi.copy() if out is None else out + phi
+    return out
+
+
+def _v2_lambda(reward: np.ndarray, engagement_next: np.ndarray,
+               rho: float = 0.5) -> float:
+    """Offline counterpart of V2's scale-matched engagement coefficient."""
+    if reward.size < 2 or engagement_next.size < 2:
+        return float(rho)
+    sd_y = float(np.std(reward, ddof=1))
+    sd_e = float(np.std(engagement_next, ddof=1))
+    if not np.isfinite(sd_y) or not np.isfinite(sd_e) or sd_e <= 1e-8:
+        return float(rho)
+    return float(rho * sd_y / sd_e)
+
+
+def fit_reward_redistribution_priors(
+    df_fit: pd.DataFrame, *, gamma_bar: float = GAMMA_BAR,
+) -> Dict[str, Any]:
+    """Estimate empirical-Bayes priors used only by redistributed V2/V4.
+
+    Stage 1 fits separate AA/FW/PJ daily regressions with the *daily sum* of
+    the two action-time features.  Stage 2 then uses the resulting predicted
+    shares in its weekly summed redistribution feature.  Pooled Stage-2 rows
+    use pooled Stage-1 coefficients; per-user Stage-2 rows use that user's
+    Stage-1 coefficients.  This mirrors the intended hierarchical prior and
+    avoids substituting observed daily mediators for their decomposed shares.
+    """
+    tensors = [
+        _user_weekly_tensors(dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True))
+        for _uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False)
+    ]
+    tensors = [td for td in tensors if td["n_w"] >= 2]
+    if not tensors:
+        raise ValueError(
+            "Need at least one participant with two complete weeks to fit "
+            "V2/V4 reward-redistribution priors."
+        )
+    daily = {}
+    pooled_daily_eta = {}
+    user_daily_eta: list[Dict[str, np.ndarray]] = []
+    for mediator in _DAILY_MEDIATORS:
+        user_fits, user_s2, X_all, y_all = [], [], [], []
+        for td in tensors:
+            X, y = _daily_mediator_design(td, mediator)
+            theta, s2 = _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)
+            user_fits.append(theta); user_s2.append(s2); X_all.append(X); y_all.append(y)
+        pooled, _ = _ridge_fit(np.vstack(X_all), np.concatenate(y_all), alpha=RIDGE_ALPHA_RL)
+        mu, Sigma, sigma2 = _pool_user_fits(pooled, user_fits, user_s2)
+        daily[mediator] = {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
+        pooled_daily_eta[mediator] = pooled
+    for td in tensors:
+        user_daily_eta.append({name: _daily_eta_for_tensor(td, name)
+                               for name in _DAILY_MEDIATORS})
+
+    stage2 = {}
+    for variant in ("v2", "v4"):
+        user_fits, user_s2, X_all, y_all = [], [], [], []
+        for td, eta_user in zip(tensors, user_daily_eta):
+            n = td["n_w"] - 1  # V2/V4 targets require E_{w+1}.
+            X_user = np.stack([_redistribution_week_phi(td, k, eta_user) for k in range(n)])
+            y_base = td["R_week"][:n]
+            e_now, e_next = td["E_w_start"][:n], td["E_w_start"][1:n + 1]
+            if variant == "v2":
+                y_user = y_base + _v2_lambda(y_base, e_next) * e_next
+            else:
+                y_user = y_base + float(gamma_bar) * e_next - e_now
+            theta, s2 = _ridge_fit(X_user, y_user, alpha=RIDGE_ALPHA_RL)
+            user_fits.append(theta); user_s2.append(s2)
+            X_all.append(np.stack([_redistribution_week_phi(td, k, pooled_daily_eta)
+                                    for k in range(n)]))
+            y_all.append(y_user)
+        pooled, _ = _ridge_fit(np.vstack(X_all), np.concatenate(y_all), alpha=RIDGE_ALPHA_RL)
+        mu, Sigma, sigma2 = _pool_user_fits(pooled, user_fits, user_s2)
+        stage2[variant] = {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
+    return {"daily_mediators": daily, "redistribution": stage2}
+
+
+def _fit_redistribution_coefficients(
+    td: Dict[str, np.ndarray], variant: str, *, gamma_bar: float = GAMMA_BAR,
+):
+    """Plug-in Stage-1/2 fits used to construct a variant-matched FQI target."""
+    daily = {name: _daily_eta_for_tensor(td, name) for name in _DAILY_MEDIATORS}
+    n = td["n_w"] - 1
+    X = np.stack([_redistribution_week_phi(td, k, daily) for k in range(n)])
+    y_base = td["R_week"][:n]
+    e_now, e_next = td["E_w_start"][:n], td["E_w_start"][1:n + 1]
+    if variant == "v2":
+        y = y_base + _v2_lambda(y_base, e_next) * e_next
+    elif variant == "v4":
+        y = y_base + float(gamma_bar) * e_next - e_now
+    else:
+        raise ValueError(f"unknown redistribution variant {variant!r}")
+    eta, _ = _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)
+    return daily, eta, y
+
+
+def _attach_redistributed_rewards(feats: Dict[str, Any], td: Dict[str, np.ndarray],
+                                  variant: str,
+                                  daily: Dict[str, np.ndarray], eta: np.ndarray,
+                                  week_targets: np.ndarray) -> Dict[str, Any]:
+    """Attach the exact per-slot V2/V4 rewards to a precomputed FQI payload."""
+    out = dict(feats)
+    rewards = np.empty((feats["n_train"], N_RL_SLOTS_WEEK), dtype=float)
+    for k in range(feats["n_train"]):
+        phi_slots = np.stack([_redistribution_week_phi_slot(td, k, i, daily)
+                              for i in range(N_RL_SLOTS_WEEK)])
+        rewards[k] = phi_slots @ eta
+        if variant == "v4":
+            rewards[k, -1] += float(week_targets[k] - rewards[k].sum())
+    out["rewards"] = rewards
+    return out
+
+
+def _redistribution_week_phi_slot(td: Dict[str, np.ndarray], k: int, rl_idx: int,
+                                  daily_etas: Dict[str, np.ndarray]) -> np.ndarray:
+    d, t = divmod(rl_idx, SLOTS_PER_DAY)
+    state = _slot_state(td, k, rl_idx)
+    shares = np.array([
+        _phi_daily_mediator(td, k, rl_idx, name) @ daily_etas[name]
+        for name in ("AA", "FW", "PJ")
+    ])
+    return build_redistribution_phi(
+        float(td["b_hat_slot"][k, rl_idx]), 0.0, state, d, t,
+        int(td["A_slot"][k, rl_idx]), shares,
+        full_mediators=(td["M_Y_week"][k], td["M_E_week"][k]),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
 # 5. Fitted-Q priors (with and without TD-modify)
 # ──────────────────────────────────────────────────────────────────
 def _precompute_q_features(
@@ -1134,6 +1321,7 @@ def _fqi_iterate(
     *,
     user_ids: Optional[List[int]] = None,
     return_design: bool = False,
+    gamma_terminal: float = GAMMA_TERMINAL,
 ) -> Tuple[
     Optional[np.ndarray],
     Optional[float],
@@ -1180,11 +1368,13 @@ def _fqi_iterate(
             targets = np.zeros((n_train, N_RL_SLOTS_WEEK))
             for k in range(n_train):
                 for idx in range(N_RL_SLOTS_WEEK):
+                    reward = (float(f["rewards"][k, idx])
+                              if "rewards" in f else 0.0)
                     if idx < N_RL_SLOTS_WEEK - 1:
                         q0 = f["phi_a0"][k, idx + 1] @ theta
                         q1 = f["phi_a1"][k, idx + 1] @ theta
                         # Non-terminal within-week discount is 1.
-                        targets[k, idx] = float(max(q0, q1))
+                        targets[k, idx] = reward + float(max(q0, q1))
                     else:
                         if use_td_modify and alpha_for_boot is not None:
                             boot = float(f["phi_next_bot"][k] @ alpha_for_boot)
@@ -1192,7 +1382,9 @@ def _fqi_iterate(
                             q0 = f["phi_next_a0"][k] @ theta
                             q1 = f["phi_next_a1"][k] @ theta
                             boot = float(max(q0, q1))
-                        targets[k, idx] = f["R"][k] + GAMMA_TERMINAL * boot
+                        if "rewards" not in f:
+                            reward = float(f["R"][k])
+                        targets[k, idx] = reward + gamma_terminal * boot
             chunks.append(targets.reshape(-1))
         y_all = np.concatenate(chunks)
         theta_new, _ = _ridge_fit(X_all, y_all, alpha=RIDGE_ALPHA_RL)
@@ -1214,6 +1406,8 @@ def _fqi_iterate(
 def _mtd_joint_design(
     feats_list: List[Dict[str, Any]],
     beta_for_targets: np.ndarray,
+    *,
+    gamma_terminal: float = GAMMA_TERMINAL,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """Stack the three bottleneck-state TD loss blocks for theta=(alpha,beta)."""
     if not feats_list:
@@ -1257,7 +1451,7 @@ def _mtd_joint_design(
 
         # Block C: terminal row with next-week bottleneck bootstrap in design.
         X_C = np.zeros((n_train, p))
-        X_C[:, :p_eta] = -GAMMA_TERMINAL * feats["phi_next_bot"]
+        X_C[:, :p_eta] = -float(gamma_terminal) * feats["phi_next_bot"]
         X_C[:, p_eta:] = feats["phi_obs"][:, N_RL_SLOTS_WEEK - 1, :]
         y_C = feats["R"]
 
@@ -1270,6 +1464,8 @@ def _mtd_joint_design(
 def _joint_fqi_iterate(
     feats_list: List[Dict[str, Any]],
     n_iters: int = N_FQI_ITERS,
+    *,
+    gamma_terminal: float = GAMMA_TERMINAL,
 ) -> Tuple[Optional[np.ndarray], Optional[float], Optional[int]]:
     """Directly fit theta=(alpha,beta) under the bottleneck-state TD loss."""
     if not feats_list:
@@ -1281,7 +1477,8 @@ def _joint_fqi_iterate(
     sigma2 = None
 
     for _ in range(n_iters):
-        X, y, p_eta = _mtd_joint_design(feats_list, theta[p_eta:])
+        X, y, p_eta = _mtd_joint_design(
+            feats_list, theta[p_eta:], gamma_terminal=gamma_terminal)
         theta_new, sigma2 = _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)
         if theta_new is None:
             return None, None, None
@@ -1292,14 +1489,15 @@ def _joint_fqi_iterate(
             break
         theta = theta_new
 
-    X, y, _ = _mtd_joint_design(feats_list, theta[p_eta:])
+    X, y, _ = _mtd_joint_design(
+        feats_list, theta[p_eta:], gamma_terminal=gamma_terminal)
     resid = y - X @ theta
     sigma2 = (max(float(np.var(resid, ddof=1)), MIN_SIGMA2)
               if resid.size > 1 else 1.0)
     return theta, sigma2, p_eta
 
 
-def fit_q_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
+def fit_q_prior(df_fit: pd.DataFrame, *, gamma_terminal: float = GAMMA_TERMINAL) -> Dict[str, Any]:
     """Q-function prior (no TD-modify) under pooled-mean + per-user-variance pooling.
 
     Prior mean comes from a single FQI run on every user's rows stacked
@@ -1319,15 +1517,45 @@ def fit_q_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
             th_nomod_users.append(None)
             s2_nomod_users.append(None)
         else:
-            th, s2_u, _ = _fqi_iterate([feats_u_no], None, use_td_modify=False)
+            th, s2_u, _ = _fqi_iterate(
+                [feats_u_no], None, use_td_modify=False, gamma_terminal=gamma_terminal)
             th_nomod_users.append(th)
             s2_nomod_users.append(s2_u)
             feats_nomod_pool.append(feats_u_no)
 
     th_nomod_pool, _, _ = _fqi_iterate(
-        feats_nomod_pool, None, use_td_modify=False)
+        feats_nomod_pool, None, use_td_modify=False, gamma_terminal=gamma_terminal)
     mu, Sigma, sigma2 = _pool_user_fits(
         th_nomod_pool, th_nomod_users, s2_nomod_users)
+    return {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
+
+
+def fit_q_redistribution_prior(
+    df_fit: pd.DataFrame, variant: str, *, gamma_terminal: float = GAMMA_TERMINAL,
+) -> Dict[str, Any]:
+    """FQI prior for V2 or V4 using its exact redistributed TD rewards.
+
+    Each participant's FQI uses participant-specific plug-in Stage-1/Stage-2
+    fits.  The pooled FQI uses pooled rows but still respects each realised
+    trajectory; this matches the established pooled-mean/per-user-spread
+    empirical-Bayes construction used by the base Q prior.
+    """
+    user_theta, user_sigma2, pooled_feats = [], [], []
+    for _uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False):
+        td = _user_weekly_tensors(dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True))
+        feats = _precompute_q_features(td, use_td_modify=False)
+        if feats is None:
+            user_theta.append(None); user_sigma2.append(None)
+            continue
+        daily, eta, targets = _fit_redistribution_coefficients(
+            td, variant, gamma_bar=gamma_terminal)
+        shaped = _attach_redistributed_rewards(feats, td, variant, daily, eta, targets)
+        theta, sigma2, _ = _fqi_iterate(
+            [shaped], None, use_td_modify=False, gamma_terminal=gamma_terminal)
+        user_theta.append(theta); user_sigma2.append(sigma2); pooled_feats.append(shaped)
+    pooled, _, _ = _fqi_iterate(
+        pooled_feats, None, use_td_modify=False, gamma_terminal=gamma_terminal)
+    mu, Sigma, sigma2 = _pool_user_fits(pooled, user_theta, user_sigma2)
     return {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
 
 
@@ -1366,6 +1594,7 @@ def build_pooled_rl_q_summary(df_fit: pd.DataFrame) -> pd.DataFrame:
         use_td_modify=False,
         user_ids=user_ids,
         return_design=True,
+        gamma_terminal=0.5,
     )
     if x_all is None or y_all is None or groups is None:
         return pd.DataFrame()
@@ -1425,7 +1654,9 @@ def _pool_joint_user_fits(
     return pooled_theta, Sigma, n_used
 
 
-def fit_q_td_modify_joint_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
+def fit_q_td_modify_joint_prior(
+    df_fit: pd.DataFrame, *, gamma_terminal: float = GAMMA_TERMINAL,
+) -> Dict[str, Any]:
     """Joint prior on theta=(eta,beta) from the bottleneck-state TD loss.
 
     The pooled prior mean is fit by running the direct joint FQI objective on
@@ -1458,7 +1689,8 @@ def fit_q_td_modify_joint_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
             s2_Q_users.append(None)
             continue
 
-        theta_u, s2_u, p_eta_u = _joint_fqi_iterate([feats_u])
+        theta_u, s2_u, p_eta_u = _joint_fqi_iterate(
+            [feats_u], gamma_terminal=gamma_terminal)
         if theta_u is None:
             user_thetas.append(None)
             s2_Q_users.append(None)
@@ -1469,7 +1701,8 @@ def fit_q_td_modify_joint_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
         s2_Q_users.append(s2_u)
         feats_pool.append(feats_u)
 
-    theta_pool, _, p_eta_pool = _joint_fqi_iterate(feats_pool)
+    theta_pool, _, p_eta_pool = _joint_fqi_iterate(
+        feats_pool, gamma_terminal=gamma_terminal)
     if p_eta is None and p_eta_pool is not None:
         p_eta = int(p_eta_pool)
 
@@ -1599,6 +1832,8 @@ def save_split_rl_prior_files(
         "feature_names": _phi_state_names(),
         **priors["reward"],
     }
+    if "reward_redistribution" in priors:
+        reward_payload["reward_redistribution"] = priors["reward_redistribution"]
     rl_q_payload = {
         "q_no_td_modify": {
             "model": "q_no_td_modify",
@@ -1614,6 +1849,17 @@ def save_split_rl_prior_files(
             **q_joint,
         },
     }
+    if "q_no_td_modify_g09" in priors:
+        rl_q_payload["q_no_td_modify_g09"] = {
+            "model": "q_no_td_modify_g09", "block": "beta",
+            "feature_names": _phi_action_names(), **priors["q_no_td_modify_g09"],
+        }
+    if "q_redistribution" in priors:
+        rl_q_payload["q_redistribution"] = {
+            name: {"model": f"q_redistribution_{name}", "block": "beta",
+                   "feature_names": _phi_action_names(), **prior}
+            for name, prior in priors["q_redistribution"].items()
+        }
 
     with open(reward_path, "w", encoding="utf-8") as f:
         json.dump(_to_jsonable(reward_payload), f, indent=2, allow_nan=False)
@@ -1680,7 +1926,10 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
     """
     pf = priors["pf"]
     reward = priors["reward"]
+    redistribution = priors.get("reward_redistribution") or {}
     q_no_mod = priors["q_no_td_modify"]
+    q_g09 = priors.get("q_no_td_modify_g09")
+    q_redistribution = priors.get("q_redistribution") or {}
     q_joint = priors.get("q_td_modify_joint") or {}
 
     pf_rows: list[dict[str, Any]] = []
@@ -1703,6 +1952,16 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
         cov=reward.get("Sigma_0"),
         names=_phi_state_names(),
     ))
+    for name, prior in (redistribution.get("daily_mediators") or {}).items():
+        rl_rows.extend(_summary_rows(
+            prior_family="RL", model=f"redistribution_stage1_{name}", block="eta",
+            mean=prior.get("mu_0"), cov=prior.get("Sigma_0"), names=[],
+        ))
+    for name, prior in (redistribution.get("redistribution") or {}).items():
+        rl_rows.extend(_summary_rows(
+            prior_family="RL", model=f"redistribution_stage2_{name}", block="eta",
+            mean=prior.get("mu_0"), cov=prior.get("Sigma_0"), names=[],
+        ))
     rl_rows.extend(_summary_rows(
         prior_family="RL",
         model="q_no_td_modify",
@@ -1711,6 +1970,16 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
         cov=q_no_mod.get("Sigma_0"),
         names=_phi_action_names(),
     ))
+    if q_g09 is not None:
+        rl_rows.extend(_summary_rows(
+            prior_family="RL", model="q_no_td_modify_g09", block="beta",
+            mean=q_g09.get("mu_0"), cov=q_g09.get("Sigma_0"), names=_phi_action_names(),
+        ))
+    for name, prior in q_redistribution.items():
+        rl_rows.extend(_summary_rows(
+            prior_family="RL", model=f"q_redistribution_{name}", block="beta",
+            mean=prior.get("mu_0"), cov=prior.get("Sigma_0"), names=_phi_action_names(),
+        ))
 
     joint_rows: list[dict[str, Any]] = []
     mu_joint = q_joint.get("mu_0")
@@ -1910,7 +2179,10 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
     pf = raw["pf"]
     rw = raw["reward"]
     qn = raw["q_no_td_modify"]
+    qn_g09 = raw.get("q_no_td_modify_g09")
+    q_redistribution = raw.get("q_redistribution")
     qj = raw.get("q_td_modify_joint")
+    redistribution = raw.get("reward_redistribution")
 
     nu_Y, G_Y = trim_pf_cae_prior(arr(pf["CAE"]["nu_0"]), arr(pf["CAE"]["Gamma_0"]))
 
@@ -1931,6 +2203,30 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
         "Sigma_0_micro":      arr(qn["Sigma_0"]),
         "sigma2_rl_micro":    float(qn["sigma2"]),
     }
+    if qn_g09 is not None:
+        out["q_no_td_modify_g09"] = {
+            "mu_0": arr(qn_g09["mu_0"]), "Sigma_0": arr(qn_g09["Sigma_0"]),
+            "sigma2": float(qn_g09["sigma2"]),
+        }
+    if q_redistribution is not None:
+        out["q_redistribution"] = {
+            name: {"mu_0": arr(prior["mu_0"]),
+                   "Sigma_0": arr(prior["Sigma_0"]), "sigma2": float(prior["sigma2"])}
+            for name, prior in q_redistribution.items()
+        }
+    if redistribution is not None:
+        out["daily_mediator_priors"] = {
+            name: {"mu_0": arr(prior["mu_0"]),
+                   "Sigma_0": arr(prior["Sigma_0"]),
+                   "sigma2": float(prior["sigma2"])}
+            for name, prior in redistribution["daily_mediators"].items()
+        }
+        out["redistribution_priors"] = {
+            name: {"mu_0": arr(prior["mu_0"]),
+                   "Sigma_0": arr(prior["Sigma_0"]),
+                   "sigma2": float(prior["sigma2"])}
+            for name, prior in redistribution["redistribution"].items()
+        }
 
     if qj is not None:
         # Joint (eta, beta) prior for the modified-TD-loss RLSVI.
@@ -1947,6 +2243,74 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
         })
 
     return out
+
+
+def fit_all_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
+    """Fit every runtime prior from an already-filtered analysis dataset.
+
+    This pure helper is used by the experiment driver's leave-one-out warm
+    start.  It deliberately performs no file I/O, so a held-out participant's
+    data cannot leak through a previously saved ``rl_priors.json``.
+    """
+    pf = fit_pf_priors(df_fit)
+    reward = fit_reward_prior(df_fit)  # retained for legacy compatibility
+    reward_redistribution = fit_reward_redistribution_priors(df_fit, gamma_bar=0.9)
+    q_no_mod = fit_q_prior(df_fit, gamma_terminal=0.5)
+    q_no_mod_g09 = fit_q_prior(df_fit, gamma_terminal=0.9)
+    q_redistribution = {
+        variant: fit_q_redistribution_prior(df_fit, variant, gamma_terminal=0.9)
+        for variant in ("v2", "v4")
+    }
+    q_mod_joint = fit_q_td_modify_joint_prior(df_fit, gamma_terminal=0.9)
+    return {
+        "pf": pf,
+        "reward": reward,
+        "reward_redistribution": reward_redistribution,
+        "q_no_td_modify": q_no_mod,
+        "q_no_td_modify_g09": q_no_mod_g09,
+        "q_redistribution": q_redistribution,
+        "q_td_modify_joint": q_mod_joint,
+    }
+
+
+def precompute_leave_one_out_priors(
+    df_fit: Optional[pd.DataFrame] = None,
+    output_dir: Path = LOO_PRIOR_DIR,
+    held_out_ids: Optional[List[int]] = None,
+) -> Dict[int, Path]:
+    """Write one complete, leakage-free runtime-prior file per participant.
+
+    ``held_out_<uid>.json`` is fitted from every other participant and is the
+    exact file selected by ``experiment.py --prior-mode loo``.  This function
+    is intentionally offline: experiment execution only reads these files.
+    """
+    df_path = WORK_DIR / "df_fit_11week.csv"
+    df = load_df_fit(df_path) if df_fit is None else df_fit.copy()
+    available_ids = sorted(int(x) for x in df["ParticipantIdentifier"].unique())
+    ids = available_ids if held_out_ids is None else sorted(set(map(int, held_out_ids)))
+    missing = sorted(set(ids) - set(available_ids))
+    if missing:
+        raise ValueError(f"requested held-out IDs absent from df_fit: {missing}")
+    if len(available_ids) < 3:
+        raise ValueError("leave-one-out fitting requires at least three participants")
+    output_dir = Path(output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths: Dict[int, Path] = {}
+    for uid in ids:
+        train = df.loc[df["ParticipantIdentifier"].astype(int) != uid].copy()
+        if train["ParticipantIdentifier"].nunique() < 2:
+            raise ValueError(f"not enough training participants after holding out {uid}")
+        print(f"Fitting leave-one-out priors: hold out {uid} ({len(train)} rows) ...", flush=True)
+        path = output_dir / f"held_out_{uid}.json"
+        save_priors(fit_all_priors(train), path)
+        paths[uid] = path
+    with open(output_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "source_df": str(df_path.resolve()) if df_fit is None else "caller-supplied DataFrame",
+            "held_out_ids": ids,
+            "files": {str(uid): path.name for uid, path in paths.items()},
+        }, f, indent=2)
+    return paths
 
 
 def main() -> Dict[str, Any]:
@@ -1990,10 +2354,30 @@ def main() -> Dict[str, Any]:
     reward = fit_reward_prior(df_fit)
     print(f"  reward: p={len(reward['mu_0'])}, sigma2={reward['sigma2']:.4f}")
 
-    print("Fitting Q-function prior (no TD-modify) ...")
-    q_no_mod = fit_q_prior(df_fit)
-    print(f"  Q (no TD-modify): p={len(q_no_mod['mu_0'])}, "
-          f"sigma2={q_no_mod['sigma2']:.4f}")
+    print("Fitting V2/V4 two-stage redistribution priors (γ̄=0.9 for V4 Stage-2) ...")
+    reward_redistribution = fit_reward_redistribution_priors(df_fit, gamma_bar=0.9)
+    for name, prior in reward_redistribution["daily_mediators"].items():
+        print(f"  Stage 1 {name}: p={len(prior['mu_0'])}, sigma2={prior['sigma2']:.4f}")
+    for name, prior in reward_redistribution["redistribution"].items():
+        print(f"  Stage 2 {name}: p={len(prior['mu_0'])}, sigma2={prior['sigma2']:.4f}")
+
+    print("Fitting Q-function prior (no TD-modify, γ̄=0.5 for V7) ...")
+    q_no_mod = fit_q_prior(df_fit, gamma_terminal=0.5)
+    print(f"  Q (no TD-modify, γ̄=0.5): p={len(q_no_mod['mu_0'])}, "
+        f"sigma2={q_no_mod['sigma2']:.4f}")
+
+    print("Fitting Q prior for the γ̄=0.9 base (V1/V3/V5) ...")
+    q_no_mod_g09 = fit_q_prior(df_fit, gamma_terminal=0.9)
+    print(f"  Q (gamma=0.9): p={len(q_no_mod_g09['mu_0'])}, "
+          f"sigma2={q_no_mod_g09['sigma2']:.4f}")
+
+    print("Fitting V2/V4 redistributed-reward Q priors (γ̄=0.9) ...")
+    q_redistribution = {
+        variant: fit_q_redistribution_prior(df_fit, variant, gamma_terminal=0.9)
+        for variant in ("v2", "v4")
+    }
+    for variant, prior in q_redistribution.items():
+        print(f"  Q ({variant}): p={len(prior['mu_0'])}, sigma2={prior['sigma2']:.4f}")
 
     print("Summarizing pooled RL Q GEE coefficients ...")
     pooled_rl_q = build_pooled_rl_q_summary(df_fit)
@@ -2007,8 +2391,8 @@ def main() -> Dict[str, Any]:
             f"{len(pooled_rl_q)} coefficients, {n_sig} significant at 0.05"
         )
 
-    print("Fitting joint (alpha, beta) prior for modified-TD-loss RLSVI ...")
-    q_mod_joint = fit_q_td_modify_joint_prior(df_fit)
+    print("Fitting joint (alpha, beta) prior for modified-TD-loss RLSVI (γ̄=0.9) ...")
+    q_mod_joint = fit_q_td_modify_joint_prior(df_fit, gamma_terminal=0.9)
     if q_mod_joint["mu_0"] is not None:
         print(f"  Q joint: p={len(q_mod_joint['mu_0'])}, "
               f"p_eta={q_mod_joint['p_eta']}, "
@@ -2020,7 +2404,10 @@ def main() -> Dict[str, Any]:
     priors = {
         "pf":           pf,
         "reward":       reward,
+        "reward_redistribution": reward_redistribution,
         "q_no_td_modify":      q_no_mod,
+        "q_no_td_modify_g09":  q_no_mod_g09,
+        "q_redistribution":    q_redistribution,
         "q_td_modify_joint":   q_mod_joint,
     }
     path = save_priors(priors)
@@ -2052,4 +2439,23 @@ def main() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Estimate shared or leave-one-out RL priors.")
+    parser.add_argument(
+        "--loo", action="store_true",
+        help="precompute one held-out prior JSON per participant instead of one shared prior",
+    )
+    parser.add_argument(
+        "--loo-output-dir", type=Path, default=LOO_PRIOR_DIR,
+        help="directory for --loo files (default: <params-dir>/loo_priors)",
+    )
+    parser.add_argument(
+        "--loo-users", nargs="+", type=int, default=None,
+        help="optional subset of held-out participant IDs to precompute",
+    )
+    cli_args = parser.parse_args()
+    if cli_args.loo:
+        paths = precompute_leave_one_out_priors(
+            output_dir=cli_args.loo_output_dir, held_out_ids=cli_args.loo_users)
+        print(f"Saved {len(paths)} leave-one-out prior bundles to {cli_args.loo_output_dir}")
+    else:
+        main()

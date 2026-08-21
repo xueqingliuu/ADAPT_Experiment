@@ -2046,8 +2046,13 @@ def build_redistribution_phi(b_hat, b_tilde, state, d, t, action,
 
 def fit_daily_mediator_decomposition(k_cur, A_hist, b_hat_hist, b_tilde_hist,
                                      get_state, get_full_mediators,
-                                     prior_scale=1.0):
-    """Fit the three penalized daily return decompositions from completed weeks."""
+                                     priors=None):
+    """Fit Stage-1 daily decompositions under their empirical-Bayes priors.
+
+    ``priors`` is keyed by ``AA``, ``FW``, and ``PJ`` and contains
+    ``mu_0``, ``Sigma_0``, and ``sigma2``.  Omission retains a conservative
+    zero/identity fallback for legacy parameter folders.
+    """
     outputs = {"AA": (0, 2), "FW": (1, 2), "PJ": (1, 3)}
     etas = {}
     for name, (matrix, col) in outputs.items():
@@ -2073,10 +2078,19 @@ def fit_daily_mediator_decomposition(k_cur, A_hist, b_hat_hist, b_tilde_hist,
             A_hist[0, 0, 0], mediator=name).size
         X = np.asarray(rows, dtype=float) if rows else np.empty((0, p))
         yy = np.asarray(y, dtype=float)
-        precision = np.eye(p) / float(prior_scale)
+        prior = (priors or {}).get(name, {})
+        mu = np.asarray(prior.get("mu_0", np.zeros(p)), dtype=float).ravel()
+        Sigma = np.asarray(prior.get("Sigma_0", np.eye(p)), dtype=float)
+        sigma2 = float(prior.get("sigma2", 1.0))
+        if mu.shape != (p,) or Sigma.shape != (p, p) or not np.isfinite(sigma2) or sigma2 <= 0:
+            raise ValueError(f"invalid Stage-1 prior for {name}")
+        try:
+            precision = np.linalg.inv(Sigma)
+        except np.linalg.LinAlgError:
+            precision = np.linalg.pinv(Sigma)
         etas[name] = np.linalg.solve(
-            precision + X.T @ X,
-            X.T @ yy,
+            precision + (X.T @ X) / sigma2,
+            precision @ mu + (X.T @ yy) / sigma2,
         )
     return etas
 
