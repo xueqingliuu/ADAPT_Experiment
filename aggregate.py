@@ -17,11 +17,12 @@ from vani_env import PARAMS_DIR, PROJECT_ROOT, denormalize_CAE
 DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla_loo"))
 
 # ── CAE reporting conventions ────────────────────────────────────────────
-# Two separate figures on the *raw* (pre-normalization) scale via
-# ``denormalize_CAE`` (raw = shift + scale*norm):
+# Figures on the *raw* (pre-normalization) scale via ``denormalize_CAE``
+# (raw = shift + scale*norm):
 #   • mean cumulative noisy CAE minus never_send (running sum of weekly
-#     CAE, paired). SE bands average over users within each replicate,
-#     then use sd / sqrt(n_exp) across the 100 seeds.
+#     CAE, paired), once with always-send and once without (ylim zoomed).
+#     SE bands average over users within each replicate, then use
+#     sd / sqrt(n_exp) across the 100 seeds.
 #   • mean walking-suggestion probability, averaged over users × replicates
 # Latent (``cae_mean_runs``) is still written to the summary table when present.
 LATENT_FIELD = "cae_mean_runs"   # latent (noise-free)
@@ -50,6 +51,7 @@ GAMMA09_ALGOS = (
     "rl_v6_invariant_redistributed",
 )
 NEVER_SEND_BASELINE = "never_send"
+ALWAYS_SEND_BASELINE = "always_send"
 
 
 def cumulative_average(x):
@@ -374,19 +376,9 @@ def _save_fig(fig, out, stem):
     plt.close(fig)
 
 
-def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
-                  uids=None):
-    """Write separate CAE and action-probability figures."""
-    names = list(stats["all_cae"].keys())
-    cum_mean, cum_se, vs_never = _cumsum_vs_reference(
-        stats["all_cae"], uids=uids,
-    )
-
-    fig, ax = plt.subplots(figsize=(7.5, 5))
-    cae_names = (
-        [n for n in names if n != NEVER_SEND_BASELINE] if vs_never else names
-    )
-    for name in cae_names:
+def _plot_cae_vs_reference(ax, names, *, cum_mean, cum_se, labels, weeks,
+                           vs_never, kind, always_note):
+    for name in names:
         m = cum_mean[name]
         s = cum_se[name]
         ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
@@ -396,19 +388,50 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
         ax.set_ylabel("Cumulative CAE(policy) − cumulative CAE(never-send)")
         ax.set_title(
             f"Cumulative CAE minus never-send (± SE across replications)\n"
-            f"running sum of weekly CAE, paired by user — {kind}"
+            f"running sum of weekly CAE, paired by user — {kind}{always_note}"
         )
     else:
         ax.set_ylabel("Cumulative CAE − mean across policies")
-        ax.set_title(f"Mean cumulative CAE, centered (± SE) — {kind}")
+        ax.set_title(f"Mean cumulative CAE, centered (± SE) — {kind}{always_note}")
     ax.set_xlabel("Week")
     ax.set_ylim(*_cae_ylim(
-        {n: cum_mean[n] for n in cae_names},
-        {n: cum_se[n] for n in cae_names},
+        {n: cum_mean[n] for n in names},
+        {n: cum_se[n] for n in names},
     ))
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
+
+
+def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
+                  uids=None):
+    """Write CAE (with and without always-send) and action-probability figures."""
+    names = list(stats["all_cae"].keys())
+    cum_mean, cum_se, vs_never = _cumsum_vs_reference(
+        stats["all_cae"], uids=uids,
+    )
+
+    plotted = (
+        [n for n in names if n != NEVER_SEND_BASELINE] if vs_never else names
+    )
+    no_always = [n for n in plotted if n != ALWAYS_SEND_BASELINE]
+
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    _plot_cae_vs_reference(
+        ax, plotted,
+        cum_mean=cum_mean, cum_se=cum_se, labels=labels, weeks=weeks,
+        vs_never=vs_never, kind=kind, always_note="",
+    )
     _save_fig(fig, out, f"cae_{suffix}")
+
+    if no_always and no_always != plotted:
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        _plot_cae_vs_reference(
+            ax, no_always,
+            cum_mean=cum_mean, cum_se=cum_se, labels=labels, weeks=weeks,
+            vs_never=vs_never, kind=kind,
+            always_note="; always-send omitted",
+        )
+        _save_fig(fig, out, f"cae_{suffix}_no_always")
 
     fig, ax = plt.subplots(figsize=(7.5, 5))
     for name in names:
@@ -653,8 +676,8 @@ def main() -> None:
             "Re-run experiment.py to record latent CAE."
         )
 
-    # Separate figures: cumulative CAE minus never-send, and weekly action
-    # probability. Latent CAE still gets a summary table when present.
+    # CAE minus never-send (with and without always-send) plus weekly π_A.
+    # Latent CAE still gets a summary table when present.
     noisy_stats = compute_stats(all_cae_noisy_full)
     make_overview(
         noisy_stats, "noisy (realized)", "noisy",

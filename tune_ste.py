@@ -38,26 +38,17 @@ Large-fatigue stack (always-send weaker; then STE via fourSC→CAE *shift*)::
         --knob foursc_to_y_shift --targets 0.5 0.8 \\
         --out-prefix env_para_ste --out-suffix _bs_large_foursc
 
-    Cluster: TUNE_PHASE=apply then a second job with
-    TUNE_PARAMS_DIR=env_para_burden_shift_large TUNE_KNOB=foursc_to_y_shift
-    TUNE_TARGETS="0.5 0.8" TUNE_OUT_SUFFIX=_bs_large_foursc.
-    At κ_b=0.4 the proxy STE floor is already ~0.29, so foursc_to_y_shift
-    can raise 0.5 and 0.8 but cannot lower 0.2.
+    Cluster: TUNE_PHASE=apply then raise STE from that folder. foursc_to_y_shift
+    alone cannot hit 0.5 / 0.8 (job 41048118: cap STE≈0.36, CAE clips).
+    Use ``benefit_foursc`` (A→MY ×κ and fourSC→Y += c(κ−1), c=0.05 capped
+    at 0.20) so mean STE can rise while CAE stays more state-dependent::
 
-Heavier-fatigue STE ladder (burden_shift calibrated to STE 0.2, then
-fourSC→CAE shift to 0.5 / 0.8; do not use ``action``, which rescales
-A→ME). The 0.2 cell *is* the floor; foursc_to_y_shift only raises STE::
+    python tune_ste.py calibrate --params-dir env_para_burden_shift_large \\
+        --knob benefit_foursc --targets 0.5 0.8 \\
+        --out-prefix env_para_ste --out-suffix _bs_large_bf
 
-    python tune_ste.py calibrate --knob burden_shift --targets 0.2 \\
-        --out-prefix env_para_ste --out-suffix _floor
-
-    python tune_ste.py calibrate --params-dir env_para_ste0.2_floor \\
-        --knob foursc_to_y_shift --targets 0.5 0.8 \\
-        --out-prefix env_para_ste --out-suffix _floor_foursc
-
-    ``benefit`` (A→MY) is a fallback if 0.8 misses the loop-gain cap;
-    it is not the personalization dial.
-
+    ADAPR_BENEFIT_FOURSC_SHIFT / _CAP change the fourSC share (defaults
+    0.05 / 0.20). burden_shift cannot hit STE 0.2 (job 40926808).
 
 How STE is measured here
     Treatment arms are constant suggestion rates (``--policy-grid``, default
@@ -68,7 +59,8 @@ How STE is measured here
 Which coefficients are scaled (``--knob``, default ``action``)
     action    walking-suggestion effects on both benefit (step-count /
               anticipated affect) and burden (engagement) mediators
-    benefit   benefit path only
+    benefit   benefit path only (A→MY)
+    benefit_foursc  A→MY ×κ and add c(κ−1) to fourSC_ewma → CAE
     burden    multiply A→ME (does not flip sign)
     burden_shift  A→ME more negative and E_w→steps / E_w→affect more positive
     foursc_to_y_shift  add kappa to fourSC_ewma → CAE (does not flip sign)
@@ -214,6 +206,26 @@ _NAME_CONSTANTS = {
 Knob = Callable[[float], dict[str, float]]
 
 
+def _benefit_foursc_shift(k: float) -> float:
+    """fourSC_ewma → CAE addend paired with an A→MY multiplier ``k``.
+
+    Defaults keep the shift well below the foursc_to_y_shift cap that
+    saturated CAE (job 41048118, κ≈1.53). Override with
+    ``ADAPR_BENEFIT_FOURSC_SHIFT`` (per unit of κ−1) and
+    ``ADAPR_BENEFIT_FOURSC_SHIFT_CAP``.
+    """
+    per = float(os.getenv("ADAPR_BENEFIT_FOURSC_SHIFT", "0.05"))
+    cap = float(os.getenv("ADAPR_BENEFIT_FOURSC_SHIFT_CAP", "0.20"))
+    return float(np.clip(per * (float(k) - 1.0), -cap, cap))
+
+
+def _benefit_foursc_multipliers(k: float) -> dict[str, float]:
+    return {"A_to_MY": float(k), "FOURSC_to_Y": -_benefit_foursc_shift(k)}
+
+
+_BENEFIT_FOURSC_APPLY = {"A_to_MY": "multiply", "FOURSC_to_Y": "subtract"}
+
+
 @dataclass(frozen=True)
 class KnobSpec:
     name: str
@@ -221,7 +233,7 @@ class KnobSpec:
     zero_is_null: bool  # STE(kappa = 0) == 0 holds exactly, for free
     sigma_invariant: bool  # control arm untouched, so sigma_i can be cached
     doc: str
-    apply: str = "multiply"  # "multiply" (θ ← κθ) or "subtract" (θ ← θ − κ)
+    apply: str | dict[str, str] = "multiply"  # or per-pathway map
 
 
 KNOBS: dict[str, KnobSpec] = {
@@ -309,6 +321,21 @@ KNOBS: dict[str, KnobSpec] = {
             "control arm and the CAE loop gain. Start a scan at 0.02–0.1."
         ),
     ),
+    "benefit_foursc": KnobSpec(
+        "benefit_foursc",
+        _benefit_foursc_multipliers,
+        zero_is_null=False,
+        sigma_invariant=False,
+        apply=_BENEFIT_FOURSC_APPLY,
+        doc=(
+            "Joint personalization + STE dial: multiply A→MY (steps/affect "
+            "CATE, including A×wear/interact) by kappa and add "
+            "c(kappa-1) to fourSC_ewma → CAE (c=0.05, cap 0.20). Fatigue "
+            "(A→ME) is left alone. Use on env_para_burden_shift_large to "
+            "raise STE to 0.5/0.8 while making CAE more fourSC-dependent. "
+            "kappa=1 is a no-op. Start a search at 1.5–2."
+        ),
+    ),
     "me_to_e": KnobSpec(
         "me_to_e",
         lambda k: {"ME_to_E": k},
@@ -338,18 +365,27 @@ def _names_for(key: str, params: dict) -> list[str]:
     raise KeyError(f"No coefficient names available for {key!r}")
 
 
+def _pathway_apply(apply: str | dict[str, str], pathway: str) -> str:
+    mode = apply.get(pathway, "multiply") if isinstance(apply, dict) else apply
+    if mode not in {"multiply", "subtract"}:
+        raise ValueError(f"unknown apply={mode!r} for pathway {pathway!r}")
+    return mode
+
+
 def scale_params(
-    params: dict, multipliers: dict[str, float], *, apply: str = "multiply"
+    params: dict,
+    multipliers: dict[str, float],
+    *,
+    apply: str | dict[str, str] = "multiply",
 ) -> tuple[dict, list[dict]]:
     """Return a copy of ``params`` with the requested pathways rescaled.
 
     ``multipliers`` maps pathway name -> scale factor; missing pathways are left
     unchanged. ``apply="multiply"`` does ``θ ← κθ`` (skip κ=1).
     ``apply="subtract"`` does ``θ ← θ − κ`` (skip κ=0), so a positive κ
-    pushes every listed coefficient more negative.
+    pushes every listed coefficient more negative. ``apply`` may also be a
+    per-pathway map (used by ``benefit_foursc``).
     """
-    if apply not in {"multiply", "subtract"}:
-        raise ValueError(f"unknown apply={apply!r}")
     unknown = set(multipliers) - set(PATHWAYS)
     if unknown:
         raise KeyError(f"Unknown pathway(s): {sorted(unknown)}")
@@ -358,9 +394,10 @@ def scale_params(
     audit: list[dict] = []
     for pathway, factor in multipliers.items():
         factor = float(factor)
-        if apply == "multiply" and factor == 1.0:
+        mode = _pathway_apply(apply, pathway)
+        if mode == "multiply" and factor == 1.0:
             continue
-        if apply == "subtract" and factor == 0.0:
+        if mode == "subtract" and factor == 0.0:
             continue
         for key, coef_names in PATHWAYS[pathway].items():
             if key not in out:
@@ -380,13 +417,13 @@ def scale_params(
                         f"{key} has {values.size} values but {coef!r} is at index {idx}"
                     )
                 old = float(values[idx])
-                values[idx] = old * factor if apply == "multiply" else old - factor
+                values[idx] = old * factor if mode == "multiply" else old - factor
                 audit.append(
                     {
                         "pathway": pathway,
                         "block": key,
                         "coef": coef,
-                        "apply": apply,
+                        "apply": mode,
                         "factor": factor,
                         "old": old,
                         "new": float(values[idx]),
@@ -414,7 +451,7 @@ def write_scaled_params(
     user_ids: Sequence[int],
     multipliers: dict[str, float],
     *,
-    apply: str = "multiply",
+    apply: str | dict[str, str] = "multiply",
 ) -> list[dict]:
     """Materialise a tuned copy of ``src_dir`` at ``dst_dir``."""
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -786,7 +823,7 @@ def loop_gains_for(
     user_ids: Sequence[int],
     multipliers: dict[str, float],
     *,
-    apply: str = "multiply",
+    apply: str | dict[str, str] = "multiply",
 ) -> list[dict]:
     """E_w and CAE loop gains after applying ``multipliers``, without writing."""
     rows = []

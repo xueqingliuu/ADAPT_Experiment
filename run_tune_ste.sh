@@ -22,13 +22,10 @@
 #   sbatch --export=ALL,TUNE_PHASE=apply,TUNE_KNOB=burden_shift,TUNE_KAPPA=0.4 \
 #          run_tune_ste.sh                                   # env_para_burden_shift_large/
 #   sbatch --export=ALL,TUNE_PARAMS_DIR=env_para_burden_shift_large,\
-#TUNE_KNOB=foursc_to_y_shift,TUNE_TARGETS="0.5 0.8",TUNE_OUT_SUFFIX=_bs_large_foursc \
-#          run_tune_ste.sh                                   # STE 0.5/0.8 on κ_b=0.4
-#   sbatch --export=ALL,TUNE_KNOB=burden_shift,TUNE_TARGETS="0.2",TUNE_OUT_SUFFIX=_floor \
-#          run_tune_ste.sh                                   # heavier fatigue, STE 0.2
-#   sbatch --export=ALL,TUNE_PARAMS_DIR=env_para_ste0.2_floor,TUNE_KNOB=foursc_to_y_shift,\
-#TUNE_TARGETS="0.5 0.8",TUNE_OUT_SUFFIX=_floor_foursc \
-#          run_tune_ste.sh                                   # fourSC→Y ladder, fatigue frozen
+#TUNE_KNOB=benefit_foursc,TUNE_TARGETS="0.5 0.8",TUNE_OUT_SUFFIX=_bs_large_bf \
+#          run_tune_ste.sh                                   # A→MY + fourSC→Y on κ_b=0.4
+#   # foursc_to_y_shift alone cannot hit 0.5/0.8 (job 41048118).
+#   # Do NOT TUNE_KNOB=burden_shift TUNE_TARGETS=0.2: floor STE≈0.27 (40926808).
 #   sbatch --export=ALL,TUNE_PHASE=diagnose run_tune_ste.sh  # E_w + CAE loop gains, ~seconds
 #   sbatch --export=ALL,TUNE_PHASE=eval run_tune_ste.sh      # STE of the untouched fit
 #   sbatch --export=ALL,TUNE_PHASE=scan run_tune_ste.sh      # STE vs knob value
@@ -38,15 +35,16 @@
 # Overrides (sbatch --export=ALL,VAR=value,...):
 #   TUNE_PHASE        diagnose|eval|scan|apply|calibrate|validate    default calibrate
 #   TUNE_PARAMS_DIR   source fit to rescale                    default env_para_vanilla
-#   TUNE_KNOB         action|benefit|burden|burden_shift|foursc_to_y_shift|...
+#   TUNE_KNOB         action|benefit|benefit_foursc|burden_shift|...
 #   TUNE_TARGETS      target mean STE values                   default "0.2 0.5 0.8"
 #   TUNE_KAPPA        apply-phase knob value                   default 0.4
 #   TUNE_OUT_DIR      apply-phase destination                  default
 #                     env_para_burden_shift_large (burden_shift) or
 #                     env_para_<knob>_<kappa>
 #   TUNE_APPLY_EVAL   1 to run proxy STE after apply           default 0
-#   TUNE_KAPPA0       calibrate search start                   default 1, or 0.2 for
-#                     burden_shift, or 0.05 for foursc_to_y_shift
+#   TUNE_KAPPA0       calibrate search start                   default 1, or 0.2 /
+#                     0.05 / 2 for burden_shift / foursc_to_y_shift /
+#                     benefit_foursc
 #   TUNE_KAPPAS       scan grid                                default "0.25 0.5 1 2 4"
 #   TUNE_EPISODES     paired episodes per arm                  default 100
 #   TUNE_POLICY_GRID  Bernoulli suggestion rates               default "0.5 1.0"
@@ -97,6 +95,8 @@ if [[ "${TUNE_KNOB}" == "burden_shift" ]]; then
   TUNE_KAPPA0="${TUNE_KAPPA0:-0.2}"
 elif [[ "${TUNE_KNOB}" == "foursc_to_y_shift" ]]; then
   TUNE_KAPPA0="${TUNE_KAPPA0:-0.05}"
+elif [[ "${TUNE_KNOB}" == "benefit_foursc" ]]; then
+  TUNE_KAPPA0="${TUNE_KAPPA0:-2.0}"
 else
   TUNE_KAPPA0="${TUNE_KAPPA0:-1.0}"
 fi
