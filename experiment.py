@@ -1203,9 +1203,9 @@ def _refresh_phi_dims():
 
 # ── RL hyperparameters (shared) ──
 # Weekly discount used by micro-query agents. V1--V6 are registered at
-# gamma_bar=0.9; V7 is the gamma_bar=0.5 sensitivity of the base. The
-# per-slot matrix is built by _gamma_dt_micro (1 within week, gamma_bar
-# on the terminal slot).
+# gamma_bar=0.9; V7 / V8 are the gamma_bar=0.5 and 0.99 sensitivities of
+# the base. The per-slot matrix is built by _gamma_dt_micro (1 within
+# week, gamma_bar on the terminal slot).
 GAMMA_BAR = 0.9
 TARGET_C     = 1
 # EPSILON_0 is defined in algorithm_helpers: RLSVI clips π to [ε, 1-ε].
@@ -1299,7 +1299,7 @@ def _default_reward_redistribution_priors():
 def _default_variant_q_priors():
     return {
         name: {"mu_0": np.zeros(P_RL_MICRO), "Sigma_0": np.eye(P_RL_MICRO), "sigma2": 1.0}
-        for name in ("g09", "v2", "v4")
+        for name in ("g09", "g099", "v2", "v4")
     }
 
 
@@ -1393,6 +1393,8 @@ def _configure_priors(params_dir=None, *, force=False):
         variant_q_priors = _default_variant_q_priors()
         if "q_no_td_modify_g09" in _priors:
             variant_q_priors["g09"] = _priors["q_no_td_modify_g09"]
+        if "q_no_td_modify_g099" in _priors:
+            variant_q_priors["g099"] = _priors["q_no_td_modify_g099"]
         if "q_redistribution" in _priors:
             variant_q_priors.update(_priors["q_redistribution"])
         else:
@@ -1505,6 +1507,8 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
         "g09": fitted["q_no_td_modify_g09"],
         **fitted["q_redistribution"],
     }
+    if fitted.get("q_no_td_modify_g099"):
+        variant_q_priors["g099"] = fitted["q_no_td_modify_g099"]
     for prior in variant_q_priors.values():
         prior["mu_0"] = np.asarray(prior["mu_0"], dtype=float)
         prior["Sigma_0"] = np.asarray(prior["Sigma_0"], dtype=float)
@@ -1625,6 +1629,22 @@ def _make_online_env(uid, seed=42, params_dir=None):
     return cfg, env, oenv
 
 
+def _q_prior_for_gamma(gamma_bar):
+    """Q prior whose FQI discount matches ``gamma_bar`` when available.
+
+    0.99 uses ``q_no_td_modify_g099`` after ``est_prior.py`` is regenerated;
+    older LOO / shared files fall back to the 0.9 prior.
+    """
+    g = float(gamma_bar)
+    if abs(g - 0.99) < 1e-9 and "g099" in variant_q_priors:
+        return variant_q_priors["g099"]
+    if g >= 0.9:
+        return variant_q_priors["g09"]
+    return {
+        "mu_0": mu_0_micro, "Sigma_0": Sigma_0_micro, "sigma2": sigma2_rl_micro,
+    }
+
+
 def run_micro_query(uid, seed=42, gamma_bar=0.5, params_dir=None):
     _ensure_priors_configured(params_dir)
     cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
@@ -1632,8 +1652,7 @@ def run_micro_query(uid, seed=42, gamma_bar=0.5, params_dir=None):
 
     week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
     dataset = EpisodeDataset(nweek)
-    q_prior = variant_q_priors["g09"] if float(gamma_bar) == 0.9 else {
-        "mu_0": mu_0_micro, "Sigma_0": Sigma_0_micro, "sigma2": sigma2_rl_micro}
+    q_prior = _q_prior_for_gamma(gamma_bar)
     agent = MicroQueryAgent(
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
         mu_0_rl=q_prior["mu_0"], Sigma_0_rl=q_prior["Sigma_0"], sigma2_rl=q_prior["sigma2"],
@@ -1827,8 +1846,8 @@ def run_random_send(uid, seed=42, params_dir=None):
     return _run_fixed_policy(RandomSendAgent, uid, seed=seed, params_dir=params_dir)
 
 
-# Algorithm registry: exactly the seven RL variants in the experiment plan,
-# followed by the three fixed-policy baselines.
+# Algorithm registry: V1--V6 at γ̄=0.9, V7/V8 base-discount sensitivities,
+# then the three fixed-policy baselines.
 ALGORITHMS = {
     "rl_v1_base_g09": (partial(run_micro_query, gamma_bar=0.9), "RL base (γ̄=0.9)"),
     "rl_v2_mtd_g09": (partial(run_micro_query_mtd, gamma_bar=0.9), "RL + bottleneck TD (γ̄=0.9)"),
@@ -1837,6 +1856,7 @@ ALGORITHMS = {
     "rl_v5_invariant_weekly": (partial(run_micro_query_reward_design, reward_design="v3", gamma_bar=0.9), "RL V3: return-invariant weekly reward (γ̄=0.9)"),
     "rl_v6_invariant_redistributed": (partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9), "RL V4: return-invariant redistributed reward (γ̄=0.9)"),
     "rl_v7_base_g05": (partial(run_micro_query, gamma_bar=0.5), "RL base (γ̄=0.5 sensitivity)"),
+    "rl_v8_base_g099": (partial(run_micro_query, gamma_bar=0.99), "RL base (γ̄=0.99 sensitivity)"),
     "never_send":   (run_never_send,  "Never send (π_A=0)"),
     "always_send":  (run_always_send, "Always send (π_A=1)"),
     "random_send":  (run_random_send, "Random send (π_A=0.5)"),

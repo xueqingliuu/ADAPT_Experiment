@@ -23,6 +23,10 @@ DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla_loo"))
 #     CAE, paired), once with always-send and once without (ylim zoomed).
 #     SE bands average over users within each replicate, then use
 #     sd / sqrt(n_exp) across the 100 seeds.
+#   • mean (cumulative CAE − never_send) / week (running average of the
+#     paired weekly difference), with and without always-send.
+#   • mean cumulative CAE / week (absolute running average; never-send is
+#     a line, not a subtractor), with and without always-send.
 #   • mean walking-suggestion probability, averaged over users × replicates
 # Latent (``cae_mean_runs``) is still written to the summary table when present.
 LATENT_FIELD = "cae_mean_runs"   # latent (noise-free)
@@ -36,12 +40,13 @@ markers = {
     "rl_v5_invariant_weekly": "d:",
     "rl_v6_invariant_redistributed": "d-",
     "rl_v7_base_g05": "o-",
+    "rl_v8_base_g099": "o--",
     "never_send": "x-",
     "always_send": "*-",
     "random_send": "+-",
 }
 
-# γ̄=0.9 RL policies (V1--V6). V7 is the γ̄=0.5 sensitivity of the base.
+# γ̄=0.9 RL policies (V1--V6). V7 / V8 are the γ̄=0.5 / 0.99 base sensitivities.
 GAMMA09_ALGOS = (
     "rl_v1_base_g09",
     "rl_v2_mtd_g09",
@@ -354,6 +359,37 @@ def _cumsum_vs_reference(all_cae, uids=None, reference=NEVER_SEND_BASELINE):
     return mean, se, use_ref
 
 
+def _running_mean_vs_reference(all_cae, reference=NEVER_SEND_BASELINE):
+    """Mean and SE of (cumulative CAE − reference) / week.
+
+    Same pairing as ``_cumsum_vs_reference``; only the scale changes
+    (running mean of the weekly difference instead of the running sum).
+    """
+    cum_mean, cum_se, use_ref = _cumsum_vs_reference(all_cae, reference=reference)
+    n_week = len(next(iter(cum_mean.values())))
+    weeks = np.arange(1, n_week + 1, dtype=float)
+    mean = {n: m / weeks for n, m in cum_mean.items()}
+    se = {n: s / weeks for n, s in cum_se.items()}
+    return mean, se, use_ref
+
+
+def _running_mean_cae(all_cae):
+    """Mean and replication-clustered SE of cumulative CAE / week.
+
+    Never-send is not subtracted. SE averages the 100 draws within each
+    seed, then ``sd / sqrt(n_exp)``.
+    """
+    mean, se = {}, {}
+    for name, a in all_cae.items():
+        a = np.asarray(a, dtype=float)
+        n_week = int(a.shape[-1])
+        weeks = np.arange(1, n_week + 1, dtype=float)
+        run_mean = np.nancumsum(a, axis=-1) / weeks
+        mean[name] = np.nanmean(run_mean, axis=(0, 1))
+        se[name] = _se_across_replications(run_mean)
+    return mean, se
+
+
 def _cae_ylim(mean, se):
     """Tight y-limits around mean ± SE so nearby policies are distinguishable."""
     lows, highs = [], []
@@ -432,6 +468,74 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
             always_note="; always-send omitted",
         )
         _save_fig(fig, out, f"cae_{suffix}_no_always")
+
+    avg_mean, avg_se, avg_vs_never = _running_mean_vs_reference(stats["all_cae"])
+    avg_plotted = (
+        [n for n in names if n != NEVER_SEND_BASELINE] if avg_vs_never else names
+    )
+    avg_no_always = [n for n in avg_plotted if n != ALWAYS_SEND_BASELINE]
+    for plot_names, stem_extra, note in (
+        (avg_plotted, "", ""),
+        (avg_no_always if avg_no_always != avg_plotted else [], "_no_always",
+         "; always-send omitted"),
+    ):
+        if not plot_names:
+            continue
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        for name in plot_names:
+            m = avg_mean[name]
+            s = avg_se[name]
+            ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
+            ax.fill_between(weeks, m - s, m + s, alpha=0.25)
+        ax.set_xlabel("Week")
+        if avg_vs_never:
+            ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
+            ax.set_ylabel("Running-mean CAE(policy) − running-mean CAE(never-send)")
+            ax.set_title(
+                f"Running-mean CAE minus never-send (± SE across replications)\n"
+                f"(cumulative difference) ÷ week, paired by user — {kind}{note}"
+            )
+        else:
+            ax.set_ylabel("Running-mean CAE − mean across policies")
+            ax.set_title(
+                f"Mean CAE per week, centered (± SE) — {kind}{note}"
+            )
+        ax.set_ylim(*_cae_ylim(
+            {n: avg_mean[n] for n in plot_names},
+            {n: avg_se[n] for n in plot_names},
+        ))
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        _save_fig(fig, out, f"cae_avg_{suffix}{stem_extra}")
+
+    level_mean, level_se = _running_mean_cae(stats["all_cae"])
+    level_no_always = [n for n in names if n != ALWAYS_SEND_BASELINE]
+    for plot_names, stem_extra, note in (
+        (names, "", ""),
+        (level_no_always if level_no_always != names else [], "_no_always",
+         "; always-send omitted"),
+    ):
+        if not plot_names:
+            continue
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        for name in plot_names:
+            m = level_mean[name]
+            s = level_se[name]
+            ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
+            ax.fill_between(weeks, m - s, m + s, alpha=0.25)
+        ax.set_xlabel("Week")
+        ax.set_ylabel("Cumulative CAE / week")
+        ax.set_title(
+            f"Running-mean CAE (± SE across replications)\n"
+            f"cumulative CAE ÷ week; never-send is a line — {kind}{note}"
+        )
+        ax.set_ylim(*_cae_ylim(
+            {n: level_mean[n] for n in plot_names},
+            {n: level_se[n] for n in plot_names},
+        ))
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        _save_fig(fig, out, f"cae_avg_level_{suffix}{stem_extra}")
 
     fig, ax = plt.subplots(figsize=(7.5, 5))
     for name in names:
@@ -591,6 +695,7 @@ def main() -> None:
     algorithms = cfg["algorithms"]
     labels = cfg["labels"]
     labels["rl_v7_base_g05"] = "RL base (\u03b3\u0304=0.5)"
+    labels["rl_v8_base_g099"] = "RL base (\u03b3\u0304=0.99)"
     nweek = cfg["nweek"]
     params_dir = resolve_denorm_params_dir(
         cfg.get("params_dir"), cli_params_dir=args.params_dir

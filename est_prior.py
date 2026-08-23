@@ -44,6 +44,7 @@ RL redistribution, Stage 2 (V2/V4)       -> reward_redistribution.redistribution
 RL Q (no TD modify, beta)       -> mu_0_micro, Sigma_0_micro, sigma2_rl_micro
    (gamma_terminal=0.5; V7 base sensitivity)
    q_no_td_modify_g09              (gamma_terminal=0.9; V1/V3/V5)
+   q_no_td_modify_g099             (gamma_terminal=0.99; V8)
 
 RL Q joint (eta, beta) for      -> mu_0_micro_mtd_joint,
    modified-TD-loss RLSVI          Sigma_0_micro_mtd_joint (FULL cov),
@@ -1853,6 +1854,11 @@ def save_split_rl_prior_files(
             "model": "q_no_td_modify_g09", "block": "beta",
             "feature_names": _phi_action_names(), **priors["q_no_td_modify_g09"],
         }
+    if "q_no_td_modify_g099" in priors:
+        rl_q_payload["q_no_td_modify_g099"] = {
+            "model": "q_no_td_modify_g099", "block": "beta",
+            "feature_names": _phi_action_names(), **priors["q_no_td_modify_g099"],
+        }
     if "q_redistribution" in priors:
         rl_q_payload["q_redistribution"] = {
             name: {"model": f"q_redistribution_{name}", "block": "beta",
@@ -1928,6 +1934,7 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
     redistribution = priors.get("reward_redistribution") or {}
     q_no_mod = priors["q_no_td_modify"]
     q_g09 = priors.get("q_no_td_modify_g09")
+    q_g099 = priors.get("q_no_td_modify_g099")
     q_redistribution = priors.get("q_redistribution") or {}
     q_joint = priors.get("q_td_modify_joint") or {}
 
@@ -1973,6 +1980,11 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
         rl_rows.extend(_summary_rows(
             prior_family="RL", model="q_no_td_modify_g09", block="beta",
             mean=q_g09.get("mu_0"), cov=q_g09.get("Sigma_0"), names=_phi_action_names(),
+        ))
+    if q_g099 is not None:
+        rl_rows.extend(_summary_rows(
+            prior_family="RL", model="q_no_td_modify_g099", block="beta",
+            mean=q_g099.get("mu_0"), cov=q_g099.get("Sigma_0"), names=_phi_action_names(),
         ))
     for name, prior in q_redistribution.items():
         rl_rows.extend(_summary_rows(
@@ -2179,6 +2191,7 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
     rw = raw["reward"]
     qn = raw["q_no_td_modify"]
     qn_g09 = raw.get("q_no_td_modify_g09")
+    qn_g099 = raw.get("q_no_td_modify_g099")
     q_redistribution = raw.get("q_redistribution")
     qj = raw.get("q_td_modify_joint")
     redistribution = raw.get("reward_redistribution")
@@ -2206,6 +2219,11 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
         out["q_no_td_modify_g09"] = {
             "mu_0": arr(qn_g09["mu_0"]), "Sigma_0": arr(qn_g09["Sigma_0"]),
             "sigma2": float(qn_g09["sigma2"]),
+        }
+    if qn_g099 is not None:
+        out["q_no_td_modify_g099"] = {
+            "mu_0": arr(qn_g099["mu_0"]), "Sigma_0": arr(qn_g099["Sigma_0"]),
+            "sigma2": float(qn_g099["sigma2"]),
         }
     if q_redistribution is not None:
         out["q_redistribution"] = {
@@ -2256,6 +2274,7 @@ def fit_all_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
     reward_redistribution = fit_reward_redistribution_priors(df_fit, gamma_bar=0.9)
     q_no_mod = fit_q_prior(df_fit, gamma_terminal=0.5)
     q_no_mod_g09 = fit_q_prior(df_fit, gamma_terminal=0.9)
+    q_no_mod_g099 = fit_q_prior(df_fit, gamma_terminal=0.99)
     q_redistribution = {
         variant: fit_q_redistribution_prior(df_fit, variant, gamma_terminal=0.9)
         for variant in ("v2", "v4")
@@ -2267,6 +2286,7 @@ def fit_all_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
         "reward_redistribution": reward_redistribution,
         "q_no_td_modify": q_no_mod,
         "q_no_td_modify_g09": q_no_mod_g09,
+        "q_no_td_modify_g099": q_no_mod_g099,
         "q_redistribution": q_redistribution,
         "q_td_modify_joint": q_mod_joint,
     }
@@ -2370,6 +2390,11 @@ def main() -> Dict[str, Any]:
     print(f"  Q (gamma=0.9): p={len(q_no_mod_g09['mu_0'])}, "
           f"sigma2={q_no_mod_g09['sigma2']:.4f}")
 
+    print("Fitting Q prior for the γ̄=0.99 base (V8) ...")
+    q_no_mod_g099 = fit_q_prior(df_fit, gamma_terminal=0.99)
+    print(f"  Q (gamma=0.99): p={len(q_no_mod_g099['mu_0'])}, "
+          f"sigma2={q_no_mod_g099['sigma2']:.4f}")
+
     print("Fitting V2/V4 redistributed-reward Q priors (γ̄=0.9) ...")
     q_redistribution = {
         variant: fit_q_redistribution_prior(df_fit, variant, gamma_terminal=0.9)
@@ -2406,6 +2431,7 @@ def main() -> Dict[str, Any]:
         "reward_redistribution": reward_redistribution,
         "q_no_td_modify":      q_no_mod,
         "q_no_td_modify_g09":  q_no_mod_g09,
+        "q_no_td_modify_g099": q_no_mod_g099,
         "q_redistribution":    q_redistribution,
         "q_td_modify_joint":   q_mod_joint,
     }
