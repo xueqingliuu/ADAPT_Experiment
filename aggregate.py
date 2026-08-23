@@ -22,7 +22,7 @@ DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla_loo"))
 #   • mean cumulative noisy CAE minus never_send (running sum of weekly
 #     CAE, paired), once with always-send and once without (ylim zoomed).
 #     SE bands average over users within each replicate, then use
-#     sd / sqrt(n_exp) across the 100 seeds.
+#     sd / sqrt(n_exp) across the experiment seeds.
 #   • mean (cumulative CAE − never_send) / week (running average of the
 #     paired weekly difference), with and without always-send.
 #   • mean cumulative CAE / week (absolute running average; never-send is
@@ -376,7 +376,7 @@ def _running_mean_vs_reference(all_cae, reference=NEVER_SEND_BASELINE):
 def _running_mean_cae(all_cae):
     """Mean and replication-clustered SE of cumulative CAE / week.
 
-    Never-send is not subtracted. SE averages the 100 draws within each
+    Never-send is not subtracted. SE averages the draws within each
     seed, then ``sd / sqrt(n_exp)``.
     """
     mean, se = {}, {}
@@ -690,10 +690,21 @@ def main() -> None:
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-    # Use first selected config as reference
+    # Union algorithms across selected configs so a newer V8 seed is not
+    # dropped just because the first folder is from an older registry.
     cfg = _load_config(run_dirs[0])
-    algorithms = cfg["algorithms"]
-    labels = cfg["labels"]
+    algorithms = list(cfg["algorithms"])
+    labels = dict(cfg.get("labels") or {})
+    for run_dir in run_dirs[1:]:
+        extra = _load_config(run_dir)
+        for name in extra.get("algorithms") or []:
+            if name not in algorithms:
+                algorithms.append(name)
+        labels.update(extra.get("labels") or {})
+    if "rl_v8_base_g099" not in algorithms and any(
+        (d / "rl_v8_base_g099.npz").exists() for d in run_dirs
+    ):
+        algorithms.append("rl_v8_base_g099")
     labels["rl_v7_base_g05"] = "RL base (\u03b3\u0304=0.5)"
     labels["rl_v8_base_g099"] = "RL base (\u03b3\u0304=0.99)"
     nweek = cfg["nweek"]

@@ -2033,7 +2033,7 @@ if __name__ == "__main__":
     )
 
     user_ids = np.loadtxt(params_dir / "user_ids.txt", dtype=int)
-    N_EXPERIMENTS = 100
+    N_EXPERIMENTS = 300
     all_seeds = list(range(N_EXPERIMENTS))
     seed_idx = args.seed_idx
     if seed_idx is None:
@@ -2053,7 +2053,7 @@ if __name__ == "__main__":
     else:
         SEEDS = all_seeds
         print(f"Running all seeds: {len(SEEDS)} experiments")
-    n_users = 100
+    n_users = 75
     # Pre-draw the participant sample for ALL experiments so that array-mode
     # (one seed per task) and full-run mode see identical populations:
     # experiment with seed s always uses row s, regardless of which seeds
