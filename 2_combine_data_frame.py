@@ -15,6 +15,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ewm_utils import mean_prior_delivered_fraction
+
 DATA_FOLDER = Path(
     "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing"
 )
@@ -118,6 +120,19 @@ df_daily_pageview["Date"] = pd.to_datetime(df_daily_pageview["Date"])
 df_hourly_pageview["Date"] = pd.to_datetime(df_hourly_pageview["Date"])
 
 df_gif["Date"] = pd.to_datetime(df_gif["Date"])
+df_gif = df_gif.sort_values(
+    ["ParticipantIdentifier", "Date", "DecisionTime"], kind="mergesort"
+)
+_interact_col = "Interacted" if "Interacted" in df_gif.columns else "Interacted_walk"
+_gif_parts = []
+for _, _g in df_gif.groupby("ParticipantIdentifier", sort=False):
+    _g = _g.copy()
+    _g["Interacted_7d"] = mean_prior_delivered_fraction(
+        _g[_interact_col], _g["WalkingSuggestion"], window=14, min_periods=7,
+    )
+    _gif_parts.append(_g)
+df_gif = pd.concat(_gif_parts, ignore_index=True)
+
 df_planning["Date"] = pd.to_datetime(df_planning["date"])
 
 df_notwearing["Date"] = pd.to_datetime(df_notwearing["Date"])

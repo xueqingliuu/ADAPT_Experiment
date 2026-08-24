@@ -1091,6 +1091,7 @@ for i, userid in enumerate(userid_all):
     past7days_hourly_pageview_count = fill_nan_with_mean(past7days_hourly_pageview_count)
     past7days_morning_wearing = fill_nan_with_mean(past7days_morning_wearing)
 
+    # Delivered-only lag; NaN when the prior 14 slots had no sends.
     Interacted_7d_walk = fill_nan_with_mean(Interacted_7d_walk)
     # anticipated_affect = np.where(np.isnan(anticipated_affect), np.nanmean(anticipated_affect), anticipated_affect)
     anticipated_affect_yesterday = fill_nan_with_mean(anticipated_affect_yesterday)
@@ -1256,14 +1257,20 @@ for i, userid in enumerate(userid_all):
 
     #### Model 3: Walking suggestion interaction model ####
 
-    # P(WalkingSuggestion = 1 | context): L2 logistic CV (rows with observed WS and predictors)
+    # P(Interacted_walk = 1 | A = 1, context): L2 logistic CV.
+    # A = 0 rows are structural zeros (no suggestion delivered), so they are
+    # not used in the likelihood. The simulator draws from this model only
+    # after a suggestion has been sent.
     ws_interaction_cond = np.stack([
         Intercept,
         Interacted_7d_walk,
         is_weekend, decision_time
     ], axis=1)
     Cs_ws_interaction = np.sort(1.0 / np.asarray(alpha_l2_list, dtype=float))
-    idx_obs_ws_interaction = ~np.isnan(ws_interaction)
+    idx_obs_ws_interaction = (
+        ~np.isnan(ws_interaction)
+        & (np.asarray(WalkingSuggestion, dtype=float) == 1.0)
+    )
     cv_ws_interaction = min(5, int(idx_obs_ws_interaction.sum()))
     ws_interaction_cond_obs = ws_interaction_cond[idx_obs_ws_interaction, :]
     ws_interaction_obs =  ws_interaction[idx_obs_ws_interaction]

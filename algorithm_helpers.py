@@ -242,51 +242,19 @@ def _per_particle_posterior(
 
 
 def _transition_feature_with_particle_mediators(
-    X_Y_base, cae_delta_Y, cae_value, X_MY_j, theta_MY_j, M_Y_obs,
+    X_Y_base, cae_delta_Y, cae_value,
 ):
-    """CAE transition row with particle-specific Mon–Sat EWMA mediators.
+    """CAE transition row: particle-specific AR-1 lag, frozen mediator EWMAs.
 
-    The Y design is ``[1, CAE_lag, fourSC_ewma, antic_ewma]``. Missing
-    MY values are filled from the particle's mediator posterior mean, then
-    compressed to EWMA over 12 fourSC slots and 6 antic days (Sunday excluded).
+    The Y design is ``[1, CAE_lag, fourSC_ewma, antic_ewma]``. Only the CAE
+    lag is particle-specific. fourSC / antic EWMAs stay as in ``X_Y_base``
+    (agent-visible values: fourSC is always observed; missing daily antic
+    is last-observation-carried-forward). Same construction as historical
+    ``X_cumul_Y_base`` rows.
     """
-    X_Y_j = np.asarray(X_Y_base, dtype=float).ravel() + float(cae_value) * np.asarray(
+    return np.asarray(X_Y_base, dtype=float).ravel() + float(cae_value) * np.asarray(
         cae_delta_Y, dtype=float
     ).ravel()
-    if X_Y_j.size < 4:
-        return X_Y_j
-
-    four_col, antic_col = 2, 3
-    n_four_max = N_RL_DAYS * N_RL_SLOTS
-    n_antic_max = N_RL_DAYS
-
-    if len(M_Y_obs) >= 1 and len(X_MY_j) >= 1:
-        y_four = np.asarray(M_Y_obs[0], dtype=float).ravel()
-        mu_four = (
-            np.asarray(X_MY_j[0], dtype=float) @ np.asarray(theta_MY_j[0], dtype=float)
-        ).ravel()
-        n_four = min(y_four.size, mu_four.size, n_four_max)
-        if n_four > 0:
-            filled = np.where(
-                np.isfinite(y_four[:n_four]), y_four[:n_four], mu_four[:n_four]
-            )
-            X_Y_j[four_col] = ewma_gamma(filled, empty=0.0)
-
-    if len(M_Y_obs) >= 2 and len(X_MY_j) >= 2:
-        y_antic = np.asarray(M_Y_obs[1], dtype=float).ravel()
-        mu_antic = (
-            np.asarray(X_MY_j[1], dtype=float) @ np.asarray(theta_MY_j[1], dtype=float)
-        ).ravel()
-        n_antic = min(y_antic.size, mu_antic.size, n_antic_max)
-        if n_antic > 0:
-            filled = np.where(
-                np.isfinite(y_antic[:n_antic]),
-                y_antic[:n_antic],
-                mu_antic[:n_antic],
-            )
-            X_Y_j[antic_col] = ewma_gamma(filled, empty=0.0)
-
-    return X_Y_j
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -462,7 +430,6 @@ class ParticleFilterRuntime:
             ]
             X_Y_j = _transition_feature_with_particle_mediators(
                 pf_data["X_Y_base"], pf_data["cae_delta_Y"], cae_curr,
-                X_MY_j, theta_MY_j, pf_data["M_Y_obs"],
             )
             mu_y_j = float(theta_Y_j @ X_Y_j)
             mu_Y_arr[j] = mu_y_j

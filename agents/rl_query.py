@@ -99,7 +99,7 @@ def estimate_belief_state_minus(
         X_MY_j        = [np.atleast_2d(X_MY_base[m]) + cae_curr * np.atleast_2d(cae_delta_MY[m])
                          for m in range(n_med)]
         X_Y_j = _transition_feature_with_particle_mediators(
-            X_Y_base, cae_delta_Y, cae_curr, X_MY_j, theta_MY_j, M_Y_obs,
+            X_Y_base, cae_delta_Y, cae_curr,
         )
 
         mu_y_j        = float(theta_Y_j @ X_Y_j)

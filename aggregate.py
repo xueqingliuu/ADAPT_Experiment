@@ -57,6 +57,8 @@ GAMMA09_ALGOS = (
 )
 NEVER_SEND_BASELINE = "never_send"
 ALWAYS_SEND_BASELINE = "always_send"
+# γ̄=0.99 base is a sensitivity in the registry; omit from figures.
+OMIT_FROM_PLOTS = frozenset({"rl_v8_base_g099"})
 
 
 def cumulative_average(x):
@@ -390,18 +392,27 @@ def _running_mean_cae(all_cae):
     return mean, se
 
 
-def _cae_ylim(mean, se):
-    """Tight y-limits around mean ± SE so nearby policies are distinguishable."""
+def _cae_ylim(mean, se, *, on="bands"):
+    """Y-limits for CAE figures.
+
+    ``on="bands"`` (default) covers mean ± SE. ``on="means"`` uses only the
+    mean paths so nearby policies occupy more of the panel; SE ribbons may
+    clip.
+    """
     lows, highs = [], []
     for name in mean:
         m = np.asarray(mean[name], dtype=float)
-        s = np.asarray(se[name], dtype=float)
-        lows.append(np.nanmin(m - s))
-        highs.append(np.nanmax(m + s))
+        if on == "means":
+            lows.append(np.nanmin(m))
+            highs.append(np.nanmax(m))
+        else:
+            s = np.asarray(se[name], dtype=float)
+            lows.append(np.nanmin(m - s))
+            highs.append(np.nanmax(m + s))
     lo = float(np.nanmin(lows))
     hi = float(np.nanmax(highs))
     span = max(hi - lo, 0.02)
-    pad = 0.15 * span
+    pad = 0.08 * span if on == "means" else 0.15 * span
     return lo - pad, hi + pad
 
 
@@ -413,7 +424,7 @@ def _save_fig(fig, out, stem):
 
 
 def _plot_cae_vs_reference(ax, names, *, cum_mean, cum_se, labels, weeks,
-                           vs_never, kind, always_note):
+                           vs_never, kind, always_note, ylim_on="bands"):
     for name in names:
         m = cum_mean[name]
         s = cum_se[name]
@@ -433,6 +444,7 @@ def _plot_cae_vs_reference(ax, names, *, cum_mean, cum_se, labels, weeks,
     ax.set_ylim(*_cae_ylim(
         {n: cum_mean[n] for n in names},
         {n: cum_se[n] for n in names},
+        on=ylim_on,
     ))
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
@@ -441,7 +453,7 @@ def _plot_cae_vs_reference(ax, names, *, cum_mean, cum_se, labels, weeks,
 def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
                   uids=None):
     """Write CAE (with and without always-send) and action-probability figures."""
-    names = list(stats["all_cae"].keys())
+    names = [n for n in stats["all_cae"] if n not in OMIT_FROM_PLOTS]
     cum_mean, cum_se, vs_never = _cumsum_vs_reference(
         stats["all_cae"], uids=uids,
     )
@@ -466,6 +478,7 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
             cum_mean=cum_mean, cum_se=cum_se, labels=labels, weeks=weeks,
             vs_never=vs_never, kind=kind,
             always_note="; always-send omitted",
+            ylim_on="means",
         )
         _save_fig(fig, out, f"cae_{suffix}_no_always")
 

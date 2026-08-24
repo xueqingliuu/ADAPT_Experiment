@@ -58,3 +58,34 @@ def ewma_gamma(values, gamma: float | None = None, *, empty: float = np.nan) -> 
     gamma = float(gamma)
     weights = gamma ** np.arange(k - 1, -1, -1, dtype=float)
     return float(np.dot(weights, vals) / weights.sum())
+
+
+def mean_prior_delivered_fraction(
+    interacted, delivered, *, window=14, min_periods=7
+):
+    """Mean of ``interacted`` among prior delivered slots; excludes current.
+
+    For each t, look at rows ``[max(0, t-window), t)``. The value is the mean
+    of ``interacted`` on rows with ``delivered == 1``. NaN if fewer than
+    ``min_periods`` prior rows exist, or if that window has no deliveries
+    (do not code those as 0 — that confounds send volume with engagement).
+    """
+    y = np.asarray(interacted, dtype=float).ravel()
+    d = np.asarray(delivered, dtype=float).ravel() == 1.0
+    if y.size != d.size:
+        raise ValueError("interacted and delivered must have the same length")
+    n = int(y.size)
+    out = np.full(n, np.nan)
+    y_del = np.where(d & np.isfinite(y), y, 0.0)
+    d_f = d.astype(float)
+    csum_y = np.concatenate(([0.0], np.cumsum(y_del)))
+    csum_d = np.concatenate(([0.0], np.cumsum(d_f)))
+    for t in range(n):
+        if t < int(min_periods):
+            continue
+        start = max(0, t - int(window))
+        n_del = csum_d[t] - csum_d[start]
+        if n_del < 1.0:
+            continue
+        out[t] = (csum_y[t] - csum_y[start]) / n_del
+    return out

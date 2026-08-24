@@ -123,7 +123,8 @@ RAW_UNIT_INTERVAL_COLS = [
     # ActivityCheck rolling fractions
     ("active_status_fraction_7days", "active_status_fraction_7days_limit"),
     ("active_status_fraction_7days_yesterday", "active_status_fraction_7days_yesterday_limit"),
-    # Rolling interaction / wear fractions
+    # Rolling interaction / wear fractions. Interacted_7d_walk is the
+    # delivered-only fraction over the prior 14 slots (NaN if none sent).
     ("Interacted_7d_walk", "Interacted_7d_walk_limit"),
     ("past7days_morning_wearing", "past7days_morning_wearing_limit"),
 ]

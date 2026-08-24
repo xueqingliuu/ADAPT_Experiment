@@ -64,11 +64,30 @@ def _rolling_mean_last(values, window=ACTIVE_STATUS_ROLLING_WINDOW, min_values=E
     if v.size < min_values:
         return 0.0
     return float(np.mean(v))
+
+
+def _delivered_interaction_fraction(actions, interactions, window=14, fallback=0.0):
+    """Mean interaction among delivered slots in the last ``window`` pairs.
+
+    Non-deliveries are omitted from the denominator. If the window has no
+    deliveries, return ``fallback`` (last defined fraction), not 0.
+    """
+    a = np.asarray(actions[-window:], dtype=float)
+    i = np.asarray(interactions[-window:], dtype=float)
+    if a.size == 0:
+        return float(fallback)
+    delivered = (a == 1.0) & np.isfinite(i)
+    if not np.any(delivered):
+        return float(fallback)
+    return float(np.mean(i[delivered]))
 # %%
 from vani_env import (
     Env,
     EnvConfig,
     make_initial_state,
+    slot_ema_initials_from_df_fit,
+    invert_log_zscore,
+    zscore_value,
     PARAMS_DIR as DEFAULT_PARAMS_DIR,
     trim_pf_cae_prior,
 )
@@ -323,12 +342,26 @@ class OnlineEnv:
         self.s = make_initial_state(
             df_fit_11week_csv, participant_id=self.env.cfg.userid
         )
-        self._stepCountLast7DaysEma_initial = float(self.s.get("stepCountLast7DaysEma", 0.0))
-        self._hist_foursc_by_slot: dict[int, list[float]] = {0: [], 1: []}
-        self._stepCountLast7DaysEma_by_slot: dict[int, float] = {
-            0: self._stepCountLast7DaysEma_initial,
-            1: self._stepCountLast7DaysEma_initial,
+        slot_ema = slot_ema_initials_from_df_fit(
+            df_fit_11week_csv, participant_id=self.env.cfg.userid, n_slots=self.K
+        )
+        self._stepCountLast7DaysEma_initial_by_slot = {
+            s: float(slot_ema["stepCountLast7DaysEma"][s]) for s in range(self.K)
         }
+        self._prior2HourStepCountEma7d_initial_by_slot = {
+            s: float(slot_ema["prior2HourStepCountEma7d"][s]) for s in range(self.K)
+        }
+        self._stepCountLast7DaysEma_initial = float(
+            self._stepCountLast7DaysEma_initial_by_slot[0]
+        )
+        self._hist_foursc_by_slot: dict[int, list[float]] = {s: [] for s in range(self.K)}
+        self._stepCountLast7DaysEma_by_slot: dict[int, float] = dict(
+            self._stepCountLast7DaysEma_initial_by_slot
+        )
+        self.s["stepCountLast7DaysEma"] = self._stepCountLast7DaysEma_initial
+        self.s["prior2HourStepCountEma7d"] = float(
+            self._prior2HourStepCountEma7d_initial_by_slot[0]
+        )
         self._initial_prior2hour = float(self.s.get("prior2HourStepCount", 0.0))
         self.s["prior2HourStepCountAgent"] = float(self.s.get("prior2HourStepCount", 0.0))
         self.s["dailyAnticipatedAffectYesterdayAgent"] = float(
@@ -340,14 +373,17 @@ class OnlineEnv:
         self.prior2HourStepCountAgentAll = np.full(self.T, np.nan)
         self._hist_prior2hour_observed: list[float] = []
         # Agent-visible prior-2-hour values (observed or imputed), per decision slot.
-        self._hist_prior2hour_by_slot: dict[int, list[float]] = {0: [], 1: []}
+        self._hist_prior2hour_by_slot: dict[int, list[float]] = {s: [] for s in range(self.K)}
         self.ws_interaction_all = np.zeros(self.T)
 
-        # Seed the rolling 7-day walking-suggestion interaction fraction.
+        # Seed the rolling 7-day walking-suggestion interaction fraction
+        # (delivered-only over the last 14 slots; last-defined if none sent).
         self._ws_interaction_initial = float(self.s.get("activitySuggestionInteractLast7Days", 0.0))
-        self._hist_ws_interaction = (
-            [self._ws_interaction_initial] * INTERACTION_ROLLING_WINDOW
-        )
+        if not np.isfinite(self._ws_interaction_initial):
+            self._ws_interaction_initial = 0.0
+        self._ws_interaction_last = self._ws_interaction_initial
+        self._hist_ws_action: list[float] = []
+        self._hist_ws_interaction: list[float] = []
 
         self.activityStatusTodayAll = np.zeros(self.D)
 
@@ -388,10 +424,11 @@ class OnlineEnv:
         self._yesterday_morning_WS = 0.0
         self._yesterday_afternoon_WS = 0.0
 
-        # s["dailyAnticipatedAffectYesterday"] is last-observation-carried-forward
-        # (updated only on dailySurveyComplete==1 days). Seeded from the df_fit
-        # baseline row (dailyAnticipatedAffectYesterday_norm). Agent-visible
-        # anticipated affect uses this same LOCF value when the survey is missed.
+        # Latent lag s["dailyAnticipatedAffectYesterday"] advances every day
+        # (seeded from df_fit dailyAnticipatedAffectYesterday_norm). Agent lag
+        # s["dailyAnticipatedAffectYesterdayAgent"] is last-observation-carried-
+        # forward: it stays at the last completed daily survey when the survey
+        # is missed.
         self._today_fourSC = np.zeros(self.K)
         self._today_pageview = np.zeros(self.K)
         self._today_action = np.zeros(self.K)
@@ -422,8 +459,9 @@ class OnlineEnv:
             )
         )
 
-        # ``activitySuggestionsSentLast7Days``: baseline from df_fit; then daily sum +
-        # ``_ewm_prior_gamma_last`` (matches ``1_data_extraction.recent_burden``).
+        # ``activitySuggestionsSentLast7Days``: baseline from df_fit
+        # (``recent_burden_norm``); then daily sum + EWM of raw {0,1,2} counts
+        # + z-score with ``recent_burden_shift`` / ``scale``.
         self._activitySuggestionsSentLast7Days_initial = float(
             self.s["activitySuggestionsSentLast7Days"]
         )
@@ -519,17 +557,21 @@ class OnlineEnv:
         """
         step_idx = int(step_idx)
         if np.isfinite(self.prior2HourStepCountAgentAll[step_idx]):
+            val = float(self.prior2HourStepCountAgentAll[step_idx])
+            if not np.isfinite(self.prior2HourStepCountAll[step_idx]):
+                self.prior2HourStepCountAll[step_idx] = val
+            if not np.isfinite(self.prior2HourStepCountObsAll[step_idx]):
+                self.prior2HourStepCountObsAll[step_idx] = val
+            latent = self.prior2HourStepCountAll[step_idx]
+            self.s["prior2HourStepCount"] = (
+                float(latent) if np.isfinite(latent) else val
+            )
+            self.s["prior2HourStepCountAgent"] = val
             return
 
         slot = int(t_sim)
         self.s["decisionTimeSlot"] = float(t_sim)
-        ema_hist = self._hist_prior2hour_by_slot[slot]
-        if ema_hist:
-            self.s["prior2HourStepCountEma7d"] = _ewm_prior_gamma_last(ema_hist)
-        else:
-            self.s["prior2HourStepCountEma7d"] = float(
-                self.s.get("prior2HourStepCountEma7d", 0.0)
-            )
+        self.s["prior2HourStepCountEma7d"] = self._prior2HourStepCountEma7d_for_slot(slot)
 
         prior2HourStepCount = self.env.gen_prior2hour_step_count(self.s, step_idx)
         self.prior2HourStepCountAll[step_idx] = prior2HourStepCount
@@ -542,15 +584,33 @@ class OnlineEnv:
         """Return (observed, agent-visible) anticipated affect for one day.
 
         Missed surveys keep the observation as NaN and show the agent the last
-        observed value (LOCF from ``dailyAnticipatedAffectYesterday``).
+        completed-survey value (LOCF from ``dailyAnticipatedAffectYesterdayAgent``).
+        The latent lag is a separate key and is not used here.
         """
         if survey_present:
             val = float(antic_latent)
             return val, val
-        last = float(self.s.get("dailyAnticipatedAffectYesterday", 0.0))
+        last = float(self.s.get("dailyAnticipatedAffectYesterdayAgent", 0.0))
         if not np.isfinite(last):
             last = 0.0
         return np.nan, last
+
+    def _record_ws_interaction(self, Ah, ws_interaction):
+        """Append this slot to the 14-slot delivered-only interaction window."""
+        self._hist_ws_action.append(float(Ah))
+        self._hist_ws_interaction.append(float(ws_interaction))
+        frac = _delivered_interaction_fraction(
+            self._hist_ws_action,
+            self._hist_ws_interaction,
+            INTERACTION_ROLLING_WINDOW,
+            fallback=self._ws_interaction_last,
+        )
+        self.s["activitySuggestionInteractLast7Days"] = frac
+        window_a = np.asarray(
+            self._hist_ws_action[-INTERACTION_ROLLING_WINDOW:], dtype=float
+        )
+        if np.any(window_a == 1.0):
+            self._ws_interaction_last = frac
 
     def _reset_episode_state(self):
         """Reset mutable episode histories before simulating a policy."""
@@ -558,9 +618,9 @@ class OnlineEnv:
         self.s["activitySuggestionsSentLast7Days"] = (
             self._activitySuggestionsSentLast7Days_initial
         )
-        self._hist_ws_interaction = (
-            [self._ws_interaction_initial] * INTERACTION_ROLLING_WINDOW
-        )
+        self._ws_interaction_last = self._ws_interaction_initial
+        self._hist_ws_action = []
+        self._hist_ws_interaction = []
 
         self.s["activitySuggestionInteractLast7Days"] = self._ws_interaction_initial
 
@@ -568,15 +628,25 @@ class OnlineEnv:
         self._hist_morning_wear = [self._wear7_initial] * 7
         self._hist_active_days = [self._active_days7_initial] * ACTIVE_STATUS_ROLLING_WINDOW
 
-        self._hist_prior2hour_by_slot = {0: [], 1: []}
-        self._hist_foursc_by_slot = {0: [], 1: []}
-        self._stepCountLast7DaysEma_by_slot = {
-            0: self._stepCountLast7DaysEma_initial,
-            1: self._stepCountLast7DaysEma_initial,
-        }
-        self.s["stepCountLast7DaysEma"] = self._stepCountLast7DaysEma_initial
-        p2h0 = float(self.s.get("prior2HourStepCount", 0.0))
-        self.prior2HourStepCountAgentAll[0] = float(self.s.get("prior2HourStepCountAgent", p2h0))
+        self._hist_prior2hour_by_slot = {s: [] for s in range(self.K)}
+        self._hist_foursc_by_slot = {s: [] for s in range(self.K)}
+        self._stepCountLast7DaysEma_by_slot = dict(
+            self._stepCountLast7DaysEma_initial_by_slot
+        )
+        self.s["stepCountLast7DaysEma"] = float(
+            self._stepCountLast7DaysEma_initial_by_slot[0]
+        )
+        self.s["prior2HourStepCountEma7d"] = float(
+            self._prior2HourStepCountEma7d_initial_by_slot[0]
+        )
+        p2h0 = float(self._initial_prior2hour)
+        if not np.isfinite(p2h0):
+            p2h0 = 0.0
+        self.s["prior2HourStepCount"] = p2h0
+        self.s["prior2HourStepCountAgent"] = p2h0
+        self.prior2HourStepCountAll[0] = p2h0
+        self.prior2HourStepCountObsAll[0] = p2h0
+        self.prior2HourStepCountAgentAll[0] = p2h0
 
         self.logYesterdayStepCount[0] = float(self.s["yesterdayStepCount"])
         self.logPageViewLast7DaysEma[0] = float(self.s["pageViewLast7DaysEma"])
@@ -679,7 +749,7 @@ class OnlineEnv:
 
         # Interaction history should not include the current slot until after
         # ``ws_interaction`` has been generated.
-        ws_interaction = self.env.gen_ws_interaction(self.s, step_idx)
+        ws_interaction = self.env.gen_ws_interaction(self.s, step_idx, Ah)
 
         self.stepCountNext4HourAll[step_idx] = fourSC
         self.stepCountNext4HourObsAll[step_idx] = fourSC
@@ -700,17 +770,24 @@ class OnlineEnv:
         self.s["pageViewNext4HourLag1"] = pv
         self.s["prior2HourStepCount"] = prior2HourStepCount
         self.s["prior2HourStepCountAgent"] = p2h_agent
-        self._hist_prior2hour_by_slot[slot].append(float(p2h_agent))
-        self._hist_foursc_by_slot[slot].append(float(fourSC))
+        self._hist_prior2hour_by_slot[slot].append(
+            invert_log_zscore(
+                p2h_agent,
+                self.env.cfg.prior2hour_log_shift,
+                self.env.cfg.prior2hour_log_scale,
+            )
+        )
+        self._hist_foursc_by_slot[slot].append(
+            invert_log_zscore(
+                fourSC,
+                self.env.cfg.fourSC_log_shift,
+                self.env.cfg.fourSC_log_scale,
+            )
+        )
         self._stepCountLast7DaysEma_by_slot[slot] = self._stepCountLast7DaysEma_for_slot(slot)
 
-        # Update rolling 7-day interaction fractions after observing current slot.
-        self._hist_ws_interaction.append(float(ws_interaction))
-
-        self.s["activitySuggestionInteractLast7Days"] = _rolling_mean_last(
-            self._hist_ws_interaction,
-            INTERACTION_ROLLING_WINDOW,
-        )
+        # Update rolling delivered-only interaction fraction after this slot.
+        self._record_ws_interaction(Ah, ws_interaction)
 
         if t_sim == self.K - 1:
             self._end_day(sim_w, d_w, d_global)
@@ -740,8 +817,13 @@ class OnlineEnv:
         self.logMorningFitbitWearLast7Days[d_global] = _rolling_mean_last(self._hist_morning_wear, 7)
 
         if self._hist_daily_suggestions:
-            self.s["activitySuggestionsSentLast7Days"] = _ewm_prior_gamma_last(
-                self._hist_daily_suggestions,
+            raw_burden = _ewm_prior_gamma_last(
+                self._hist_daily_suggestions, min_values=1
+            )
+            self.s["activitySuggestionsSentLast7Days"] = zscore_value(
+                raw_burden,
+                self.env.cfg.recent_burden_shift,
+                self.env.cfg.recent_burden_scale,
             )
         else:
             self.s["activitySuggestionsSentLast7Days"] = (
@@ -773,10 +855,9 @@ class OnlineEnv:
         self.s["morningFitbitWear"] = fitbit
         daily_pres = self.env.gen_dailysurvey(self.s, ws_m, ws_a, Iw*self.wp_all[sim_w], d_global)
         self.s["dailySurveyComplete"] = daily_pres
-        # Latent anticipated affect — always drawn from the generative process.
-        # Stored as s["dailyAnticipatedAffect"] so that tomorrow's decision-slot calls
-        # to gen_fourSC_mean / gen_antic_mean in vani_env.py see the true latent
-        # from yesterday (not the NaN-masked carry-forward).
+        # Latent anticipated affect — always drawn. Tomorrow's gen_fourSC_mean /
+        # gen_antic_mean read s["dailyAnticipatedAffectYesterday"], which is
+        # updated to this draw even if the daily survey is missing.
         antic = self.env.gen_antic(self.s, ws_m, ws_a, d_global)
         self.s["dailyAnticipatedAffect"] = antic
 
@@ -795,9 +876,8 @@ class OnlineEnv:
         self.dailyAnticipatedAffectObsAll[d_global] = antic_obs
         self.dailyAnticipatedAffectAgentAll[d_global] = antic_agent
 
-        # Last-observed carry-forward; agent lag uses the same LOCF value.
-        if survey_present:
-            self.s["dailyAnticipatedAffectYesterday"] = antic
+        # Latent lag always advances. Agent lag is LOCF of last completed survey.
+        self.s["dailyAnticipatedAffectYesterday"] = antic
         self.s["dailyAnticipatedAffectYesterdayAgent"] = antic_agent
 
         self.s["yesterdayStepCount"] = daily_sum_step
@@ -882,10 +962,19 @@ class OnlineEnv:
 
             self.s["stepCountNext4HourLag1"] = fourSC
             self.s["pageViewNext4HourLag1"] = pv
-            self._hist_foursc_by_slot[int(t_sim)].append(float(fourSC))
+            self._hist_foursc_by_slot[int(t_sim)].append(
+                invert_log_zscore(
+                    fourSC,
+                    self.env.cfg.fourSC_log_shift,
+                    self.env.cfg.fourSC_log_scale,
+                )
+            )
             self._stepCountLast7DaysEma_by_slot[int(t_sim)] = (
                 self._stepCountLast7DaysEma_for_slot(int(t_sim))
             )
+            # Sunday has no walking suggestion; still occupies a slot in the
+            # 14-slot delivered-only interaction window.
+            self._record_ws_interaction(0.0, 0.0)
 
         self._end_day(sim_w, d_w_sun, d_global)
 
@@ -954,14 +1043,36 @@ class OnlineEnv:
         return 0.0 if n <= 1 else (wk - (1.0 + n) / 2.0) / ((n - 1.0) / 2.0)
 
     def _stepCountLast7DaysEma_for_slot(self, slot):
-        """EWM of prior ≤7 same-slot 4-hour step counts (excludes current slot).
+        """EWM of prior ≤7 same-slot *raw* 4-hour counts, then EMA z-score.
 
-        Matches ``1_data_extraction`` ``EMA_StepCount`` (groupby DecisionTime).
+        Matches ``1_data_extraction`` ``EMA_StepCount`` (groupby DecisionTime)
+        followed by ``3_standardization`` ``EMA_StepCount_norm``.
         """
-        hist = self._hist_foursc_by_slot[int(slot)]
+        slot = int(slot)
+        hist = self._hist_foursc_by_slot[slot]
         if hist:
-            return _ewm_prior_gamma_last(hist)
-        return self._stepCountLast7DaysEma_initial
+            raw_ema = _ewm_prior_gamma_last(hist, min_values=1)
+            return zscore_value(
+                raw_ema, self.env.cfg.ema_step_shift, self.env.cfg.ema_step_scale
+            )
+        return float(self._stepCountLast7DaysEma_initial_by_slot[slot])
+
+    def _prior2HourStepCountEma7d_for_slot(self, slot):
+        """EWM of prior ≤7 same-slot *raw* prior-2-hour counts, then EMA z-score.
+
+        Matches ``1_data_extraction`` ``EMA_Prior2HourStepCount`` (groupby
+        DecisionTime) followed by ``3_standardization`` ``EMA_Prior2HourStepCount_norm``.
+        """
+        slot = int(slot)
+        hist = self._hist_prior2hour_by_slot[slot]
+        if hist:
+            raw_ema = _ewm_prior_gamma_last(hist, min_values=1)
+            return zscore_value(
+                raw_ema,
+                self.env.cfg.ema_prior2hour_shift,
+                self.env.cfg.ema_prior2hour_scale,
+            )
+        return float(self._prior2HourStepCountEma7d_initial_by_slot[slot])
 
     def _pf_foursc_row(self, step_idx):
         sim_w, _d_w, t_sim, d_global = self._decode_step_idx(step_idx)
@@ -1014,7 +1125,11 @@ class OnlineEnv:
         )
 
     def _pf_cae_row(self, sim_w):
-        """PF CAE transition row: EWMA of Mon–Sat mediators only (12 slots / 6 days)."""
+        """PF CAE transition row: EWMA of Mon–Sat mediators only (12 slots / 6 days).
+
+        Anticipated affect uses the agent-visible series (LOCF on missed
+        daily surveys). Current-week and historical CAE rows share this.
+        """
         slot_start = self._step_idx(sim_w, 0, 0)
         slot_stop = slot_start + N_RL_DAYS * self.K
         day_start = self._day_idx(sim_w, 0)

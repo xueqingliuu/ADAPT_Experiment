@@ -25,7 +25,7 @@ import pandas as pd
 import seaborn as sns
 from matplotlib.ticker import MaxNLocator
 
-from ewm_utils import ewma_gamma
+from ewm_utils import ewma_gamma, mean_prior_delivered_fraction
 
 plt.ion()
 
@@ -2014,12 +2014,19 @@ for n in range(len(complete_participant_ids)):
 
 df_gif_all = pd.DataFrame(df_gif_all)
 
-# Fraction interacted over prior 14 walking-suggestion slots (~7 days × 2); excludes current slot
+# Delivered-only interaction fraction over prior 14 slots (~7 days × 2);
+# excludes current slot. Non-deliveries are not coded 0 in the denominator.
+# Windows with no deliveries stay NaN (imputed later when a complete vector
+# is required).
 df_gif_all = df_gif_all.sort_values(['ParticipantIdentifier', 'Date', 'DecisionTime'], kind='mergesort')
-df_gif_all['Interacted_7d'] = (
-    df_gif_all.groupby('ParticipantIdentifier', sort=False)['Interacted']
-    .transform(lambda s: _mean_prior_rows(s, window=14, min_periods=7))
-)
+_gif_parts = []
+for _, _g in df_gif_all.groupby('ParticipantIdentifier', sort=False):
+    _g = _g.copy()
+    _g['Interacted_7d'] = mean_prior_delivered_fraction(
+        _g['Interacted'], _g['WalkingSuggestion'], window=14, min_periods=7,
+    )
+    _gif_parts.append(_g)
+df_gif_all = pd.concat(_gif_parts, ignore_index=True)
 
 # recent_burden: X_d = daily walking-suggestion count (sum over AM/PM slots), then
 #   _ewm_prior_rows on the daily series (window=7, gamma derived from k, the

@@ -64,6 +64,35 @@ def denormalize_CAE(cae_norm, params_dir=PARAMS_DIR):
     shift, scale = load_CAE_norm_params(params_dir)
     return shift + scale * np.asarray(cae_norm, dtype=float)
 
+
+def invert_log_zscore(norm, shift, scale):
+    """Undo ``(log(x+1) - shift) / scale`` and return raw count ``x >= 0``."""
+    s = float(scale)
+    if s == 0.0 or not math.isfinite(s):
+        s = 1.0
+    try:
+        z = float(norm)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(z):
+        return 0.0
+    log_val = float(np.clip(float(shift) + s * z, 0.0, 20.0))
+    return float(np.expm1(log_val))
+
+
+def zscore_value(raw, shift, scale):
+    """Apply ``(raw - shift) / scale`` (the EMA_StepCount / EMA_Prior2Hour map)."""
+    s = float(scale)
+    if s == 0.0 or not math.isfinite(s):
+        s = 1.0
+    try:
+        x = float(raw)
+    except (TypeError, ValueError):
+        x = 0.0
+    if not math.isfinite(x):
+        x = 0.0
+    return (x - float(shift)) / s
+
 THETA_PRIOR2HOUR_STEP_COUNT_NAMES = [
     "intercept",
     "EMA_Prior2HourStepCount",
@@ -545,6 +574,10 @@ class EnvConfig:
         self.params_dir = params_path
         std = _load_json(params_path / "std_params.json")
         self.limits_fourSC = std["4hour_step_count_limit"]
+        self.fourSC_log_shift = float(std["4hour_step_count_shift"])
+        self.fourSC_log_scale = float(std["4hour_step_count_scale"])
+        self.ema_step_shift = float(std["EMA_step_count_shift"])
+        self.ema_step_scale = float(std["EMA_step_count_scale"])
         self.limits_pageview = std["HourlyPageviewCount_limit"]
         self.limits_CAE = std["CAE_avg_limit"]
         self.limits_CAE_short = std["CAE_short_avg_limit"]
@@ -561,6 +594,12 @@ class EnvConfig:
         self.limits_perceivedUtility = [-2.657, 2.953]
         self.limits_week_present = [0.0, 1.0]
         self.limits_prior2hour_step_count = std["prior2hour_step_count_limit"]
+        self.prior2hour_log_shift = float(std["prior2hour_step_count_shift"])
+        self.prior2hour_log_scale = float(std["prior2hour_step_count_scale"])
+        self.ema_prior2hour_shift = float(std["EMA_prior2hour_step_count_shift"])
+        self.ema_prior2hour_scale = float(std["EMA_prior2hour_step_count_scale"])
+        self.recent_burden_shift = float(std["recent_burden_shift"])
+        self.recent_burden_scale = float(std["recent_burden_scale"])
         self.limits_active_status = [0.0, 1.0]
         self.limits_ws_interaction = [0.0, 1.0]
         # Tool surveys are normalized from the raw 1..7 scale to [-1, 1].
@@ -910,7 +949,13 @@ class Env:
         eta = float(self.cfg.theta_ws_interaction @ X)
         return eta if return_logit else self._sigmoid(eta)
 
-    def gen_ws_interaction(self, s, step_idx):
+    def gen_ws_interaction(self, s, step_idx, Ah=1.0):
+        """Draw interaction with a delivered activity suggestion.
+
+        ``A = 0`` means no suggestion was sent, so the interaction event is 0.
+        """
+        if float(Ah) == 0.0:
+            return 0.0
         eta = self.gen_ws_interaction_mean(s, return_logit=True)
         base_p = self._sigmoid(eta)
         noise = self._sample_noise(self.cfg.resid_ws_interaction, step_idx, name="ws_interaction")
@@ -1358,18 +1403,25 @@ def _read_last_csv_row_for_participant(path, participant_id):
     return last_match
 
 
+# Current ``df_fit_11week.csv`` names first; older camelCase aliases kept for
+# backward compatibility. ``_float_csv_cell`` uses the first finite match.
 _STATE_FROM_DF_FIT_ROW = (
-    ("stepCountNext4HourLag1", ("FourSC_lag1",)),
-    ("pageViewNext4HourLag1", ("hourly_pageview_count_lag1",)),
+    ("stepCountNext4HourLag1", ("FourSC_lag1", "fourSC_lag1")),
+    ("pageViewNext4HourLag1", ("hourly_pageview_count_lag1", "HourlyPageviewCount_lag1")),
     ("prior2HourStepCountEma7d", ("EMA_Prior2HourStepCount_norm", "EMA_Prior2HourStepCount")),
-    ("prior2HourStepCountLag1", ("prior2HourStepCountLag1",)),
-    ("prior2HourStepCount", ("prior2HourStepCount_norm", "prior2HourStepCount")),
+    ("prior2HourStepCountLag1", ("prior2hour_step_count_lag1", "prior2HourStepCountLag1")),
+    ("prior2HourStepCount", (
+        "prior2hour_step_norm",
+        "prior2hour_step",
+        "prior2HourStepCount_norm",
+        "prior2HourStepCount",
+    )),
     ("yesterdayStepCount", ("YesterdayStepCount_norm", "YesterdayStepCount")),
     ("stepCountLast7DaysEma", ("EMA_StepCount_norm", "EMA_StepCount")),
     ("pageViewLast7DaysEma", ("Past7DaysPageviewEMA_norm", "Past7DaysPageviewEMA")),
-    ("morningFitbitWearLast7DaysAlt", ("morningFitbitWearLast7Days", )),
-    ("morningFitbitWearLast7Days", ("morningFitbitWearLast7Days",)),
-    ("dailySurveyComplete", ("dailySurveyComplete",)),
+    ("morningFitbitWearLast7DaysAlt", ("past7days_daywearing", "morningFitbitWearLast7Days")),
+    ("morningFitbitWearLast7Days", ("past7days_morning_wearing", "morningFitbitWearLast7Days")),
+    ("dailySurveyComplete", ("daily_present", "dailySurveyComplete")),
     ("activeDaysLast7Days", ("active_status_fraction_7days", "activeDaysLast7Days")),
     ("activitySuggestionsSentLast7Days", (
         "recent_burden_norm",
@@ -1377,12 +1429,31 @@ _STATE_FROM_DF_FIT_ROW = (
         "recentBurdenEma",
         "activitySuggestionsSentLast7Days",
     )),
-    ("activitySuggestionInteractLast7Days", ("activitySuggestionInteractLast7Days",)),
-    ("dailyAnticipatedAffectYesterday", ("dailyAnticipatedAffectYesterday_norm", "dailyAnticipatedAffectYesterday")),
-    ("dailyAnticipatedAffect", ("dailyAnticipatedAffect_norm", "dailyAnticipatedAffect")),
-    ("caeAverageLastWeek", ("caeAverageLastWeek_norm", "caeAverageLastWeek")),
+    ("activitySuggestionInteractLast7Days", ("Interacted_7d_walk", "activitySuggestionInteractLast7Days")),
+    ("dailyAnticipatedAffectYesterday", (
+        "anticipated_affect_yesterday_norm",
+        "anticipated_affect_yesterday",
+        "dailyAnticipatedAffectYesterday_norm",
+        "dailyAnticipatedAffectYesterday",
+    )),
+    ("dailyAnticipatedAffect", (
+        "anticipated_affect_norm",
+        "anticipated_affect",
+        "dailyAnticipatedAffect_norm",
+        "dailyAnticipatedAffect",
+    )),
+    ("caeAverageLastWeek", (
+        "CAE_avg_lastweek_norm",
+        "CAE_avg_lastweek",
+        "caeAverageLastWeek_norm",
+        "caeAverageLastWeek",
+    )),
     ("morningFitbitWearYesterday", ("morning_wearing",)),
-    ("dailySurveyCompleteYesterday", ("dailySurveyComplete_yesterday",)),
+    ("dailySurveyCompleteYesterday", (
+        "daily_present_yesterday",
+        "yesterday_present",
+        "dailySurveyComplete_yesterday",
+    )),
     ("activityStatusToday", ("active_status",)),
 )
 
@@ -1423,6 +1494,96 @@ def _resolve_df_fit_11week_path(explicit_path=None):
     if explicit_path:
         return Path(explicit_path)
     return PARAMS_DIR / "df_fit_11week.csv"
+
+
+def _csv_id_equal(raw, want):
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return False
+    try:
+        return int(float(str(raw).strip())) == int(want)
+    except (TypeError, ValueError):
+        return str(raw).strip() == str(want)
+
+
+def _decision_time_slot(row):
+    for key in ("DecisionTime", "decisionTime", "decision_time"):
+        if key not in row:
+            continue
+        raw = row[key]
+        if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+            continue
+        try:
+            return int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _load_csv_rows_for_participant(path, participant_id):
+    path = Path(path)
+    if not path.is_file():
+        return []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rdr = csv.DictReader(f)
+        fieldnames = list(rdr.fieldnames or [])
+        rows = list(rdr)
+    if not rows:
+        return []
+    id_key = _participant_id_column(fieldnames)
+    if participant_id is None:
+        if not id_key:
+            return rows[:1]
+        return [r for r in rows if _csv_id_equal(r.get(id_key), rows[0].get(id_key))]
+    try:
+        want = int(participant_id)
+    except (TypeError, ValueError):
+        want = str(participant_id).strip()
+    if not id_key:
+        return []
+    return [r for r in rows if _csv_id_equal(r.get(id_key), want)]
+
+
+_SLOT_EMA_CSV_KEYS = (
+    ("stepCountLast7DaysEma", ("EMA_StepCount_norm", "EMA_StepCount")),
+    ("prior2HourStepCountEma7d", ("EMA_Prior2HourStepCount_norm", "EMA_Prior2HourStepCount")),
+)
+
+
+def slot_ema_initials_from_df_fit(df_fit_11week_csv=None, participant_id=None, n_slots=2):
+    """First finite per-slot EMA from ``df_fit_11week.csv``.
+
+    ``EMA_StepCount`` and ``EMA_Prior2HourStepCount`` are fit within each
+    ``DecisionTime`` stream. Missing slots fall back to the participant's
+    first finite value, then 0.
+    """
+    n_slots = int(n_slots)
+    path = _resolve_df_fit_11week_path(df_fit_11week_csv)
+    per_slot = {name: {} for name, _ in _SLOT_EMA_CSV_KEYS}
+    participant_first = {name: None for name, _ in _SLOT_EMA_CSV_KEYS}
+    for row in _load_csv_rows_for_participant(path, participant_id):
+        slot = _decision_time_slot(row)
+        for name, csv_keys in _SLOT_EMA_CSV_KEYS:
+            v = _float_csv_cell(row, *csv_keys, default=float("nan"))
+            if not math.isfinite(v):
+                continue
+            if participant_first[name] is None:
+                participant_first[name] = v
+            if slot is None or slot < 0 or slot >= n_slots:
+                continue
+            if slot not in per_slot[name]:
+                per_slot[name][slot] = v
+        if all(len(d) >= n_slots for d in per_slot.values()):
+            break
+    out = {}
+    for name, _ in _SLOT_EMA_CSV_KEYS:
+        fallback = participant_first[name]
+        if fallback is None or not math.isfinite(fallback):
+            fallback = 0.0
+        out[name] = {
+            s: float(per_slot[name][s]) if s in per_slot[name] else float(fallback)
+            for s in range(n_slots)
+        }
+    return out
 
 
 def make_initial_state(df_fit_11week_csv=None, participant_id=None):
