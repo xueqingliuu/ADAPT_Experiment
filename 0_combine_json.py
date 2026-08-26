@@ -380,11 +380,9 @@ def _heart_rate_float(v: Any) -> float | None:
 def _heart_rate_value(rec: dict) -> Any:
     """Heart rate (bpm) from top-level Value — Fitbit intraday is usually a number."""
     v = rec.get("Value")
-    if isinstance(v, dict):
-        return v.get("value") or v.get("bpm") or v.get("Value")
     hr = _heart_rate_float(v)
     if hr is None:
-        return v
+        return None if isinstance(v, dict) else v
     return int(hr) if hr.is_integer() else hr
 
 

@@ -73,6 +73,11 @@ from algorithm_helpers import (
 from experiment import OnlineEnv
 from vani_env import PARAMS_DIR, Env, EnvConfig
 
+
+def _resolve_params_dir(params_dir=None) -> Path:
+    """Canonical parameter folder used for train/eval metadata."""
+    return Path(PARAMS_DIR if params_dir is None else params_dir).expanduser().resolve()
+
 SLOTS_PER_WEEK = N_RL_DAYS * N_RL_SLOTS
 DQN_WEEKLY_GAMMA = 0.5
 # Non-terminal within-week slots use discount 1; the week-terminal slot uses
@@ -99,11 +104,11 @@ TEST_SEED0 = 300_000
 # a performance heuristic, not a 95% test (that would be c≈1.645).
 VAL_FALLBACK_C = 1.0
 STE_OBSERVATION_SCALER = "none"
-# Frozen DiscreteCQL observation (exp 3/4/5). Independent of the RLSVI
+# Frozen DiscreteCQL observation. Independent of the RLSVI
 # ``build_phi_state`` rewrite: 10-d interaction base, drop ``b_tilde`` at
-# index 9, 5 mediator EWMAs in the original order, 7-d C.
+# index 9, 5 mediator EWMAs in the original order, 6-d C.
 STE_BTILDE_INDEX = 9
-STE_OBS_DIM = 21
+STE_OBS_DIM = 20
 
 try:
     import d3rlpy
@@ -183,35 +188,34 @@ def _ste_mediator_ewma(M_Y, M_E, d, t) -> np.ndarray:
 
 
 def _ste_context_vector(state) -> np.ndarray:
-    """Length-7 C used by DiscreteCQL.
+    """Length-6 C used by DiscreteCQL.
 
     ``[yesterday steps, prior-2h, active days, suggestions sent,
-    salience yesterday, interact, I_w J_w]``. RLSVI ``C`` dropped salience
-    and moved ``I_w J_w`` into the Q base; rebuild that 7-vector here.
-    Salience is no longer simulated, so that slot is 0.
+    salience yesterday, interact]``. RLSVI ``C`` dropped salience;
+    rebuild that 6-vector here. Salience is no longer simulated, so
+    that slot is 0.
     """
     C = np.asarray(state["C"], dtype=float).ravel()
-    qxw = float(state.get("query_x_weekly_present", 0.0) or 0.0)
-    if not np.isfinite(qxw):
-        qxw = 0.0
     salience = float(state.get("salienceMessageSentYesterday", 0.0) or 0.0)
     if not np.isfinite(salience):
         salience = 0.0
-    if C.size == 7:
+    if C.size == 6:
         return C.astype(float, copy=False)
+    if C.size == 7:
+        return C[:6].astype(float, copy=False)
     if C.size != 5:
-        raise ValueError(f"unexpected RLSVI C length {C.size}; STE expects 5 or 7")
+        raise ValueError(f"unexpected RLSVI C length {C.size}; STE expects 5, 6, or 7")
     return np.array(
-        [C[0], C[1], C[2], C[3], salience, C[4], qxw],
+        [C[0], C[1], C[2], C[3], salience, C[4]],
         dtype=float,
     )
 
 
 def build_ste_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0) -> np.ndarray:
-    """Frozen DiscreteCQL ``phi`` (before dropping ``b_tilde``). Length 22.
+    """Frozen DiscreteCQL ``phi`` (before dropping ``b_tilde``). Length 21.
 
     ``[1, weekend, t, E, weekend*E, t*E, b_hat, weekend*b_hat, t*b_hat, b_tilde]
-    ⌢ [M_ewma (5)] ⌢ [C (7)]``.
+    ⌢ [M_ewma (5)] ⌢ [C (6)]``.
     Not ``build_phi_state``: that map is for online RLSVI and may change.
     """
     E_w = float(state["E_w"])
@@ -230,7 +234,7 @@ def build_ste_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0) -> np.ndarray:
 
 
 def build_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int) -> np.ndarray:
-    """Continuing-task DiscreteCQL state (frozen 21-d map).
+    """Continuing-task DiscreteCQL state (frozen 20-d map).
 
     Drops ``b_tilde``: with ``I_w = J_w = 1`` there is no CAE measurement
     uncertainty, so that slot would only be a constant zero.
@@ -282,10 +286,7 @@ def collect_mdp_episode(
             f"oenv.nweek={oenv.nweek}, n_transition_weeks={n_transition_weeks}"
         )
 
-    oenv._hist_daily_suggestions.clear()
-    oenv.s["activitySuggestionsSentLast7Days"] = (
-        oenv._activitySuggestionsSentLast7Days_initial
-    )
+    oenv._reset_episode_state()
 
     states, actions, rewards = [], [], []
     terminals, timeouts = [], []
@@ -355,12 +356,17 @@ def build_offline_buffer(
     walk_prob: float,
     base_seed: int,
     noise: str = "ar1",
+    params_dir: Path | None = None,
 ) -> dict:
     """Stack continuing-task trajectories with one look-ahead state each."""
     chunks = {k: [] for k in ("states", "actions", "rewards", "terminals", "timeouts")}
     for i in range(n_episodes):
         simulation_weeks = nweek + 1
-        cfg = EnvConfig(userid, nweek=simulation_weeks)
+        cfg = (
+            EnvConfig(userid, nweek=simulation_weeks)
+            if params_dir is None
+            else EnvConfig(userid, params_dir=params_dir, nweek=simulation_weeks)
+        )
         env = Env(cfg, noise=noise)
         oenv = OnlineEnv(env, nweek=simulation_weeks, seed=base_seed + i)
         ep = collect_mdp_episode(
@@ -683,10 +689,7 @@ def rollout_total_cae(
     oenv = OnlineEnv(env, nweek=nweek, seed=seed)
     rng = np.random.default_rng(seed)
 
-    oenv._hist_daily_suggestions.clear()
-    oenv.s["activitySuggestionsSentLast7Days"] = (
-        oenv._activitySuggestionsSentLast7Days_initial
-    )
+    oenv._reset_episode_state()
     n_decisions = 0
     n_treat = 0
 
@@ -746,15 +749,17 @@ def eval_ste_job(
     n_test: int = 1000,
     nweek: int | None = None,
     noise: str = "ar1",
+    params_dir: Path | None = None,
 ) -> None:
     """Write rows ``[sum_CAE_zero, sum_CAE_opt]`` for one validated evaluation run."""
     _require_d3()
-    uid_path = Path(userid_path) if userid_path else PARAMS_DIR / "user_ids.txt"
+    params_path = _resolve_params_dir(params_dir)
+    uid_path = Path(userid_path) if userid_path else params_path / "user_ids.txt"
     userid_all = np.loadtxt(uid_path, dtype=int)
     userid = _userid_from_job(jobid, userid_all)
 
     if nweek is None:
-        nweek = int(EnvConfig(userid).nweek)
+        nweek = int(EnvConfig(userid, params_dir=params_path).nweek)
 
     logger_dir = Path("d3rlpy_logs") / f"ste_exp_{exp}"
     experiment_name = f"user{userid}"
@@ -780,6 +785,7 @@ def eval_ste_job(
         "gamma_scheme": "terminal_only",
         "continuing_task": True,
         "bootstrap_lookahead_weeks": 1,
+        "params_dir": str(params_path),
     }
     for key, value in expected.items():
         if metadata.get(key) != value:
@@ -803,7 +809,12 @@ def eval_ste_job(
         test_seed = TEST_SEED0 + n
         rd.seed(test_seed)
         out[n, 0] = rollout_total_cae(
-            userid, nweek=nweek, seed=test_seed, policy="zero", noise=noise
+            userid,
+            nweek=nweek,
+            seed=test_seed,
+            policy="zero",
+            noise=noise,
+            params_dir=params_path,
         )
         if selected_policy == "zero":
             out[n, 1] = out[n, 0]
@@ -816,6 +827,7 @@ def eval_ste_job(
                 policy="dqn_greedy",
                 dqn=dqn,
                 noise=noise,
+                params_dir=params_path,
             )
 
     path = Path("results_ste") / f"exp{exp}"
@@ -840,16 +852,18 @@ def train_ste_job(
     n_gate: int = N_GATE_EPISODES,
     val_every: int = VAL_EVERY_STEPS,
     val_fallback_c: float = VAL_FALLBACK_C,
+    params_dir: Path | None = None,
 ) -> None:
     """Train DiscreteCQL for ``userid = user_ids[jobid]``."""
     _require_d3()
-    uid_path = Path(userid_path) if userid_path else PARAMS_DIR / "user_ids.txt"
+    params_path = _resolve_params_dir(params_dir)
+    uid_path = Path(userid_path) if userid_path else params_path / "user_ids.txt"
     userid_all = np.loadtxt(uid_path, dtype=int)
     userid = _userid_from_job(jobid, userid_all)
     seed = 2024 + int(jobid)
 
     if nweek is None:
-        nweek = int(EnvConfig(userid).nweek)
+        nweek = int(EnvConfig(userid, params_dir=params_path).nweek)
     _assert_seed_ranges_disjoint(n_val, n_gate)
 
     rd.seed(seed)
@@ -860,6 +874,7 @@ def train_ste_job(
         walk_prob=walk_prob,
         base_seed=seed,
         noise=noise,
+        params_dir=params_path,
     )
 
     logger_dir = Path("d3rlpy_logs") / f"ste_exp_{exp}"
@@ -881,6 +896,7 @@ def train_ste_job(
         seed=seed,
         n_val=n_val,
         val_every=val_every,
+        params_dir=params_path,
     )
     dqn = d3rlpy.load_learnable(str(model_dir))
     selection.pop("g_zero", None)
@@ -891,6 +907,7 @@ def train_ste_job(
         seeds=gate_seeds,
         policy="zero",
         noise=noise,
+        params_dir=params_path,
     )
     gate_stats = summarize_paired_policy(
         userid,
@@ -900,6 +917,7 @@ def train_ste_job(
         seeds=gate_seeds,
         g_zero=g_zero_gate,
         prefix="gate",
+        params_dir=params_path,
     )
     deploy_cql = decide_deploy_cql(
         gate_stats["gate_delta"],
@@ -933,6 +951,7 @@ def train_ste_job(
         "gamma_scheme": "terminal_only",
         "continuing_task": True,
         "bootstrap_lookahead_weeks": 1,
+        "params_dir": str(params_path),
         "i_w_fixed": 1,
         "j_w_fixed": 1,
         "seed": seed,
@@ -1143,6 +1162,12 @@ def main(argv: list[str] | None = None) -> None:
         default=VAL_FALLBACK_C,
         help="Deploy CQL only if gate_Δ - c*SE(gate_Δ) > 0 (default 1.0)",
     )
+    pt.add_argument(
+        "--params-dir",
+        type=str,
+        default=None,
+        help="Parameter folder (default: vani_env.PARAMS_DIR / ADAPR_PARAMS_DIR)",
+    )
 
     pe = sub.add_parser("eval", help="Evaluate zero vs DiscreteCQL for user_ids[jobid]")
     pe.add_argument("jobid", type=int)
@@ -1152,6 +1177,12 @@ def main(argv: list[str] | None = None) -> None:
     pe.add_argument("--nweek", type=int, default=None)
     pe.add_argument(
         "--noise", type=str, default="ar1", choices=("random", "sequential", "ar1")
+    )
+    pe.add_argument(
+        "--params-dir",
+        type=str,
+        default=None,
+        help="Must match the folder recorded at train time",
     )
 
     pa = sub.add_parser("aggregate", help="Print average user STE from saved eval files")
@@ -1201,6 +1232,7 @@ def main(argv: list[str] | None = None) -> None:
             n_gate=args.n_gate,
             val_every=args.val_every,
             val_fallback_c=args.val_fallback_c,
+            params_dir=Path(args.params_dir) if args.params_dir else None,
         )
     elif args.cmd == "eval":
         eval_ste_job(
@@ -1210,6 +1242,7 @@ def main(argv: list[str] | None = None) -> None:
             n_test=args.n_test,
             nweek=args.nweek,
             noise=args.noise,
+            params_dir=Path(args.params_dir) if args.params_dir else None,
         )
     elif args.cmd == "report":
         users = None

@@ -1,15 +1,29 @@
-"""Rescale ``env_para_vanilla`` so mean STE is near a chosen target (0.2 / 0.5 / 0.8).
+"""Rescale ``env_para_vanilla`` so mean *proxy* STE is near a chosen target (0.2 / 0.5 / 0.8).
 
-STE is the same quantity as ``ste_vanilla.py``: for each participant, never-suggest
-vs a treatment policy, then ``(mean_G_treat - mean_G_control) / sd(G_control)``,
-averaged over users. This script does **not** train DiscreteCQL. It multiplies a
-small set of coefficients by a scalar ``kappa`` and simulates cheap policies
-until the proxy STE hits the target.
+This is not the DiscreteCQL estimand in ``ste_vanilla.py``. For each participant
+the proxy is ``max(0, max_arm Δ̂_i) / σ̂_i``, averaged over users: Δ̂_i is the
+paired mean total-CAE gap vs never-suggest on the **same** Monte-Carlo episodes
+used to pick the arm. Arms are Bernoulli rates (``--policy-grid``, default 0.5
+and 1.0) plus, optionally, DiscreteCQL trained in the *source* environment
+(``--dqn-exp``) and only rolled out here. Same-sample max is upward-biased for
+the oracle best-arm Δ; clipping at 0 encodes that never-suggest is in the class.
+``--proxy-to-true`` is an optional shrinkage (default 1: no adjustment).
 
-``burden_shift`` subtracts ``kappa`` from every A→ME action coefficient
-and adds the same ``kappa`` to E_w → fourSC and E_w → anticipated affect,
-so send→engagement→E_w can reach CAE. Typical ``|A→ME|`` is ~0.3; start
-a scan at 0.2–0.5, not 2–4. This also moves the never-suggest arm.
+``ste_vanilla.aggregate_ste`` is a different quantity: DiscreteCQL trained in
+the tuned folder, a deployment gate on held-out seeds, then a test Δ that can
+be negative. Hitting proxy 0.5 does not guarantee confirmation STE 0.5.
+
+This script does **not** train DiscreteCQL. It multiplies a small set of
+coefficients by a scalar ``kappa`` and simulates the cheap proxy until it hits
+the target.
+
+``burden_shift`` subtracts ``kappa`` from the *main* A→ME action coefficients
+(not the A×E_w interactions) and adds the same ``kappa`` to E_w → fourSC
+and E_w → anticipated affect, so send→engagement→E_w can reach CAE.
+Leaving the A×E_w slopes unshifted keeps the fatigue addend ``−κ A``
+rather than ``−κ A (1+E_w)``, which would change sign for ``E_w < −1``.
+Typical ``|A→ME|`` is ~0.3; start a scan at 0.2–0.5, not 2–4. This also
+moves the never-suggest arm.
 
 Commands
     diagnose    E_w and CAE loop gains (no simulation)
@@ -50,11 +64,12 @@ Large-fatigue stack (always-send weaker; then STE via fourSC→CAE *shift*)::
     ADAPR_BENEFIT_FOURSC_SHIFT / _CAP change the fourSC share (defaults
     0.05 / 0.20). burden_shift cannot hit STE 0.2 (job 40926808).
 
-How STE is measured here
+How the proxy is measured
     Treatment arms are constant suggestion rates (``--policy-grid``, default
     0.5 and 1.0). Optionally add an already-trained DiscreteCQL policy with
-    ``--dqn-exp``; that network is only evaluated, not retrained. The reported
-    STE is a lower bound on DiscreteCQL trained inside the tuned environment.
+    ``--dqn-exp``; that network is only evaluated, not retrained in the scaled
+    env. The reported number is this proxy, not a lower (or upper) bound on
+    in-env DiscreteCQL / ``aggregate_ste``.
 
 Which coefficients are scaled (``--knob``, default ``action``)
     action    walking-suggestion effects on both benefit (step-count /
@@ -62,7 +77,7 @@ Which coefficients are scaled (``--knob``, default ``action``)
     benefit   benefit path only (A→MY)
     benefit_foursc  A→MY ×κ and add c(κ−1) to fourSC_ewma → CAE
     burden    multiply A→ME (does not flip sign)
-    burden_shift  A→ME more negative and E_w→steps / E_w→affect more positive
+    burden_shift  A→ME mains more negative and E_w→steps / E_w→affect more positive
     foursc_to_y_shift  add kappa to fourSC_ewma → CAE (does not flip sign)
     my_to_y / foursc_to_y / me_to_e / e_to_my   structural paths; these
               also change the control arm, so they are not the recommended
@@ -79,7 +94,8 @@ Stability
 
 Cluster
     ``sbatch run_tune_ste.sh`` runs calibrate, then submits ``run_ste.sh`` in
-    each written folder so a fresh DiscreteCQL policy measures the true STE.
+    each written folder so a fresh DiscreteCQL policy measures the confirmation
+    STE (``aggregate_ste``), which is a different estimand from this proxy.
 
 Use a tuned folder instead of vanilla::
 
@@ -127,6 +143,8 @@ BURDEN_SHIFT_LARGE_KAPPA = 0.4
 
 # Copied verbatim into every tuned parameter directory so it can be handed to
 # ``ste_vanilla.py`` / ``experiment.py`` as a drop-in replacement.
+# ``rl_priors.json`` is the RCT/vanilla prior (not re-fit on the κ-scaled
+# DGP). ``loo_priors`` is installed as a relative symlink, not copied.
 SUPPORTING_FILES = (
     "std_params.json",
     "user_ids.txt",
@@ -146,9 +164,8 @@ SUPPORTING_FILES = (
 # ``WalkingSuggestion_by_perceived_utility_lastweek`` belongs to ``A_to_MY``,
 # not ``E_to_MY``.
 #
-# The ``query_imputed_*`` block of PV/FW/PJ is deliberately excluded: STE
-# rollouts hold ``I_w = 1`` in both arms, so it contributes identically to
-# treatment and control and cancels out of ``Delta_i``.
+# The ``query_Jw_*`` suffix of PV/FW/PJ is deliberately excluded: it is a
+# ``J_w`` term, not an action coefficient. STE still does not scale it.
 
 _ACTION_PREFIXES_ANTIC = ("A0_morning", "A1_afternoon")
 
@@ -182,6 +199,14 @@ PATHWAYS: dict[str, dict[str, tuple[str, ...]]] = {
             "theta6_A1_afternoon_by_Ew",
         ),
     },
+    # Main action effects only: a constant (in E_w) shift of the A→ME
+    # intercept. Subtracting κ from the A×E_w terms as well would change
+    # the action effect by −κ(1+E_w) and flip sign for E_w < −1.
+    "A_to_ME_main": {
+        "theta_penalized_PV": ("alpha3_action",),
+        "theta_penalized_FW": ("beta3_A0_morning", "beta5_A1_afternoon"),
+        "theta_penalized_PJ": ("theta3_A0_morning", "theta5_A1_afternoon"),
+    },
     "ME_to_E": {
         "theta_penalized_Ew": ("a2_PV_lag_week", "a3_FW_lag_week", "a4_PJ_lag_week"),
     },
@@ -192,7 +217,7 @@ PATHWAYS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 # Pathways that are gated by an action indicator, hence invisible to pi_0.
-ACTION_GATED = frozenset({"A_to_MY", "A_to_ME"})
+ACTION_GATED = frozenset({"A_to_MY", "A_to_ME", "A_to_ME_main"})
 
 # Fallback coefficient names for blocks that carry no ``*_names`` key in JSON.
 _NAME_CONSTANTS = {
@@ -274,16 +299,18 @@ KNOBS: dict[str, KnobSpec] = {
     ),
     "burden_shift": KnobSpec(
         "burden_shift",
-        lambda k: {"A_to_ME": k, "E_to_MY": -k},
+        lambda k: {"A_to_ME_main": k, "E_to_MY": -k},
         zero_is_null=False,
         sigma_invariant=False,
         apply="subtract",
         doc=(
-            "Coherent fatigue: subtract kappa from every A→ME action "
-            "coefficient and add kappa to E_w → fourSC and E_w → anticipated "
-            "affect (raw units; typical |A→ME| ≈ 0.3, fitted E→MY ≈ 0.02). "
-            "Sending lowers engagement, and a lower E_w then lowers steps and "
-            "affect, so the path can reach CAE. Moves the control arm (E→MY)."
+            "Coherent fatigue: subtract kappa from the main A→ME action "
+            "coefficients (not A×E_w) and add kappa to E_w → fourSC and "
+            "E_w → anticipated affect (raw units; typical |A→ME| ≈ 0.3, "
+            "fitted E→MY ≈ 0.02). The fatigue addend is −κ A, independent "
+            "of E_w. Sending lowers engagement, and a lower E_w then lowers "
+            "steps and affect, so the path can reach CAE. Moves the control "
+            "arm (E→MY)."
         ),
     ),
     "my_to_y": KnobSpec(
@@ -445,6 +472,27 @@ def _write_json_atomic(path: Path, payload) -> None:
         json.load(f)
 
 
+def _install_loo_priors_link(dst_dir: Path) -> None:
+    """Point ``dst_dir/loo_priors`` at vanilla with a relative symlink.
+
+    RCT/vanilla LOO bundles are the intended STE-folder priors. Absolute
+    cluster paths break locally; a relative link travels with the repo.
+    """
+    vanilla_loo = (PROJECT_ROOT / "env_para_vanilla" / "loo_priors").resolve()
+    if not vanilla_loo.is_dir():
+        return
+    dst_dir = dst_dir.resolve()
+    if dst_dir == vanilla_loo.parent:
+        return
+    dst_loo = dst_dir / "loo_priors"
+    rel = os.path.relpath(vanilla_loo, start=dst_dir)
+    if dst_loo.is_symlink() or dst_loo.is_file():
+        dst_loo.unlink()
+    elif dst_loo.exists():
+        return
+    dst_loo.symlink_to(rel)
+
+
 def write_scaled_params(
     src_dir: Path,
     dst_dir: Path,
@@ -459,6 +507,7 @@ def write_scaled_params(
         src = src_dir / fname
         if src.is_file():
             shutil.copy2(src, dst_dir / fname)
+    _install_loo_priors_link(dst_dir)
 
     audit: list[dict] = []
     for uid in user_ids:
@@ -484,13 +533,14 @@ class ProxySpec:
     difference has far less variance than either arm, and averaging over ~30
     participants shrinks it further, so 100 episodes already puts the standard
     error of the reported mean STE around 0.01 -- below the default tolerance.
-    A short ``policy_grid`` is deliberate: ``Delta_i`` takes a max over the
-    treatment arms, and a max over noisy estimates is biased upward, so extra
-    arms buy a tighter lower bound at the cost of more bias and more compute.
+    A short ``policy_grid`` is deliberate: ``Delta_i`` is a max over treatment
+    arms on the same episodes used to estimate it (winner's curse). Extra arms
+    raise the reported proxy and the selection bias; they are not a tighter
+    bound on ``ste_vanilla.aggregate_ste``.
 
     ``dqn_model_dir`` points at a directory of ``ste_vanilla.py`` checkpoints
-    (``user<uid>_model.d3``); when set, each participant's trained DiscreteCQL
-    policy is added as one more treatment arm.
+    (``user<uid>_model.d3``); when set, each participant's source-env
+    DiscreteCQL policy is added as one more treatment arm (not retrained).
     """
 
     episodes: int = 100
@@ -626,9 +676,8 @@ def _eval_user(task: tuple) -> dict:
 
     best = max(arms, key=lambda k: arms[k]["delta"])
     sigma = float(np.std(zero_totals, ddof=1))
-    # The control arm is "never suggest", which belongs to every policy class
-    # considered here, so the optimum can never do worse than it; a negative
-    # best-arm delta means never-suggest wins and Delta_i is 0.
+    # Population best-arm Δ cannot be negative (never-suggest is in the class).
+    # Clip the same-sample estimate at 0; the unclipped winner is ``delta_raw``.
     delta = max(0.0, arms[best]["delta"])
     return {
         "userid": int(uid),
@@ -691,6 +740,12 @@ def evaluate(
         r["ste"] = float(r["ste"]) * float(proxy_to_true)
     ste = np.array([r["ste"] for r in rows], dtype=float)
     finite = ste[np.isfinite(ste)]
+    n_nan = int(ste.size - finite.size)
+    if n_nan:
+        print(
+            f"  [warn] {n_nan}/{ste.size} users had non-finite proxy STE; "
+            "excluded from the mean and from n_users"
+        )
     return {
         "params_dir": str(params_dir),
         "proxy_to_true": float(proxy_to_true),
@@ -698,7 +753,9 @@ def evaluate(
         "median_ste": float(np.median(finite)) if finite.size else float("nan"),
         "min_ste": float(np.min(finite)) if finite.size else float("nan"),
         "max_ste": float(np.max(finite)) if finite.size else float("nan"),
-        "n_users": len(rows),
+        "n_users": int(finite.size),
+        "n_users_total": int(ste.size),
+        "n_users_nan": n_nan,
         "users": rows,
     }
 
@@ -1064,7 +1121,7 @@ def require_dqn_checkpoints(spec: ProxySpec, user_ids: Sequence[int]) -> None:
         raise SystemExit(
             f"{model_dir} observation dim is not the frozen STE map "
             f"(trained state_dim={wrong_dim[0][1]}, STE_OBS_DIM={STE_OBS_DIM}). "
-            "Point TUNE_DQN_EXP at DiscreteCQL trained on this 21-d vector "
+            "Point TUNE_DQN_EXP at DiscreteCQL trained on this 20-d vector "
             "(vanilla CQL is exp 5), or set TUNE_DQN_EXP=''."
         )
     print(f"DiscreteCQL arm: {len(user_ids)} checkpoints from {model_dir}")
@@ -1245,10 +1302,11 @@ def cmd_calibrate(args) -> None:
     arms = [f"Bernoulli p in {spec.policy_grid}"]
     if spec.dqn_model_dir:
         arms.append(f"DiscreteCQL from {Path(spec.dqn_model_dir).name}")
-    print(f"proxy: max over [{', '.join(arms)}] vs never-suggest, "
-          f"{spec.episodes} paired episodes/arm, {len(user_ids)} participants")
+    print(f"proxy: same-sample max over [{', '.join(arms)}] vs never-suggest, "
+          f"truncated at 0; {spec.episodes} paired episodes/arm, "
+          f"{len(user_ids)} participants")
     if args.proxy_to_true != 1.0:
-        print(f"proxy-to-true calibration factor: {args.proxy_to_true:g}")
+        print(f"proxy-to-true shrinkage: {args.proxy_to_true:g}")
 
     source_gains = diagnose(base_dir, user_ids)
     source_bad = unstable_users(source_gains)
@@ -1477,7 +1535,7 @@ def cmd_apply(args) -> None:
         report["achieved_mean_ste"] = float(result["mean_ste"])
         for key in (
             "mean_ste", "median_ste", "min_ste", "max_ste",
-            "n_users", "users", "proxy_to_true",
+            "n_users", "n_users_total", "n_users_nan", "users", "proxy_to_true",
         ):
             if key in result:
                 report[key] = result[key]
@@ -1522,7 +1580,16 @@ def build_parser() -> argparse.ArgumentParser:
             "--policy-grid", type=float, nargs="+", default=list(ProxySpec.policy_grid)
         )
         sp.add_argument("--jobs", type=int, default=None)
-        sp.add_argument("--proxy-to-true", type=float, default=1.0)
+        sp.add_argument(
+            "--proxy-to-true",
+            type=float,
+            default=1.0,
+            help=(
+                "Multiply each user's proxy STE after max/truncation "
+                "(default 1.0: report the proxy as-is). Not estimated from "
+                "DiscreteCQL; set only with an external shrinkage factor."
+            ),
+        )
         sp.add_argument("--report", default=None)
         sp.add_argument(
             "--dqn-exp",

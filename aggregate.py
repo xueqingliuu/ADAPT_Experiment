@@ -46,15 +46,6 @@ markers = {
     "random_send": "+-",
 }
 
-# γ̄=0.9 RL policies (V1--V6). V7 / V8 are the γ̄=0.5 / 0.99 base sensitivities.
-GAMMA09_ALGOS = (
-    "rl_v1_base_g09",
-    "rl_v2_mtd_g09",
-    "rl_v3_biased_weekly",
-    "rl_v4_biased_redistributed",
-    "rl_v5_invariant_weekly",
-    "rl_v6_invariant_redistributed",
-)
 NEVER_SEND_BASELINE = "never_send"
 ALWAYS_SEND_BASELINE = "always_send"
 # γ̄=0.99 base is a sensitivity in the registry; omit from figures.
@@ -252,7 +243,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_RESULTS_ROOT,
         help="Parent directory containing timestamped run folders "
-             "(default: RESULTS_ROOT env or results_vanilla).",
+             "(default: RESULTS_ROOT env or results_vanilla_loo).",
     )
     parser.add_argument(
         "--array-job-id",
@@ -282,40 +273,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def compute_stats(all_cae_full):
-    """Per-week aggregate stats over (experiments × participants), raw scale."""
-    all_cae = {name: arr[..., 1:] for name, arr in all_cae_full.items()}  # drop week 0
+    """Drop week 0 and build cumulative averages of the grand mean."""
+    all_cae = {name: arr[..., 1:] for name, arr in all_cae_full.items()}
     mean_cae = {n: np.nanmean(a, axis=(0, 1)) for n, a in all_cae.items()}
-    se_cae = {
-        n: np.nanstd(a, axis=(0, 1)) / np.sqrt(a.shape[0] * a.shape[1])
-        for n, a in all_cae.items()
-    }
-    median_cae = {n: np.nanmedian(a, axis=(0, 1)) for n, a in all_cae.items()}
-    p25_cae = {n: np.nanpercentile(a, 25, axis=(0, 1)) for n, a in all_cae.items()}
-    p75_cae = {n: np.nanpercentile(a, 75, axis=(0, 1)) for n, a in all_cae.items()}
-    cumavg_cae = {n: cumulative_average(mean_cae[n]) for n in all_cae}
     return {
         "all_cae": all_cae,
-        "mean": mean_cae,
-        "se": se_cae,
-        "median": median_cae,
-        "p25": p25_cae,
-        "p75": p75_cae,
-        "cumavg": cumavg_cae,
+        "cumavg": {n: cumulative_average(mean_cae[n]) for n in all_cae},
     }
-
-
-def _per_uid_mean(arr, uids):
-    """Mean of ``arr`` within each unique uid.
-
-    ``arr`` is ``(n_exp, n_slot, ...)`` and ``uids`` is ``(n_exp, n_slot)``.
-    Returns ``(n_uid, ...)``.
-    """
-    uids = np.asarray(uids)
-    unique = np.unique(uids)
-    return np.stack(
-        [np.nanmean(arr[uids == u], axis=0) for u in unique],
-        axis=0,
-    )
 
 
 def _se_across_replications(arr):
@@ -564,71 +528,38 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
     _save_fig(fig, out, f"action_prob_{suffix}")
 
 
-def make_gamma09_minus_never_plot(all_cae_full, kind, suffix, *, out, labels, weeks):
-    """Plot paired CAE difference: each γ̄=0.9 policy minus never_send."""
-    if NEVER_SEND_BASELINE not in all_cae_full:
-        print(
-            f"\nWARNING: '{NEVER_SEND_BASELINE}' missing; "
-            f"skipping γ̄=0.9 minus-never plot ({suffix})."
-        )
-        return
+def _load_run_uids(run_dir: Path) -> np.ndarray | None:
+    """Uid labels for one run folder: ``run_uids.npy``, else any ``*.npz``.
 
-    baseline = all_cae_full[NEVER_SEND_BASELINE][..., 1:]
-    names = [n for n in GAMMA09_ALGOS if n in all_cae_full]
-    if not names:
-        print(f"\nWARNING: no γ̄=0.9 algorithms found; skipping minus-never plot ({suffix}).")
-        return
-
-    diffs = {n: all_cae_full[n][..., 1:] - baseline for n in names}
-    stats = {
-        "mean": {n: np.nanmean(d, axis=(0, 1)) for n, d in diffs.items()},
-        "se": {
-            n: np.nanstd(d, axis=(0, 1)) / np.sqrt(d.shape[0] * d.shape[1])
-            for n, d in diffs.items()
-        },
-        "cumavg": {
-            n: cumulative_average(np.nanmean(d, axis=(0, 1)))
-            for n, d in diffs.items()
-        },
-    }
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    ax = axes[0]
-    for name in names:
-        m = stats["mean"][name]
-        s = stats["se"][name]
-        ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
-        ax.fill_between(weeks, m - s, m + s, alpha=0.15)
-    ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
-    ax.set_xlabel("Week")
-    ax.set_ylabel("CAE difference (raw scale)")
-    ax.set_title(f"γ̄=0.9 CAE − never_send (± SE) — {kind}, raw scale")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1]
-    for name in names:
-        ax.plot(
-            weeks, stats["cumavg"][name], markers.get(name, "o-"),
-            label=labels.get(name, name),
-        )
-    ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
-    ax.set_xlabel("Week")
-    ax.set_ylabel("Cumulative-average CAE difference (raw scale)")
-    ax.set_title(f"Average-over-time γ̄=0.9 CAE − never_send — {kind}, raw scale")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(out / f"gamma09_minus_never_{suffix}.png", dpi=150, bbox_inches="tight")
-    fig.savefig(out / f"gamma09_minus_never_{suffix}.pdf", bbox_inches="tight")
-    plt.close(fig)
+    Independent of which algorithm files exist in the folder, so a missing
+    first-algorithm ``.npz`` cannot drop that folder's uids while later
+    algorithms still contribute CAE rows.
+    """
+    npy = run_dir / "run_uids.npy"
+    if npy.exists():
+        u = np.load(npy)
+    else:
+        u = None
+        for f in sorted(run_dir.glob("*.npz")):
+            with np.load(f) as data:
+                if "run_uids" in data.files:
+                    u = np.asarray(data["run_uids"])
+                    break
+        if u is None:
+            return None
+    u = np.asarray(u)
+    if u.ndim == 1:
+        u = u.reshape(1, -1)
+    return u
 
 
-def _se_clustered_by_user(arr, uids=None):
-    """SE of the grand mean of weekly CAE, clustered by experiment."""
-    del uids
+def _se_across_replications_scalar(arr):
+    """SE of the grand mean of weekly CAE, clustered by experiment.
+
+    ``arr`` is ``(n_exp, n_slot, n_week)``. Average users and weeks within
+    each seed, then ``sd / sqrt(n_exp)``. Same clustering as
+    :func:`_se_across_replications`; this is the scalar (all-weeks) version.
+    """
     per_exp = np.nanmean(arr, axis=(1, 2))
     n_eff = int(np.sum(~np.isnan(per_exp)))
     if n_eff <= 1:
@@ -636,7 +567,7 @@ def _se_clustered_by_user(arr, uids=None):
     return float(np.nanstd(per_exp, ddof=1) / np.sqrt(n_eff))
 
 
-def write_summary(stats, kind, suffix, *, out, uids=None):
+def write_summary(stats, kind, suffix, *, out):
     """Raw-scale summary table for one CAE variant."""
     names = list(stats["all_cae"].keys())
     all_cae = stats["all_cae"]
@@ -652,7 +583,7 @@ def write_summary(stats, kind, suffix, *, out, uids=None):
     lines.append("".join([f"{'Mean CAE (all weeks)':>{col_w}}"] +
                  [f"{np.nanmean(all_cae[n]):>{col_w}.4f}" for n in names]))
     lines.append("".join([f"{'SE CAE (across reps)':>{col_w}}"] +
-                 [f"{_se_clustered_by_user(all_cae[n], uids=uids):>{col_w}.4f}"
+                 [f"{_se_across_replications_scalar(all_cae[n]):>{col_w}.4f}"
                   for n in names]))
     lines.append("".join([f"{'Mean CAE (week 3+)':>{col_w}}"] +
                  [f"{np.nanmean(all_cae[n][..., 2:]):>{col_w}.4f}" for n in names]))
@@ -739,8 +670,22 @@ def main() -> None:
     all_cae_latent_full = {}   # raw-scale latent CAE incl. baseline
     all_cae_noisy_full = {}    # raw-scale realized CAE incl. baseline
     all_piA = {}
-    uid_parts = []
     latent_available = True    # set False if any run lacks the latent field
+
+    uid_parts = []
+    for d in run_dirs:
+        u = _load_run_uids(d)
+        if u is None:
+            print(
+                f"Missing run_uids.npy (and no npz run_uids) in {d.name}; "
+                "not attaching uid labels"
+            )
+            uid_parts = []
+            break
+        uid_parts.append(u)
+    all_uids = np.concatenate(uid_parts, axis=0) if uid_parts else None
+    if all_uids is not None:
+        print(f"Loaded {len(np.unique(all_uids))} unique user ids from run folders.")
 
     for name in algorithms:
         latent_parts = []
@@ -761,11 +706,6 @@ def main() -> None:
             else:
                 latent_available = False
             piA_parts.append(data["piA_runs"])                       # (1, n_users, W, 6, 2)
-            if name == algorithms[0] and "run_uids" in data.files:
-                u = np.asarray(data["run_uids"])
-                if u.ndim == 1:
-                    u = u.reshape(1, -1)
-                uid_parts.append(u)
 
         if not noisy_parts:
             print(f"No {name}.npz found in any run folder; skipping {name}")
@@ -777,7 +717,6 @@ def main() -> None:
 
         print(name, "CAE shape:", all_cae_noisy_full[name].shape)
 
-    all_uids = np.concatenate(uid_parts, axis=0) if uid_parts else None
     sample = next(iter(all_cae_noisy_full.values()), None)
     n_exp = int(sample.shape[0]) if sample is not None else 0
     print(
@@ -788,11 +727,10 @@ def main() -> None:
         if all_uids.shape[:2] != sample.shape[:2]:
             print(
                 f"WARNING: run_uids shape {all_uids.shape} does not match "
-                f"CAE {sample.shape}; pairing still uses aligned arrays."
+                f"CAE {sample.shape} (an algorithm is missing from some "
+                f"folders); dropping uid labels rather than mis-pairing."
             )
             all_uids = None
-        else:
-            print(f"Loaded {len(np.unique(all_uids))} unique user ids.")
 
     # Only keep algorithms that actually had data across the run folders.
     algorithms = [name for name in algorithms if name in all_cae_noisy_full]
@@ -814,13 +752,13 @@ def main() -> None:
         uids=all_uids,
     )
     write_summary(
-        noisy_stats, "noisy (realized)", "noisy", out=out, uids=all_uids,
+        noisy_stats, "noisy (realized)", "noisy", out=out,
     )
 
     if all_cae_latent_full:
         latent_stats = compute_stats(all_cae_latent_full)
         write_summary(
-            latent_stats, "latent (no noise)", "latent", out=out, uids=all_uids,
+            latent_stats, "latent (no noise)", "latent", out=out,
         )
 
     # Save aggregated arrays too (raw scale).

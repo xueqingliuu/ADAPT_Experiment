@@ -5,13 +5,25 @@ likelihood by quadrature, and jointly models the weekly check-in (J, U1, U2)
 and the within-week mediators (page views, Fitbit wear, daily check-in).
 Each participant is fit separately after a pooled initialization.
 
+Weekly PV/FW/PJ summaries that enter the E_w transition use a **fixed
+denominator** (14 slots / 7 days) with NaNs contributing 0. That is the
+intended "missing = not engaged" convention for PV and PJ. **FW inherits
+the same rule knowingly**: a missing wear flag is treated as not wearing,
+even though sensor missingness is not the same as non-wear. Simulation
+(``vani_env._week_means_from_arrays``) and Ê_w (script 6 / ``agents/ew_hat``)
+use the same averages so fit and rollout stay aligned. Sparse-wear users
+therefore have deflated FW inputs at fit time.
+
 Writes, under ``env_para_vanilla/``:
     params_env_<uid>.json     E_w / PV / FW / PJ coefficients
     pred_<uid>.json           filtered E_w trajectory
     df_fit.csv columns        perceived_utility, perceived_utility_lastweek
 
-Query-effect coefficients are *not* fit here; run ``impute_query_effect.py``.
-Next: ``5_fit_vanilla_testbed.py``.
+PV / FW / PJ emissions include a lagged-J query block
+``J_{w-1} · [1, E_w, recent_burden]`` (last Sunday's ``week_present``),
+written as the ``query_Jw_*`` suffix on ``theta_penalized_{PV,FW,PJ}``.
+Ridge centers for those three coefficients are 0. ``I_w`` is not in the
+model. Next: ``5_fit_vanilla_testbed.py``.
 """
 from __future__ import annotations
 
@@ -31,9 +43,17 @@ from scipy.optimize import minimize
 from scipy.special import logsumexp
 import json
 
-from impute_query_effect import impute_query_action_interaction_effects
-
 logger = logging.getLogger(__name__)
+
+# Suffix names on theta_penalized_{PV,FW,PJ}. Same layout vani_env splits.
+QUERY_JW_NAMES = (
+    "query_Jw_intercept",
+    "query_Jw_Ew",
+    "query_Jw_recent_burden",
+)
+# Packed theta: 41 emission/AR coeffs + 9 lagged-J query coeffs
+# (PV/FW/PJ × intercept, E_w, recent_burden).
+_THETA_DIM_BASE = 50
 
 # %%
 # read data
@@ -171,6 +191,12 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     """
     i = 0
     theta = np.asarray(theta, dtype=float)
+    n_expected = _THETA_DIM_BASE if e1_known else _THETA_DIM_BASE + 2
+    if theta.size != n_expected:
+        raise ValueError(
+            f"theta length {theta.size} != {n_expected} "
+            f"(e1_known={e1_known})"
+        )
 
     a0 = theta[i]
     i += 1
@@ -223,6 +249,12 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     i += 1
     alpha_ar1 = theta[i]
     i += 1
+    alpha_q0 = theta[i]
+    i += 1
+    alpha_qE = theta[i]
+    i += 1
+    alpha_qrb = theta[i]
+    i += 1
 
     beta0 = theta[i]
     i += 1
@@ -242,6 +274,12 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     i += 1
     beta_ar1 = theta[i]
     i += 1
+    beta_q0 = theta[i]
+    i += 1
+    beta_qE = theta[i]
+    i += 1
+    beta_qrb = theta[i]
+    i += 1
 
     theta0 = theta[i]
     i += 1
@@ -260,6 +298,12 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     theta2_rb = theta[i]
     i += 1
     theta_ar1 = theta[i]
+    i += 1
+    theta_q0 = theta[i]
+    i += 1
+    theta_qE = theta[i]
+    i += 1
+    theta_qrb = theta[i]
     i += 1
 
     out = {
@@ -286,6 +330,9 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "alpha4": alpha4,
         "sigma_PV": sigma_PV,
         "alpha_ar1": alpha_ar1,
+        "alpha_q0": alpha_q0,
+        "alpha_qE": alpha_qE,
+        "alpha_qrb": alpha_qrb,
         "beta0": beta0,
         "beta1": beta1,
         "beta3": beta3,
@@ -295,6 +342,9 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "beta2_is_weekend": beta2_is_weekend,
         "beta2_rb": beta2_rb,
         "beta_ar1": beta_ar1,
+        "beta_q0": beta_q0,
+        "beta_qE": beta_qE,
+        "beta_qrb": beta_qrb,
         "theta0": theta0,
         "theta1": theta1,
         "theta3": theta3,
@@ -304,6 +354,9 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "theta2_is_weekend": theta2_is_weekend,
         "theta2_rb": theta2_rb,
         "theta_ar1": theta_ar1,
+        "theta_q0": theta_q0,
+        "theta_qE": theta_qE,
+        "theta_qrb": theta_qrb,
     }
     if not e1_known:
         out["m0"] = theta[i]
@@ -329,7 +382,8 @@ def build_penalized_prior_center(*, e1_known: bool) -> np.ndarray:
     plausible value in the expected direction instead of toward 0 (and, on
     the old approach, potentially reflected to a large value of the wrong
     sign). Every coefficient not listed here keeps the original zero-centered
-    penalty (nudge = 0).
+    penalty (nudge = 0), including the lagged-J query block
+    ``(alpha|beta|theta)_q*``.
 
     Indices are recovered by unpacking a probe vector of its own positions
     through ``unpack_theta``, so this stays correct if that function's field
@@ -390,14 +444,17 @@ def log_pooled_theta(
         ("PV", [
             "alpha0", "alpha1", "alpha2_is_weekend", "alpha2_dt", "alpha2_rb",
             "alpha3", "alpha4", "sigma_PV", "alpha_ar1",
+            "alpha_q0", "alpha_qE", "alpha_qrb",
         ]),
         ("FW", [
             "beta0", "beta1", "beta3", "beta4", "beta5", "beta6",
             "beta2_is_weekend", "beta2_rb", "beta_ar1",
+            "beta_q0", "beta_qE", "beta_qrb",
         ]),
         ("PJ", [
             "theta0", "theta1", "theta3", "theta4", "theta5", "theta6",
             "theta2_is_weekend", "theta2_rb", "theta_ar1",
+            "theta_q0", "theta_qE", "theta_qrb",
         ]),
     ]
     if not e1_known:
@@ -413,7 +470,7 @@ def log_pooled_theta(
 
 
 def theta_dim(*, e1_known: bool) -> int:
-    return 41 if e1_known else 43
+    return _THETA_DIM_BASE if e1_known else _THETA_DIM_BASE + 2
 
 
 def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
@@ -458,7 +515,8 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         0.0,
         0.0,
         np.log(max(sdPV, 0.1)),
-        0.0,
+        0.0,  # alpha_ar1
+        0.0, 0.0, 0.0,  # alpha_q0, alpha_qE, alpha_qrb (lagged J)
         0.0,
         0.1,
         0.0,
@@ -467,6 +525,8 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         0.0,
         0.0,
         0.0,
+        0.0,  # beta_ar1
+        0.0, 0.0, 0.0,  # beta_q0, beta_qE, beta_qrb
         0.0,
         0.0,
         0.0,
@@ -475,12 +535,18 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         0.0,
         0.0,
         0.0,
-        0.0,
-        0.0,
+        0.0,  # theta_ar1
+        0.0, 0.0, 0.0,  # theta_q0, theta_qE, theta_qrb
     ]
     if not e1_known:
         parts.extend([0.0, np.log(1.0)])
-    return np.asarray(parts, dtype=float)
+    out = np.asarray(parts, dtype=float)
+    n_expected = theta_dim(e1_known=e1_known)
+    if out.size != n_expected:
+        raise RuntimeError(
+            f"initial_theta length {out.size} != theta_dim {n_expected}"
+        )
+    return out
 
 
 def build_user_blocks(
@@ -500,6 +566,7 @@ def build_user_blocks(
     PV_lag1_col="hourly_pageview_count_lag1",
     FW_lag_col="morning_wearing",
     PJ_lag_col="daily_present_yesterday",
+    J_lag_col="week_present_lastweek",
     *,
     hourly_pv=True,
     full_weeks=None,   # e.g. range(1, 13)
@@ -517,12 +584,16 @@ def build_user_blocks(
         afternoon row) for FW/PJ logit covariates.
         AR coefficients multiply precomputed lag columns: ``PV_lag1_col`` per hour,
         ``FW_lag_col`` / ``PJ_lag_col`` per day (NaNs treated as 0 in the likelihood).
-        Missing weeks keep these as empty arrays.
+        ``J_lag`` is last Sunday's ``week_present`` (``J_lag_col``), used as
+        ``J_{w-1} · [1, E_w, rb]`` on this week's PV/FW/PJ. Missing weeks keep
+        these as empty arrays.
 
       - Weekly intensity summaries for the transition use fixed denominators
-        (``nansum(pv)/14``, ``nansum(FW|PJ)/7``): each slot contributes 0 if NaN,
-        not a mean over observed-only slots. With a complete 14-slot / 7-day
-        panel this matches zero-imputed averages.
+        (``nansum(pv)/14``, ``nansum(FW|PJ)/7``): each slot contributes 0 if
+        NaN, not a mean over observed-only slots. With a complete 14-slot /
+        7-day panel this matches zero-imputed averages. For FW this codes
+        sensor missingness as not wearing; that is intentional so the
+        simulator and Ê_w use the same summary.
 
       - The state transition uses separate weekly summaries:
             PV_sum_trans, FW_sum_trans, PJ_sum_trans
@@ -562,6 +633,10 @@ def build_user_blocks(
         J_week = _first_nonmissing(g_week[J_col])
         U1 = _first_nonmissing(g_week[U1_col])
         U2 = _first_nonmissing(g_week[U2_col])
+        if J_lag_col is not None and J_lag_col in g_week.columns:
+            J_lag = _first_nonmissing(g_week[J_lag_col])
+        else:
+            J_lag = np.nan
 
         pv_y_list, pv_a_list = [], []
         pv_lag1_list = []
@@ -642,6 +717,8 @@ def build_user_blocks(
         day_FW_lag = np.asarray(day_fw_lag_list, dtype=float)
         day_PJ_lag = np.asarray(day_pj_lag_list, dtype=float)
 
+        # Fixed 14/7 denominators: NaN slot → 0. FW missingness is treated as
+        # not wearing (same convention as vani_env / script 6 / ew_hat).
         PV_sum = float(np.nansum(pv_y) / 14.0) if np.any(~np.isnan(pv_y)) else np.nan
         FW_sum = float(np.nansum(FW_daily) / 7.0) if np.any(~np.isnan(FW_daily)) else np.nan
         PJ_sum = float(np.nansum(PJ_daily) / 7.0) if np.any(~np.isnan(PJ_daily)) else np.nan
@@ -649,6 +726,7 @@ def build_user_blocks(
             "week": int(week),
             "is_missing_week": False,
             "J_week": J_week,
+            "J_lag": J_lag,
             "U1": U1,
             "U2": U2,
             "pv_y": pv_y,
@@ -706,6 +784,7 @@ def build_user_blocks(
                 "week": int(week),
                 "is_missing_week": True,
                 "J_week": np.nan,
+                "J_lag": np.nan,
                 "U1": np.nan,
                 "U2": np.nan,
                 "pv_y": np.asarray([], dtype=float),
@@ -736,7 +815,23 @@ def build_user_blocks(
             b["PJ_sum_trans"] = b["PJ_sum"] if not np.isnan(b["PJ_sum"]) else pj_mean
             blocks.append(b)
 
+    j_week_by_w = {int(b["week"]): b["J_week"] for b in blocks}
+    for b in blocks:
+        if np.isfinite(b.get("J_lag", np.nan)):
+            continue
+        prev = j_week_by_w.get(int(b["week"]) - 1, np.nan)
+        b["J_lag"] = float(prev) if np.isfinite(prev) else 0.0
+
     return blocks
+
+
+def _jw_query_shift(q0, qE, qrb, j_lag, e, rb):
+    """``J_lag * (q0 + qE * E + qrb * rb)``. ``e`` may be a quadrature grid."""
+    j = 0.0 if j_lag is None or not np.isfinite(j_lag) else float(j_lag)
+    if j == 0.0:
+        return 0.0 * e
+    rb_f = 0.0 if rb is None or not np.isfinite(rb) else float(rb)
+    return j * (q0 + qE * e + qrb * rb_f)
 
 
 def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) -> np.ndarray:
@@ -788,6 +883,10 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             + dotc
             + par["alpha_ar1"] * y_lag
             + a * (par["alpha3"] + par["alpha4"] * grid)
+            + _jw_query_shift(
+                par["alpha_q0"], par["alpha_qE"], par["alpha_qrb"],
+                block.get("J_lag"), grid, row[2],
+            )
         )
         ll += normal_logpdf(y, mu, par["sigma_PV"])
 
@@ -819,6 +918,10 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             + par["beta_ar1"] * y_lag
             + a0 * (par["beta3"] + par["beta4"] * grid)
             + a1 * (par["beta5"] + par["beta6"] * grid)
+            + _jw_query_shift(
+                par["beta_q0"], par["beta_qE"], par["beta_qrb"],
+                block.get("J_lag"), grid, bd_d,
+            )
         )
         ll += bernoulli_logpmf(y, eta)
 
@@ -850,6 +953,10 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             + par["theta_ar1"] * y_lag
             + a0 * (par["theta3"] + par["theta4"] * grid)
             + a1 * (par["theta5"] + par["theta6"] * grid)
+            + _jw_query_shift(
+                par["theta_q0"], par["theta_qE"], par["theta_qrb"],
+                block.get("J_lag"), grid, bd_d,
+            )
         )
         ll += bernoulli_logpmf(y, eta)
 
@@ -961,6 +1068,9 @@ def penalized_json_export(
             r3(par["alpha3"]),
             r3(par["alpha4"]),
             r3(par["sigma_PV"]),
+            r3(par["alpha_q0"]),
+            r3(par["alpha_qE"]),
+            r3(par["alpha_qrb"]),
         ],
         "theta_penalized_PV_names": [
             "alpha0",
@@ -972,6 +1082,7 @@ def penalized_json_export(
             "alpha3_action",
             "alpha4_action_by_Ew",
             "sigma_PV",
+            *QUERY_JW_NAMES,
         ],
 
         "theta_penalized_FW": [
@@ -984,6 +1095,9 @@ def penalized_json_export(
             r3(par["beta4"]),
             r3(par["beta5"]),
             r3(par["beta6"]),
+            r3(par["beta_q0"]),
+            r3(par["beta_qE"]),
+            r3(par["beta_qrb"]),
         ],
         "theta_penalized_FW_names": [
             "beta0",
@@ -995,6 +1109,7 @@ def penalized_json_export(
             "beta4_A0_morning_by_Ew",
             "beta5_A1_afternoon",
             "beta6_A1_afternoon_by_Ew",
+            *QUERY_JW_NAMES,
         ],
 
         "theta_penalized_PJ": [
@@ -1007,6 +1122,9 @@ def penalized_json_export(
             r3(par["theta4"]),
             r3(par["theta5"]),
             r3(par["theta6"]),
+            r3(par["theta_q0"]),
+            r3(par["theta_qE"]),
+            r3(par["theta_qrb"]),
         ],
         "theta_penalized_PJ_names": [
             "theta0",
@@ -1018,12 +1136,20 @@ def penalized_json_export(
             "theta4_A0_morning_by_Ew",
             "theta5_A1_afternoon",
             "theta6_A1_afternoon_by_Ew",
+            *QUERY_JW_NAMES,
         ],
 
         "penalized_loglik": r3(filt["loglik"]),
         "penalized_objective": r3(res.fun),
         "penalized_opt_success": bool(res.success),
         "penalized_opt_nit": int(res.nit) if hasattr(res, "nit") else None,
+        "_query_Jw_effect": {
+            "source": (
+                "joint lagged-J in script-4 PV/FW/PJ emissions "
+                "(week_present_lastweek)"
+            ),
+            "apply": "add J_w * (q @ z); I_w not in model",
+        },
     }
 
     if not e1_fixed:
@@ -1126,6 +1252,10 @@ def penalized_json_export(
                 + dotc
                 + par["alpha_ar1"] * y_lag
                 + A * (par["alpha3"] + par["alpha4"] * e)
+                + _jw_query_shift(
+                    par["alpha_q0"], par["alpha_qE"], par["alpha_qrb"],
+                    block.get("J_lag"), e, row[2],
+                )
             )
 
             pPV.append(r3(mu))
@@ -1190,6 +1320,10 @@ def penalized_json_export(
                 + par["beta_ar1"] * lag_d
                 + A0 * (par["beta3"] + par["beta4"] * e)
                 + A1 * (par["beta5"] + par["beta6"] * e)
+                + _jw_query_shift(
+                    par["beta_q0"], par["beta_qE"], par["beta_qrb"],
+                    block.get("J_lag"), e, burden_d,
+                )
             )
 
             ph = float(_sigm(eta))
@@ -1255,6 +1389,10 @@ def penalized_json_export(
                 + par["theta_ar1"] * lag_d
                 + A0 * (par["theta3"] + par["theta4"] * e)
                 + A1 * (par["theta5"] + par["theta6"] * e)
+                + _jw_query_shift(
+                    par["theta_q0"], par["theta_qE"], par["theta_qrb"],
+                    block.get("J_lag"), e, burden_d,
+                )
             )
 
             ph = float(_sigm(eta))
@@ -1396,10 +1534,11 @@ def write_joint_penalized_into_vanilla_json_files(
       params_env_<id>.json
       pred_<id>.json
 
-    The files are **overwritten** with the penalized-fit keys (any stale vanilla keys
-    or query-imputation suffix from a prior run are wiped). The downstream
-    ``2_fit_vanilla_testbed.py`` then merges its vanilla keys into the same
-    JSONs while preserving the penalized-fit keys written here.
+    The files are **overwritten** with the penalized-fit keys (any stale vanilla
+    keys from a prior run are wiped). The lagged-J ``query_Jw_*`` suffix is
+    part of this write. Downstream ``5_fit_vanilla_testbed.py`` then merges
+    its vanilla keys into the same JSONs while preserving the penalized-fit
+    keys written here.
     """
     wd = WORK_DIR if work_dir is None else Path(work_dir)
     wd.mkdir(parents=True, exist_ok=True)
@@ -1906,7 +2045,7 @@ def make_bounds(*, e1_known: bool):
 
     # If E1 prior is estimated, bound log sigma0 too
     if not e1_known:
-        bounds[42] = (np.log(0.03), np.log(10.0))
+        bounds[-1] = (np.log(0.03), np.log(10.0))
 
     return bounds
 
@@ -2746,7 +2885,7 @@ if __name__ == "__main__":
 
     # Write filtered E_w (perceived utility) back to df_fit.csv so that
     # 2_fit_vanilla_testbed.py can read perceived_utility / perceived_utility_lastweek.
-    save_df_fit_with_perceived_utility(
+    df_fit_out = save_df_fit_with_perceived_utility(
         df_fit,
         filtered_states,
         out_path=folder / "df_fit.csv",
@@ -2761,12 +2900,3 @@ if __name__ == "__main__":
         show=True,
     )
     print(f"Diagnostic figures saved under {_diag_dir}")
-
-    impute_query_action_interaction_effects(
-        df_fit["ParticipantIdentifier"].unique(),
-        work_dir=WORK_DIR,
-        xi=1.0 / 8.0,
-        digits=3,
-        rng=np.random.default_rng(2026),
-    )
-    print("Imputed query-action interaction blocks into params_env_<id>.json (see _query_interaction_impute).")

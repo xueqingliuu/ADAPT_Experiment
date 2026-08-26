@@ -30,12 +30,10 @@ PF outcome  Y  (CAE)            -> nu_0_Y, Gamma_0_Y, sigma2_Y
 PF outcome  tY (CAE_short)      -> nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y
 
 
-RL reward shaping （biased)              -> mu_0_reward, Sigma_0_reward, sigma2_reward
+RL reward shaping                        -> mu_0_reward, Sigma_0_reward, sigma2_reward
    (build_phi_action_rewardshaping;
     sum_{d,t} Delta_{d,t} psi on
     Delta_{6,2} * Y_w + gamma_bar * E_{w+1})
-
-RL reward shaping （unbiased)              -> mu_0_reward_unbiased, Sigma_0_reward_unbiased, sigma2_reward_unbiased
 
 RL redistribution, Stage 1 (AA/FW/PJ)    -> reward_redistribution.daily_mediators
 RL redistribution, Stage 2 (V2/V4)       -> reward_redistribution.redistribution
@@ -101,8 +99,9 @@ from algorithm_helpers import (
 )
 from vani_env import (
     PF_THETA_CAE_NAMES,
+    assert_complete_week_slots,
+    cae_mediator_ewma_rows,
     trim_pf_cae_prior,
-    within_week_ewma,
 )
 
 
@@ -118,9 +117,10 @@ COMBINED_DIR = Path(
         "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing",
     )
 ).expanduser().resolve()
-# Select the parameter set whose ``df_fit_11week.csv`` is used and whose
-# priors are overwritten.  This is essential for tuned STE folders: their
-# rewards/engagement scales need their own V2/V4 priors.
+# Priors are written into WORK_DIR. The design still comes from that
+# folder's ``df_fit_11week.csv`` (RCT panel). Tuned STE folders only copy
+# that CSV — they do not contain κ-scaled trajectories — so STE-folder
+# priors stay RCT/vanilla-sized unless you replace the CSV.
 WORK_DIR = Path(os.getenv(
     "ADAPR_EST_PRIOR_PARAMS_DIR", str(PROJECT_ROOT / "env_para_vanilla")
 )).expanduser().resolve()
@@ -164,6 +164,11 @@ RL_ME_SHAPE = (6, 4)
 RIDGE_ALPHA_PF = 1.0     # ridge prior precision for PF mediator / Y / tY fits
 RIDGE_ALPHA_RL = 1.0     # ridge prior precision for RL Q / reward / joint fits
 MIN_SIGMA2 = 1e-6
+# Prior variance for design columns that are identically zero offline
+# (e.g. ``b_tilde``). Flooring their across-user θ-variance at MIN_SIGMA2
+# yields N(0, 1e-6) — too tight for RLSVI to learn online. Intercept is
+# constant but *not* unused (max |x|=1); only all-zero columns get this.
+UNIDENTIFIED_PRIOR_VAR = 1.0
 N_FQI_ITERS = 25         # fitted-Q iterations per user
 
 
@@ -200,7 +205,7 @@ def _filter_users_with_cae_obs(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _default_df_fit_path() -> Path:
-    """Prefer the params-dir 11-week file so priors match the simulated cohort.
+    """Prefer WORK_DIR's 11-week RCT panel (also copied into STE folders).
 
     ``COMBINED_DIR/df_fit.csv`` is only a fallback (larger RCT extract).
     """
@@ -224,7 +229,9 @@ def load_df_fit(path: Optional[Path] = None) -> pd.DataFrame:
     if not p.is_file():
         raise FileNotFoundError(f"df_fit not found: {p}")
     print(f"Loading df_fit from {p}", flush=True)
-    return _filter_users_with_cae_obs(_week_fix_and_filter(pd.read_csv(p)))
+    df = _filter_users_with_cae_obs(_week_fix_and_filter(pd.read_csv(p)))
+    assert_complete_week_slots(df)
+    return df
 
 
 
@@ -262,16 +269,106 @@ def _ridge_fit(
         A = Xo.T @ Xo + alpha * np.eye(p)
         theta = np.linalg.solve(A, Xo.T @ yo)
         resid = yo - Xo @ theta
-    if resid.size > 1:
-        sigma2 = max(float(np.var(resid, ddof=1)), MIN_SIGMA2)
-    else:
-        sigma2 = 1.0
+    sigma2 = _ridge_residual_sigma2(resid, p)
     return theta, sigma2
 
 
+def _ridge_residual_sigma2(resid: np.ndarray, n_features: int) -> float:
+    """Residual variance ``RSS / (n - p)``, floored at ``MIN_SIGMA2``.
+
+    Ridge residuals are not orthogonal to the columns and need not have
+    mean zero, so the centered sample variance (``np.var(..., ddof=1)``)
+    is the wrong estimator. When ``n <= p`` the residual df is not
+    positive and this returns 1.0.
+    """
+    resid = np.asarray(resid, dtype=float).ravel()
+    df = int(resid.size) - int(n_features)
+    if df <= 0:
+        return 1.0
+    rss = float(np.dot(resid, resid))
+    return max(rss / df, MIN_SIGMA2)
+
+
 def _feature_column_std(X: np.ndarray, index: int) -> float:
-    """Sample std of one design column (0 => structurally unused)."""
+    """Sample std of one design column (0 => constant, including intercept)."""
     return float(np.nanstd(np.asarray(X, dtype=float)[:, index]))
+
+
+def _all_zero_design_columns(X: np.ndarray, atol: float = MIN_FEATURE_STD) -> np.ndarray:
+    """True for columns that are structurally unused (identically ~0).
+
+    Distinct from zero *standard deviation*: the intercept is constant but
+    identified. ``b_tilde`` is all zeros because offline φ always passes 0.
+    """
+    X = np.asarray(X, dtype=float)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    if X.size == 0:
+        return np.zeros(0, dtype=bool)
+    peak = np.nanmax(np.abs(X), axis=0)
+    return np.where(np.isfinite(peak), peak < float(atol), True)
+
+
+def _inflate_unidentified_variance(
+    var: np.ndarray, X_pooled: Optional[np.ndarray],
+) -> np.ndarray:
+    """Raise all-zero design-column variances to ``UNIDENTIFIED_PRIOR_VAR``."""
+    var = np.asarray(var, dtype=float).ravel()
+    if X_pooled is None:
+        return var
+    unused = _all_zero_design_columns(X_pooled)
+    if unused.size != var.size:
+        return var
+    return np.where(unused, np.maximum(var, UNIDENTIFIED_PRIOR_VAR), var)
+
+
+def _inflate_unidentified_cov(
+    Sigma: np.ndarray, X_pooled: Optional[np.ndarray],
+) -> np.ndarray:
+    """Raise all-zero design-column *diagonals* to ``UNIDENTIFIED_PRIOR_VAR``."""
+    Sigma = np.array(Sigma, dtype=float, copy=True)
+    if X_pooled is None or Sigma.size == 0:
+        return Sigma
+    unused = _all_zero_design_columns(X_pooled)
+    if unused.size != Sigma.shape[0]:
+        return Sigma
+    diag = np.diag(Sigma).copy()
+    diag[unused] = np.maximum(diag[unused], UNIDENTIFIED_PRIOR_VAR)
+    np.fill_diagonal(Sigma, diag)
+    return Sigma
+
+
+def _assert_named_coords_diffuse(
+    Sigma_0: Optional[np.ndarray],
+    names: List[str],
+    required: Tuple[str, ...],
+    *,
+    min_var: float = UNIDENTIFIED_PRIOR_VAR,
+) -> None:
+    """Fail if named unidentified coordinates still have a dogmatic prior."""
+    if Sigma_0 is None:
+        return
+    diag = np.diag(np.asarray(Sigma_0, dtype=float))
+    lookup = {name: i for i, name in enumerate(names)}
+    for name in required:
+        if name not in lookup:
+            continue
+        i = lookup[name]
+        if float(diag[i]) < float(min_var) - 1e-12:
+            raise AssertionError(
+                f"{name} prior variance {float(diag[i]):.3g} < {min_var}"
+            )
+
+
+def _stack_phi_obs(feats_list: List[Dict[str, Any]]) -> Optional[np.ndarray]:
+    """Stack FQI ``phi_obs`` rows used as the Q-prior design."""
+    if not feats_list:
+        return None
+    p = int(feats_list[0]["p_phi"])
+    return np.concatenate(
+        [np.asarray(f["phi_obs"], dtype=float).reshape(-1, p) for f in feats_list],
+        axis=0,
+    )
 
 
 def _unidentified_inference() -> Dict[str, Any]:
@@ -315,10 +412,7 @@ def _ridge_fit_summary(
         theta = a_inv @ (Xo.T @ yo)
         resid = yo - Xo @ theta
 
-    if resid.size > 1:
-        sigma2 = max(float(np.var(resid, ddof=1)), MIN_SIGMA2)
-    else:
-        sigma2 = 1.0
+    sigma2 = _ridge_residual_sigma2(resid, n_features)
 
     cov = sigma2 * (a_inv @ xtx @ a_inv)
     se = np.sqrt(np.maximum(np.diag(cov), 0.0))
@@ -531,6 +625,7 @@ def _pool_user_fits(
     pooled_theta: Optional[np.ndarray],
     user_thetas: List[Optional[np.ndarray]],
     user_sigma2s: List[Optional[float]],
+    X_pooled: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
     """Build a (prior mean, diag cov, sigma2) tuple under empirical-Bayes pooling.
 
@@ -543,6 +638,9 @@ def _pool_user_fits(
                    the prior covariance.
     user_sigma2s   list of per-user residual variances aligned with
                    ``user_thetas``; their average becomes sigma2.
+    X_pooled       optional stacked design. All-zero columns (structurally
+                   unidentified) get prior variance ``UNIDENTIFIED_PRIOR_VAR``
+                   instead of the ``MIN_SIGMA2`` floor.
 
     The prior mean comes from the pooled fit; sigma2 is the average of
     per-user residual variances; the per-user thetas characterise
@@ -561,6 +659,7 @@ def _pool_user_fits(
         # Not enough per-user fits to estimate across-user variance.
         var = np.ones(p)
     var = np.maximum(var, MIN_SIGMA2)
+    var = _inflate_unidentified_variance(var, X_pooled)
     cov = np.diag(var)
     sigma2 = _mean_user_sigma2(user_sigma2s)
     return pooled_theta, cov, sigma2
@@ -601,6 +700,7 @@ def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     parameter being estimated, so the regression here uses the actual
     ``caeAverageLastWeek_norm`` column.
     """
+    assert_complete_week_slots(dat)
     int_ = np.ones(len(dat))
     lag1 = _fill_nan(dat["FourSC_lag1"].to_numpy())
     yest_step = _fill_nan(dat["YesterdayStepCount_norm"].to_numpy())
@@ -628,8 +728,8 @@ def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
 
     # ── PF-specific shaping ───────────────────────────────────────────
     n_w = len(dat) // K_SLOTS_WEEK
-    X = X[: n_w * K_SLOTS_WEEK].reshape(n_w, K_SLOTS_WEEK, X.shape[1])
-    y = y[: n_w * K_SLOTS_WEEK].reshape(n_w, K_SLOTS_WEEK)
+    X = X.reshape(n_w, K_SLOTS_WEEK, X.shape[1])
+    y = y.reshape(n_w, K_SLOTS_WEEK)
     # Drop Sunday slots (indices 12, 13) → keep 12 RL-controlled slots per week.
     X = X[:, : _PF_FOURSC_SLOTS_PER_WEEK, :]
     y = y[:, : _PF_FOURSC_SLOTS_PER_WEEK]
@@ -656,12 +756,13 @@ def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     the regression population parameter, so actual ``caeAverageLastWeek_norm``
     values are used here.
     """
+    assert_complete_week_slots(dat)
     am = dat["DecisionTime"].to_numpy() == 0
     dat_am = dat.loc[am].reset_index(drop=True)
     n = len(dat_am)
     int_ = np.ones(n)
     antic_yest = _fill_nan(dat_am["anticipated_affect_yesterday_norm"].to_numpy())
-    act = _fill_nan(dat_am["active_status"].to_numpy())
+    act = _fill_nan(dat_am["active_status_fraction_7days"].to_numpy())
     is_weekend = dat_am["is_weekend"].to_numpy()
     pu = _fill_nan(dat_am["perceived_utility_lastweek"].to_numpy())
     cae = _fill_nan(dat_am["CAE_avg_lastweek_norm"].to_numpy())
@@ -675,7 +776,7 @@ def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
 
     # Per-day WS pair (rows of dat alternate AM, PM for each Date).
     WS_all = dat["WalkingSuggestion"].to_numpy().astype(float)
-    pair = WS_all[: (len(dat) // 2) * 2].reshape(-1, 2)
+    pair = WS_all.reshape(-1, 2)
     ws_m = pair[:n, 0]
     ws_a = pair[:n, 1]
 
@@ -692,8 +793,8 @@ def _build_antic_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     # ── PF-specific shaping ───────────────────────────────────────────
     days_per_week = 7
     n_w = n // days_per_week
-    X = X[: n_w * days_per_week].reshape(n_w, days_per_week, X.shape[1])
-    y = y[: n_w * days_per_week].reshape(n_w, days_per_week)
+    X = X.reshape(n_w, days_per_week, X.shape[1])
+    y = y.reshape(n_w, days_per_week)
     # Drop Sunday (day index 6) → keep 6 RL-controlled days per week.
     X = X[:, : _PF_ANTIC_DAYS_PER_WEEK, :]
     y = y[:, : _PF_ANTIC_DAYS_PER_WEEK]
@@ -708,29 +809,21 @@ def _build_CAE_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """Weekly CAE design: [1, CAE_lw, fourSC_ewma, antic_ewma].
 
     EWMA summaries use RL-controlled Mon–Sat only (12 slots / 6 days).
+    Missing slots are filled with that week's finite mean
+    (:func:`vani_env.cae_mediator_ewmas`), matching the runtime PF helper.
     """
+    assert_complete_week_slots(dat)
     n_w = len(dat) // K_SLOTS_WEEK
-    dat = dat.iloc[: n_w * K_SLOTS_WEEK]
     cae_y = dat["CAE_avg_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)[:, 0]
     cae_lw = _fill_nan(dat["CAE_avg_lastweek_norm"].to_numpy()).reshape(-1, K_SLOTS_WEEK)[:, 0]
 
-    mu_fSC = float(np.nanmean(dat["4hour_step_norm"])) if dat["4hour_step_norm"].notna().any() else 0.0
-    mu_antic = float(np.nanmean(dat["anticipated_affect_norm"])) if dat["anticipated_affect_norm"].notna().any() else 0.0
-
-    foursc = dat["4hour_step_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)
-    foursc = np.where(np.isnan(foursc), mu_fSC, foursc)[:, :N_RL_SLOTS_WEEK]
-    antic = dat["anticipated_affect_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)
-    antic = np.where(np.isnan(antic), mu_antic, antic).reshape(-1, 7, 2).mean(axis=2)
-    antic = antic[:, :DAYS_PER_WEEK_RL]
-
-    foursc_e = np.array(
-        [within_week_ewma(row) for row in foursc],
-        dtype=float,
-    )
-    antic_e = np.array(
-        [within_week_ewma(row) for row in antic],
-        dtype=float,
-    )
+    foursc = dat["4hour_step_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)[
+        :, :N_RL_SLOTS_WEEK
+    ]
+    antic = dat["anticipated_affect_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)[
+        :, :N_RL_SLOTS_WEEK
+    ]
+    foursc_e, antic_e = cae_mediator_ewma_rows(foursc, antic)
 
     X = np.column_stack([
         np.ones(n_w), cae_lw, foursc_e, antic_e,
@@ -740,8 +833,7 @@ def _build_CAE_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _build_CAE_short_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    n_w = len(dat) // K_SLOTS_WEEK
-    dat = dat.iloc[: n_w * K_SLOTS_WEEK]
+    assert_complete_week_slots(dat)
     cae_short = dat["CAE_short_avg_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)[:, 0]
     cae_avg = _fill_nan(dat["CAE_avg_norm"].to_numpy().reshape(-1, K_SLOTS_WEEK)[:, 0])
     X = np.column_stack([np.ones(len(cae_short)), cae_avg])
@@ -811,10 +903,14 @@ def fit_pf_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
     th_tY_pool, _ = _ridge_fit(
         np.vstack(X_tY_all),  np.concatenate(y_tY_all),  alpha=RIDGE_ALPHA_PF)
 
-    nu_fSC, G_fSC, s2_fSC = _pool_user_fits(th_fSC_pool, fSC_thetas, fSC_sigma2s)
-    nu_ant, G_ant, s2_ant = _pool_user_fits(th_ant_pool, ant_thetas, ant_sigma2s)
-    nu_Y,   G_Y,   s2_Y   = _pool_user_fits(th_Y_pool,   Y_thetas,   Y_sigma2s)
-    nu_tY,  G_tY,  s2_tY  = _pool_user_fits(th_tY_pool,  tY_thetas,  tY_sigma2s)
+    nu_fSC, G_fSC, s2_fSC = _pool_user_fits(
+        th_fSC_pool, fSC_thetas, fSC_sigma2s, X_pooled=np.vstack(X_fSC_all))
+    nu_ant, G_ant, s2_ant = _pool_user_fits(
+        th_ant_pool, ant_thetas, ant_sigma2s, X_pooled=np.vstack(X_ant_all))
+    nu_Y,   G_Y,   s2_Y   = _pool_user_fits(
+        th_Y_pool,   Y_thetas,   Y_sigma2s,   X_pooled=np.vstack(X_Y_all))
+    nu_tY,  G_tY,  s2_tY  = _pool_user_fits(
+        th_tY_pool,  tY_thetas,  tY_sigma2s,  X_pooled=np.vstack(X_tY_all))
 
     return {
         "fourSC":    {"nu_0": nu_fSC, "Gamma_0": G_fSC, "sigma2": s2_fSC,
@@ -833,13 +929,10 @@ def fit_pf_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────
 def _build_rl_context_vector_from_row(row) -> np.ndarray:
     """Match ``experiment.build_rl_context_vector`` (length ``N_RL_CONTEXT``).
-
-    ``I_w * J_w`` is a separate base feature, not part of ``C``. Offline,
-    ``I_w`` is treated as 1 and ``J_w`` is ``week_present``.
     """
     return build_rl_context_vector(
         yesterdayStepCount=float(row["YesterdayStepCount_norm"]),
-        prior2HourStepCountAgent=float(row["prior2hour_step_norm"]),
+        prior2HourStepCount=float(row["prior2hour_step_norm"]),
         activeDaysLast7Days=float(row["active_status_fraction_7days"]),
         activitySuggestionsSentLast7Days=float(
             row["recent_burden_norm" if "recent_burden_norm" in row.index else "recentBurdenEma_norm"]
@@ -848,26 +941,17 @@ def _build_rl_context_vector_from_row(row) -> np.ndarray:
     )
 
 
-def _query_x_weekly_from_row(row) -> float:
-    """Offline ``I_w * J_w``: query always sent, times ``week_present``."""
-    wp = row["week_present"] if "week_present" in row.index else 0.0
-    try:
-        wp = float(wp)
-    except (TypeError, ValueError):
-        return 0.0
-    return wp if np.isfinite(wp) else 0.0
-
-
 def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
     """Pre-build all per-week / per-slot quantities needed for RL phi builders.
 
     ``dat`` must be one participant, sorted by (Date, DecisionTime), with
-    a length that is a multiple of K_SLOTS_WEEK.  Day order within each week
-    is Monday .. Sunday.  Rows are NaN-filled with the
-    participant's mean so the resulting tensors are finite.
+    a complete 14-slot panel every week (Monday .. Sunday).  Rows are
+    NaN-filled with the participant's mean so the resulting tensors are
+    finite.
     """
+    assert_complete_week_slots(dat)
     n_w = len(dat) // K_SLOTS_WEEK
-    dat = dat.iloc[: n_w * K_SLOTS_WEEK].reset_index(drop=True)
+    dat = dat.reset_index(drop=True)
 
     cols = [
         "YesterdayStepCount_norm", "EMA_StepCount_norm", "prior2hour_step_norm",
@@ -882,21 +966,12 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
     ]
     for c in cols:
         dat[c] = _fill_nan(dat[c].to_numpy())
-    if "week_present" not in dat.columns:
-        dat["week_present"] = 0.0
-    else:
-        dat["week_present"] = np.where(
-            np.isfinite(dat["week_present"].to_numpy(dtype=float)),
-            dat["week_present"].to_numpy(dtype=float),
-            0.0,
-        )
 
     n_rl = N_RL_SLOTS_WEEK   # 12 slots Mon-Sat
     p_C = N_RL_CONTEXT
 
     # Per-slot quantities for d in 1..6 (Mon-Sat).
     C_slot = np.zeros((n_w, n_rl, p_C))
-    query_x_slot = np.zeros((n_w, n_rl))
     E_w_slot = np.zeros((n_w, n_rl))
     b_hat_slot = np.zeros((n_w, n_rl))
     A_slot = np.zeros((n_w, n_rl), dtype=int)
@@ -925,7 +1000,6 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
                 rl_idx = (d - 1) * 2 + (t - 1)
                 row = dat.iloc[slot]
                 C_slot[k, rl_idx] = _build_rl_context_vector_from_row(row)
-                query_x_slot[k, rl_idx] = _query_x_weekly_from_row(row)
                 E_w_slot[k, rl_idx] = float(row["perceived_utility_lastweek"])
                 b_hat_slot[k, rl_idx] = float(row["CAE_avg_lastweek_norm"])
                 A_slot[k, rl_idx] = int(row["WalkingSuggestion"])
@@ -946,7 +1020,6 @@ def _user_weekly_tensors(dat: pd.DataFrame) -> Dict[str, np.ndarray]:
     return {
         "n_w":         n_w,
         "C_slot":      C_slot,
-        "query_x_slot": query_x_slot,
         "E_w_slot":    E_w_slot,
         "b_hat_slot":  b_hat_slot,
         "A_slot":      A_slot,
@@ -965,7 +1038,6 @@ def _slot_state(t_dict: Dict[str, np.ndarray], k: int, rl_idx: int) -> Dict[str,
         "M_Y": t_dict["M_Y_week"][k],
         "M_E": t_dict["M_E_week"][k],
         "C":   t_dict["C_slot"][k, rl_idx],
-        "query_x_weekly_present": float(t_dict["query_x_slot"][k, rl_idx]),
     }
 
 
@@ -1031,9 +1103,11 @@ def fit_reward_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
         target   = Delta_{6,2} * Y_w + GAMMA_BAR * E_{w+1}
 
     where ``Y_w`` is the weekly CAE (``caeAverage_norm``) and ``E_{w+1}`` is
-    next week's start-of-week engagement. Shaped intermediate rewards and
-    the terminal compensation ``R_{w,add}`` are *not* included here — those
-    enter only the Q-function FQI targets at runtime.
+    next week's start-of-week engagement. The last week is dropped (same as
+    V2/V4 and FQI in this file) because it has no successor ``E_{w+1}``.
+    Shaped intermediate rewards and the terminal compensation ``R_{w,add}``
+    are *not* included here — those enter only the Q-function FQI targets
+    at runtime.
 
     Prior mean is the pooled fit across all users' weeks; diagonal prior
     covariance comes from per-user fits.
@@ -1049,11 +1123,12 @@ def fit_reward_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
             thetas.append(None)
             sigma2s.append(None)
             continue
-        Phi = np.stack([_phi_rs_week_discounted(td, k) for k in range(n_w)])
-        E_next = np.zeros(n_w, dtype=float)
-        if n_w > 1:
-            E_next[:-1] = td["E_w_start"][1:]
-        y = DELTA_TERMINAL * td["R_week"] + GAMMA_BAR * E_next
+        n = n_w - 1  # last week has no E_{w+1}
+        Phi = np.stack([_phi_rs_week_discounted(td, k) for k in range(n)])
+        y = (
+            DELTA_TERMINAL * td["R_week"][:n]
+            + GAMMA_BAR * td["E_w_start"][1 : n + 1]
+        )
         Phi_all.append(Phi); y_all.append(y)
         theta, s2 = _ridge_fit(Phi, y, alpha=RIDGE_ALPHA_RL)
         thetas.append(theta)
@@ -1065,7 +1140,10 @@ def fit_reward_prior(df_fit: pd.DataFrame) -> Dict[str, Any]:
     else:
         pooled_theta = None
 
-    mu, Sigma, sigma2 = _pool_user_fits(pooled_theta, thetas, sigma2s)
+    X_pooled = np.vstack(Phi_all) if Phi_all else None
+    mu, Sigma, sigma2 = _pool_user_fits(
+        pooled_theta, thetas, sigma2s, X_pooled=X_pooled)
+    _assert_named_coords_diffuse(Sigma, _phi_state_names(), ("b_tilde",))
     return {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
 
 
@@ -1169,7 +1247,8 @@ def fit_reward_redistribution_priors(
             theta, s2 = _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)
             user_fits.append(theta); user_s2.append(s2); X_all.append(X); y_all.append(y)
         pooled, _ = _ridge_fit(np.vstack(X_all), np.concatenate(y_all), alpha=RIDGE_ALPHA_RL)
-        mu, Sigma, sigma2 = _pool_user_fits(pooled, user_fits, user_s2)
+        mu, Sigma, sigma2 = _pool_user_fits(
+            pooled, user_fits, user_s2, X_pooled=np.vstack(X_all))
         daily[mediator] = {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
         pooled_daily_eta[mediator] = pooled
     for td in tensors:
@@ -1194,7 +1273,8 @@ def fit_reward_redistribution_priors(
                                     for k in range(n)]))
             y_all.append(y_user)
         pooled, _ = _ridge_fit(np.vstack(X_all), np.concatenate(y_all), alpha=RIDGE_ALPHA_RL)
-        mu, Sigma, sigma2 = _pool_user_fits(pooled, user_fits, user_s2)
+        mu, Sigma, sigma2 = _pool_user_fits(
+            pooled, user_fits, user_s2, X_pooled=np.vstack(X_all))
         stage2[variant] = {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
     return {"daily_mediators": daily, "redistribution": stage2}
 
@@ -1396,8 +1476,7 @@ def _fqi_iterate(
         theta = theta_new
 
     resid = y_all - X_all @ theta
-    sigma2 = (max(float(np.var(resid, ddof=1)), MIN_SIGMA2)
-              if resid.size > 1 else 1.0)
+    sigma2 = _ridge_residual_sigma2(resid, X_all.shape[1])
     if return_design:
         return theta, sigma2, None, X_all, y_all, groups
     return theta, sigma2, None
@@ -1492,8 +1571,7 @@ def _joint_fqi_iterate(
     X, y, _ = _mtd_joint_design(
         feats_list, theta[p_eta:], gamma_terminal=gamma_terminal)
     resid = y - X @ theta
-    sigma2 = (max(float(np.var(resid, ddof=1)), MIN_SIGMA2)
-              if resid.size > 1 else 1.0)
+    sigma2 = _ridge_residual_sigma2(resid, X.shape[1])
     return theta, sigma2, p_eta
 
 
@@ -1526,7 +1604,10 @@ def fit_q_prior(df_fit: pd.DataFrame, *, gamma_terminal: float = GAMMA_TERMINAL)
     th_nomod_pool, _, _ = _fqi_iterate(
         feats_nomod_pool, None, use_td_modify=False, gamma_terminal=gamma_terminal)
     mu, Sigma, sigma2 = _pool_user_fits(
-        th_nomod_pool, th_nomod_users, s2_nomod_users)
+        th_nomod_pool, th_nomod_users, s2_nomod_users,
+        X_pooled=_stack_phi_obs(feats_nomod_pool))
+    _assert_named_coords_diffuse(
+        Sigma, _phi_action_names(), ("b_tilde", "A*b_tilde"))
     return {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
 
 
@@ -1555,7 +1636,10 @@ def fit_q_redistribution_prior(
         user_theta.append(theta); user_sigma2.append(sigma2); pooled_feats.append(shaped)
     pooled, _, _ = _fqi_iterate(
         pooled_feats, None, use_td_modify=False, gamma_terminal=gamma_terminal)
-    mu, Sigma, sigma2 = _pool_user_fits(pooled, user_theta, user_sigma2)
+    mu, Sigma, sigma2 = _pool_user_fits(
+        pooled, user_theta, user_sigma2, X_pooled=_stack_phi_obs(pooled_feats))
+    _assert_named_coords_diffuse(
+        Sigma, _phi_action_names(), ("b_tilde", "A*b_tilde"))
     return {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
 
 
@@ -1622,6 +1706,7 @@ def build_pooled_rl_q_summary(df_fit: pd.DataFrame) -> pd.DataFrame:
 def _pool_joint_user_fits(
     pooled_theta: Optional[np.ndarray],
     user_thetas: List[Optional[np.ndarray]],
+    X_pooled: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[int]]:
     """Joint-prior analogue of ``_pool_user_fits``.
 
@@ -1630,7 +1715,8 @@ def _pool_joint_user_fits(
     Unlike ``_pool_user_fits``, ``Sigma`` is the **full** sample covariance
     across users of the per-user joint theta vectors, not a diagonal of
     per-coordinate variances. Output is regularised to be PSD via a tiny
-    eigenvalue floor.
+    eigenvalue floor. All-zero design columns (structurally unidentified)
+    get prior variance ``UNIDENTIFIED_PRIOR_VAR`` on the diagonal.
     """
     if pooled_theta is None:
         return None, None, 0
@@ -1646,6 +1732,8 @@ def _pool_joint_user_fits(
         Sigma = np.atleast_2d(Sigma)
     else:
         Sigma = np.eye(p)
+    Sigma = 0.5 * (Sigma + Sigma.T)
+    Sigma = _inflate_unidentified_cov(Sigma, X_pooled)
     Sigma = 0.5 * (Sigma + Sigma.T)
     if Sigma.shape[0] > 0:
         min_eig = float(np.linalg.eigvalsh(Sigma).min())
@@ -1706,7 +1794,17 @@ def fit_q_td_modify_joint_prior(
     if p_eta is None and p_eta_pool is not None:
         p_eta = int(p_eta_pool)
 
-    mu_0, Sigma_0, n_used = _pool_joint_user_fits(theta_pool, user_thetas)
+    X_joint = None
+    if theta_pool is not None and feats_pool and p_eta is not None:
+        X_joint, _, _ = _mtd_joint_design(
+            feats_pool, theta_pool[int(p_eta):], gamma_terminal=gamma_terminal)
+    mu_0, Sigma_0, n_used = _pool_joint_user_fits(
+        theta_pool, user_thetas, X_pooled=X_joint)
+    eta_names, beta_names = _joint_feature_names(
+        {"mu_0": mu_0, "p_eta": p_eta})
+    _assert_named_coords_diffuse(
+        Sigma_0, eta_names + beta_names,
+        ("eta_b_tilde", "beta_b_tilde", "beta_A*b_tilde"))
 
     return {
         "mu_0":              mu_0,
@@ -1777,7 +1875,6 @@ def _phi_state_names() -> list[str]:
         "E_w",
         "b_hat",
         "b_tilde",
-        "query_x_weekly_present",
     ] + _rl_my_names() + _rl_me_names() + _rl_context_names()
 
 
@@ -2163,7 +2260,8 @@ def save_prior_summary_tables(
             "``identified=False`` marks structurally unused features with "
             "zero design variance (e.g. ``b_tilde``, masked day-6 mediators); "
             "SE / p-values are omitted for those rows. RL priors still use "
-            "ridge-FQI for ``mu_0_micro``.",
+            "ridge-FQI for ``mu_0_micro``; all-zero design columns get "
+            "``UNIDENTIFIED_PRIOR_VAR`` instead of the ``MIN_SIGMA2`` floor.",
             "",
             _dataframe_to_markdown(pooled_rl_q),
             "",

@@ -52,7 +52,7 @@ _THETA_BLOCK_TITLES = {
 }
 
 # Names skipped as non-structural (noise scales / imputation hooks).
-_SKIP_NAME_PREFIXES = ("sigma_", "query_imputed_")
+_SKIP_NAME_PREFIXES = ("sigma_", "query_imputed_", "query_Jw_")
 
 SHORT_LABELS = {
     "perceived_utility_lastweek": "E_w",

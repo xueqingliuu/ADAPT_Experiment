@@ -37,17 +37,39 @@ def _ewm_prior_gamma_last(
     """EWM over prior ≤window values (excludes current).
 
     Same normalized discount as ``1_data_extraction._ewm_prior_rows``.
-    ``gamma=None`` (default) derives the decay from how many of the ``window``
-    slots are actually populated (:func:`ewm_utils.gamma_from_n`), so an early
-    partial window (e.g. 4 of 7 days) decays differently than a full one.
-    Non-finite entries are imputed to 0. Returns 0 if the window has fewer than
-    ``min_values`` prior observations.
+    ``gamma=None`` (default) derives the decay from the window length
+    (:func:`ewm_utils.gamma_from_n`), so an early partial window (e.g. 4 of
+    7 days) decays differently than a full one. Non-finite entries are
+    imputed to 0 *before* the average (missing counts as zero, not as a
+    calendar gap). Returns 0 if the window has fewer than ``min_values``
+    prior observations.
     """
     w = np.asarray(values[-window:], dtype=float)
     if w.size < min_values:
         return 0.0
     w = np.where(np.isfinite(w), w, 0.0)
     return ewma_gamma(w, gamma, empty=0.0)
+
+
+def _seeded_ewm(generated, base, window=EWM_WINDOW):
+    """EWM over a full ``window``, left-padded with the study-entry ``base``.
+
+    ``base`` is the first-row / first-finite EMA from ``df_fit_11week``
+    (vanilla panel start), not the MRT-end value. Fitting never sees a
+    cold start (scripts 1--2 already dropped burn-in). Without this pad,
+    a simulated 7-day summary either returns 0 until ``EWM_MIN_VALUES``
+    generated days exist, or jumps to a 1-day EWM of the first simulated
+    observation. Copies of ``base`` occupy the missing prior days and are
+    displaced as simulated values arrive.
+    """
+    base = float(base) if np.isfinite(base) else 0.0
+    gen = [
+        float(v)
+        for v in list(generated)[-int(window):]
+        if np.isfinite(v)
+    ]
+    nbase = max(0, int(window) - len(gen))
+    return ewma_gamma([base] * nbase + gen, None, empty=base)
 
 
 # parameters for rolling mean
@@ -87,6 +109,7 @@ from vani_env import (
     make_initial_state,
     slot_ema_initials_from_df_fit,
     invert_log_zscore,
+    invert_zscore,
     zscore_value,
     PARAMS_DIR as DEFAULT_PARAMS_DIR,
     trim_pf_cae_prior,
@@ -245,9 +268,8 @@ class EpisodeDataset:
 #
 # State dict ``self.s`` (beyond ``Env.gen_*`` outputs)
 # ----------------------------------------------------
-# ``self.s`` is the latent simulator state used by vani_env.Env.  Step
-# outcomes (4-hour, prior-2-hour, daily sums) are never gated on Fitbit
-# wear: latent / observed / agent-visible copies are the same draw.
+# ``self.s`` is the latent simulator state used by vani_env.Env.
+# 4-hour and prior-2-hour steps are not Fitbit-gated (one array each).
 # Anticipated affect is still gated on daily-survey completion.
 # ──────────────────────────────────────────────────────────────────
 
@@ -257,8 +279,10 @@ class OnlineEnv:
         df_fit_11week_csv=None, df_fit_full=None, params_dir=None,
     ):
         # ``start_dow``: civil weekday index in ``{1,…,7}`` with **1 = Monday** (``df_fit`` / study).
-        # ``df_fit_full``: optional pre-loaded df_fit DataFrame (multi-week aggregates)
-        # for week-0 E_w_hat bootstrap. If omitted, runtime falls back to 0.0.
+        # ``df_fit_full``: optional pre-loaded df_fit for week-0 Ê_w from the
+        # last pre-RL week. No current runner passes it (``_make_online_env``,
+        # ``ste_vanilla``), so ``E_known_all[0]`` is always
+        # ``initial_Ew_hat_for_user``'s default 2.0, not 0.0.
         if seed is not None:
             rd.seed(seed)
 
@@ -283,9 +307,7 @@ class OnlineEnv:
         self.T = self.D * self.K
         self.start_dow = start_dow
 
-        self.stepCountNext4HourAll = np.zeros(self.T) # latent draw (used by gen_CAE)
-        self.stepCountNext4HourObsAll = np.full(self.T, np.nan) # same as latent; not Fitbit-gated
-        self.stepCountNext4HourAgentAll = np.zeros(self.T) # same as latent; not Fitbit-gated
+        self.stepCountNext4HourAll = np.zeros(self.T)
         self.pageViewNext4HourAll = np.zeros(self.T)
         self.action_all = np.zeros(self.T)
         self.activitySuggestionsSentLast7DaysAll = np.full(self.T, np.nan)
@@ -304,11 +326,11 @@ class OnlineEnv:
         # cross-algorithm comparison (removes per-draw measurement noise).
         self.CAE_mean_all = np.full(self.nweek+1, np.nan)
         self.pu_all = np.full(self.nweek+1, np.nan)        # latent E_w (env truth)
-        # ``J_w`` (week-survey present) is predetermined for week ``k`` at the
-        # end of week ``k-1`` (in ``_finalize_week(k-1)`` via ``gen_week_present``
-        # conditioned on the just-realized ``pu[k-1]``). Week 0 has no prior
-        # week to condition on, so we bootstrap ``J_w[0] = 1`` (treat the first
-        # study week as a guaranteed-present week).
+        # ``wp_all[k] = J_k`` is drawn at the end of week ``k-1`` from
+        # ``E_{k-1}`` (Script 4: Sunday ``J_w, U_w ~ E_w``). That Sunday
+        # also writes CAE of week ``k-1`` at ``CAE_all[k]``, so ``J_k``
+        # gates whether that CAE is observed. ``wp_all[0] = 1`` bootstraps
+        # week 0 (no prior Sunday).
         self.wp_all = np.full(self.nweek+1, np.nan)
         self.wp_all[0] = 1.0
         self.CAE_short_all = np.full(self.nweek+1, np.nan)
@@ -342,6 +364,11 @@ class OnlineEnv:
         self.s = make_initial_state(
             df_fit_11week_csv, participant_id=self.env.cfg.userid
         )
+        self._pageViewLast7DaysEma_initial = float(
+            self.s.get("pageViewLast7DaysEma", 0.0)
+        )
+        if not np.isfinite(self._pageViewLast7DaysEma_initial):
+            self._pageViewLast7DaysEma_initial = 0.0
         slot_ema = slot_ema_initials_from_df_fit(
             df_fit_11week_csv, participant_id=self.env.cfg.userid, n_slots=self.K
         )
@@ -354,6 +381,26 @@ class OnlineEnv:
         self._stepCountLast7DaysEma_initial = float(
             self._stepCountLast7DaysEma_initial_by_slot[0]
         )
+        self._step_ema_raw_seed_by_slot = {
+            s: max(
+                0.0,
+                invert_zscore(
+                    v, self.env.cfg.ema_step_shift, self.env.cfg.ema_step_scale
+                ),
+            )
+            for s, v in self._stepCountLast7DaysEma_initial_by_slot.items()
+        }
+        self._p2h_ema_raw_seed_by_slot = {
+            s: max(
+                0.0,
+                invert_zscore(
+                    v,
+                    self.env.cfg.ema_prior2hour_shift,
+                    self.env.cfg.ema_prior2hour_scale,
+                ),
+            )
+            for s, v in self._prior2HourStepCountEma7d_initial_by_slot.items()
+        }
         self._hist_foursc_by_slot: dict[int, list[float]] = {s: [] for s in range(self.K)}
         self._stepCountLast7DaysEma_by_slot: dict[int, float] = dict(
             self._stepCountLast7DaysEma_initial_by_slot
@@ -363,15 +410,13 @@ class OnlineEnv:
             self._prior2HourStepCountEma7d_initial_by_slot[0]
         )
         self._initial_prior2hour = float(self.s.get("prior2HourStepCount", 0.0))
-        self.s["prior2HourStepCountAgent"] = float(self.s.get("prior2HourStepCount", 0.0))
+        lag0 = float(self.s.get("stepCountNext4HourLag1", 0.0))
+        self._initial_foursc_lag1 = lag0 if np.isfinite(lag0) else 0.0
         self.s["dailyAnticipatedAffectYesterdayAgent"] = float(
             self.s.get("dailyAnticipatedAffectYesterday", 0.0)
         )
 
         self.prior2HourStepCountAll = np.full(self.T, np.nan)
-        self.prior2HourStepCountObsAll = np.full(self.T, np.nan)
-        self.prior2HourStepCountAgentAll = np.full(self.T, np.nan)
-        self._hist_prior2hour_observed: list[float] = []
         # Agent-visible prior-2-hour values (observed or imputed), per decision slot.
         self._hist_prior2hour_by_slot: dict[int, list[float]] = {s: [] for s in range(self.K)}
         self.ws_interaction_all = np.zeros(self.T)
@@ -411,6 +456,10 @@ class OnlineEnv:
         self.s["perceivedUtilityLastWeek"] = 2.0   # keep env state consistent
         # CAE_short is not used in the baseline slot
         self.CAE_short_all[0] = 0
+        # Week-1 Exp-tool-1/2 from the first ``df_fit_11week`` row (Monday).
+        # NaN if that week's Sunday survey was unanswered — do not fill from a
+        # later week. ``U1_all[0]`` / ``U2_all[0]`` are snapshot-only; week-0
+        # Ê_w is 2.0 unless ``df_fit_full`` is passed (no runner does).
         self.U1_all[0] = float(self.s["expTool1"])
         self.U2_all[0] = float(self.s["expTool2"])
 
@@ -448,8 +497,8 @@ class OnlineEnv:
 
         # Approximated E_w available to the agent at the start of each week.
         # ``E_known_all[k]`` is computed from observable aggregates of the previous
-        # simulated week (``_finalize_week``); ``E_known_all[0]`` is bootstrapped from
-        # the participant's last pre-RL week in df_fit.csv via the same linear formula.
+        # simulated week (``_finalize_week``). ``E_known_all[0]`` is 2.0 unless
+        # ``df_fit_full`` is passed into ``OnlineEnv`` (no runner currently does).
         self.E_known_all = np.full(self.nweek + 1, np.nan)
         self.E_known_all[0] = float(
             initial_Ew_hat_for_user(
@@ -464,6 +513,13 @@ class OnlineEnv:
         # + z-score with ``recent_burden_shift`` / ``scale``.
         self._activitySuggestionsSentLast7Days_initial = float(
             self.s["activitySuggestionsSentLast7Days"]
+        )
+        if not np.isfinite(self._activitySuggestionsSentLast7Days_initial):
+            self._activitySuggestionsSentLast7Days_initial = 0.0
+        self._burden_raw_seed = invert_zscore(
+            self._activitySuggestionsSentLast7Days_initial,
+            self.env.cfg.recent_burden_shift,
+            self.env.cfg.recent_burden_scale,
         )
         self._hist_daily_suggestions: list[float] = []
 
@@ -495,14 +551,22 @@ class OnlineEnv:
         norm = 0.0 if denom == 0 else (day_of_week - (1.0 + self.W_days) / 2.0) / denom
         return float(norm), day_of_week
 
+    def _jw_week(self, sim_w) -> int:
+        """Simulated ``J_w`` (``wp_all``), 0/1. Not gated on ``I_w``."""
+        if not (0 <= sim_w < self.wp_all.size):
+            return 0
+        v = float(self.wp_all[sim_w])
+        return int(v > 0.5) if np.isfinite(v) else 0
+
     def start_week(self, k, I_w):
         self._Iw_per_week[k] = I_w
         # ``E_known_all[k]`` is set in ``__init__`` (k=0) or by
         # ``_finalize_week(k-1)`` (k >= 1); see ``agents.ew_hat.compute_Ew_hat_from_week``.
-        # ``wp_all[k]`` is also already populated: bootstrapped to 1.0 for
-        # k == 0, and drawn at the end of week k-1 for k >= 1 (see
-        # ``_finalize_week``). Daily mediators read ``I_w * wp_all[sim_w]``
-        # with ``wp_all[sim_w]`` already a realized 0/1.
+        # ``wp_all[k] = J_k`` is already populated: bootstrapped to 1.0 for
+        # k == 0, and drawn at the end of week k-1 from ``E_{k-1}`` for
+        # k >= 1. Daily mediators read ``J_k`` (not ``I_w``): the query
+        # suffix is added when ``J_k = 1``. The same ``J_k`` still gates
+        # observation of CAE of week ``k-1`` (stored at ``CAE_all[k]``).
 
         self._foursc_wk[:] = 0.0 
         self._antic_wk[:] = 0.0
@@ -524,13 +588,14 @@ class OnlineEnv:
 
         pf_data = self.get_pf_data(k)
 
-        # Outcomes of simulated week ``sim_w_prev`` are stored at index
-        # ``sim_w_prev + 1`` (index 0 = baseline).  J_w for week ``sim_w_prev``
-        # is predetermined and lives at ``wp_all[sim_w_prev]``.
-        y_sim = self.CAE_all[self._weekly_idx(sim_w_prev)]
-        ty_sim = self.CAE_short_all[self._weekly_idx(sim_w_prev)]
-        wp = self.wp_all[sim_w_prev]
-        jw = int(float(wp))
+        # End of week ``sim_w_prev`` writes CAE of that week and ``J_{sim_w_prev+1}``
+        # at the same storage index (0 = baseline). ``J_k`` therefore gates
+        # ``CAE_all[k]``.
+        weekly_idx = self._weekly_idx(sim_w_prev)
+        y_sim = self.CAE_all[weekly_idx]
+        ty_sim = self.CAE_short_all[weekly_idx]
+        wp = self.wp_all[weekly_idx]
+        jw = 0 if (not np.isfinite(wp)) else int(float(wp))
         Y_prev = float(y_sim)
         tY_prev = float(ty_sim)
 
@@ -556,17 +621,8 @@ class OnlineEnv:
         ``step_idx`` so ``step_action`` can reuse the same draw.
         """
         step_idx = int(step_idx)
-        if np.isfinite(self.prior2HourStepCountAgentAll[step_idx]):
-            val = float(self.prior2HourStepCountAgentAll[step_idx])
-            if not np.isfinite(self.prior2HourStepCountAll[step_idx]):
-                self.prior2HourStepCountAll[step_idx] = val
-            if not np.isfinite(self.prior2HourStepCountObsAll[step_idx]):
-                self.prior2HourStepCountObsAll[step_idx] = val
-            latent = self.prior2HourStepCountAll[step_idx]
-            self.s["prior2HourStepCount"] = (
-                float(latent) if np.isfinite(latent) else val
-            )
-            self.s["prior2HourStepCountAgent"] = val
+        if np.isfinite(self.prior2HourStepCountAll[step_idx]):
+            self.s["prior2HourStepCount"] = float(self.prior2HourStepCountAll[step_idx])
             return
 
         slot = int(t_sim)
@@ -575,10 +631,7 @@ class OnlineEnv:
 
         prior2HourStepCount = self.env.gen_prior2hour_step_count(self.s, step_idx)
         self.prior2HourStepCountAll[step_idx] = prior2HourStepCount
-        self.prior2HourStepCountObsAll[step_idx] = prior2HourStepCount
-        self.prior2HourStepCountAgentAll[step_idx] = prior2HourStepCount
         self.s["prior2HourStepCount"] = prior2HourStepCount
-        self.s["prior2HourStepCountAgent"] = prior2HourStepCount
 
     def _agent_antic(self, antic_latent: float, survey_present: bool):
         """Return (observed, agent-visible) anticipated affect for one day.
@@ -614,7 +667,9 @@ class OnlineEnv:
 
     def _reset_episode_state(self):
         """Reset mutable episode histories before simulating a policy."""
-        self._hist_daily_suggestions.clear()
+        self._hist_daily_pv = []
+        self.s["pageViewLast7DaysEma"] = self._pageViewLast7DaysEma_initial
+        self._hist_daily_suggestions = []
         self.s["activitySuggestionsSentLast7Days"] = (
             self._activitySuggestionsSentLast7Days_initial
         )
@@ -643,10 +698,8 @@ class OnlineEnv:
         if not np.isfinite(p2h0):
             p2h0 = 0.0
         self.s["prior2HourStepCount"] = p2h0
-        self.s["prior2HourStepCountAgent"] = p2h0
         self.prior2HourStepCountAll[0] = p2h0
-        self.prior2HourStepCountObsAll[0] = p2h0
-        self.prior2HourStepCountAgentAll[0] = p2h0
+        self.s["stepCountNext4HourLag1"] = float(self._initial_foursc_lag1)
 
         self.logYesterdayStepCount[0] = float(self.s["yesterdayStepCount"])
         self.logPageViewLast7DaysEma[0] = float(self.s["pageViewLast7DaysEma"])
@@ -742,18 +795,15 @@ class OnlineEnv:
         # Pre-decision covariate: same slot's 2-hour window (also set before act()).
         self._generate_prior2hour_for_slot(sim_w, d_w, t_sim, d_global, step_idx)
         prior2HourStepCount = float(self.prior2HourStepCountAll[step_idx])
-        p2h_agent = float(self.prior2HourStepCountAgentAll[step_idx])
 
         fourSC = self.env.gen_fourSC(self.s, Ah, step_idx)
-        pv = self.env.gen_pageview(self.s, Ah, I_w*self.wp_all[sim_w], step_idx)
+        pv = self.env.gen_pageview(self.s, Ah, self._jw_week(sim_w), step_idx)
 
         # Interaction history should not include the current slot until after
         # ``ws_interaction`` has been generated.
         ws_interaction = self.env.gen_ws_interaction(self.s, step_idx, Ah)
 
         self.stepCountNext4HourAll[step_idx] = fourSC
-        self.stepCountNext4HourObsAll[step_idx] = fourSC
-        self.stepCountNext4HourAgentAll[step_idx] = fourSC
         self.pageViewNext4HourAll[step_idx] = pv
         self.ws_interaction_all[step_idx] = ws_interaction
 
@@ -769,10 +819,9 @@ class OnlineEnv:
         self.s["stepCountNext4HourLag1"] = fourSC
         self.s["pageViewNext4HourLag1"] = pv
         self.s["prior2HourStepCount"] = prior2HourStepCount
-        self.s["prior2HourStepCountAgent"] = p2h_agent
         self._hist_prior2hour_by_slot[slot].append(
             invert_log_zscore(
-                p2h_agent,
+                prior2HourStepCount,
                 self.env.cfg.prior2hour_log_shift,
                 self.env.cfg.prior2hour_log_scale,
             )
@@ -808,27 +857,21 @@ class OnlineEnv:
         self.logActiveDaysLast7Days[d_global] = float(
             self.s.get("activeDaysLast7Days", 0.0)
         )
-        if self._hist_daily_pv:
-            self.logPageViewLast7DaysEma[d_global] = _ewm_prior_gamma_last(
-                self._hist_daily_pv
-            )
-        else:
-            self.logPageViewLast7DaysEma[d_global] = float(self.s["pageViewLast7DaysEma"])
+        self.logPageViewLast7DaysEma[d_global] = _seeded_ewm(
+            self._hist_daily_pv,
+            self._pageViewLast7DaysEma_initial,
+        )
         self.logMorningFitbitWearLast7Days[d_global] = _rolling_mean_last(self._hist_morning_wear, 7)
 
-        if self._hist_daily_suggestions:
-            raw_burden = _ewm_prior_gamma_last(
-                self._hist_daily_suggestions, min_values=1
-            )
-            self.s["activitySuggestionsSentLast7Days"] = zscore_value(
-                raw_burden,
-                self.env.cfg.recent_burden_shift,
-                self.env.cfg.recent_burden_scale,
-            )
-        else:
-            self.s["activitySuggestionsSentLast7Days"] = (
-                self._activitySuggestionsSentLast7Days_initial
-            )
+        raw_burden = _seeded_ewm(
+            self._hist_daily_suggestions,
+            self._burden_raw_seed,
+        )
+        self.s["activitySuggestionsSentLast7Days"] = zscore_value(
+            raw_burden,
+            self.env.cfg.recent_burden_shift,
+            self.env.cfg.recent_burden_scale,
+        )
 
         # Antic / fitbit / daily are drawn in _end_day (today’s WS). gen_pageview uses
         # yesterday_* in vani_env; fourSC uses dailyAnticipatedAffectYesterday (prior-day affect) only.
@@ -844,16 +887,16 @@ class OnlineEnv:
 
         ws_m = float(self._today_action[0])
         ws_a = float(self._today_action[1])
-        Iw = self._Iw_per_week[sim_w]
+        Jw = self._jw_week(sim_w)
 
         # Same-day predictors for daily mediators (before fitbit / dailysurvey / antic).
         self.s["todayStepCount"] = daily_sum_step
         self.s["pageViewMorningToday"] = float(self._today_pageview[0])
         self.s["pageViewAfternoonToday"] = float(self._today_pageview[1])
 
-        fitbit = self.env.gen_fitbitwearing(self.s, ws_m, ws_a, Iw*self.wp_all[sim_w], d_global)
+        fitbit = self.env.gen_fitbitwearing(self.s, ws_m, ws_a, Jw, d_global)
         self.s["morningFitbitWear"] = fitbit
-        daily_pres = self.env.gen_dailysurvey(self.s, ws_m, ws_a, Iw*self.wp_all[sim_w], d_global)
+        daily_pres = self.env.gen_dailysurvey(self.s, ws_m, ws_a, Jw, d_global)
         self.s["dailySurveyComplete"] = daily_pres
         # Latent anticipated affect — always drawn. Tomorrow's gen_fourSC_mean /
         # gen_antic_mean read s["dailyAnticipatedAffectYesterday"], which is
@@ -867,7 +910,7 @@ class OnlineEnv:
 
         day_base = self._step_idx(sim_w, d_w, 0)
         daily_sum_step_agent = float(np.sum(
-            self.stepCountNext4HourAgentAll[day_base:day_base + self.K]
+            self.stepCountNext4HourAll[day_base:day_base + self.K]
         ))
         self.logTodayStepCount[d_global] = daily_sum_step_agent
 
@@ -889,7 +932,10 @@ class OnlineEnv:
 
         self._hist_daily_pv.append(float(daily_mean_pv))
         self._hist_morning_wear.append(float(fitbit))
-        self.s["pageViewLast7DaysEma"] = _ewm_prior_gamma_last(self._hist_daily_pv)
+        self.s["pageViewLast7DaysEma"] = _seeded_ewm(
+            self._hist_daily_pv,
+            self._pageViewLast7DaysEma_initial,
+        )
 
         past7_wear = _rolling_mean_last(self._hist_morning_wear, 7)
         self.s["morningFitbitWearLast7Days"] = past7_wear
@@ -918,7 +964,7 @@ class OnlineEnv:
         if sim_w < 0 or sim_w >= self.nweek or self._week_finalized[sim_w]:
             return
 
-        Iw = self._Iw_per_week[sim_w]
+        Jw = self._jw_week(sim_w)
         d_w_sun = SUNDAY_D_W
         d_global = self._day_idx(sim_w, d_w_sun)
         # Match df_fit / 1.1_standardization: (week - (1+n)/2) / ((n-1)/2) → week ∈ {1,…,n} maps to [-1, 1]
@@ -947,11 +993,9 @@ class OnlineEnv:
             self.action_all[step_idx] = Ah
 
             fourSC = self.env.gen_fourSC(self.s, Ah, step_idx)
-            pv = self.env.gen_pageview(self.s, Ah, Iw*self.wp_all[sim_w], step_idx)
+            pv = self.env.gen_pageview(self.s, Ah, Jw, step_idx)
 
             self.stepCountNext4HourAll[step_idx] = fourSC
-            self.stepCountNext4HourObsAll[step_idx] = fourSC
-            self.stepCountNext4HourAgentAll[step_idx] = fourSC
             self.pageViewNext4HourAll[step_idx] = pv
             self._today_fourSC[t_sim] = fourSC
             self._today_pageview[t_sim] = pv
@@ -978,6 +1022,8 @@ class OnlineEnv:
 
         self._end_day(sim_w, d_w_sun, d_global)
 
+        e_w = float(self.s["perceivedUtilityLastWeek"])
+
         # Latent (noise-free) conditional mean E[CAE | realized history]; the
         # realized ``cae`` below adds residual noise (and clipping) on top.
         cae_mean = self.env.gen_CAE_mean(
@@ -988,29 +1034,26 @@ class OnlineEnv:
             self.s["caeAverageLastWeek"], week_norm,
             self._foursc_wk, self._antic_wk, sim_w,
         )
+        cs = self.env.gen_CAE_short(cae, sim_w)
+
+        weekly_idx = self._weekly_idx(sim_w)
+        # Sunday J/U are Script-4 emissions of this week's ``E_w``, drawn
+        # before the E_w → E_{w+1} transition. ``wp_all[sim_w]`` was set at
+        # the end of week ``sim_w - 1`` (or in ``__init__`` for week 0) and
+        # is not overwritten. Same storage index as CAE of week ``sim_w``.
+        u1 = self.env.gen_tool_U1(e_w, sim_w)
+        u2 = self.env.gen_tool_U2(e_w, sim_w)
+        j_w = self.env.gen_week_present(e_w, weekly_idx)
 
         pu = self.env.gen_perceivedUtility(
-            self.s["perceivedUtilityLastWeek"], week_norm,
+            e_w, week_norm,
             self._pw_wk, self._dw_wk, self._dp_wk, sim_w,
         )
 
-        cs = self.env.gen_CAE_short(cae, sim_w)
-
-        # Tool-survey draws (only meaningful when ``J_w[sim_w] == 1``; the
-        # agent's E_w approximation multiplies by ``J_w[sim_w]`` so the term
-        # is zeroed out otherwise).
-        u1 = self.env.gen_tool_U1(pu, sim_w)
-        u2 = self.env.gen_tool_U2(pu, sim_w)
-
-
-        # ``wp_all[sim_w]`` was set at end of week ``sim_w - 1`` (or in
-        # ``__init__`` for ``sim_w == 0``); we do NOT overwrite it here.
-        # Instead, draw ``J_w[sim_w + 1]`` conditioned on this week's ``pu``.
-        weekly_idx = self._weekly_idx(sim_w)
         self.CAE_all[weekly_idx] = cae
         self.CAE_mean_all[weekly_idx] = cae_mean
         self.pu_all[weekly_idx] = pu
-        self.wp_all[weekly_idx] = self.env.gen_week_present(pu, weekly_idx)
+        self.wp_all[weekly_idx] = j_w
         self.CAE_short_all[weekly_idx] = cs
         self.U1_all[weekly_idx] = u1
         self.U2_all[weekly_idx] = u2
@@ -1020,8 +1063,9 @@ class OnlineEnv:
         # The agent never sees this; it gets ``E_known_all`` instead.
         self.s["perceivedUtilityLastWeek"] = pu
 
-        # Compute E_w_hat for the *next* RL week using observable aggregates of
-        # the just-finalized week (J, U1, U2, PV_sum, FW_sum, PJ_sum).
+        # E-hat for next week: this week's PV/FW/PJ with this Sunday's J/U1/U2
+        # (index ``weekly_idx = sim_w + 1``). Stored there so ``start_week(k)``
+        # reads ``E_known_all[k]``.
 
         self.E_known_all[weekly_idx] = compute_Ew_hat_from_week(
             sim_w,
@@ -1032,7 +1076,6 @@ class OnlineEnv:
             pageViewNext4HourAll=self.pageViewNext4HourAll,
             dw_wk=self._dw_wk,
             dp_wk=self._dp_wk,
-            baseline_offset=BASELINE_OFFSET,
         )
 
         self._week_finalized[sim_w] = True
@@ -1046,48 +1089,58 @@ class OnlineEnv:
         """EWM of prior ≤7 same-slot *raw* 4-hour counts, then EMA z-score.
 
         Matches ``1_data_extraction`` ``EMA_StepCount`` (groupby DecisionTime)
-        followed by ``3_standardization`` ``EMA_StepCount_norm``.
+        followed by ``3_standardization`` ``EMA_StepCount_norm``. The 7-day
+        window is left-padded with the study-entry EMA (first finite
+        per-slot value from ``df_fit_11week``, inverted to raw counts)
+        until enough simulated slots exist.
         """
         slot = int(slot)
-        hist = self._hist_foursc_by_slot[slot]
-        if hist:
-            raw_ema = _ewm_prior_gamma_last(hist, min_values=1)
-            return zscore_value(
-                raw_ema, self.env.cfg.ema_step_shift, self.env.cfg.ema_step_scale
-            )
-        return float(self._stepCountLast7DaysEma_initial_by_slot[slot])
+        raw_ema = _seeded_ewm(
+            self._hist_foursc_by_slot[slot],
+            self._step_ema_raw_seed_by_slot[slot],
+        )
+        return zscore_value(
+            raw_ema, self.env.cfg.ema_step_shift, self.env.cfg.ema_step_scale
+        )
 
     def _prior2HourStepCountEma7d_for_slot(self, slot):
         """EWM of prior ≤7 same-slot *raw* prior-2-hour counts, then EMA z-score.
 
         Matches ``1_data_extraction`` ``EMA_Prior2HourStepCount`` (groupby
         DecisionTime) followed by ``3_standardization`` ``EMA_Prior2HourStepCount_norm``.
+        The 7-day window is left-padded with the study-entry EMA (first
+        finite per-slot value from ``df_fit_11week``, inverted to raw
+        counts) until enough simulated slots exist.
         """
         slot = int(slot)
-        hist = self._hist_prior2hour_by_slot[slot]
-        if hist:
-            raw_ema = _ewm_prior_gamma_last(hist, min_values=1)
-            return zscore_value(
-                raw_ema,
-                self.env.cfg.ema_prior2hour_shift,
-                self.env.cfg.ema_prior2hour_scale,
-            )
-        return float(self._prior2HourStepCountEma7d_initial_by_slot[slot])
+        raw_ema = _seeded_ewm(
+            self._hist_prior2hour_by_slot[slot],
+            self._p2h_ema_raw_seed_by_slot[slot],
+        )
+        return zscore_value(
+            raw_ema,
+            self.env.cfg.ema_prior2hour_shift,
+            self.env.cfg.ema_prior2hour_scale,
+        )
 
     def _pf_foursc_row(self, step_idx):
         sim_w, _d_w, t_sim, d_global = self._decode_step_idx(step_idx)
         Ah = float(self.action_all[step_idx])
         if step_idx > 0:
-            prev = self.stepCountNext4HourAgentAll[step_idx - 1]
+            prev = self.stepCountNext4HourAll[step_idx - 1]
             lag1 = float(prev) if np.isfinite(prev) else 0.0
         else:
-            lag1 = float(self.s.get("stepCountNext4HourLag1", 0.0))
+            # Frozen MRT-start lag. Live s["stepCountNext4HourLag1"] is the
+            # most recently generated fourSC, so using it would inject a
+            # future outcome into week-0 Monday AM when historical PF rows
+            # are rebuilt at k ≥ 2.
+            lag1 = float(self._initial_foursc_lag1)
             if not np.isfinite(lag1):
                 lag1 = 0.0
         return build_fourSC_features(
             yesterdayStepCount=self.logYesterdayStepCount[d_global],
             stepCountLast7DaysEma=self.logStepCountLast7DaysEma[step_idx],
-            prior2HourStepCount=float(self.prior2HourStepCountAgentAll[step_idx]),
+            prior2HourStepCount=float(self.prior2HourStepCountAll[step_idx]),
             activitySuggestionsSentLast7Days=float(
                 self.activitySuggestionsSentLast7DaysAll[step_idx]
             ),
@@ -1134,30 +1187,20 @@ class OnlineEnv:
         slot_stop = slot_start + N_RL_DAYS * self.K
         day_start = self._day_idx(sim_w, 0)
         day_stop = day_start + N_RL_DAYS
-        foursc_wk = self.stepCountNext4HourAgentAll[slot_start:slot_stop]
+        foursc_wk = self.stepCountNext4HourAll[slot_start:slot_stop]
         antic_wk = self.dailyAnticipatedAffectAgentAll[day_start:day_stop]
         return build_pf_CAE_features(0.0, foursc_wk, antic_wk)
-
-    def _query_x_weekly_present(self, k):
-        """Current-week ``I_w * J_w``."""
-        iw = float(self._Iw_per_week[k]) if 0 <= k < self._Iw_per_week.size else 0.0
-        wp = float(self.wp_all[k]) if 0 <= k < self.wp_all.size else 0.0
-        if not np.isfinite(iw):
-            iw = 0.0
-        if not np.isfinite(wp):
-            wp = 0.0
-        return iw, wp
 
     def _rl_context_vector(self, k, d, t):
         d_global = self._day_idx(k, d)
         step_idx = self._step_idx(k, d, t)
-        if np.isfinite(self.prior2HourStepCountAgentAll[step_idx]):
-            p2h = float(self.prior2HourStepCountAgentAll[step_idx])
+        if np.isfinite(self.prior2HourStepCountAll[step_idx]):
+            p2h = float(self.prior2HourStepCountAll[step_idx])
         else:
-            p2h = float(self.s.get("prior2HourStepCountAgent", self._initial_prior2hour))
+            p2h = float(self.s.get("prior2HourStepCount", self._initial_prior2hour))
         return build_rl_context_vector(
             yesterdayStepCount=self.logYesterdayStepCount[d_global],
-            prior2HourStepCountAgent=p2h,
+            prior2HourStepCount=p2h,
             activeDaysLast7Days=float(self.s["activeDaysLast7Days"]),
             activitySuggestionsSentLast7Days=float(self.s["activitySuggestionsSentLast7Days"]),
             activitySuggestionInteractLast7Days=float(
@@ -1166,13 +1209,13 @@ class OnlineEnv:
         )
 
     def get_pf_data(self, k):
-        """PF inputs for week ``k``; rows built from logged outcomes + covariates."""
+        """PF inputs for week ``k``; rows built from logs and frozen initials."""
         return build_pf_data(
             k,
             sim_w_prev=k - 1,
             nweek=self.nweek,
             W_days=self.W_days,
-            stepCountNext4HourObsAll=self.stepCountNext4HourObsAll,
+            stepCountNext4HourAll=self.stepCountNext4HourAll,
             dailyAnticipatedAffectObsAll=self.dailyAnticipatedAffectObsAll,
             CAE_all=self.CAE_all,
             CAE_short_all=self.CAE_short_all,
@@ -1189,8 +1232,6 @@ class OnlineEnv:
         E_w = self.E_known_all[k] if (
             0 <= k < self.nweek and not np.isnan(self.E_known_all[k])
         ) else 0.0
-        query_sent, weekly_present = self._query_x_weekly_present(k)
-        qxw = float(query_sent) * float(weekly_present)
 
         if d == QUERY_D and t == QUERY_T:
             return {
@@ -1198,7 +1239,6 @@ class OnlineEnv:
                 "M_Y": np.zeros(RL_MY_SHAPE),
                 "M_E": np.zeros(RL_ME_SHAPE),
                 "C": np.zeros(N_RL_CONTEXT),
-                "query_x_weekly_present": qxw,
             }
 
         M_Y = np.zeros(RL_MY_SHAPE)
@@ -1213,7 +1253,7 @@ class OnlineEnv:
                 if (dd, tt) < (d, t):
                     r = self._step_idx(k, dd, tt)
                     if r < self.T:
-                        M_Y[dd, tt] = self.stepCountNext4HourAgentAll[r]
+                        M_Y[dd, tt] = self.stepCountNext4HourAll[r]
                         M_E[dd, tt] = self.pageViewNext4HourAll[r]
 
         return {
@@ -1221,7 +1261,6 @@ class OnlineEnv:
             "M_Y": M_Y,
             "M_E": M_E,
             "C": self._rl_context_vector(k, d, t),
-            "query_x_weekly_present": qxw,
         }
 
 _setup_log("OnlineEnv defined.")
@@ -1283,7 +1322,6 @@ _DUMMY_RL_STATE = {
     "M_Y": np.zeros(RL_MY_SHAPE),
     "M_E": np.zeros(RL_ME_SHAPE),
     "C":   np.zeros(N_RL_CONTEXT),
-    "query_x_weekly_present": 0.0,
 }
 P_RL_MICRO = int(
     build_phi_action(0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0).shape[0]
@@ -1324,7 +1362,8 @@ def _refresh_phi_dims():
 GAMMA_BAR = 0.9
 TARGET_C     = 1
 # EPSILON_0 is defined in algorithm_helpers: RLSVI clips π to [ε, 1-ε].
-# The always/never baselines are hard 1 / 0 (not the clip bounds).
+# The always/never baselines are hard 1 / 0 (not the clip bounds), so they
+# are outside the ε-greedy policy class the learning agents live in.
 # Default action probability is an average of ensemble softmaxes
 # (ADAPR_ENSEMBLE_ACTION=softmax, temperature ADAPR_SOFTMAX_TAU).
 J_PARTICLES  = 50
@@ -1947,12 +1986,12 @@ def _run_fixed_policy(agent_cls, uid, seed=42, params_dir=None):
 
 
 def run_never_send(uid, seed=42, params_dir=None):
-    """Baseline: send with π_A = ε in every slot (clip lower bound)."""
+    """Baseline: never send (A=0, π_A=0). Not the RLSVI clip π_A=ε."""
     return _run_fixed_policy(NeverSendAgent, uid, seed=seed, params_dir=params_dir)
 
 
 def run_always_send(uid, seed=42, params_dir=None):
-    """Baseline: send with π_A = 1-ε in every slot (clip upper bound)."""
+    """Baseline: always send (A=1, π_A=1). Not the RLSVI clip π_A=1-ε."""
     return _run_fixed_policy(AlwaysSendAgent, uid, seed=seed, params_dir=params_dir)
 
 
@@ -2019,14 +2058,10 @@ def _snapshot_oenv(oenv):
         "dailySurveyCompleteAll":              oenv.dailySurveyCompleteAll.copy(),       # daily-survey present
         "activityStatusTodayAll":           oenv.activityStatusTodayAll.copy(),
         # ── slot-level ────────────────────────────────────────────
-        "stepCountNext4HourAll":             oenv.stepCountNext4HourAll.copy(),      # latent
-        "stepCountNext4HourObsAll":         oenv.stepCountNext4HourObsAll.copy(),
-        "stepCountNext4HourAgentAll":       oenv.stepCountNext4HourAgentAll.copy(),
+        "stepCountNext4HourAll":             oenv.stepCountNext4HourAll.copy(),
         "pageViewNext4HourAll":           oenv.pageViewNext4HourAll.copy(),
         "action_all":             oenv.action_all.copy(),
-        "prior2HourStepCountAll":    oenv.prior2HourStepCountAll.copy(),  # latent
-        "prior2HourStepCountObsAll":     oenv.prior2HourStepCountObsAll.copy(),
-        "prior2HourStepCountAgentAll": oenv.prior2HourStepCountAgentAll.copy(),
+        "prior2HourStepCountAll":    oenv.prior2HourStepCountAll.copy(),
         "ws_interaction_all":     oenv.ws_interaction_all.copy(),
     }
 

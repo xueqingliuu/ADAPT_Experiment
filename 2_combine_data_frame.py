@@ -22,10 +22,11 @@ DATA_FOLDER = Path(
 )
 folder = DATA_FOLDER
 
-# Drop first BURN_IN_DAYS calendar days after each participant's earliest
-# decision-panel date (Date >= min_date + BURN_IN_DAYS). With BURN_IN_DAYS=6,
-# that removes 6 days; remaining calendar + week filters yield 84 analysis days.
-BURN_IN_DAYS = 6
+# Extraction grids start 7 days before study date_min (92 calendar days,
+# through date_min+84). Drop that 7-day pad so the first retained date is
+# study start. Week 13 then drops the extra day at date_min+84. For
+# Monday-start users that leaves weeks 1-12 = 84 analysis days.
+BURN_IN_DAYS = 7
 EXCLUDED_WEEKS = (0, 13)
 
 DAILY_SURVEY_COLS = [
@@ -165,6 +166,16 @@ print(df_merged.head())
 
 # %% [markdown]
 # ## 4. Weekly survey (ISO week join + `_lastweek` lags)
+#
+# Emission-only contract: `fill_weekly_12` places surveys on Sunday slots
+# (±2 days, so Monday/Tuesday completions still attach to that Sunday).
+# This join then copies `CAE_avg`, `week_present`, tools, etc. onto **every
+# day of that ISO week**, including Monday–Saturday before `observed_date`.
+# Weekly models (CAE, E_w, Ê_w) already treat those columns as end-of-week
+# emissions, not decision-time state. Do not use `CAE_avg` / `week_present`
+# as Monday-known covariates. `CAE_avg_lastweek` is the intended lag; a
+# Tuesday completion slotted to last Sunday can still appear on a few next
+# Mondays (~1% of rows).
 
 # %%
 # ISO week/year keys for joining weekly survey to daily decision rows
@@ -321,7 +332,11 @@ df_merged["day"] = (
 # Monday=1 … Sunday=7
 df_merged["dow"] = df_merged["Date"].dt.dayofweek + 1
 
-# Study week index (Mon–Sun blocks); overwrites ISO week used only for joining
+# Study week index (Mon-Sun blocks); overwrites ISO week used only for joining.
+# After BURN_IN_DAYS=7 the first retained date is study start. If that day is
+# Monday, week is 1-based (1-13); week 13 is the pad day date_min+84.
+# EXCLUDED_WEEKS still lists 0 for a leftover partial week if study start
+# is not Monday.
 df_merged = df_merged.sort_values(["ParticipantIdentifier", "Date"])
 _start_dow = df_merged.groupby("ParticipantIdentifier", sort=False)["Date"].transform("min").dt.dayofweek
 _wk = ((df_merged["day"] + _start_dow) // 7).astype(int)

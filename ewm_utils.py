@@ -1,23 +1,29 @@
 """Project-wide exponentially weighted average.
 
-Matches ``1_data_extraction._ewm_prior_rows`` / pandas
-``Series.ewm(alpha=1-gamma, adjust=True).mean().iloc[-1]``:
+Normalized discounted mean of a chronological sequence (oldest first,
+most recent last). Non-finite slots keep their place in the decay and are
+omitted from both numerator and denominator:
 
-    sum_{j=1}^{k} gamma^{j-1} x_{k-j+1}
-    -------------------------------------
-    sum_{j=1}^{k} gamma^{j-1}
+    sum_j gamma^{j-1} x_{n-j+1} I_j
+    --------------------------------
+    sum_j gamma^{j-1} I_j
 
-The sequence is chronological (oldest first, most recent last), so the last
-observation gets weight 1 and the oldest gets ``gamma^{k-1}``.
+where ``I_j = 1`` if that slot is finite. Dropping NaNs *before* weighting
+would time-warp the decay (two observations a week apart get consecutive
+powers) and, with the default ``gamma=None``, would also change ``gamma``
+with the missing count.
 
-``gamma`` is **not** a fixed constant: by default it is derived from ``k``,
-the number of (finite) data points actually being averaged, via
-``gamma_from_n``. This keeps the decay envelope comparable across windows of
-different length — the oldest point in a full window always gets weight
-``gamma^{k-1} = ((k-1)/k)^{k-1} -> 1/e`` as ``k`` grows, regardless of ``k``.
-It also reduces to the historical constant ``gamma = 6/7`` exactly when
-``k = 7`` (the calendar-week window used throughout ``1_data_extraction.py``).
-Pass an explicit ``gamma`` to opt out of this and use a fixed decay instead.
+When every entry is finite this equals
+``pandas.Series(values).ewm(alpha=1-gamma, adjust=True).mean().iloc[-1]``
+for a *fixed* ``gamma``. The same identity holds with NaNs if pandas is
+called with its default ``ignore_na=False``. ``ignore_na=True`` is the
+calendar-blind drop-NaNs rule and is *not* equivalent.
+
+``gamma`` is **not** a fixed constant by default: it is derived from ``n``,
+the calendar length of ``values`` (including NaN slots), via
+``gamma_from_n``. The oldest *slot* in an ``n``-point window gets weight
+``gamma^{n-1} = ((n-1)/n)^{n-1} -> 1/e``. That is ``gamma = 6/7`` when
+``n = 7``. Pass an explicit ``gamma`` for a fixed decay.
 """
 from __future__ import annotations
 
@@ -30,10 +36,11 @@ EWM_GAMMA = 6.0 / 7.0
 
 
 def gamma_from_n(n: int) -> float:
-    """Default decay for an ``n``-point window: ``gamma = (n-1)/n`` (``alpha = 1/n``).
+    """Default decay for an ``n``-slot window: ``gamma = (n-1)/n`` (``alpha = 1/n``).
 
-    Reduces to ``6/7`` for ``n = 7``. For ``n <= 1`` there is only one weight
-    so the decay is irrelevant; returns 0.0.
+    ``n`` is the calendar length of the array, including NaN slots. Reduces
+    to ``6/7`` for ``n = 7``. For ``n <= 1`` there is only one weight so the
+    decay is irrelevant; returns 0.0.
     """
     n = int(n)
     if n <= 1:
@@ -44,20 +51,23 @@ def gamma_from_n(n: int) -> float:
 def ewma_gamma(values, gamma: float | None = None, *, empty: float = np.nan) -> float:
     """Normalized discounted average; most recent observation last.
 
-    Non-finite entries are dropped first. If nothing remains, return ``empty``.
-    ``gamma=None`` (default) derives the decay from the number of remaining
-    points via :func:`gamma_from_n`; pass a numeric ``gamma`` for a fixed decay.
+    Non-finite entries keep their calendar position but do not contribute
+    to the average. If nothing finite remains, return ``empty``.
+    ``gamma=None`` (default) derives the decay from the calendar length of
+    ``values`` via :func:`gamma_from_n`; pass a numeric ``gamma`` for a
+    fixed decay.
     """
     vals = np.asarray(values, dtype=float).ravel()
-    vals = vals[np.isfinite(vals)]
-    k = int(vals.size)
-    if k == 0:
+    finite = np.isfinite(vals)
+    n = int(vals.size)
+    if n == 0 or not bool(finite.any()):
         return float(empty)
     if gamma is None:
-        gamma = gamma_from_n(k)
+        gamma = gamma_from_n(n)
     gamma = float(gamma)
-    weights = gamma ** np.arange(k - 1, -1, -1, dtype=float)
-    return float(np.dot(weights, vals) / weights.sum())
+    weights = gamma ** np.arange(n - 1, -1, -1, dtype=float)
+    w = weights[finite]
+    return float(np.dot(w, vals[finite]) / w.sum())
 
 
 def mean_prior_delivered_fraction(

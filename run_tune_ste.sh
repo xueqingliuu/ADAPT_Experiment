@@ -15,7 +15,7 @@
 #
 #   mkdir -p logs
 #   sbatch run_tune_ste.sh                                   # action knob → 0.2/0.5/0.8, then
-#                                                            # auto-submit true-STE DQN jobs
+#                                                            # auto-submit confirmation DiscreteCQL jobs
 #   sbatch --export=ALL,TUNE_KNOB=burden_shift,TUNE_TARGETS="0.2 0.5",TUNE_OUT_SUFFIX=_burden_shift \
 #          run_tune_ste.sh                                   # A→ME down, E→MY up; writes
 #                                                            # env_para_ste0.2_burden_shift etc.
@@ -27,7 +27,7 @@
 #   # foursc_to_y_shift alone cannot hit 0.5/0.8 (job 41048118).
 #   # Do NOT TUNE_KNOB=burden_shift TUNE_TARGETS=0.2: floor STE≈0.27 (40926808).
 #   sbatch --export=ALL,TUNE_PHASE=diagnose run_tune_ste.sh  # E_w + CAE loop gains, ~seconds
-#   sbatch --export=ALL,TUNE_PHASE=eval run_tune_ste.sh      # STE of the untouched fit
+#   sbatch --export=ALL,TUNE_PHASE=eval run_tune_ste.sh      # proxy STE of the untouched fit
 #   sbatch --export=ALL,TUNE_PHASE=scan run_tune_ste.sh      # STE vs knob value
 #   TUNE_PHASE=validate bash run_tune_ste.sh                 # login node: re-submit the
 #                                                            # confirmation runs by hand
@@ -54,18 +54,21 @@
 #   TUNE_NOISE        ar1|random|sequential                    default ar1
 #   TUNE_OUT_PREFIX   tuned dirs are <prefix><target><suffix>  default env_para_ste
 #   TUNE_OUT_SUFFIX   e.g. _burden → env_para_ste0.2_burden    default ""
-#   TUNE_VALIDATE     1 to submit true-STE jobs after calibrate (default 1)
+#   TUNE_VALIDATE     1 to submit confirmation DiscreteCQL jobs after calibrate (default 1)
 #   TUNE_REQUIRE_STABLE  1 to refuse unstable folders (default 1)
-#   TUNE_TOL  TUNE_MAX_ITER  TUNE_SEED  TUNE_PROXY_TO_TRUE  TUNE_JOBS
+#   TUNE_TOL  TUNE_MAX_ITER  TUNE_SEED  TUNE_JOBS
+#   TUNE_PROXY_TO_TRUE  multiply proxy STE after max/truncation (default 1.0;
+#                     not a DiscreteCQL calibration factor unless you set one)
 #   TUNE_SCRATCH      working dir for candidate params     default
 #                     .ste_tune_scratch_<knob>_<jobid>
 #
 # Calibration writes env_para_ste0.2/, env_para_ste0.5/, env_para_ste0.8/ only
-# when every participant's E_w and CAE loops are stable and the proxy STE is
-# within TUNE_TOL of the target. Each folder is a drop-in parameter set plus
-# ste_tuning.json.
+# when every participant's E_w and CAE loops are stable and the *proxy* STE
+# (Bernoulli grid ± transferred CQL, same-sample max, truncated at 0) is
+# within TUNE_TOL of the target. That is not ste_vanilla.aggregate_ste.
+# Each folder is a drop-in parameter set plus ste_tuning.json.
 # On success the script then submits one run_ste.sh array per folder
-# (STE_EXP=ste0.2 etc.) so the true DQN STE is measured automatically.
+# (STE_EXP=ste0.2 etc.) so DiscreteCQL can measure the confirmation STE.
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")}"
@@ -269,7 +272,7 @@ submit_validation_jobs() {
   local submitted=0 dir
   local -a dirs=()
   if ! command -v sbatch >/dev/null 2>&1; then
-    echo "ERROR: sbatch is not available; cannot submit true-STE jobs." >&2
+    echo "ERROR: sbatch is not available; cannot submit confirmation DiscreteCQL STE jobs." >&2
     echo "On a login node: TUNE_PHASE=validate bash run_tune_ste.sh" >&2
     return 1
   fi
@@ -327,11 +330,11 @@ case "${TUNE_PHASE}" in
     apply_status=$?
     set -e
     if [[ "${TUNE_VALIDATE}" != "1" ]]; then
-      echo "TUNE_VALIDATE=0: skipping true-STE jobs. Re-run with TUNE_PHASE=validate TUNE_VALIDATE_DIR=${TUNE_OUT_DIR}."
+      echo "TUNE_VALIDATE=0: skipping confirmation DiscreteCQL STE jobs. Re-run with TUNE_PHASE=validate TUNE_VALIDATE_DIR=${TUNE_OUT_DIR}."
       exit "${apply_status}"
     fi
     if [[ "${apply_status}" -ne 0 ]]; then
-      echo "Apply failed (exit ${apply_status}); not submitting true-STE jobs." >&2
+      echo "Apply failed (exit ${apply_status}); not submitting confirmation DiscreteCQL STE jobs." >&2
       exit "${apply_status}"
     fi
     if ! command -v sbatch >/dev/null 2>&1; then
@@ -339,7 +342,7 @@ case "${TUNE_PHASE}" in
       echo "From a login node: TUNE_PHASE=validate TUNE_VALIDATE_DIR=${TUNE_OUT_DIR} bash run_tune_ste.sh"
       exit 0
     fi
-    echo "Submitting true-STE DQN jobs for ${TUNE_OUT_DIR}."
+    echo "Submitting confirmation DiscreteCQL jobs for ${TUNE_OUT_DIR}."
     submit_validation_jobs "${TUNE_OUT_DIR}"
     ;;
   calibrate)
@@ -365,7 +368,7 @@ case "${TUNE_PHASE}" in
     cal_status=$?
     set -e
     if [[ "${TUNE_VALIDATE}" != "1" ]]; then
-      echo "TUNE_VALIDATE=0: skipping true-STE jobs. Re-run with TUNE_PHASE=validate."
+      echo "TUNE_VALIDATE=0: skipping confirmation DiscreteCQL STE jobs. Re-run with TUNE_PHASE=validate."
       exit "${cal_status}"
     fi
     if ! command -v sbatch >/dev/null 2>&1; then
@@ -374,13 +377,13 @@ case "${TUNE_PHASE}" in
       exit "${cal_status}"
     fi
     if [[ "${cal_status}" -eq 0 || "${cal_status}" -eq 2 ]]; then
-      echo "Submitting true-STE DQN jobs for stable folders."
+      echo "Submitting confirmation DiscreteCQL jobs for stable folders."
       submit_validation_jobs || {
         # Nothing to submit is fatal only when calibration claimed full success.
         [[ "${cal_status}" -eq 0 ]] && exit 1
       }
     else
-      echo "Calibration failed (exit ${cal_status}); not submitting true-STE jobs." >&2
+      echo "Calibration failed (exit ${cal_status}); not submitting confirmation DiscreteCQL STE jobs." >&2
     fi
     exit "${cal_status}"
     ;;

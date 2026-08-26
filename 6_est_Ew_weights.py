@@ -5,6 +5,11 @@ outcome is the filtered trajectory in ``pred_<uid>.json``. The five predictors
 are weekly check-in, pleasantness/helpfulness, page-view average, Fitbit-wear
 average, and daily-check-in average.
 
+PV/FW/PJ averages use the same fixed denominators as script 4 (14 slots /
+7 days) with missing values as 0. FW therefore treats a missing wear flag
+as not wearing, matching the simulator — not a wear-among-observed-days
+mean.
+
 Fits nonnegative within-user ridge (demean each person, shared slopes, then
 one intercept on the raw scale). Writes
 ``env_para_vanilla/Ew_pooled_linear_coefs.json``.
@@ -85,7 +90,13 @@ def weekly_predictor_table(
     decision_col: str = "DecisionTime",
     response_imputation_means: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    """One row per (ParticipantIdentifier, week) with predictors from ``df_fit``."""
+    """One row per (ParticipantIdentifier, week) with predictors from ``df_fit``.
+
+    ``PV_sum`` / ``FW_sum`` / ``PJ_sum`` are ``nansum / 14`` and ``nansum / 7``
+    (missing → 0), matching ``4_perceived_utility.build_user_blocks``. A
+    missing Fitbit wear flag is coded as not wearing, not dropped from the
+    denominator.
+    """
     if response_imputation_means is None:
         response_imputation_means = weekly_response_imputation_means(df)
     u1_mean = float(response_imputation_means["U1"])
@@ -117,6 +128,7 @@ def weekly_predictor_table(
             vpj = row0["daily_present"]
             fw_daily.append(float(vfw) if pd.notna(vfw) else 0.0)
             pj_daily.append(float(vpj) if pd.notna(vpj) else 0.0)
+        # Missing wear → 0 / 7, not mean over observed days (script 4 / vani_env).
         fw_arr = np.asarray(fw_daily, dtype=float)
         pj_arr = np.asarray(pj_daily, dtype=float)
         fw_sum = float(np.sum(fw_arr) / 7.0) if fw_arr.size else 0.0

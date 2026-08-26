@@ -8,6 +8,18 @@ actions. Residuals default to an AR(1) bootstrap of the fitted leftovers.
 ``PARAMS_DIR`` is ``env_para_vanilla`` unless ``ADAPR_PARAMS_DIR`` is set
 (used by ``tune_ste.py`` to swap in a rescaled copy). This module does not
 run an RL agent; ``experiment.OnlineEnv`` wraps it for slot-by-slot control.
+
+FourSC coefficients are loaded from JSON in MRT-fit coordinates, then
+translated onto the two closed-loop proxies the simulator can actually
+regenerate (yesterday = sum of the prior day's two 4-hour step z-scores;
+7-day page-view EMA = EWM of daily means of 4-hour page-view z-scores).
+Set ``ADAPR_FOURSC_CLOSED_LOOP_PROXY=0`` to keep the untranslated JSON.
+
+Page views are a two-part hurdle: logistic ``P(count>0)`` on current ``E_w``
+plus a resample from that person's observed positive counts. The J_w-estimated
+query suffix is *added* when ``J_w = 1`` (``Δp = Δμ / (z̄₊ − z₀)`` on the
+hurdle). ``I_w`` is not in this model. Set ``ADAPR_PV_HURDLE=0`` to keep the
+Gaussian generator. FW/PJ stay on their original logits.
 """
 from __future__ import annotations
 
@@ -15,10 +27,12 @@ import csv
 import json
 import math
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
 import numpy.random as rd
+import pandas as pd
 
 from ewm_utils import ewma_gamma
 
@@ -92,6 +106,20 @@ def zscore_value(raw, shift, scale):
     if not math.isfinite(x):
         x = 0.0
     return (x - float(shift)) / s
+
+
+def invert_zscore(norm, shift, scale):
+    """Undo ``(raw - shift) / scale`` (the EMA / recent-burden map)."""
+    s = float(scale)
+    if s == 0.0 or not math.isfinite(s):
+        s = 1.0
+    try:
+        z = float(norm)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(z):
+        return 0.0
+    return float(shift) + s * z
 
 THETA_PRIOR2HOUR_STEP_COUNT_NAMES = [
     "intercept",
@@ -221,7 +249,8 @@ _CAE_WEEK_IDX = THETA_CAE_NAMES.index("week")
 PV_ML_BASE = 9
 FW_ML_BASE = 9
 PJ_ML_BASE = 9
-# Query suffix: intercept, E_w, recent_burden (weekend / decision-time dropped).
+# Query suffix: J_w × (intercept, E_w, recent_burden), jointly fit in script 4.
+# Added when J_w=1; I_w is not in the PV/FW/PJ model.
 PV_ML_QUERY = 3
 FW_ML_QUERY = 3
 PJ_ML_QUERY = 3
@@ -278,14 +307,79 @@ def _fill_nan_with_finite_mean(x: np.ndarray, default: float = 0.0) -> np.ndarra
     return np.where(np.isfinite(vals), vals, _finite_mean_or_default(vals, default))
 
 
+def assert_complete_week_slots(
+    df,
+    *,
+    uid_col: str = "ParticipantIdentifier",
+    week_col: str = "week",
+    date_col: str = "Date",
+    decision_col: str = "DecisionTime",
+    slots_per_week: int = 14,
+    slots_per_day: int = 2,
+) -> None:
+    """Raise unless every (user, week) is a full 7-day × 2-slot panel.
+
+    Fit loaders chunk by positional ``reshape(-1, 14)`` / ``len // 14``.
+    A mid-panel hole would shift every later week's AM/PM and Sunday
+    assignment without this guard.
+    """
+    if df is None or len(df) == 0:
+        return
+    missing = [
+        c for c in (uid_col, week_col, date_col, decision_col) if c not in df.columns
+    ]
+    if missing:
+        raise KeyError(f"assert_complete_week_slots missing columns {missing}")
+
+    week_sizes = df.groupby([uid_col, week_col], sort=False).size()
+    bad_weeks = week_sizes[week_sizes != slots_per_week]
+    if len(bad_weeks) > 0:
+        preview = ", ".join(
+            f"user={uid} week={w} n={int(n)}"
+            for (uid, w), n in bad_weeks.head(8).items()
+        )
+        raise ValueError(
+            f"expected {slots_per_week} rows per (user, week); "
+            f"{len(bad_weeks)} groups differ ({preview})"
+        )
+
+    day_sizes = df.groupby([uid_col, date_col], sort=False).size()
+    bad_days = day_sizes[day_sizes != slots_per_day]
+    if len(bad_days) > 0:
+        preview = ", ".join(
+            f"user={uid} date={d} n={int(n)}"
+            for (uid, d), n in bad_days.head(8).items()
+        )
+        raise ValueError(
+            f"expected {slots_per_day} rows per (user, Date); "
+            f"{len(bad_days)} groups differ ({preview})"
+        )
+
+    slot_pairs = (
+        df.groupby([uid_col, date_col], sort=False)[decision_col]
+        .agg(lambda s: tuple(sorted(int(v) for v in s if pd.notna(v))))
+    )
+    expected_slots = tuple(range(slots_per_day))
+    bad_slots = slot_pairs[slot_pairs != expected_slots]
+    if len(bad_slots) > 0:
+        preview = ", ".join(
+            f"user={uid} date={d} slots={slots}"
+            for (uid, d), slots in bad_slots.head(8).items()
+        )
+        raise ValueError(
+            f"expected DecisionTime {expected_slots} each (user, Date); "
+            f"{len(bad_slots)} groups differ ({preview})"
+        )
+
+
 def within_week_ewma(values, gamma=None) -> float:
     """Normalized discounted average over a chronological sequence.
 
     Same formula as ``1_data_extraction._ewm_prior_rows`` / ``ewm_utils.ewma_gamma``.
-    ``gamma=None`` (default) derives the decay from how many points are being
-    averaged (:func:`ewm_utils.gamma_from_n`), so a 14-slot fourSC week and a
-    7-day antic week get different-but-comparable decay envelopes. Empty /
-    all-NaN → 0.
+    ``gamma=None`` (default) derives the decay from the calendar length of
+    ``values`` (:func:`ewm_utils.gamma_from_n`), so a 14-slot fourSC week and a
+    7-day antic week get different-but-comparable decay envelopes. NaNs keep
+    their slot in the decay. Empty / all-NaN → 0.
     """
     return ewma_gamma(values, gamma, empty=0.0)
 
@@ -308,6 +402,8 @@ def cae_mediator_ewmas(foursc_wk, antic_wk) -> tuple[float, float]:
 
     Accepts a full calendar week (14 slots / 7 days) or RL Mon–Sat
     (12 slots / 6 days). Decay follows ``gamma_from_n`` of the window length.
+    Missing entries are filled with **this week's** finite mean (not the
+    user's trajectory mean) so fit-time and simulation EWMAs match.
     """
     foursc = _fill_nan_with_finite_mean(np.asarray(foursc_wk, dtype=float).ravel())
     if foursc.size not in (CAE_FOURSC_SLOTS, CAE_FOURSC_SLOTS_RL):
@@ -325,6 +421,26 @@ def cae_mediator_ewmas(foursc_wk, antic_wk) -> tuple[float, float]:
         within_week_ewma(foursc),
         within_week_ewma(antic),
     )
+
+
+def cae_mediator_ewma_rows(foursc_weeks, antic_weeks) -> tuple[np.ndarray, np.ndarray]:
+    """Apply :func:`cae_mediator_ewmas` independently to each week."""
+    foursc_weeks = np.asarray(foursc_weeks, dtype=float)
+    antic_weeks = np.asarray(antic_weeks, dtype=float)
+    if foursc_weeks.ndim == 1:
+        foursc_weeks = foursc_weeks[None, :]
+    if antic_weeks.ndim == 1:
+        antic_weeks = antic_weeks[None, :]
+    n = int(foursc_weeks.shape[0])
+    if antic_weeks.shape[0] != n:
+        raise ValueError(
+            f"foursc_weeks has {n} weeks but antic_weeks has {antic_weeks.shape[0]}"
+        )
+    foursc_e = np.empty(n, dtype=float)
+    antic_e = np.empty(n, dtype=float)
+    for i in range(n):
+        foursc_e[i], antic_e[i] = cae_mediator_ewmas(foursc_weeks[i], antic_weeks[i])
+    return foursc_e, antic_e
 
 
 def build_CAE_features(CAE_lastweek, week_norm, foursc_wk, antic_wk) -> np.ndarray:
@@ -559,6 +675,458 @@ def _ml_query_features(s) -> np.ndarray:
     )
 
 
+def _ml_query_applied_shift(q, s, Jw: int) -> float:
+    """``mu += J_w * (q @ z)``. ``I_w`` is not in this model."""
+    q = np.asarray(q, dtype=float).ravel()
+    if q.size == 0 or int(Jw) == 0:
+        return 0.0
+    return float(np.dot(q, _ml_query_features(s)))
+
+
+def _foursc_closed_loop_proxy_enabled() -> bool:
+    raw = os.environ.get("ADAPR_FOURSC_CLOSED_LOOP_PROXY", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _uid_key(uid):
+    try:
+        return int(float(uid))
+    except (TypeError, ValueError):
+        return str(uid).strip()
+
+
+def _fill_nan_with_mean(x, default=0.0):
+    x = np.asarray(x, dtype=float)
+    if np.all(~np.isfinite(x)):
+        return np.full_like(x, float(default), dtype=float)
+    return np.where(np.isfinite(x), x, float(np.nanmean(x)))
+
+
+def _ewm_prior_series(vals, window=7):
+    """EWM over the prior ``window`` calendar rows; current day excluded.
+
+    Passes the raw window (NaNs included) to :func:`ewm_utils.ewma_gamma` so
+    decay follows calendar spacing, matching ``1_data_extraction._ewm_prior_rows``.
+    """
+    vals = np.asarray(vals, dtype=float)
+    w = int(window)
+    out = np.full(vals.size, np.nan)
+    for i in range(1, vals.size):
+        out[i] = ewma_gamma(vals[max(0, i - w):i], None, empty=np.nan)
+    return out
+
+
+def _df_numeric_col(df, *names, default=np.nan):
+    for name in names:
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=float)
+    return np.full(len(df), default, dtype=float)
+
+
+def add_closed_loop_foursc_proxies(df: pd.DataFrame) -> pd.DataFrame:
+    """Add yesterday-step and 7-day page-view proxies the closed loop generates."""
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out = out.sort_values(
+        ["ParticipantIdentifier", "Date", "DecisionTime"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    daily = (
+        out.groupby(["ParticipantIdentifier", "Date"], sort=False)
+        .agg(
+            step_sum=("4hour_step_norm", lambda s: s.sum(min_count=2)),
+            pv_mean=("HourlyPageviewCount_norm", "mean"),
+        )
+        .reset_index()
+    )
+    daily["yesterday_step_proxy"] = daily.groupby(
+        "ParticipantIdentifier", sort=False
+    )["step_sum"].shift(1)
+    daily["pageview_ema_proxy"] = np.nan
+    for _, g in daily.groupby("ParticipantIdentifier", sort=False):
+        daily.loc[g.index, "pageview_ema_proxy"] = _ewm_prior_series(
+            g["pv_mean"].to_numpy(dtype=float)
+        )
+    return out.merge(
+        daily[
+            [
+                "ParticipantIdentifier",
+                "Date",
+                "yesterday_step_proxy",
+                "pageview_ema_proxy",
+            ]
+        ],
+        on=["ParticipantIdentifier", "Date"],
+        how="left",
+    )
+
+
+def _foursc_design_matrix(df: pd.DataFrame, yesterday, pv7) -> np.ndarray:
+    """Design aligned with ``Env.gen_fourSC_mean`` / script-5 ``fourSC_cond``."""
+    yest = _fill_nan_with_mean(yesterday)
+    pv = _fill_nan_with_mean(pv7)
+    four_lag = _fill_nan_with_mean(_df_numeric_col(df, "FourSC_lag1", "fourSC_lag1"))
+    ema = _fill_nan_with_mean(
+        _df_numeric_col(df, "EMA_StepCount_norm", "EMA_StepCount")
+    )
+    p2 = _fill_nan_with_mean(
+        _df_numeric_col(df, "prior2hour_step_norm", "prior2hour_step")
+    )
+    burden = _fill_nan_with_mean(_df_numeric_col(df, "recent_burden_norm"))
+    wear = _fill_nan_with_mean(_df_numeric_col(df, "past7days_morning_wearing"))
+    inter = _fill_nan_with_mean(_df_numeric_col(df, "Interacted_7d_walk"))
+    antic = _fill_nan_with_mean(
+        _df_numeric_col(df, "anticipated_affect_yesterday_norm")
+    )
+    active = _fill_nan_with_mean(
+        _df_numeric_col(df, "active_status_fraction_7days")
+    )
+    weekend = _fill_nan_with_mean(_df_numeric_col(df, "is_weekend"), default=0.0)
+    dt = _fill_nan_with_mean(_df_numeric_col(df, "DecisionTime"), default=0.0)
+    pu = _fill_nan_with_mean(_df_numeric_col(df, "perceived_utility_lastweek"))
+    cae = _fill_nan_with_mean(
+        _df_numeric_col(df, "CAE_avg_lastweek_norm", "CAE_avg_lastweek")
+    )
+    action = _df_numeric_col(df, "WalkingSuggestion")
+    action = np.where(np.isfinite(action), action, 0.0)
+    one = np.ones(len(df), dtype=float)
+    X = np.column_stack(
+        [
+            one,
+            four_lag,
+            yest,
+            ema,
+            p2,
+            burden,
+            pv,
+            wear,
+            inter,
+            antic,
+            active,
+            weekend,
+            dt,
+            pu,
+            cae,
+            action,
+            action * yest,
+            action * p2,
+            action * burden,
+            action * pv,
+            action * wear,
+            action * inter,
+            action * antic,
+            action * dt,
+            action * pu,
+            action * cae,
+        ]
+    )
+    return np.where(np.isfinite(X), X, 0.0)
+
+
+def _ridge_preserve_mean(X_proxy, mu_old, theta_old, alpha=0.1) -> np.ndarray:
+    """θ_new such that X_proxy @ θ_new ≈ μ_old, with θ_new shrunk toward θ_old."""
+    theta_old = np.asarray(theta_old, dtype=float).ravel()
+    X_proxy = np.asarray(X_proxy, dtype=float)
+    mu_old = np.asarray(mu_old, dtype=float).ravel()
+    target = mu_old - X_proxy @ theta_old
+    gram = X_proxy.T @ X_proxy
+    gram.flat[:: gram.shape[0] + 1] += float(alpha)
+    rhs = X_proxy.T @ target
+    try:
+        delta = np.linalg.solve(gram, rhs)
+    except np.linalg.LinAlgError:
+        delta = np.linalg.lstsq(gram, rhs, rcond=None)[0]
+    return theta_old + delta
+
+
+def _proxy_init_from_user_df(g: pd.DataFrame) -> tuple[float, float]:
+    y = _fill_nan_with_mean(g["yesterday_step_proxy"].to_numpy(dtype=float))
+    p = _fill_nan_with_mean(g["pageview_ema_proxy"].to_numpy(dtype=float))
+    return float(y[0]) if y.size else 0.0, float(p[0]) if p.size else 0.0
+
+
+_FOURSC_PROXY_BUNDLE: dict = {}
+
+
+def _foursc_proxy_bundle_for_params_dir(params_dir) -> dict:
+    """Translate every user's FourSC θ onto closed-loop proxies (cached)."""
+    params_dir = Path(params_dir).expanduser().resolve()
+    cached = _FOURSC_PROXY_BUNDLE.get(params_dir)
+    if cached is not None:
+        return cached
+
+    bundle: dict = {}
+    df_path = params_dir / "df_fit_11week.csv"
+    if not df_path.is_file():
+        _FOURSC_PROXY_BUNDLE[params_dir] = bundle
+        return bundle
+
+    df = pd.read_csv(df_path)
+    required = {"ParticipantIdentifier", "Date", "DecisionTime", "4hour_step_norm", "HourlyPageviewCount_norm"}
+    if not required.issubset(df.columns):
+        _FOURSC_PROXY_BUNDLE[params_dir] = bundle
+        return bundle
+
+    df["ParticipantIdentifier"] = df["ParticipantIdentifier"].map(_uid_key)
+    df = add_closed_loop_foursc_proxies(df)
+    pop = []
+    for uid, g in df.groupby("ParticipantIdentifier", sort=False):
+        uid = _uid_key(uid)
+        p_env = params_dir / f"params_env_{uid}.json"
+        if not p_env.is_file():
+            continue
+        theta_old = trim_theta_foursc(_json_float_list("theta_fourSC", _load_json(p_env)))
+        if theta_old.size != P_FOURSC:
+            continue
+        X_mrt = _foursc_design_matrix(
+            g,
+            _df_numeric_col(g, "YesterdayStepCount_norm", "YesterdayStepCount"),
+            _df_numeric_col(g, "Past7DaysPageviewEMA_norm", "Past7DaysPageviewEMA"),
+        )
+        X_proxy = _foursc_design_matrix(
+            g,
+            g["yesterday_step_proxy"].to_numpy(dtype=float),
+            g["pageview_ema_proxy"].to_numpy(dtype=float),
+        )
+        if X_mrt.shape[1] != theta_old.size or X_proxy.shape[1] != theta_old.size:
+            continue
+        mu_old = X_mrt @ theta_old
+        theta_new = _ridge_preserve_mean(X_proxy, mu_old, theta_old)
+        mu_new = X_proxy @ theta_new
+        y = _df_numeric_col(g, "4hour_step_norm")
+        resid = np.full(len(g), np.nan, dtype=float)
+        ok = np.isfinite(y)
+        resid[ok] = y[ok] - mu_new[ok]
+        pop.extend(resid[ok].tolist())
+        denom = float(np.sum((mu_old - mu_old.mean()) ** 2))
+        r2 = (
+            float(1.0 - np.sum((mu_new - mu_old) ** 2) / denom)
+            if denom > 0.0
+            else float("nan")
+        )
+        rmse = float(np.sqrt(np.mean((mu_new - mu_old) ** 2)))
+        yest_init, pv_init = _proxy_init_from_user_df(g)
+        bundle[uid] = {
+            "theta": theta_new,
+            "resid": resid,
+            "yesterday_init": yest_init,
+            "pageview_init": pv_init,
+            "rmse": rmse,
+            "r2": r2,
+        }
+    if pop:
+        bundle["_population"] = np.asarray(pop, dtype=float)
+    _FOURSC_PROXY_BUNDLE[params_dir] = bundle
+    if os.environ.get("ADAPR_FOURSC_PROXY_LOG", "").strip() not in {"", "0", "false"}:
+        r2s = [v["r2"] for v in bundle.values() if isinstance(v, dict) and "r2" in v]
+        if r2s:
+            print(
+                f"FourSC closed-loop proxy translation: n={len(r2s)} "
+                f"median R^2={float(np.nanmedian(r2s)):.4f}"
+            )
+    return bundle
+
+
+def _foursc_proxy_initials_from_csv(df_path, participant_id):
+    """First-row mean-filled proxies for the closed-loop FourSC features."""
+    df_path = Path(df_path)
+    if not df_path.is_file():
+        return None, None
+    params_dir = df_path.resolve().parent
+    bundle = _FOURSC_PROXY_BUNDLE.get(params_dir)
+    uid = _uid_key(participant_id)
+    if bundle is not None:
+        rec = bundle.get(uid)
+        if rec is None:
+            return None, None
+        return rec["yesterday_init"], rec["pageview_init"]
+    df = pd.read_csv(df_path)
+    if "4hour_step_norm" not in df.columns or "HourlyPageviewCount_norm" not in df.columns:
+        return None, None
+    df["ParticipantIdentifier"] = df["ParticipantIdentifier"].map(_uid_key)
+    df = add_closed_loop_foursc_proxies(df)
+    g = df[df["ParticipantIdentifier"] == uid]
+    if g.empty:
+        return None, None
+    return _proxy_init_from_user_df(g)
+
+
+def _pv_hurdle_enabled() -> bool:
+    raw = os.environ.get("ADAPR_PV_HURDLE", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _pv_hurdle_features_state(s, Ah: float) -> np.ndarray:
+    """Occurrence design: E_w, weekend, slot, burden, lag1, A, A×E_w."""
+    ew = float(s["perceivedUtilityLastWeek"])
+    ah = float(Ah)
+    return np.array(
+        [
+            ew,
+            float(s["isWeekend"]),
+            float(s["decisionTimeSlot"]),
+            float(s["activitySuggestionsSentLast7Days"]),
+            float(s["pageViewNext4HourLag1"]),
+            ah,
+            ah * ew,
+        ],
+        dtype=float,
+    )
+
+
+def _pv_hurdle_features_df(g: pd.DataFrame) -> np.ndarray:
+    ew = _fill_nan_with_mean(_df_numeric_col(g, "perceived_utility_lastweek"))
+    weekend = _fill_nan_with_mean(_df_numeric_col(g, "is_weekend", "isWeekend"), default=0.0)
+    dt = _fill_nan_with_mean(_df_numeric_col(g, "DecisionTime"), default=0.0)
+    rb = _fill_nan_with_mean(_df_numeric_col(g, "recent_burden_norm", "recent_burden"))
+    lag1 = _fill_nan_with_mean(
+        _df_numeric_col(g, "hourly_pageview_count_lag1")
+    )
+    ah = _fill_nan_with_mean(_df_numeric_col(g, "WalkingSuggestion"), default=0.0)
+    return np.column_stack([ew, weekend, dt, rb, lag1, ah, ah * ew])
+
+
+def _raw_pageview_counts(g: pd.DataFrame) -> np.ndarray:
+    """Undo script-3 ``log(x+1)`` overwrite of ``HourlyPageviewCount``."""
+    log1p = _df_numeric_col(g, "HourlyPageviewCount")
+    raw = np.expm1(log1p)
+    raw = np.where(np.isfinite(raw), raw, 0.0)
+    return np.rint(np.clip(raw, 0.0, None)).astype(int)
+
+
+def _fit_one_pv_hurdle(X: np.ndarray, y: np.ndarray, raw: np.ndarray) -> dict:
+    from sklearn.linear_model import LogisticRegression
+
+    positive = raw[raw > 0].astype(int)
+    ah = np.rint(np.clip(X[:, 5], 0.0, 1.0)).astype(int)
+    pools = {
+        a: raw[(ah == a) & (raw > 0)].astype(int)
+        for a in (0, 1)
+    }
+    rec = {
+        "coef": None,
+        "intercept": None,
+        "const": float(y.mean()) if y.size else 0.0,
+        "positive_pool": positive,
+        "action_positive_pools": pools,
+        "n": int(y.size),
+        "n_pos": int(positive.size),
+        "p_hat": float(y.mean()) if y.size else 0.0,
+    }
+    if y.size == 0 or np.unique(y).size < 2:
+        return rec
+    model = LogisticRegression(C=10.0, solver="lbfgs", max_iter=5000)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        model.fit(X, y)
+    rec["coef"] = model.coef_.ravel().copy()
+    rec["intercept"] = float(model.intercept_[0])
+    rec["const"] = None
+    return rec
+
+
+_PV_HURDLE_BUNDLE: dict = {}
+
+
+def _pv_hurdle_bundle_for_params_dir(params_dir) -> dict:
+    """Per-user page-view occurrence models + positive-count pools (cached)."""
+    params_dir = Path(params_dir).expanduser().resolve()
+    cached = _PV_HURDLE_BUNDLE.get(params_dir)
+    if cached is not None:
+        return cached
+
+    bundle: dict = {"_population": np.array([], dtype=int)}
+    df_path = params_dir / "df_fit_11week.csv"
+    if not df_path.is_file():
+        _PV_HURDLE_BUNDLE[params_dir] = bundle
+        return bundle
+
+    df = pd.read_csv(df_path)
+    need = {
+        "ParticipantIdentifier",
+        "HourlyPageviewCount",
+        "perceived_utility_lastweek",
+        "WalkingSuggestion",
+    }
+    if not need.issubset(df.columns):
+        _PV_HURDLE_BUNDLE[params_dir] = bundle
+        return bundle
+
+    df["ParticipantIdentifier"] = df["ParticipantIdentifier"].map(_uid_key)
+    population = []
+    for uid, g in df.groupby("ParticipantIdentifier", sort=False):
+        uid = _uid_key(uid)
+        X = _pv_hurdle_features_df(g)
+        raw = _raw_pageview_counts(g)
+        ok = np.all(np.isfinite(X), axis=1)
+        X, raw = X[ok], raw[ok]
+        y = (raw > 0).astype(int)
+        rec = _fit_one_pv_hurdle(X, y, raw)
+        bundle[uid] = rec
+        population.extend(rec["positive_pool"].tolist())
+    bundle["_population"] = np.asarray(population, dtype=int)
+    _PV_HURDLE_BUNDLE[params_dir] = bundle
+    if os.environ.get("ADAPR_PV_HURDLE_LOG", "").strip() not in {"", "0", "false"}:
+        phats = [v["p_hat"] for v in bundle.values() if isinstance(v, dict) and "p_hat" in v]
+        npos = [v["n_pos"] for v in bundle.values() if isinstance(v, dict) and "n_pos" in v]
+        if phats:
+            print(
+                f"Page-view hurdle: n={len(phats)} "
+                f"median P(PV>0)={float(np.median(phats)):.3f} "
+                f"median n_pos={float(np.median(npos)):.0f}"
+            )
+    return bundle
+
+
+def _pv_hurdle_action_scales(params_dir, uid, theta_ml_PV) -> tuple[float, float]:
+    """Map STE A→ME scaling of Gaussian α3/α4 onto hurdle A / A×E slopes."""
+    one = (1.0, 1.0)
+    vanilla_dir = (PROJECT_ROOT / "env_para_vanilla").resolve()
+    params_dir = Path(params_dir).expanduser().resolve()
+    if params_dir == vanilla_dir:
+        return one
+    vanilla_path = vanilla_dir / f"params_env_{_uid_key(uid)}.json"
+    if not vanilla_path.is_file():
+        return one
+    base_now, _ = _split_ml_pv_full(np.asarray(theta_ml_PV, dtype=float).ravel())
+    if base_now.size < 8:
+        return one
+    p_van = _load_json(vanilla_path)
+    theta_van = np.asarray(
+        p_van.get("theta_penalized_PV") or p_van.get("theta_ml_PV") or [],
+        dtype=float,
+    ).ravel()
+    base_van, _ = _split_ml_pv_full(theta_van)
+    if base_van.size < 8:
+        return one
+    a3_now, a4_now = float(base_now[6]), float(base_now[7])
+    a3_van, a4_van = float(base_van[6]), float(base_van[7])
+    s_a = a3_now / a3_van if abs(a3_van) > 1e-12 else 1.0
+    s_ae = a4_now / a4_van if abs(a4_van) > 1e-12 else 1.0
+    if not np.isfinite(s_a):
+        s_a = 1.0
+    if not np.isfinite(s_ae):
+        s_ae = 1.0
+    return float(s_a), float(s_ae)
+
+
+def _pv_hurdle_positive_pool(rec: dict, Ah: float, population: np.ndarray) -> np.ndarray:
+    a = 0 if float(Ah) < 0.5 else 1
+    pool = np.asarray(rec["action_positive_pools"].get(a, []), dtype=int)
+    if pool.size < 5:
+        pool = np.asarray(rec["positive_pool"], dtype=int)
+    if pool.size == 0:
+        pool = np.asarray(population, dtype=int)
+    if pool.size == 0:
+        pool = np.array([1], dtype=int)
+    return pool
+
+
+def _standardize_pageview_count(raw, shift: float, scale: float) -> float:
+    s = float(scale) if float(scale) != 0.0 and math.isfinite(float(scale)) else 1.0
+    return (math.log1p(max(0.0, float(raw))) - float(shift)) / s
+
+
 # %%
 class EnvConfig:
     """Load environment parameters from ``params_env_{userid}.json``."""
@@ -579,6 +1147,8 @@ class EnvConfig:
         self.ema_step_shift = float(std["EMA_step_count_shift"])
         self.ema_step_scale = float(std["EMA_step_count_scale"])
         self.limits_pageview = std["HourlyPageviewCount_limit"]
+        self.pageview_log_shift = float(std["HourlyPageviewCount_shift"])
+        self.pageview_log_scale = float(std["HourlyPageviewCount_scale"])
         self.limits_CAE = std["CAE_avg_limit"]
         self.limits_CAE_short = std["CAE_short_avg_limit"]
         # Affine map back to the raw (pre-normalization) CAE level:
@@ -716,6 +1286,8 @@ class EnvConfig:
             and self.theta_ml_PJ.size >= PJ_ML_BASE
         )
         self._validate_shapes()
+        self._apply_foursc_closed_loop_proxy()
+        self._apply_pv_hurdle()
 
     def _validate_shapes(self) -> None:
         expected = {
@@ -749,6 +1321,65 @@ class EnvConfig:
 
         if self.theta_ml_PJ.size and self.theta_ml_PJ.shape[0] < PJ_ML_BASE:
             raise ValueError(f"theta_ml_PJ must have length >= {PJ_ML_BASE}")
+
+    def _apply_foursc_closed_loop_proxy(self) -> None:
+        """Map FourSC θ/residuals onto the covariates the closed loop generates."""
+        self.foursc_closed_loop_proxy = None
+        if not _foursc_closed_loop_proxy_enabled():
+            return
+        bundle = _foursc_proxy_bundle_for_params_dir(self.params_dir)
+        rec = bundle.get(_uid_key(self.userid))
+        if rec is None:
+            return
+        self.theta_fourSC = np.asarray(rec["theta"], dtype=float).copy()
+        self.resid_fourSC = np.asarray(rec["resid"], dtype=float).copy()
+        pop = bundle.get("_population")
+        if pop is not None and np.asarray(pop).size:
+            self.population_residuals = dict(self.population_residuals)
+            self.population_residuals["resid_fourSC_population"] = np.asarray(
+                pop, dtype=float
+            ).copy()
+        self.foursc_closed_loop_proxy = {
+            "rmse": rec["rmse"],
+            "r2": rec["r2"],
+            "yesterday_init": rec["yesterday_init"],
+            "pageview_init": rec["pageview_init"],
+        }
+
+    def _apply_pv_hurdle(self) -> None:
+        """Fit/load the page-view occurrence model for this participant."""
+        self.pv_hurdle = None
+        self.pv_hurdle_population = np.array([], dtype=int)
+        if not _pv_hurdle_enabled():
+            return
+        bundle = _pv_hurdle_bundle_for_params_dir(self.params_dir)
+        rec = bundle.get(_uid_key(self.userid))
+        if rec is None:
+            return
+        pop = np.asarray(bundle.get("_population", []), dtype=int)
+        coef = rec["coef"]
+        if coef is not None:
+            coef = np.asarray(coef, dtype=float).copy()
+            s_a, s_ae = _pv_hurdle_action_scales(
+                self.params_dir, self.userid, self.theta_ml_PV
+            )
+            if coef.size >= 7:
+                coef[5] *= s_a
+                coef[6] *= s_ae
+        self.pv_hurdle = {
+            "coef": coef,
+            "intercept": rec["intercept"],
+            "const": rec["const"],
+            "positive_pool": np.asarray(rec["positive_pool"], dtype=int).copy(),
+            "action_positive_pools": {
+                int(a): np.asarray(p, dtype=int).copy()
+                for a, p in rec["action_positive_pools"].items()
+            },
+            "n": rec["n"],
+            "n_pos": rec["n_pos"],
+            "p_hat": rec["p_hat"],
+        }
+        self.pv_hurdle_population = pop.copy()
 
 
 # %%
@@ -964,8 +1595,12 @@ class Env:
 
     def gen_fourSC_mean(self, s, Ah):
         """
-        ``P_FOURSC`` predictors — matches ``5_fit_vanilla_testbed`` fourSC_cond.
-        ``yesterdayStepCount`` is the sum of the prior day's two 4-hour slots.
+        ``P_FOURSC`` predictors — same column order as script-5 ``fourSC_cond``.
+
+        ``yesterdayStepCount`` and ``pageViewLast7DaysEma`` are the closed-loop
+        proxies (prior-day sum of two 4-hour step z-scores; EWM of daily means
+        of 4-hour page-view z-scores). ``EnvConfig`` translates JSON coefficients
+        onto those proxies at load time.
         """
         wear7 = float(s.get("morningFitbitWearLast7Days", s["morningFitbitWearLast7DaysAlt"]))
         pv7 = float(s["pageViewLast7DaysEma"])
@@ -1010,11 +1645,15 @@ class Env:
         noise = self._sample_noise(self.cfg.resid_fourSC, step_idx, name="fourSC")
         return float(np.clip(mean + noise, *self.cfg.limits_fourSC))
 
-    def _ml_pv_mean(self, s, Ah: float, Iw: int) -> float:
+    def _ml_pv_query_shift(self, s, Jw: int) -> float:
+        _, q = _split_ml_pv_full(self.cfg.theta_ml_PV)
+        return _ml_query_applied_shift(q, s, Jw)
+
+    def _ml_pv_mean(self, s, Ah: float, Jw: int) -> float:
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
         Ew = float(s["perceivedUtilityLastWeek"])
-        base, q = _split_ml_pv_full(self.cfg.theta_ml_PV)
+        base, _ = _split_ml_pv_full(self.cfg.theta_ml_PV)
         (
             alpha0,
             alpha1,
@@ -1036,15 +1675,61 @@ class Env:
             + alpha_ar1 * lag1
             + Ah * (alpha3 + alpha4 * Ew)
         )
-        if Iw != 0:
-            mu += float(Iw * (q @ _ml_query_features(s)))
-        return float(mu)
+        return float(mu + self._ml_pv_query_shift(s, Jw))
 
-    def gen_pageview_mean(self, s, Ah, Iw=0):
-        return self._ml_pv_mean(s, float(Ah), int(Iw))
+    def _pv_hurdle_occurrence(self, s, Ah: float, Jw: int):
+        rec = self.cfg.pv_hurdle
+        x = _pv_hurdle_features_state(s, Ah)
+        if rec["coef"] is None:
+            p_base = float(np.clip(rec["const"] if rec["const"] is not None else 0.0, 0.0, 1.0))
+        else:
+            eta = float(rec["intercept"] + x @ rec["coef"])
+            p_base = self._sigmoid(eta)
 
-    def gen_pageview(self, s, Ah, Iw, step_idx):
-        mu = self._ml_pv_mean(s, float(Ah), int(Iw))
+        pool = _pv_hurdle_positive_pool(rec, Ah, self.cfg.pv_hurdle_population)
+        shift = float(self.cfg.pageview_log_shift)
+        scale = float(self.cfg.pageview_log_scale)
+        z_zero = _standardize_pageview_count(0.0, shift, scale)
+        z_pos = np.array(
+            [_standardize_pageview_count(v, shift, scale) for v in pool],
+            dtype=float,
+        )
+        mean_z_pos = float(np.mean(z_pos)) if z_pos.size else z_zero
+        denom = mean_z_pos - z_zero
+        intended = self._ml_pv_query_shift(s, Jw)
+        if abs(denom) < 1e-12:
+            p_adj = p_base
+        else:
+            p_adj = float(np.clip(p_base + intended / denom, 0.0, 1.0))
+        return p_adj, pool, z_zero, mean_z_pos
+
+    def gen_pageview_mean(self, s, Ah, Jw=0):
+        if self.cfg.pv_hurdle is not None:
+            p_adj, _pool, z_zero, mean_z_pos = self._pv_hurdle_occurrence(
+                s, float(Ah), int(Jw)
+            )
+            mu = (1.0 - p_adj) * z_zero + p_adj * mean_z_pos
+            return float(np.clip(mu, *self.cfg.limits_pageview))
+        return self._ml_pv_mean(s, float(Ah), int(Jw))
+
+    def gen_pageview(self, s, Ah, Jw, step_idx):
+        if self.cfg.pv_hurdle is not None:
+            p_adj, pool, _z_zero, _mean_z_pos = self._pv_hurdle_occurrence(
+                s, float(Ah), int(Jw)
+            )
+            # Always consume one uniform and one choice so policies that
+            # differ on P(count=0) stay aligned on the global RNG stream.
+            u = rd.random()
+            pick = int(rd.choice(pool))
+            raw_count = 0 if u >= p_adj else pick
+            z = _standardize_pageview_count(
+                raw_count,
+                self.cfg.pageview_log_shift,
+                self.cfg.pageview_log_scale,
+            )
+            return float(np.clip(z, *self.cfg.limits_pageview))
+
+        mu = self._ml_pv_mean(s, float(Ah), int(Jw))
         base, _ = _split_ml_pv_full(self.cfg.theta_ml_PV)
         sigma = float(base[8]) if base.size > 8 else 0.1
         if self.cfg.resid_ml_hourly_pageview.size > 0 and np.any(np.isfinite(self.cfg.resid_ml_hourly_pageview)):
@@ -1100,7 +1785,7 @@ class Env:
         noise = self._sample_noise(self.cfg.resid_antic, day_idx, name="antic")
         return float(np.clip(mean + noise, *self.cfg.limits_antic))
 
-    def _ml_fw_eta(self, s, ws_morning, ws_afternoon, Iw: int, return_logit: bool):
+    def _ml_fw_eta(self, s, ws_morning, ws_afternoon, Jw: int, return_logit: bool):
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
         Ew = float(s["perceivedUtilityLastWeek"])
@@ -1118,15 +1803,14 @@ class Env:
             + ws_morning * (beta3 + beta4 * Ew)
             + ws_afternoon * (beta5 + beta6 * Ew)
         )
-        if Iw != 0:
-            eta += float(Iw * (q @ _ml_query_features(s)))
+        eta += _ml_query_applied_shift(q, s, Jw)
         return eta if return_logit else self._sigmoid(eta)
 
-    def gen_fitbitwearing_mean(self, s, ws_morning, ws_afternoon, Iw=0, return_logit=False):
-        return self._ml_fw_eta(s, ws_morning, ws_afternoon, int(Iw), return_logit)
+    def gen_fitbitwearing_mean(self, s, ws_morning, ws_afternoon, Jw=0, return_logit=False):
+        return self._ml_fw_eta(s, ws_morning, ws_afternoon, int(Jw), return_logit)
 
-    def gen_fitbitwearing(self, s, ws_morning, ws_afternoon, Iw, day_idx):
-        eta = self._ml_fw_eta(s, ws_morning, ws_afternoon, int(Iw), return_logit=True)
+    def gen_fitbitwearing(self, s, ws_morning, ws_afternoon, Jw, day_idx):
+        eta = self._ml_fw_eta(s, ws_morning, ws_afternoon, int(Jw), return_logit=True)
         base_p = self._sigmoid(eta)
         noise = self._sample_noise(
             self.cfg.resid_ml_nextday_wearing, day_idx, name="nextday_wearing"
@@ -1136,7 +1820,7 @@ class Env:
         p = float(np.clip(base_p + noise, *self.cfg.limits_fitbitwearing))
         return float(rd.binomial(1, p))
 
-    def _ml_pj_eta(self, s, ws_morning, ws_afternoon, Iw: int, return_logit: bool):
+    def _ml_pj_eta(self, s, ws_morning, ws_afternoon, Jw: int, return_logit: bool):
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
         Ew = float(s["perceivedUtilityLastWeek"])
@@ -1154,15 +1838,14 @@ class Env:
             + ws_morning * (t3 + t4 * Ew)
             + ws_afternoon * (t5 + t6 * Ew)
         )
-        if Iw != 0:
-            eta += float(Iw * (q @ _ml_query_features(s)))
+        eta += _ml_query_applied_shift(q, s, Jw)
         return eta if return_logit else self._sigmoid(eta)
 
-    def gen_dailysurvey_mean(self, s, ws_morning, ws_afternoon, Iw=0, return_logit=False):
-        return self._ml_pj_eta(s, ws_morning, ws_afternoon, int(Iw), return_logit)
+    def gen_dailysurvey_mean(self, s, ws_morning, ws_afternoon, Jw=0, return_logit=False):
+        return self._ml_pj_eta(s, ws_morning, ws_afternoon, int(Jw), return_logit)
 
-    def gen_dailysurvey(self, s, ws_morning, ws_afternoon, Iw, day_idx):
-        eta = self._ml_pj_eta(s, ws_morning, ws_afternoon, int(Iw), return_logit=True)
+    def gen_dailysurvey(self, s, ws_morning, ws_afternoon, Jw, day_idx):
+        eta = self._ml_pj_eta(s, ws_morning, ws_afternoon, int(Jw), return_logit=True)
         base_p = self._sigmoid(eta)
         noise = self._sample_noise(
             self.cfg.resid_ml_daily_present, day_idx, name="daily_present"
@@ -1185,6 +1868,12 @@ class Env:
 
     @staticmethod
     def _week_means_from_arrays(pw_wk, dw_wk, dp_wk):
+        """Weekly PV/FW/PJ averages for the E_w transition.
+
+        Fixed denominators: ``nansum(pv)/14``, ``nansum(FW|PJ)/7``. NaN
+        slots contribute 0, matching ``4_perceived_utility.build_user_blocks``.
+        For FW that means a missing wear flag is treated as not wearing.
+        """
         pw = np.asarray(pw_wk, dtype=float).ravel()
         if pw.size == 14:
             pv_m = float(np.nansum(pw) / 14.0)
@@ -1368,39 +2057,6 @@ def _read_first_csv_row_for_participant(path, participant_id):
             if str(raw).strip() == str(want):
                 return row
     return None
-
-
-def _read_last_csv_row_for_participant(path, participant_id):
-    if participant_id is None:
-        return None
-    path = Path(path)
-    if not path.is_file():
-        return None
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        rdr = csv.DictReader(f)
-        fieldnames = list(rdr.fieldnames or [])
-        rows = list(rdr)
-    if not rows:
-        return None
-    id_key = _participant_id_column(fieldnames)
-    if not id_key:
-        return None
-    try:
-        want = int(participant_id)
-    except (TypeError, ValueError):
-        want = str(participant_id).strip()
-    last_match = None
-    for row in rows:
-        raw = row.get(id_key)
-        if raw is None or (isinstance(raw, str) and raw.strip() == ""):
-            continue
-        try:
-            if int(float(str(raw).strip())) == int(want):
-                last_match = row
-        except (TypeError, ValueError):
-            if str(raw).strip() == str(want):
-                last_match = row
-    return last_match
 
 
 # Current ``df_fit_11week.csv`` names first; older camelCase aliases kept for
@@ -1587,6 +2243,12 @@ def slot_ema_initials_from_df_fit(df_fit_11week_csv=None, participant_id=None, n
 
 
 def make_initial_state(df_fit_11week_csv=None, participant_id=None):
+    """Study-entry state from the first ``df_fit_11week`` row for this user.
+
+    EMA pads, lags, CAE last week, and Exp-tool-1/2 all come from that first
+    Monday row (vanilla-panel start), not the MRT-end row. Tools are NaN when
+    week 1's Sunday survey was unanswered — do not borrow a later week.
+    """
     s = {
         "stepCountNext4HourLag1": 0.0,
         "pageViewNext4HourLag1": 0.0,
@@ -1625,8 +2287,13 @@ def make_initial_state(df_fit_11week_csv=None, participant_id=None):
     df_path = _resolve_df_fit_11week_path(df_fit_11week_csv)
     row = _read_first_csv_row_for_participant(df_path, participant_id)
     s.update(_state_updates_from_df_fit_row(row))
-    last_row = _read_last_csv_row_for_participant(df_path, participant_id)
-    if last_row is not None:
-        s["expTool1"] = _float_csv_cell(last_row, "Exp-tool-1", default=float("nan"))
-        s["expTool2"] = _float_csv_cell(last_row, "Exp-tool-2", default=float("nan"))
+    if row is not None:
+        s["expTool1"] = _float_csv_cell(row, "Exp-tool-1", default=float("nan"))
+        s["expTool2"] = _float_csv_cell(row, "Exp-tool-2", default=float("nan"))
+    if _foursc_closed_loop_proxy_enabled():
+        yest_p, pv_p = _foursc_proxy_initials_from_csv(df_path, participant_id)
+        if yest_p is not None:
+            s["yesterdayStepCount"] = float(yest_p)
+        if pv_p is not None:
+            s["pageViewLast7DaysEma"] = float(pv_p)
     return s

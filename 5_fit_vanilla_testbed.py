@@ -8,7 +8,8 @@ or as a hierarchical Bayesian model:
 
 Writes ``params_env_<uid>.json`` (mediator/outcome blocks and residuals),
 ``pred_<uid>.json``, ``user_ids.txt``, and ``population_residuals.json``.
-Does not overwrite the E_w / PV / FW / PJ blocks from script 4.
+Does not overwrite the E_w / PV / FW / PJ blocks from script 4 (including
+the lagged-J ``query_Jw_*`` suffix on PV/FW/PJ).
 Next: ``6_est_Ew_weights.py``.
 """
 import json
@@ -29,7 +30,7 @@ from sklearn.linear_model import (
     RidgeCV,
 )
 
-from vani_env import within_week_ewma
+from vani_env import assert_complete_week_slots, cae_mediator_ewma_rows
 
 
 # %%
@@ -83,6 +84,7 @@ df_fit["day_norm"] = (
 df_fit["week_norm"] = (
     df_fit["week"] - (1 + VANILLA_WEEK_RANGE) / 2
 ) / ((VANILLA_WEEK_RANGE - 1) / 2)
+assert_complete_week_slots(df_fit)
 # %%
 # import warnings
 # from sklearn.exceptions import UndefinedMetricWarning
@@ -321,8 +323,9 @@ def build_cae_mixedlm_data(df, userid_all, K=14):
                   + EWMA of 14 FourSC decision-slot summaries
                   + EWMA of 7 anticipated-affect daily summaries
 
-    The two EWMA terms use the same ``gamma=6/7`` normalized discount as
-    ``1_data_extraction._ewm_prior_rows`` (most recent observation last).
+    The two EWMA terms use :func:`vani_env.cae_mediator_ewmas` (week-local
+    NaN fill, then the same normalized discount as
+    ``1_data_extraction._ewm_prior_rows``; most recent observation last).
 
     Output columns:
         ParticipantIdentifier
@@ -340,13 +343,9 @@ def build_cae_mixedlm_data(df, userid_all, K=14):
             .reset_index(drop=True)
         )
 
-        # Keep only complete weeks of K decision rows.
-        # Your current code uses reshape(-1, K), so this is needed.
-        n_full_weeks = len(dat_user) // K
-        if n_full_weeks == 0:
+        if len(dat_user) == 0:
             continue
-
-        dat_user = dat_user.iloc[: n_full_weeks * K].copy()
+        assert_complete_week_slots(dat_user)
 
         # Decision-level arrays.
         CAE_avg = dat_user["CAE_avg_norm"].to_numpy(dtype=float)
@@ -365,28 +364,12 @@ def build_cae_mixedlm_data(df, userid_all, K=14):
         week_sw = week.reshape(-1, K)[:, 0]
         Intercept_sw = np.ones(len(week_sw))
 
-        # FourSC: 14 decision slots per week.
+        # FourSC: 14 decision slots per week. Anticipated affect is stored on
+        # both AM/PM rows; pass the 14-slot week so AM/PM averaging matches
+        # the simulator (``_antic_daily_from_week``).
         foursc_wk = fourSC.reshape(-1, K)
-        mu_foursc = safe_nanmean(fourSC)
-        foursc_wk = np.where(np.isnan(foursc_wk), mu_foursc, foursc_wk)
-
-        # Anticipated affect: daily outcome repeated across AM/PM rows.
-        # Convert 14 decision rows into 7 daily averages.
         af = anticipated_affect.reshape(-1, K)
-        mu_antic = safe_nanmean(anticipated_affect)
-        af = np.where(np.isnan(af), mu_antic, af)
-
-        antic_wk = af.reshape(-1, 7, 2).mean(axis=2)
-        antic_wk = np.where(np.isnan(antic_wk), mu_antic, antic_wk)
-
-        foursc_e = np.array(
-            [within_week_ewma(row) for row in foursc_wk],
-            dtype=float,
-        )
-        antic_e = np.array(
-            [within_week_ewma(row) for row in antic_wk],
-            dtype=float,
-        )
+        foursc_e, antic_e = cae_mediator_ewma_rows(foursc_wk, af)
 
         X = np.column_stack(
             [
@@ -442,12 +425,9 @@ def build_cae_short_mixedlm_data(df, userid_all, K=14):
             .reset_index(drop=True)
         )
 
-        # Keep only complete weeks of K decision rows.
-        n_full_weeks = len(dat_user) // K
-        if n_full_weeks == 0:
+        if len(dat_user) == 0:
             continue
-
-        dat_user = dat_user.iloc[: n_full_weeks * K].copy()
+        assert_complete_week_slots(dat_user)
 
         # Decision-level arrays.
         CAE_avg = dat_user["CAE_avg_norm"].to_numpy(dtype=float)
@@ -582,6 +562,7 @@ def build_antic_bayes_data(df, userid_all):
         )
         if len(dat_user) == 0:
             continue
+        assert_complete_week_slots(dat_user)
 
         anticipated_affect = dat_user["anticipated_affect_norm"].to_numpy()
         anticipated_affect_yesterday = fill_nan_with_mean(
@@ -995,6 +976,7 @@ population_resid_pools = {
 for i, userid in enumerate(userid_all):
     dat_user = df_fit[df_fit['ParticipantIdentifier'] == userid].copy()
     dat_user = dat_user.sort_values(['Date', 'DecisionTime'], na_position='last').reset_index(drop=True)
+    assert_complete_week_slots(dat_user)
 
     # fill in initial values (last week's affective association, and perceived utility)
     # set the first 0-13 days to 0
@@ -1461,24 +1443,8 @@ for i, userid in enumerate(userid_all):
     Intercept_sw = np.ones(len(week_sw))
 
     foursc_wk = fourSC.reshape(-1, K)
-    _mu_foursc = safe_nanmean(fourSC)
-    _mu_antic = safe_nanmean(anticipated_affect)
-
-    foursc_wk = np.where(np.isnan(foursc_wk), _mu_foursc, foursc_wk)
-
-    _af = anticipated_affect.reshape(-1, K)
-    _af = np.where(np.isnan(_af), _mu_antic, _af)
-    antic_wk = _af.reshape(-1, 7, 2).mean(axis=2)
-    antic_wk = np.where(np.isnan(antic_wk), _mu_antic, antic_wk)
-
-    foursc_e = np.array(
-        [within_week_ewma(row) for row in foursc_wk],
-        dtype=float,
-    )
-    antic_e = np.array(
-        [within_week_ewma(row) for row in antic_wk],
-        dtype=float,
-    )
+    af = anticipated_affect.reshape(-1, K)
+    foursc_e, antic_e = cae_mediator_ewma_rows(foursc_wk, af)
 
     CAE_cond = np.column_stack([
         Intercept_sw,

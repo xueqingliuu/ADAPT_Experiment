@@ -162,7 +162,7 @@ def _convert_one_utc_to_local(ts_utc, tz_name, utc_offset):
     # Fallback: static UTC offset (no DST logic)
     delta = _offset_cache.get(str(utc_offset), _offset_to_timedelta(utc_offset))
     if pd.isna(delta):
-        return ts_utc.tz_localize(None)  # fallback to UTC naive
+        return pd.NaT  # unknown offset: do not pretend UTC wall clock is local
     return (ts_utc + delta).tz_localize(None)
 
 
@@ -219,8 +219,12 @@ def convert_utc_columns_to_user_local(
                 converted.loc[idx_k] = True
             still = need_offset & ~converted
             if still.any():
-                # Unknown offset → UTC-naive wall clock
-                local.loc[still] = ts.loc[still].dt.tz_localize(None)
+                n_unknown = int(still.sum())
+                print(
+                    f"WARNING: {n_unknown} timestamps have unknown timezone/"
+                    "offset; left as NaT (not UTC wall clock)."
+                )
+                local.loc[still] = pd.NaT
 
         out[col] = local
 
@@ -598,11 +602,15 @@ print(survey_task_weekly["date"].dtype)
 # %%
 def fill_weekly_12(df1, df2, id_col="ParticipantIdentifier", date_col="date",
                          tolerance_days=2, weeks=12):
-    """
-    df1: wide weekly-level survey frame with [id_col, date_col, value columns...]
-    df2: wide weekly-level survey task frame with [id_col, date_col, survey task...]
-    Returns a frame with exactly `weeks` rows per participant, anchored at the
-    participant's earliest observed date, spaced at 7-day intervals (± tolerance).
+    """Map observed weekly surveys onto a 12-week Sunday slot grid.
+
+    ``df1`` is the wide weekly survey; ``df2`` is the weekly task calendar.
+    Each participant gets ``weeks`` rows, anchored at their earliest task
+    date and spaced every 7 days. An observation attaches to the nearest
+    slot if it is within ``tolerance_days`` (default 2). In this MRT the
+    slots are Sundays, so Monday/Tuesday completions still fill that
+    Sunday. Script 2 then joins on the slot's ISO week, copying the
+    emission onto all seven days — not a decision-time covariate.
     """
     # ensure datetime (normalized to date)
     df1 = df1.copy()
@@ -1020,19 +1028,20 @@ def _ewm_prior_rows(series, gamma=None, window=7, min_periods=1):
     Excludes the current row.
 
     Computes:
-        sum_{j=1}^k gamma^{j-1} x_{t-j}
-        ---------------------------------
-        sum_{j=1}^k gamma^{j-1}
+        sum_{j=1}^n gamma^{j-1} x_{t-j} I_j
+        -----------------------------------
+        sum_{j=1}^n gamma^{j-1} I_j
 
-    where j=1 is the most recent prior row. Same implementation as
-    ``ewm_utils.ewma_gamma`` (pandas ``ewm(alpha=1-gamma, adjust=True)``).
+    where j=1 is the most recent prior row and ``I_j`` is 0 if that row is
+    NaN. Same implementation as ``ewm_utils.ewma_gamma``. NaN rows stay in
+    the window so the decay follows calendar spacing (pandas
+    ``ewm(..., ignore_na=False)`` on the same window, for a fixed gamma).
 
-    ``gamma=None`` (default) derives the decay from ``k``, the number of
-    prior rows actually available in this window (:func:`ewm_utils.gamma_from_n`).
-    A full 7-row window gets ``gamma=6/7`` exactly as before; a partial window
-    near the start of a participant's data (e.g. ``k=3``) gets a shallower
-    decay (``gamma=2/3``) rather than the same 6/7 with fewer terms. Pass a
-    numeric ``gamma`` to force a fixed decay regardless of ``k``.
+    ``gamma=None`` (default) derives the decay from ``n``, the calendar
+    length of this rolling window (:func:`ewm_utils.gamma_from_n`), not the
+    finite count. A full 7-row window gets ``gamma=6/7`` even if some days
+    are missing; a partial window near the start (e.g. ``n=3``) gets
+    ``gamma=2/3``. Pass a numeric ``gamma`` to force a fixed decay.
     """
 
     def _ewm_last(window_values):
@@ -1410,6 +1419,164 @@ def resolve_wakeup_for_date(df_wb_participant, date):
     return wakeup_time
 
 
+def _wake_bed_interval(date, wakeup_time, bedtime_time):
+    """Naive [wakeup, bedtime] timestamps; bedtime after midnight rolls to the next day.
+
+    ``datetime.time`` has no date, so ``Timestamp.combine(same_date, 00:30)``
+    is 12:30am *that* morning and the wear window is empty whenever bedtime
+    is past midnight. Roll the end forward one day in that case.
+    """
+    d = pd.Timestamp(date).date()
+    start = pd.Timestamp.combine(d, wakeup_time)
+    end = pd.Timestamp.combine(d, bedtime_time)
+    if pd.isna(start) or pd.isna(end):
+        return start, end
+    if end <= start:
+        end = end + pd.Timedelta(days=1)
+    return start, end
+
+
+def _wear_frames_for_interval(hr_by_date, step_by_date, date_key, end_dt):
+    """HR/step tables covering ``date_key`` through ``end_dt`` (next day if needed)."""
+    keys = [date_key]
+    end_date = pd.Timestamp(end_dt).date()
+    day0 = pd.Timestamp(date_key).date()
+    if end_date > day0:
+        keys.append(day0 + datetime.timedelta(days=1))
+
+    def _cat(store):
+        parts = []
+        for k in keys:
+            g = store.get(k)
+            if g is None:
+                g = store.get(pd.Timestamp(k))
+            if g is None or (hasattr(g, "empty") and g.empty):
+                continue
+            parts.append(g)
+        if not parts:
+            return pd.DataFrame()
+        return pd.concat(parts, ignore_index=True)
+
+    return _cat(hr_by_date), _cat(step_by_date)
+
+
+# Post-delivery MessageDisplay windows (minutes). A display strictly before
+# the gif send is not an interaction with that notification.
+_INTERACT_WINDOW_MIN = {0: 300.0, 1: 600.0}
+
+
+def _as_naive_timestamp(val):
+    """Parse to a tz-naive Timestamp so local delivery/display clocks compare."""
+    ts = pd.to_datetime(val, errors="coerce")
+    if pd.isna(ts):
+        return pd.NaT
+    if getattr(ts, "tzinfo", None) is not None:
+        return ts.tz_localize(None)
+    return ts
+
+
+def _interacted_after_delivery(displays, delivery_ts, decision_time):
+    """1 iff a MessageDisplay falls in this slot's post-delivery window.
+
+    Morning (decision_time=0): [0, 300] minutes after ``delivery_ts``.
+    Afternoon (decision_time=1): [0, 600] minutes after ``delivery_ts``.
+    Displays before the send do not count. Applied per delivered slot — do
+    not substitute a same-day display *count* for the timing test.
+    """
+    window_min = _INTERACT_WINDOW_MIN.get(int(decision_time))
+    if window_min is None:
+        return 0
+    delivery_ts = _as_naive_timestamp(delivery_ts)
+    if pd.isna(delivery_ts):
+        return 0
+    for interaction in displays:
+        interaction = _as_naive_timestamp(interaction)
+        if pd.isna(interaction) or interaction < delivery_ts:
+            continue
+        time_diff = (interaction - delivery_ts).total_seconds() / 60.0
+        if 0.0 <= time_diff <= window_min:
+            return 1
+    return 0
+
+
+def _time_to_timedelta(t):
+    """Clock time → timedelta since midnight (for distance to slot anchors)."""
+    if isinstance(t, pd.Timedelta):
+        return t
+    if not hasattr(t, "hour"):
+        t = pd.Timestamp(t)
+    return pd.Timedelta(
+        hours=int(t.hour),
+        minutes=int(t.minute),
+        seconds=int(getattr(t, "second", 0) or 0),
+    )
+
+
+def _nearest_decision_time(delivered_td, m_time, a_time):
+    """0 = morning, 1 = afternoon. Exact ties go to afternoon (old `<` test)."""
+    d_m = abs((delivered_td - m_time).total_seconds())
+    d_a = abs((delivered_td - a_time).total_seconds())
+    return 0 if d_m < d_a else 1
+
+
+def _gif_slot_record(participant_id, date, time_val, decision_time, walking_suggestion, interacted):
+    return {
+        "ParticipantIdentifier": participant_id,
+        "Date": date,
+        "Time": time_val,
+        "DecisionTime": decision_time,
+        "WalkingSuggestion": walking_suggestion,
+        "Interacted": interacted,
+    }
+
+
+def _deliveries_by_nearest_slot(times, timestamps, m_time, a_time):
+    """Map each send to the closer of morning / afternoon.
+
+    Within a slot the first pair is the send closest to that slot's
+    scheduled time (canonical delivery used for ``Time``).
+    """
+    buckets = {0: [], 1: []}
+    for time_val, ts in zip(times, timestamps):
+        td = _time_to_timedelta(time_val)
+        dt = _nearest_decision_time(td, m_time, a_time)
+        slot_td = m_time if dt == 0 else a_time
+        dist = abs((td - slot_td).total_seconds())
+        buckets[dt].append((dist, time_val, ts))
+    for dt in buckets:
+        buckets[dt].sort(key=lambda item: item[0])
+        buckets[dt] = [(time_val, ts) for _, time_val, ts in buckets[dt]]
+    return buckets
+
+
+def _slot_rows_nearest_deliveries(
+    participant_id, date, times, timestamps, m_time, a_time, displays,
+):
+    """Two slot records; ``WalkingSuggestion=1`` iff a send mapped to that slot.
+
+    Used for one-delivery days and for ≥3 sends (resends / extras). Empty
+    ``times`` yields both slots untreated (true no-delivery days).
+    """
+    default_m = (pd.Timestamp("2000-01-01") + m_time).time()
+    default_a = (pd.Timestamp("2000-01-01") + a_time).time()
+    by_slot = _deliveries_by_nearest_slot(times, timestamps, m_time, a_time)
+    rows = []
+    for dt, default_t in ((0, default_m), (1, default_a)):
+        occ = by_slot[dt]
+        if not occ:
+            rows.append(_gif_slot_record(participant_id, date, default_t, dt, 0, 0))
+            continue
+        interacted = 0
+        for _t, ts in occ:
+            if _interacted_after_delivery(displays, ts, dt):
+                interacted = 1
+                break
+        rows.append(
+            _gif_slot_record(participant_id, date, occ[0][0], dt, 1, interacted)
+        )
+    return rows
+
+
 # %% [markdown]
 # ## 5. Daily engagement (page views)
 # 
@@ -1462,13 +1629,14 @@ for participant_id in complete_participant_ids:
         date = min_date + pd.Timedelta(days=i)
         # print(date)
         wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
-
+        start_dt, end_dt = _wake_bed_interval(date, wakeup_time, bedtime_time)
 
         # filter out the days with less than 8 hours of wearing fitbit (more than 8 hours of heart rate =0 or nan
         # within the wakeup and bedtime)
-        pageview_participant_date = pageview_participant[pageview_participant.Timestamp.dt.date == date]
-        pageview_participant_date = pageview_participant_date[pageview_participant_date.Timestamp.dt.time >= wakeup_time]
-        pageview_participant_date = pageview_participant_date[pageview_participant_date.Timestamp.dt.time <= bedtime_time]
+        pageview_participant_date = pageview_participant[
+            (pageview_participant.Timestamp >= start_dt)
+            & (pageview_participant.Timestamp <= end_dt)
+        ]
         
 
         # Calculate time span from first to last valid reading
@@ -1542,15 +1710,14 @@ for participant_id in complete_participant_ids:
         date = min_date + pd.Timedelta(days=i)
         
         wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
+        wakeup_datetime, bedtime_datetime = _wake_bed_interval(
+            date, wakeup_time, bedtime_time
+        )
 
-        # Get all heart rate data for this date
-        pageview_participant_date = pageview_participant[pageview_participant.Timestamp.dt.date == date]
-        pageview_participant_date = pageview_participant_date[pageview_participant_date.Timestamp.dt.time >= wakeup_time]
-        pageview_participant_date = pageview_participant_date[pageview_participant_date.Timestamp.dt.time <= bedtime_time]
-        
-        # Create hourly bins from wakeup to bedtime
-        wakeup_datetime = pd.Timestamp.combine(date, wakeup_time)
-        bedtime_datetime = pd.Timestamp.combine(date, bedtime_time)
+        pageview_participant_date = pageview_participant[
+            (pageview_participant.Timestamp >= wakeup_datetime)
+            & (pageview_participant.Timestamp <= bedtime_datetime)
+        ]
         
         # Generate hourly time bins
         num_decisions = 2 # 2 decision points per day wakeup + 1, wakeup + 6
@@ -1870,147 +2037,45 @@ for n in range(len(complete_participant_ids)):
         #     for dt in (0, 1)
         # ]
 
-        if gif_row.shape[0] == 2:
+        displays = tmp_par_date["datetime_local"].values
+        gif_row = gif_row.sort_values("Timestamp")
+        n_sent = int(gif_row.shape[0])
+
+        if n_sent == 0:
+            # True no-delivery day only — n>=3 is *not* treated as untreated.
+            df_gif_all.extend(
+                _slot_rows_nearest_deliveries(
+                    participant_id, date, [], [], m_time, a_time, displays,
+                )
+            )
+        elif n_sent == 2:
             decision_time = 0
             for time_val, timestamp_val in zip(gif_row['time'].values, gif_row['Timestamp'].values):
-                # Check if opened within 1 hour
-                # open_status = 0
-                # for open_timestamp in gif_row_open['timestamp'].values:
-                #     time_diff = abs((pd.to_datetime(open_timestamp) - pd.to_datetime(timestamp_val)).total_seconds() / 60)
-                #     if time_diff <= 60:  # Within 60 minutes
-                #         open_status = 1
-                #         break
-
-                # check if the user interacted with the notification
-                
-                if len(tmp_par_date['datetime_local'].values) >= 2:
-                    interacted = 1
-                else:
-                    interacted = 0
-                    for interaction in tmp_par_date['datetime_local'].values:
-                        if interaction < timestamp_val:
-                            continue
-                        time_diff = pd.Timedelta(interaction - timestamp_val).total_seconds() / 60
-                        # print(time_diff)
-                        if decision_time == 0 and 0 <= time_diff <= 300:
-                            interacted = 1
-                            break
-                        elif decision_time == 1 and 0 <= time_diff <= 600:
-                            interacted = 1
-                            break
-
-                df_gif_all.append({
-                    'ParticipantIdentifier': participant_id,
-                    'Date': date,
-                    'Time': time_val,
-                    'DecisionTime': decision_time,
-                    'WalkingSuggestion': 1,
-                    'Interacted': interacted
-                    # 'ViewStatus': min(open_status + int(valid_count[decision_time] > 0), 1)
-                })
+                interacted = _interacted_after_delivery(
+                    displays, timestamp_val, decision_time
+                )
+                df_gif_all.append(_gif_slot_record(
+                    participant_id, date, time_val, decision_time, 1, interacted,
+                ))
                 decision_time += 1
-        elif gif_row.shape[0] == 1:
-            # One delivery - determine if it's morning or afternoon
-            delivered_time = gif_row['time'].iloc[0]
-            delivered_timestamp = gif_row['Timestamp'].iloc[0]
-
-            # Check if opened within 1 hour
-            # TODO: check if this is correct
-            # open_status = 0
-            # for open_timestamp in gif_row_open['timestamp'].values:
-            #     time_diff = abs((pd.to_datetime(open_timestamp) - pd.to_datetime(delivered_timestamp)).total_seconds() / 60)
-            #     if time_diff <= 60:  # Within 60 minutes
-            #         open_status = 1
-            #         break
-
-            # check if the user interacted with the notification
-            
-            if len(tmp_par_date['datetime_local'].values) >= 1:
-                interacted = 1
-            else:
-                interacted = 0
-                for interaction in tmp_par_date['datetime_local'].values:
-                    if interaction < timestamp_val:
-                        continue
-                    time_diff = pd.Timedelta(interaction - timestamp_val).total_seconds() / 60
-                    if decision_time == 0 and 0 <= time_diff <= 300:
-                        interacted = 1
-                        break
-                    elif decision_time == 1 and 0 <= time_diff <= 600:
-                        interacted = 1
-                        break
-
-        
-            # Convert time to timedelta for comparison
-            delivered_td = pd.Timedelta(
-                hours=delivered_time.hour, 
-                minutes=delivered_time.minute, 
-                seconds=delivered_time.second
-            )
-            
-            # Check which slot it's closer to
-            is_morning = abs((delivered_td - m_time).total_seconds()) < abs((delivered_td - a_time).total_seconds())
-            
-            if is_morning:
-                # Delivered in morning, not in afternoon
-                df_gif_all.append({
-                    'ParticipantIdentifier': participant_id,
-                    'Date': date,
-                    'Time': delivered_time,
-                    'DecisionTime': 0,
-                    'WalkingSuggestion': 1,
-                    'Interacted': interacted
-                    # 'ViewStatus': min(open_status + int(valid_count[0] > 0), 1)
-                })
-                df_gif_all.append({
-                    'ParticipantIdentifier': participant_id,
-                    'Date': date,
-                    'Time': (pd.Timestamp('2000-01-01') + a_time).time(),
-                    'DecisionTime': 1,
-                    'WalkingSuggestion': 0,
-                    'Interacted': 0
-                    # 'ViewStatus': int(valid_count[1] > 0)
-                })
-            else:
-                # Delivered in afternoon, not in morning
-                df_gif_all.append({
-                    'ParticipantIdentifier': participant_id,
-                    'Date': date,
-                    'Time': (pd.Timestamp('2000-01-01') + m_time).time(),
-                    'DecisionTime': 0,
-                    'WalkingSuggestion': 0,
-                    'Interacted': 0
-                    # 'ViewStatus': int(valid_count[0] > 0)
-                })
-                df_gif_all.append({
-                    'ParticipantIdentifier': participant_id,
-                    'Date': date,
-                    'Time': delivered_time,
-                    'DecisionTime': 1,
-                    'WalkingSuggestion': 1,
-                    'Interacted': interacted
-                    # 'ViewStatus': min(open_status + int(valid_count[1] > 0), 1)
-                })
         else:
-            # No deliveries - both slots empty
-            df_gif_all.append({
-                'ParticipantIdentifier': participant_id,
-                'Date': date,
-                'Time': (pd.Timestamp('2000-01-01') + m_time).time(),
-                'DecisionTime': 0,
-                'WalkingSuggestion': 0,
-                'Interacted': 0
-                # 'ViewStatus': int(valid_count[0] > 0)
-            })
-            df_gif_all.append({
-                'ParticipantIdentifier': participant_id,
-                'Date': date,
-                'Time': (pd.Timestamp('2000-01-01') + a_time).time(),
-                'DecisionTime': 1,
-                'WalkingSuggestion': 0,
-                'Interacted': 0
-                # 'ViewStatus': int(valid_count[1] > 0)
-            })
+            # n == 1 (nearest slot) or n >= 3 (resends / extras → nearest slot).
+            if n_sent >= 3:
+                print(
+                    f"Warning: {n_sent} gif deliveries for participant "
+                    f"{participant_id} on {date}; assigning each send to the nearest slot"
+                )
+            df_gif_all.extend(
+                _slot_rows_nearest_deliveries(
+                    participant_id,
+                    date,
+                    gif_row["time"].values,
+                    gif_row["Timestamp"].values,
+                    m_time,
+                    a_time,
+                    displays,
+                )
+            )
 
 df_gif_all = pd.DataFrame(df_gif_all)
 
@@ -2029,9 +2094,9 @@ for _, _g in df_gif_all.groupby('ParticipantIdentifier', sort=False):
 df_gif_all = pd.concat(_gif_parts, ignore_index=True)
 
 # recent_burden: X_d = daily walking-suggestion count (sum over AM/PM slots), then
-#   _ewm_prior_rows on the daily series (window=7, gamma derived from k, the
-#   number of prior days available; r = 6/7 once a full 7-day window exists):
-#   (X_{d-1} + r X_{d-2} + ... + r^{k-1} X_{d-k}) / (1 + r + ... + r^{k-1})
+#   _ewm_prior_rows on the daily series (window=7, gamma from the calendar
+#   window length; r = 6/7 once a full 7-day window exists). Missing days
+#   keep their slot in the decay and are omitted from the average.
 _daily_panel = (
     df_gif_all.groupby(['ParticipantIdentifier', 'Date'], sort=False)['WalkingSuggestion']
     .sum()
@@ -2153,6 +2218,39 @@ print(stepcountbymin_selected[stepcountbymin_selected["ParticipantIdentifier"] =
 # within the wakeup and bedtime)
 
 
+# Prior-to-decision step covariate and its wear gate share this lookback.
+# Decision times are wakeup+1h (AM) and wakeup+6h (PM); the window is
+# half-open [end - 2h, end). HourWearing=1 iff the valid-wear span exceeds
+# 100 minutes of those 120.
+PRIOR_2HOUR_LOOKBACK = pd.Timedelta(hours=2)
+PRIOR_2HOUR_WEAR_MINUTES = 100.0
+
+
+def _prior_2hour_window(wakeup_datetime, decision_time):
+    """Half-open [start, end) ending at the AM/PM decision time."""
+    end_window = (
+        wakeup_datetime + pd.Timedelta(hours=1)
+        if int(decision_time) == 0
+        else wakeup_datetime + pd.Timedelta(hours=6)
+    )
+    return end_window - PRIOR_2HOUR_LOOKBACK, end_window
+
+
+def _sum_steps_in_window(step_df, start_window, end_window):
+    """Sum finite minute-level steps on [start_window, end_window); NaN if none."""
+    if step_df is None or len(step_df) == 0:
+        return np.nan
+    vals = pd.to_numeric(
+        step_df.loc[
+            (step_df["DateTime"] >= start_window)
+            & (step_df["DateTime"] < end_window),
+            "Value",
+        ],
+        errors="coerce",
+    ).dropna()
+    return float(vals.sum()) if len(vals) else np.nan
+
+
 def _valid_wear_span_seconds(hr_df, step_df, start_dt, end_dt, end_inclusive=True):
     """First-to-last valid wearable minute span (seconds) in [start_dt, end_dt]."""
     if hr_df is None or hr_df.empty:
@@ -2234,11 +2332,11 @@ for participant_id in complete_participant_ids:
         wakeup_time, bedtime_time = resolve_schedule_for_date(
             df_wakeup_bedtime_participant, date_key
         )
-        start_dt = pd.Timestamp.combine(date_key, wakeup_time)
-        end_dt = pd.Timestamp.combine(date_key, bedtime_time)
+        start_dt, end_dt = _wake_bed_interval(date_key, wakeup_time, bedtime_time)
+        hr_day, step_day = _wear_frames_for_interval(
+            hr_by_date, step_by_date, date_key, end_dt
+        )
 
-        hr_day = hr_by_date.get(date_key, pd.DataFrame())
-        step_day = step_by_date.get(date_key, pd.DataFrame())
         valid_hours = (
             _valid_wear_span_seconds(
                 hr_day, step_day, start_dt, end_dt, end_inclusive=True
@@ -2381,19 +2479,16 @@ for participant_id in complete_participant_ids:
         step_day = step_by_date.get(date_key, pd.DataFrame())
 
         for current_decision in (0, 1):
-            end_window = (
-                wakeup_datetime + pd.Timedelta(hours=1)
-                if current_decision == 0
-                else wakeup_datetime + pd.Timedelta(hours=6)
+            start_window, end_window = _prior_2hour_window(
+                wakeup_datetime, current_decision
             )
-            start_window = end_window - pd.Timedelta(hours=2)
             valid_minutes = (
                 _valid_wear_span_seconds(
                     hr_day, step_day, start_window, end_window, end_inclusive=False
                 )
                 / 60.0
             )
-            wearing = 0 if valid_minutes <= 100 else 1
+            wearing = 0 if valid_minutes <= PRIOR_2HOUR_WEAR_MINUTES else 1
 
             missing_2hours_list.append({
                 "ParticipantIdentifier": participant_id,
@@ -2403,7 +2498,6 @@ for participant_id in complete_participant_ids:
             })
 
 df_2hours = pd.DataFrame(missing_2hours_list)
-# print(df_30_minutes[df_30_minutes['ParticipantIdentifier'] == 13].head())
 
 print(df_2hours)
 
@@ -2521,9 +2615,8 @@ for participant_id in complete_participant_ids:
         if wakeup_time is None or bedtime_time is None:
             continue
 
-        wakeup_dt = pd.Timestamp.combine(date, wakeup_time)
+        wakeup_dt, bedtime_dt = _wake_bed_interval(date, wakeup_time, bedtime_time)
         morning_end = wakeup_dt + pd.Timedelta(hours=1)
-        bedtime_dt = pd.Timestamp.combine(date, bedtime_time)
 
         # Rest-of-day: after wakeup+1 hour to bedtime
         hr_rest = hr_p.loc[
@@ -2695,14 +2788,14 @@ for participant_id in complete_participant_ids:
         # .time()
         # )
 
-        # Get all heart rate data for this date
-        stepcountbymin_participant_date = stepcountbymin_participant[stepcountbymin_participant.Date == date]
-        stepcountbymin_participant_date = stepcountbymin_participant_date[stepcountbymin_participant_date.DateTime.dt.time >= wakeup_time]
-        stepcountbymin_participant_date = stepcountbymin_participant_date[stepcountbymin_participant_date.DateTime.dt.time <= bedtime_time]
-        
-        # Create hourly bins from wakeup to bedtime
-        wakeup_datetime = pd.Timestamp.combine(date, wakeup_time)
-        bedtime_datetime = pd.Timestamp.combine(date, bedtime_time)
+        wakeup_datetime, bedtime_datetime = _wake_bed_interval(
+            date, wakeup_time, bedtime_time
+        )
+
+        stepcountbymin_participant_date = stepcountbymin_participant[
+            (stepcountbymin_participant.DateTime >= wakeup_datetime)
+            & (stepcountbymin_participant.DateTime <= bedtime_datetime)
+        ]
         
 
         
@@ -2804,14 +2897,14 @@ for participant_id in complete_participant_ids:
         date = min_date + pd.Timedelta(days=i)
         
         wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
+        wakeup_datetime, bedtime_datetime = _wake_bed_interval(
+            date, wakeup_time, bedtime_time
+        )
 
-
-        # Get all heart rate data for this date
-        stepcountbymin_participant_date = stepcountbymin_participant[stepcountbymin_participant.Date == date]
- 
-        # Create hourly bins from wakeup to bedtime
-        wakeup_datetime = pd.Timestamp.combine(date, wakeup_time)
-        bedtime_datetime = pd.Timestamp.combine(date, bedtime_time)
+        stepcountbymin_participant_date = stepcountbymin_participant[
+            (stepcountbymin_participant.DateTime >= wakeup_datetime)
+            & (stepcountbymin_participant.DateTime < bedtime_datetime)
+        ]
         
 
         
@@ -2845,14 +2938,16 @@ for participant_id in complete_participant_ids:
 
         today_step_counts.append({
             'ParticipantIdentifier': participant_id,
-            'Date': date + pd.Timedelta(days=1),
+            'Date': date,
             'TodayStepCount': valid_sc
         })
         
 
 df_today_step_counts = pd.DataFrame(today_step_counts)
 
-# Previous calendar row's TodayStepCount per participant (chronological by Date).
+# Yesterday at D = TodayStepCount of the previous calendar row (steps on D-1).
+# Date is the measurement day — do not store under D+1; that plus shift(1)
+# would make YesterdayStepCount a two-day lag.
 df_today_step_counts['YesterdayStepCount'] = (
     df_today_step_counts
     .sort_values(['ParticipantIdentifier', 'Date'], kind='mergesort')
@@ -2870,7 +2965,7 @@ print(len(df_today_step_counts[df_today_step_counts['TodayStepCount'].isna()]) /
 
 
 # %%
-# extract hourly step counts in between wakeup and bedtime
+# Prior-2h step counts: same [decision-2h, decision) window as HourWearing.
 
 prior_2hours_step_counts = []
 
@@ -2881,77 +2976,40 @@ for participant_id in complete_participant_ids:
     min_date = summary_surveytask.loc[
         summary_surveytask['ParticipantIdentifier'] == participant_id
     ].iloc[0].date_min
-    # print(min_date)
     date_range_length = 85
 
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
-        
-        wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
+        wakeup_time, bedtime_time = resolve_schedule_for_date(
+            df_wakeup_bedtime_participant, date
+        )
+        wakeup_datetime = pd.Timestamp.combine(pd.Timestamp(date).date(), wakeup_time)
 
-
-        # Get all heart rate data for this date
-        stepcountbymin_participant_date = stepcountbymin_participant[stepcountbymin_participant.Date == date]
-        stepcountbymin_participant_date = stepcountbymin_participant_date[stepcountbymin_participant_date.DateTime.dt.time >= wakeup_time]
-        stepcountbymin_participant_date = stepcountbymin_participant_date[stepcountbymin_participant_date.DateTime.dt.time <= bedtime_time]
-        
-        # Create hourly bins from wakeup to bedtime
-        wakeup_datetime = pd.Timestamp.combine(date, wakeup_time)
-        bedtime_datetime = pd.Timestamp.combine(date, bedtime_time)
-        
-
-        
-        # Generate hourly time bins
-        decision_time = 0
-        num_decisions = 2 # 2 decision points per day wakeup + 1, wakeup + 6
-        while decision_time < num_decisions:
-            end_window = wakeup_datetime + pd.Timedelta(hours=1) if decision_time == 0 else wakeup_datetime + pd.Timedelta(hours=6)
-            start_window = end_window - pd.Timedelta(hours=0.5)
-
-            # read heart rate data for this hour
+        for decision_time in (0, 1):
+            start_window, end_window = _prior_2hour_window(
+                wakeup_datetime, decision_time
+            )
             missing_2hours_participant_date = df_2hours[
                 (df_2hours['ParticipantIdentifier'] == participant_id) &
                 (df_2hours['Date'] == date) &
                 (df_2hours['DecisionTime'] == decision_time)
             ]
-
             wearing = missing_2hours_participant_date['HourWearing'].iloc[0]
-            
-            # Filter data for this hour
-            hour_data = stepcountbymin_participant_date[
-                (stepcountbymin_participant_date['DateTime'] >= start_window) &
-                (stepcountbymin_participant_date['DateTime'] < end_window)
-            ]
-            
-            # Filter valid step count readings (not 0 and not NaN)
-            valid_sc_init = hour_data[
-                (hour_data['Value'].notna())
-            ]
-            
-            # Calculate number of valid step counts in this hour
-            if (len(valid_sc_init) > 0) and (wearing == 1):
-                valid_sc = sum(valid_sc_init['Value'])
-            else:
-                valid_sc = np.nan
-
-            # print the proportion of wearing == 1 but valid_sc !=0
-            if len(valid_sc_init) > 0:
-                check_valid_sc = sum(valid_sc_init['Value'])
-                check_status = int((check_valid_sc > 0) & (wearing == 0))
-            else:
-                check_status = np.nan
-
-
+            window_sum = _sum_steps_in_window(
+                stepcountbymin_participant, start_window, end_window
+            )
+            valid_sc = window_sum if wearing == 1 else np.nan
+            check_status = (
+                np.nan if not np.isfinite(window_sum)
+                else int((window_sum > 0) and (wearing == 0))
+            )
             prior_2hours_step_counts.append({
                 'ParticipantIdentifier': participant_id,
                 'Date': date,
                 'DecisionTime': decision_time,
-                # 'DateTimeStart': start_window,
                 'StepCount': valid_sc,
                 'CheckStatus': check_status
             })
-            
-            decision_time += 1
 
 df_prior_2hours_step_counts = pd.DataFrame(prior_2hours_step_counts)
 

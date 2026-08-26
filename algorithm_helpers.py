@@ -606,9 +606,9 @@ def require_finite_belief(value, *, week, name="b_hat"):
     return x
 
 
-# Default clip used by RLSVI and by the clipped always/never baselines
-# (π = 1-ε and π = ε). Keep a single constant so those stay in the same
-# policy class as the learning agents.
+# Default clip used by RLSVI only (π ∈ [ε, 1-ε]). The never/always baselines
+# are hard 0/1; they are not in this policy class and are not generated from
+# EPSILON_0. Changing this constant does not change those baselines.
 EPSILON_0 = 0.1
 
 # Boltzmann temperature for the ensemble softmax. Q is on the weekly ``b_hat``
@@ -1480,18 +1480,22 @@ def build_fourSC_features(
 def build_rl_context_vector(
     *,
     yesterdayStepCount,
-    prior2HourStepCountAgent,
     activeDaysLast7Days,
     activitySuggestionsSentLast7Days,
     activitySuggestionInteractLast7Days,
+    prior2HourStepCount=None,
+    prior2HourStepCountAgent=None,
 ):
     """Per-decision context ``C`` for RLSVI (length 5).
 
-    ``I_w * J_w`` is a separate base feature, not part of ``C``.
+    ``prior2HourStepCountAgent`` is accepted as a deprecated alias.
     """
+    p2h = prior2HourStepCount if prior2HourStepCount is not None else prior2HourStepCountAgent
+    if p2h is None:
+        raise TypeError("build_rl_context_vector requires prior2HourStepCount")
     return np.array([
         float(yesterdayStepCount),
-        float(prior2HourStepCountAgent), float(activeDaysLast7Days),
+        float(p2h), float(activeDaysLast7Days),
         float(activitySuggestionsSentLast7Days),
         float(activitySuggestionInteractLast7Days),
     ], dtype=float)
@@ -1616,15 +1620,13 @@ def make_state(context):
     """Convert environment context into the ``state`` dict for :func:`build_phi_action`.
 
     ``context`` must contain ``E_w``, ``M_Y``, ``M_E``, and ``C``
-    (length ``N_RL_CONTEXT``). ``query_x_weekly_present`` (``I_w * J_w``)
-    is optional and defaults to 0.
+    (length ``N_RL_CONTEXT``).
     """
     return {
         "E_w": float(context["E_w"]),
         "M_Y": np.asarray(context["M_Y"], dtype=float),
         "M_E": np.asarray(context["M_E"], dtype=float),
         "C": np.asarray(context["C"], dtype=float).ravel(),
-        "query_x_weekly_present": _query_x_weekly_from_state(context),
     }
 
 
@@ -1634,7 +1636,7 @@ def build_pf_data(
     sim_w_prev,
     nweek,
     W_days,
-    stepCountNext4HourObsAll,
+    stepCountNext4HourAll,
     dailyAnticipatedAffectObsAll,
     CAE_all,
     CAE_short_all,
@@ -1648,8 +1650,8 @@ def build_pf_data(
     """Assemble PF inputs for the belief update at RL week ``k`` (0-based).
 
     Design rows are built on demand via ``fourSC_row_fn(step_idx)``,
-    ``antic_row_fn(d_global)``, and ``cae_row_fn(sim_w)`` from logged outcomes
-    and covariates (not from ``self.s``).
+    ``antic_row_fn(d_global)``, and ``cae_row_fn(sim_w)`` from logged
+    outcomes, covariates, and frozen episode-start lags (not live ``self.s``).
     """
     K14 = FOURSC_SLOTS_PER_WEEK
     antic_lag1_col = 1
@@ -1665,7 +1667,7 @@ def build_pf_data(
     four_rows = np.array([start_row + m for m in range(N_MED_SLOT)], dtype=int)
     X_four = np.array([fourSC_row_fn(int(r)) for r in four_rows], dtype=float)
     delta_four = np.array([fourSC_cae_delta(X_four[i]) for i in range(X_four.shape[0])])
-    y_four = stepCountNext4HourObsAll[four_rows].copy()
+    y_four = stepCountNext4HourAll[four_rows].copy()
 
     antic_rows = np.array(
         [sim_w_prev * W_days + d for d in range(N_MED_ANTIC_DAY)], dtype=int,
@@ -1698,7 +1700,7 @@ def build_pf_data(
         delta_four_c = np.array([
             fourSC_cae_delta(X_four_c[i]) for i in range(X_four_c.shape[0])
         ])
-        y_four_c = stepCountNext4HourObsAll[four_rows_c].copy()
+        y_four_c = stepCountNext4HourAll[four_rows_c].copy()
         obs_mask_four = np.isfinite(y_four_c)
         X_cumul_MY_base.append(X_four_c[obs_mask_four])
         cae_delta_cumul_MY.append(delta_four_c[obs_mask_four])
@@ -1736,7 +1738,9 @@ def build_pf_data(
         cae_delta_full = np.zeros((sim_w_prev, 2))
         cae_delta_full[:, 1] = 1.0
         y_tY_full = CAE_short_all[1:sim_w_prev + 1].copy()
-        jw_tY_mask = wp_all[:sim_w_prev] == 1.0
+        # ``wp_all[i]`` and ``CAE_short_all[i]`` are written on the same Sunday
+        # (i >= 1): J_i gates CAE of week i-1.
+        jw_tY_mask = wp_all[1:sim_w_prev + 1] == 1.0
         X_cumul_tY = X_tY_full[jw_tY_mask]
         cae_delta_cumul_tY = cae_delta_full[jw_tY_mask]
         y_cumul_tY = y_tY_full[jw_tY_mask]
@@ -1811,9 +1815,10 @@ def _within_week_ewma(values, gamma=None):
     """Normalized discounted average over a chronological within-week sequence.
 
     Same formula as ``1_data_extraction._ewm_prior_rows``. ``gamma=None``
-    (default) derives the decay from the number of points visible so far
+    (default) derives the decay from the calendar length of ``values``
     (:func:`ewm_utils.gamma_from_n`) — e.g. the 12-slot fourSC stream and the
-    6-day antic stream get different-but-comparable decay envelopes. Empty → 0.
+    6-day antic stream get different-but-comparable decay envelopes. NaNs
+    keep their slot in the decay. Empty → 0.
     """
     return ewma_gamma(values, gamma, empty=0.0)
 
@@ -1874,15 +1879,6 @@ def _time_features(d, t):
     return weekday_vs_weekend, slot_pm
 
 
-def _query_x_weekly_from_state(state) -> float:
-    val = state.get("query_x_weekly_present", 0.0)
-    try:
-        val = float(val)
-    except (TypeError, ValueError):
-        return 0.0
-    return val if np.isfinite(val) else 0.0
-
-
 PHI_STATE_BASE_NAMES = (
     "intercept",
     "weekday_vs_weekend",
@@ -1890,7 +1886,6 @@ PHI_STATE_BASE_NAMES = (
     "E_w",
     "b_hat",
     "b_tilde",
-    "query_x_weekly_present",
 )
 PHI_STATE_BTILDE_INDEX = PHI_STATE_BASE_NAMES.index("b_tilde")
 
@@ -1899,7 +1894,7 @@ def build_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0):
     """
     State-only features shared by RLSVI and DQN (no action cross-terms).
 
-    phi_state = [1, d_n, t_n, E_w, b_hat, b_tilde, I_w*J_w]
+    phi_state = [1, d_n, t_n, E_w, b_hat, b_tilde]
               ⌢ [M_ewma (AA, SC, PV, FW, PJ), C_{w,d,t}]
 
     ``d_n`` / ``t_n`` are the weekday/weekend and AM/PM encodings from
@@ -1909,10 +1904,9 @@ def build_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0):
     d_feat, t_feat = _time_features(d, t)
     M_ewma = summarize_mediators_ewma(state["M_Y"], state["M_E"], d, t)
     C_dt = np.asarray(state["C"]).ravel()
-    qxw = _query_x_weekly_from_state(state)
 
     base = np.array([
-        1.0, d_feat, t_feat, E_w, b_hat, b_tilde, qxw,
+        1.0, d_feat, t_feat, E_w, b_hat, b_tilde,
     ])
     if base.size != len(PHI_STATE_BASE_NAMES):
         raise RuntimeError(
@@ -1927,7 +1921,7 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
     """
     Feature map  phi(tilde_S_{w,d,t}, A_{w,d,t}).
 
-    phi = [1, d_n, t_n, E_w, b_hat, b_tilde, I_w*J_w]
+    phi = [1, d_n, t_n, E_w, b_hat, b_tilde]
         ⌢ [M_ewma (AA, SC, PV, FW, PJ), C_{w,d,t}]
         ⌢ A * [1, E_w, b_hat, b_tilde]            if ACTION_BLOCK_INCLUDE_C=0
         ⌢ A * [1, E_w, b_hat, b_tilde, C_{w,d,t}]  otherwise
@@ -1943,15 +1937,14 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
         'E_w'  : float
         'M_Y'  : (6, n_y) array
         'M_E'  : (6, n_e) array
-        'C'    : (n_c,) array – decision-point context (no I_w*J_w)
-        'query_x_weekly_present' : float – I_w * J_w
+        'C'    : (n_c,) array – decision-point context
     d       : int – zero-based day, 0..5
     t       : int – zero-based slot, 0 or 1
     action  : int – A_{w,d,t} in {0, 1}
 
     Returns
     -------
-    phi : (p,) array   where  p = 7 + 5 + n_c + (4 + n_c * ACTION_BLOCK_INCLUDE_C)
+    phi : (p,) array   where  p = 6 + 5 + n_c + (4 + n_c * ACTION_BLOCK_INCLUDE_C)
     """
     E_w = state['E_w']
     C_dt = np.asarray(state['C']).ravel()
@@ -1976,10 +1969,9 @@ def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
         nxt_d, nxt_t = next_slot
     M_ewma = summarize_mediators_ewma(state['M_Y'], state['M_E'], nxt_d, nxt_t)
     C_dt = np.asarray(state['C']).ravel()
-    qxw = _query_x_weekly_from_state(state)
 
     base = np.array([
-        1.0, d_feat, t_feat, E_w, b_hat, b_tilde, qxw,
+        1.0, d_feat, t_feat, E_w, b_hat, b_tilde,
     ])
     med_ctx = np.concatenate([M_ewma, C_dt])
     return np.concatenate([base, med_ctx])
@@ -1992,11 +1984,10 @@ def build_daily_mediator_phi(b_hat, b_tilde, state, d, t, action,
                              mediator=None):
     """Feature vector for the daily-mediator return decomposition.
 
-    ``mediator`` is one of ``AA``, ``FW``, or ``PJ``.  The incentive-by-week
-    term is deliberately present only for FW and PJ, matching the protocol.
-    Weekday/weekend is omitted: both decision times on a day share the same
-    daily outcome, so a day encoding cannot identify within-day shares.
-    ``d`` / ``t`` still select which past mediators enter the EWMA.
+    ``mediator`` is one of ``AA``, ``FW``, or ``PJ``. Weekday/weekend is
+    omitted: both decision times on a day share the same daily outcome, so
+    a day encoding cannot identify within-day shares. ``d`` / ``t`` still
+    select which past mediators enter the EWMA.
     """
     E_w = float(state["E_w"])
     C_dt = np.asarray(state["C"], dtype=float).ravel()
@@ -2006,19 +1997,16 @@ def build_daily_mediator_phi(b_hat, b_tilde, state, d, t, action,
     action_ctx = float(action) * np.concatenate(
         [[1.0, E_w, float(b_hat), float(b_tilde)], C_dt]
     )
-    out = np.concatenate([
+    return np.concatenate([
         [1.0, E_w, float(b_hat), float(b_tilde)], med_ctx, action_ctx
     ])
-    if mediator in {"FW", "PJ"}:
-        out = np.concatenate([out, [_query_x_weekly_from_state(state)]])
-    return out
 
 
 def build_redistribution_phi(b_hat, b_tilde, state, d, t, action,
                              daily_shares, full_mediators=None):
     """Stage-2 feature vector for within-week reward redistribution.
 
-    psi = [1, d_n, E_w, b_hat, b_tilde, I_w*J_w]
+    psi = [1, d_n, E_w, b_hat, b_tilde]
         ⌢ [M_ewma (AA, SC, PV, FW, PJ), C_{w,d,t}]
         ⌢ [M^Y_{d,t}, M^E_{d,t}, AA_hat, FW_hat, PJ_hat]
 
@@ -2037,8 +2025,7 @@ def build_redistribution_phi(b_hat, b_tilde, state, d, t, action,
     next_my = float(M_Y[d, t])
     next_me = float(M_E[d, t])
     return np.concatenate([
-        [1.0, d_feat, E_w, float(b_hat), float(b_tilde),
-         _query_x_weekly_from_state(state)],
+        [1.0, d_feat, E_w, float(b_hat), float(b_tilde)],
         summarize_mediators_ewma(state["M_Y"], state["M_E"], d, t), C_dt,
         [next_my, next_me], np.asarray(daily_shares, dtype=float).ravel(),
     ])
@@ -2930,7 +2917,7 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
       • Query block (block 0) is always zero; walking block (block 1)
         is active.
 
-    phi = [1, d_n, t_n, E, b_hat, b_tilde, I_w*J_w]
+    phi = [1, d_n, t_n, E, b_hat, b_tilde]
         ⌢ [M_ewma, C_{w,d,t}]
         ⌢ [query: 1, E, b_hat, b_tilde (, C if ACTION_BLOCK_INCLUDE_C)]
         ⌢ [walk:  1, E, b_hat, b_tilde (, C if ACTION_BLOCK_INCLUDE_C)]
@@ -2951,7 +2938,7 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
 
     Returns
     -------
-    phi : (p,) array   where  p = 7 + 5 + n_c + 2*(4 + n_c * ACTION_BLOCK_INCLUDE_C)
+    phi : (p,) array   where  p = 6 + 5 + n_c + 2*(4 + n_c * ACTION_BLOCK_INCLUDE_C)
     """
     E_w = state['E_w']
     C_dt = np.asarray(state['C']).ravel()              # (n_c,)
@@ -2960,7 +2947,6 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
     # same length so phi's dimension is identical for query and walking
     # (the agent uses one shared beta for both).
     C_dt_eff = np.zeros_like(C_dt) if is_query else C_dt
-    qxw = 0.0 if is_query else _query_x_weekly_from_state(state)
 
     if is_query:
         d_feat, t_feat = 0.0, 0.0
@@ -2970,7 +2956,7 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
         M_ewma = summarize_mediators_ewma(state['M_Y'], state['M_E'], d, t)
 
     base = np.array([
-        1.0, d_feat, t_feat, E_w, b_hat, b_tilde, qxw,
+        1.0, d_feat, t_feat, E_w, b_hat, b_tilde,
     ])
     med_ctx = np.concatenate([M_ewma, C_dt_eff])
     interact = action_interact_vec(E_w, b_hat, b_tilde, C_dt_eff)
