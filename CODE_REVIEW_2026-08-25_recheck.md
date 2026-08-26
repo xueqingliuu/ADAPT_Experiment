@@ -110,3 +110,53 @@ Remaining items — all small:
 2. **`wp_all[0] = 1.0` bootstrap** (`experiment.py:335`): simulated week 0 gets the q boost, but the fitted week-1 has `J_lag = 0` (study entry, no prior intervention). Its only remaining role is the week-0 mediator gate, so `0.0` is the faithful choice — unless the RL deployment actually opens with a delivered weekly intervention; your call, one character either way.
 3. **Loop-gain guards omit the q path** (low): `_loop_gain_penalty` (`4_perceived_utility.py:1851-1875`) and `tune_ste.loop_gain_Ew` (`:770-809`) compute d(med)/dE without the `qE·J` contribution (and there is now a second, two-week feedback path E_w → J_w → med_{w+1}). With |q| small this barely moves g, but the barrier claims to bound the compound gain — add J∈{0,1} arms (dPV/dE = α₁ + A·α₄ + J·α_qE, etc.) or note the omission next to the formula.
 4. The PF-side question from §2 stands (CAE-short assumed observed on all J=1 weeks — fine iff the short measure is embedded in the opened intervention, which your protocol description supports).
+
+---
+
+## 5. STE tuning review — tune_ste.py, ste_vanilla.py, run_tune_ste.sh (21:00 tree)
+
+Scope: the two commands you ran — `apply burden_shift κ=0.4 → env_para_burden_shift_large`, then `calibrate foursc_to_y_shift targets 0.5/0.8 on that folder`. Full read of all three files plus empirical checks against the folders on disk.
+
+### T1. HIGH — the κ=0.4 folder on disk (and on the cluster) was built with the OLD burden_shift semantics; re-apply is NOT optional
+- **Evidence:** `env_para_burden_shift_large/ste_tuning.json` records `multipliers: {A_to_ME: 0.4, E_to_MY: −0.4}` with 372 scaled coefficients (12/user) — the old pathway that subtracts κ from the **A×E_w interactions too** (verified per-user: `alpha4_action_by_Ew` shifted −0.188→−0.588 etc.). The current knob is `{A_to_ME_main: κ, E_to_MY: −κ}` (mains only, 9/user), introduced precisely because the old version makes the fatigue addend −κ(1+E_w), which **flips sign for E_w < −1** — sending *raises* engagement in exactly the low-engagement states that matter.
+- **Blast radius:** everything stacked on that folder inherits it — `env_para_ste0.5_bs_large_bf`, `env_para_ste0.8_bs_large_bf`, and the `results_ste0.5/0.8_bs_large_bf_loo` experiment outputs.
+- **Fix:** after the pipeline refit, rerun command 1 with the current code (`--overwrite` will be needed: same knob name, so `refuse_knob_overwrite` won't block; but the stale `ste_tuning.json` will be replaced correctly), then re-calibrate the stacked folders.
+
+### T2. HIGH — `_pv_hurdle_action_scales` translates subtractive knobs multiplicatively; ratios explode and flip sign
+- **File:** `vani_env.py:1081-1111`: `s_a = a3_now / a3_van` (guarded only against |a3_van|<1e-12 and non-finite), then hurdle logistic `coef[5] *= s_a`, `coef[6] *= s_ae`.
+- **Measured on the κ=0.4 folder:** s_a ∈ [−6.3, +58.1], median ≈ 0; **|s_a| > 5 for 4 users and sign-flipped for 15 of 31**. uid 333: a3 = −0.007 → −0.407 ⇒ hurdle action slope ×58 — P(PV>0 | A) saturates; uid 33: s_a = −6.3 — direction and magnitude both distorted. The pathology is inherent: an *additive* shift on a Gaussian mean coefficient (a3 ← a3 − κ) cannot be represented as a *multiplicative* rescaling of a logistic slope, and it persists under the current mains-only knob (s_a = (a3v−κ)/a3v still blows up whenever the fitted a3v ≈ 0, which is typical).
+- **Consequence:** in every burden_shift-derived folder, the PV-occurrence response to the action is not the intended −κ z-units — for some users it is enormous, for half it points the wrong way. This distorts PV → E_w dynamics differently per arm and per user, so both the proxy STE and the confirmation STE are measured in a DGP that does not match the documented knob.
+- **Fix:** translate additive knobs additively, using the machinery already there for the J shift: compute the intended Gaussian action-effect change Δμ_A = (a3_now − a3_van) + (a4_now − a4_van)·E_w and add `A · Δμ_A / (z̄₊ − z₀)` to `p_adj` inside `_pv_hurdle_occurrence` (exactly like `intended`), keeping the fitted hurdle slopes untouched. Keep the ratio path only for multiplicative knobs (`action`, `benefit`, `burden`, `benefit_foursc`'s A→MY part), or clip s_a and warn loudly.
+- **Test:** for a subtract knob, assert `gen_pageview_mean(s, A=1) − gen_pageview_mean(s, A=0)` in the tuned env ≈ (vanilla difference − κ) within the hurdle's representable range, per user.
+
+### T3. MEDIUM — your second command is documented (twice) to be infeasible
+`foursc_to_y_shift` calibrate to 0.5/0.8 on the burden folder: the module docstring (`tune_ste.py:55-58`) and the shell header (`run_tune_ste.sh:27`) both record that this knob caps at proxy STE ≈ 0.36 (job 41048118; CAE hits its clip limits, and the CAE loop-gain cap binds). `calibrate` will print "closest achievable", skip both targets, exit 1, and submit nothing. The recorded working recipe is `TUNE_KNOB=benefit_foursc` (which is exactly what produced your existing `_bs_large_bf` folders). If you specifically want the foursc-shift mechanism, targets ≤ ~0.3 are the realistic range — verify with `TUNE_PHASE=scan` first.
+
+### T4. MEDIUM (statistical, known & now documented) — the calibration proxy is an upward-biased, different estimand
+Proxy = per-user max over arms (Bernoulli 0.5/1.0 ± transferred CQL) of the paired Δ̂ **on the same episodes used to pick the arm**, truncated at 0, ÷ σ̂(never-suggest). Same-sample max ⇒ winner's curse; truncation ⇒ E[max(0,noise)] > 0 near null. The docstrings now state this clearly and the confirmation pipeline measures the honest estimand, so this is an accepted design — but remember that "env_para_ste0.5" names the *proxy* target; papers should quote `ste_vanilla aggregate`. Cheap tightening if you ever want it: split the 100 paired episodes — pick the arm on half, estimate Δ on the other half (removes the max bias at the cost of √2 noise).
+
+### T5. MEDIUM — the transferred-CQL arm (TUNE_DQN_EXP=5 default) predates the pipeline refit
+`run_tune_ste.sh:116` defaults the extra proxy arm to `d3rlpy_logs/ste_exp_5` checkpoints, which were trained under the **old** vanilla DGP. After the current refit (query rework + H-fixes) those policies come from a different environment than the "source env" the docstring intends. Retrain exp 5 on the refit vanilla before recalibrating, or set `TUNE_DQN_EXP=''` and calibrate on the Bernoulli grid only (the compat checker will not catch this — it validates the observation map, deliberately not the env parameters).
+
+### T6–T9. LOW
+- **T6:** both loop-gain guards (`tune_ste.loop_gain_Ew`, script-4 barrier) omit the `qE·J` contribution to d(med)/dE and the new two-week E→J→med path (see §4.3).
+- **T7:** calibrate/scan scratch dirs (`.ste_tune_scratch_*`, one subfolder per κ, each with a full params copy + `df_fit_11week.csv`) are never deleted.
+- **T8:** `aggregate_ste` reports the mean user STE with no uncertainty; sd across users/√n (plus the per-user paired SEs already in metadata) would cost one line.
+- **T9:** `SUPPORTING_FILES` copies the (currently stale) `rl_priors.json` into every tuned folder — same H1/N4 regeneration requirement applies to tuned folders.
+
+### Verified sound (checked, no issues)
+- **ste_vanilla.py procedure:** seed hygiene is clean and asserted disjoint (train 2024+jobid+ep / selection 100000+ / gate 150000+ / test 300000+); checkpoint selection on val seeds, deployment gate on independent seeds (`Δ − c·SE > 0`, paired SE = sd(D)/√n — correct), test on fresh seeds; gated-out users contribute STE exactly 0 via `out[n,1]=out[n,0]` — an honest estimate of the deployed decision rule, with no winner's-curse leakage into the test estimate.
+- **CRN pairing:** every arm re-seeds the global RNG per episode (`rd.seed(seed)` in `rollout_total_cae`); `prepare_ste_state_vector` is called on non-DQN arms too, so all arms consume the same pre-decision draws; tune_ste's zero-arm cache is correctly restricted to `sigma_invariant` knobs (burden_shift/foursc shift correctly re-simulate the control arm at every κ).
+- **Reward/discount construction:** weekly CAE reward lands on the terminal Saturday slot after `_finalize_week` (matching `run_episode` ordering); `WeeklyDiscountTransitionPicker` (γ within week 1, 0.5 at the boundary) matches `_gamma_dt_micro` and est_prior's FQI; the timeout sentinel with one look-ahead week is the correct d3rlpy encoding of a truncated continuing task.
+- **No future information:** `known_weekly_cae(k)` = CAE of week k−1 (finalized before week k); the frozen 20-d STE observation is built from `get_context` (strictly-past mediators) after generating the current slot's pre-decision covariates.
+- **Metadata gates:** eval now refuses a params_dir mismatch (round-1 L4 fixed); the shell's checkpoint compat checker validates algo + frozen state_dim before enabling the CQL arm; `folder_is_stable` gates auto-submission on `stable: true`; the knob stack is recorded through stacked folders.
+- **Stacking mechanics:** `apply` → `calibrate --params-dir <applied folder>` composes correctly (pathway sets disjoint; supporting files and the loo_priors symlink propagate; `refuse_knob_overwrite` and per-target suffixed output dirs prevent clobbering).
+- **Root finder:** secant + Illinois false-position with a shared response curve across targets, stability-capped bracket, and same-seed evaluations (smooth f(κ)) — sensible and robust; `largest_stable_kappa` bisection is valid because every gain is affine in κ (the stable set is an interval containing 0).
+
+### Suggested order of operations for the large-fatigue stack
+1. Finish the pipeline refit (4→5→6, priors) — everything below re-derives from it.
+2. Fix T2 (hurdle translation for subtract knobs); optionally add the J arm to the loop-gain guards (T6).
+3. Re-run command 1 (`apply burden_shift κ=0.4`) with the current code — do not reuse the cluster folder (T1).
+4. Retrain the vanilla CQL arm (exp 5) or set `TUNE_DQN_EXP=''` (T5).
+5. Calibrate with `TUNE_KNOB=benefit_foursc` for 0.5/0.8 (T3); use `foursc_to_y_shift` only via `scan` if you want its mechanism at lower targets.
+6. Let the auto-submitted `run_ste.sh` confirmation runs define the reported STE (T4).

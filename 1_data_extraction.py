@@ -166,6 +166,20 @@ def _convert_one_utc_to_local(ts_utc, tz_name, utc_offset):
     return (ts_utc + delta).tz_localize(None)
 
 
+def _as_calendar_dates(s):
+    """Python ``datetime.date`` values; missing timestamps stay pandas ``NaT``.
+
+    ``Series.dt.date`` on NaT becomes float NaN, which cannot be compared with
+    ``datetime.date`` in ``groupby.min``. Keep a uniform object column instead.
+    """
+    ts = pd.to_datetime(s, errors="coerce")
+    out = pd.Series(pd.NaT, index=ts.index, dtype=object)
+    ok = ts.notna()
+    if ok.any():
+        out.loc[ok] = ts.loc[ok].dt.date
+    return out
+
+
 def convert_utc_columns_to_user_local(
     df,
     datetime_cols,
@@ -174,18 +188,58 @@ def convert_utc_columns_to_user_local(
 ):
     """Vectorized UTC→local conversion (groupby IANA tz / offset)."""
     out = df.copy()
-
+    out["_pid"] = out[participant_col].astype(str)
     out["_join_date"] = (
         pd.to_datetime(out[join_date_col], errors="coerce", utc=True).dt.date
     )
 
+    tz = tz_lookup.copy()
+    tz["ParticipantIdentifier"] = tz["ParticipantIdentifier"].astype(str)
+
     out = out.merge(
-        tz_lookup,
+        tz,
         how="left",
-        left_on=[participant_col, "_join_date"],
+        left_on=["_pid", "_join_date"],
         right_on=["ParticipantIdentifier", "date"],
         suffixes=("", "_tz"),
     )
+
+    # UTC calendar date is often the next local day for US evening stamps.
+    miss = out["timeZone"].isna() & out["utcOffset"].isna()
+    if miss.any():
+        prev_date = pd.to_datetime(out.loc[miss, "_join_date"], errors="coerce") - pd.Timedelta(
+            days=1
+        )
+        prev = pd.DataFrame(
+            {
+                "_pid": out.loc[miss, "_pid"].to_numpy(),
+                "date": prev_date.dt.date.to_numpy(),
+            },
+            index=out.index[miss],
+        )
+        prev = prev.merge(
+            tz,
+            how="left",
+            left_on=["_pid", "date"],
+            right_on=["ParticipantIdentifier", "date"],
+        )
+        prev.index = out.index[miss]
+        out.loc[miss, "timeZone"] = prev["timeZone"]
+        out.loc[miss, "utcOffset"] = prev["utcOffset"]
+
+    # Last resort: this participant's usual zone (not UTC wall clock).
+    miss = out["timeZone"].isna() & out["utcOffset"].isna()
+    if miss.any():
+        pid_fb = (
+            tz.sort_values(["ParticipantIdentifier", "date"])
+            .groupby("ParticipantIdentifier", as_index=False)
+            .agg({"timeZone": _first_nonempty, "utcOffset": _first_nonempty})
+            .rename(columns={"ParticipantIdentifier": "_pid"})
+        )
+        fb = out.loc[miss, ["_pid"]].merge(pid_fb, on="_pid", how="left")
+        fb.index = out.index[miss]
+        out.loc[miss, "timeZone"] = fb["timeZone"]
+        out.loc[miss, "utcOffset"] = fb["utcOffset"]
 
     for col in datetime_cols:
         ts = pd.to_datetime(out[col], errors="coerce", utc=True)
@@ -229,7 +283,14 @@ def convert_utc_columns_to_user_local(
         out[col] = local
 
     out = out.drop(
-        columns=["_join_date", "ParticipantIdentifier_tz", "date", "timeZone", "utcOffset"],
+        columns=[
+            "_join_date",
+            "_pid",
+            "ParticipantIdentifier_tz",
+            "date",
+            "timeZone",
+            "utcOffset",
+        ],
         errors="ignore",
     )
     return out
@@ -253,6 +314,7 @@ def _filter_wearable_to_participant_windows(df, participant_ids, summary_df, pad
         on="ParticipantIdentifier",
         how="inner",
     )
+    out = out[out["Date"].notna()]
     out = out[(out["Date"] >= out["start_date"]) & (out["Date"] <= out["end_date"])]
     return out.drop(columns=["start_date", "end_date"])
 
@@ -321,10 +383,10 @@ surveyquestionresults = convert_utc_columns_to_user_local(
 )
 
 # Add local calendar dates after timezone conversion.
-surveytask["date"] = pd.to_datetime(surveytask["InsertedDate"]).dt.date
-surveyquestionresults["date"] = pd.to_datetime(
+surveytask["date"] = _as_calendar_dates(surveytask["InsertedDate"])
+surveyquestionresults["date"] = _as_calendar_dates(
     surveyquestionresults["InsertedDate"]
-).dt.date
+)
 
 survey_key_weekly = surveytask[surveytask.SurveyName == 'MRT - Weekly Check-in survey'].SurveyKey.values[0]
 survey_key_monthly = surveytask[surveytask.SurveyName == 'MRT - Monthly check-in survey and goal setting'].SurveyKey.values[0]
@@ -348,9 +410,11 @@ print(surveyquestionresults.head())
 # ## 1c. Active-phase span (daily EOD survey tasks)
 
 # %%
-surveytask['date'] = pd.to_datetime(surveytask['InsertedDate']).dt.date
 # survey_task_active = surveytask[surveytask.surveyname == 'MRT - Salience - Message Display']
-survey_task_active = surveytask[surveytask.SurveyName == 'MRT - Daily End of day survey and Planning Exercise']
+survey_task_active = surveytask[
+    (surveytask.SurveyName == 'MRT - Daily End of day survey and Planning Exercise')
+    & surveytask['date'].notna()
+]
 summary_surveytask = (
     survey_task_active
     .groupby('ParticipantIdentifier')['date']
@@ -2147,12 +2211,12 @@ print(heartratebymin.head())
 
 # %%
 # for the active phase, we require 12*7 = 84 days of step count data
-heartratebymin["DateTime"] = pd.to_datetime(heartratebymin["DateTime"])
-heartratebymin["Date"] = heartratebymin["DateTime"].dt.date
+heartratebymin["DateTime"] = pd.to_datetime(heartratebymin["DateTime"], errors="coerce")
+heartratebymin["Date"] = _as_calendar_dates(heartratebymin["DateTime"])
 heartratebymin = heartratebymin.sort_values(by=["ParticipantIdentifier", "DateTime"])
 
 summary = (
-    heartratebymin
+    heartratebymin.dropna(subset=["Date"])
     .groupby("ParticipantIdentifier")["Date"]
     .agg(date_min="min", date_max="max", n_days="nunique")
     .assign(span_days=lambda df: (pd.to_datetime(df.date_max) -
@@ -2190,12 +2254,12 @@ stepcountbymin = convert_utc_columns_to_user_local(
 )
 
 # %%
-stepcountbymin["DateTime"] = pd.to_datetime(stepcountbymin["DateTime"])
-stepcountbymin["Date"] = stepcountbymin["DateTime"].dt.date
+stepcountbymin["DateTime"] = pd.to_datetime(stepcountbymin["DateTime"], errors="coerce")
+stepcountbymin["Date"] = _as_calendar_dates(stepcountbymin["DateTime"])
 stepcountbymin = stepcountbymin.sort_values(by=["ParticipantIdentifier", "DateTime"])
 
 summary = (
-    stepcountbymin
+    stepcountbymin.dropna(subset=["Date"])
     .groupby("ParticipantIdentifier")["Date"]
     .agg(date_min="min", date_max="max", n_days="nunique")
     .assign(span_days=lambda df: (pd.to_datetime(df.date_max) -
