@@ -5,7 +5,7 @@
 #SBATCH -c 1
 #SBATCH -t 2-10:00:00
 #SBATCH --mem=3G
-#SBATCH --array=1-300%20
+#SBATCH --array=1-100%20
 #SBATCH -o logs/exp_%A_%a.out
 #SBATCH -e logs/exp_%A_%a.err
 

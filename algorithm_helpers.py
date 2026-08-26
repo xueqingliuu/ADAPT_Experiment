@@ -703,11 +703,10 @@ def weekly_pv_sum_for_ew(slot_pv, *, shift=None, scale=None):
     return float(np.nansum(v) / 14.0)
 
 
-def apply_pooled_coefs(coefs, J_w, half_J_tool8, PV_sum, FW_sum, PJ_sum):
+def apply_pooled_coefs(coefs, half_J_tool8, PV_sum, FW_sum, PJ_sum):
     """Apply the pooled linear approximation for agent-visible E_w."""
     return float(
         float(coefs.get("intercept", 0.0))
-        + coefs["J_w"] * float(J_w)
         + coefs["half_J_tool8"] * float(half_J_tool8)
         + coefs["PV_sum"] * float(PV_sum)
         + coefs["FW_sum"] * float(FW_sum)

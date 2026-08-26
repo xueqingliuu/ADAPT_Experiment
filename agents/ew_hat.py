@@ -102,7 +102,6 @@ def initial_Ew_hat_for_user(user_id, df_fit=None, coefs=None):
     last = tbl.sort_values("week").iloc[-1]
     return apply_pooled_coefs(
         coefs,
-        last["J_w"],
         last["half_J_tool8"],
         last["PV_sum"],
         last["FW_sum"],
@@ -156,5 +155,5 @@ def compute_Ew_hat_from_week(
     fw_sum = float(np.nansum(dw_wk) / 7.0)
     pj_sum = float(np.nansum(dp_wk) / 7.0)
     return apply_pooled_coefs(
-        coefs, J_w, half_J_tool8, pv_sum, fw_sum, pj_sum,
+        coefs, half_J_tool8, pv_sum, fw_sum, pj_sum,
     )

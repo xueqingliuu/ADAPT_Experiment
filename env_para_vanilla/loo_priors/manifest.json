@@ -25,13 +25,17 @@
     204,
     225,
     239,
+    248,
     252,
     269,
     277,
     285,
+    291,
     299,
     307,
-    333
+    327,
+    333,
+    339
   ],
   "files": {
     "13": "held_out_13.json",
@@ -58,12 +62,16 @@
     "204": "held_out_204.json",
     "225": "held_out_225.json",
     "239": "held_out_239.json",
+    "248": "held_out_248.json",
     "252": "held_out_252.json",
     "269": "held_out_269.json",
     "277": "held_out_277.json",
     "285": "held_out_285.json",
+    "291": "held_out_291.json",
     "299": "held_out_299.json",
     "307": "held_out_307.json",
-    "333": "held_out_333.json"
+    "327": "held_out_327.json",
+    "333": "held_out_333.json",
+    "339": "held_out_339.json"
   }
 }

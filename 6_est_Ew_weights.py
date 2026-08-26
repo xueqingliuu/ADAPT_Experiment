@@ -1,9 +1,10 @@
 """Approximate filtered E_w with a pooled linear combination of weekly summaries.
 
 Used at RCT time, when the latent E_w from script 4 is not available. The
-outcome is the filtered trajectory in ``pred_<uid>.json``. The five predictors
-are weekly check-in, pleasantness/helpfulness, page-view average, Fitbit-wear
-average, and daily-check-in average.
+outcome is the filtered trajectory in ``pred_<uid>.json``. The four predictors
+are pleasantness/helpfulness, page-view average, Fitbit-wear average, and
+daily-check-in average. Week-survey presence ``J_w`` is not a standalone
+regressor; it only gates ``half_J_tool8``.
 
 PV/FW/PJ averages use the same fixed denominators as script 4 (14 slots /
 7 days) with missing values as 0. FW therefore treats a missing wear flag
@@ -36,9 +37,9 @@ COMBINED_DIR = Path(
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
 EW_POOLED_COEF_JSON = WORK_DIR / "Ew_pooled_linear_coefs.json"
 COEF_DECIMALS = 3
-FEATURE_COLS = ["J_w", "half_J_tool8", "PV_sum", "FW_sum", "PJ_sum"]
+FEATURE_COLS = ["half_J_tool8", "PV_sum", "FW_sum", "PJ_sum"]
 OUTCOME_COL = "pred_penalized_filtered_Ew"
-DEFAULT_RIDGE_ALPHA = 15.0
+DEFAULT_RIDGE_ALPHA = 10.0
 DEFAULT_NONNEGATIVE_SLOPES = True
 
 
@@ -198,7 +199,6 @@ def build_pooled_regression_frame(
                     "ParticipantIdentifier": r["ParticipantIdentifier"],
                     "week": wk,
                     "pred_penalized_filtered_Ew": ew_by_w[wk],
-                    "J_w": r["J_w"],
                     "half_J_tool8": r["half_J_tool8"],
                     "PV_sum": r["PV_sum"],
                     "FW_sum": r["FW_sum"],
@@ -219,10 +219,10 @@ def fit_within_user_linear_Ew(
     Shared within-user slopes via person-mean demeaning (+ optional ridge), plus
     a grand-mean intercept so predictions apply to raw weekly predictors.
 
-    ``ridge_alpha=0`` is within-user OLS; ``ridge_alpha>0`` is ridge on the
-    demeaned predictors in their original units. When ``nonnegative_slopes`` is
-    true, every slope is constrained to be at least zero; the reconstructed
-    intercept remains unconstrained.
+    ``ridge_alpha=0`` is within-user OLS; ``ridge_alpha>0`` (default 5) is ridge
+    on the demeaned predictors in their original units. When
+    ``nonnegative_slopes`` is true, every slope is constrained to be at least
+    zero; the reconstructed intercept remains unconstrained.
     """
     ycol = OUTCOME_COL
     md = m.copy()
@@ -292,7 +292,7 @@ def fit_pooled_linear_Ew(
         ordinary pooled OLS on raw levels (``ridge_alpha`` ignored).
     ridge_alpha :
         Ridge penalty used after within-user demeaning (original predictor units).
-        Default 15. Set to 0 for within-user OLS.
+        Default 5. Set to 0 for within-user OLS.
     nonnegative_slopes :
         If True (default), constrain every within-user slope to be nonnegative.
         Ignored for pooled OLS.
