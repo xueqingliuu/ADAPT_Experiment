@@ -714,9 +714,10 @@ seed = 2026
 
 dat_user_all = []
 
-# Keep only users with at least one observed CAE value.
-# Users with no CAE observations lead to fallback-zero CAE models, which can
-# create unrealistic downstream trajectories.
+# Script 1 already drops all-missing CAE at cohort construction
+# (EXCLUDE_IF_ALL_CAE_MISSING). Keep this check as a safety net: a all-NaN
+# CAE_avg_norm would yield a fallback-zero CAE model and unrealistic
+# downstream trajectories.
 _all_userids = df_fit['ParticipantIdentifier'].unique()
 _has_cae_obs = (
     df_fit.groupby('ParticipantIdentifier', sort=False)['CAE_avg_norm']
@@ -938,6 +939,8 @@ X_fourSC_obs = fourSC_bayes_df[THETA_FOURSC_NAMES].to_numpy(dtype=float)
 y_fourSC_obs = fourSC_bayes_df["FourSC"].to_numpy(dtype=float)
 groups_fourSC_obs = fourSC_bayes_df["ParticipantIdentifier"].to_numpy()
 
+# 24-column RE model × 35 users; 2k/1k at target_accept=0.97 hit
+# max_rhat=1.018 (0 divergences). Match CAE's longer NUTS schedule.
 mixedlm_fourSC = fit_bayesian_random_coef_model(
     y=y_fourSC_obs,
     X=X_fourSC_obs,
@@ -946,9 +949,9 @@ mixedlm_fourSC = fit_bayesian_random_coef_model(
     beta_prior_mu=FOURSC_BETA_PRIOR_MU,
     beta_prior_sd=FOURSC_BETA_PRIOR_SD,
     re_sd_prior_mode=FOURSC_RE_SD_PRIOR_MODE,
-    draws=1000,
-    tune=2000,
-    target_accept=0.97,
+    draws=2000,
+    tune=3000,
+    target_accept=0.99,
 )
 
 print(mixedlm_fourSC.summary())

@@ -32,10 +32,17 @@
 #   TUNE_PHASE=validate bash run_tune_ste.sh                 # login node: re-submit the
 #                                                            # confirmation runs by hand
 #
+# Three-variant protocol in one job (vanilla / fatigue→0.2 / benefit→0.5,0.8):
+#   sbatch --export=ALL,TUNE_PHASE=protocol run_tune_ste.sh
+#
 # Overrides (sbatch --export=ALL,VAR=value,...):
-#   TUNE_PHASE        diagnose|eval|scan|apply|calibrate|validate    default calibrate
+#   TUNE_PHASE        diagnose|eval|scan|apply|calibrate|protocol|validate  default calibrate
 #   TUNE_PARAMS_DIR   source fit to rescale                    default env_para_vanilla
-#   TUNE_KNOB         action|benefit|benefit_foursc|burden_shift|...
+#   TUNE_KNOB         fatigue|action|benefit|benefit_foursc|... (burden_shift = fatigue alias)
+#   TUNE_FATIGUE_TARGET   protocol stage-1 target              default 0.2
+#   TUNE_BENEFIT_TARGETS  protocol stage-2 targets             default "0.5 0.8"
+#   TUNE_OVERWRITE    1 to pass --overwrite (needed when replacing folders
+#                     written under an older knob name/semantics)  default 0
 #   TUNE_TARGETS      target mean STE values                   default "0.2 0.5 0.8"
 #   TUNE_KAPPA        apply-phase knob value                   default 0.4
 #   TUNE_OUT_DIR      apply-phase destination                  default
@@ -94,7 +101,10 @@ TUNE_PHASE="${TUNE_PHASE:-calibrate}"
 TUNE_PARAMS_DIR="${TUNE_PARAMS_DIR:-env_para_vanilla}"
 TUNE_KNOB="${TUNE_KNOB:-action}"
 TUNE_TARGETS="${TUNE_TARGETS:-0.2 0.5 0.8}"
-if [[ "${TUNE_KNOB}" == "burden_shift" ]]; then
+TUNE_FATIGUE_TARGET="${TUNE_FATIGUE_TARGET:-0.2}"
+TUNE_BENEFIT_TARGETS="${TUNE_BENEFIT_TARGETS:-0.5 0.8}"
+TUNE_OVERWRITE="${TUNE_OVERWRITE:-0}"
+if [[ "${TUNE_KNOB}" == "burden_shift" || "${TUNE_KNOB}" == "fatigue" ]]; then
   TUNE_KAPPA0="${TUNE_KAPPA0:-0.2}"
 elif [[ "${TUNE_KNOB}" == "foursc_to_y_shift" ]]; then
   TUNE_KAPPA0="${TUNE_KAPPA0:-0.05}"
@@ -106,7 +116,7 @@ fi
 TUNE_KAPPAS="${TUNE_KAPPAS:-0.25 0.5 1 2 4}"
 TUNE_KAPPA="${TUNE_KAPPA:-0.4}"
 TUNE_APPLY_EVAL="${TUNE_APPLY_EVAL:-0}"
-if [[ "${TUNE_KNOB}" == "burden_shift" ]]; then
+if [[ "${TUNE_KNOB}" == "burden_shift" || "${TUNE_KNOB}" == "fatigue" ]]; then
   TUNE_OUT_DIR="${TUNE_OUT_DIR:-env_para_burden_shift_large}"
 else
   TUNE_OUT_DIR="${TUNE_OUT_DIR:-env_para_${TUNE_KNOB}_${TUNE_KAPPA}}"
@@ -295,7 +305,56 @@ submit_validation_jobs() {
   return 0
 }
 
+OVERWRITE_FLAG=()
+if [[ "${TUNE_OVERWRITE}" == "1" ]]; then
+  OVERWRITE_FLAG=(--overwrite)
+fi
+
 case "${TUNE_PHASE}" in
+  protocol)
+    STABLE_FLAG=(--require-stable)
+    if [[ "${TUNE_REQUIRE_STABLE}" == "0" ]]; then
+      STABLE_FLAG=(--no-require-stable)
+    fi
+    SUFFIX_ARGS=()
+    if [[ -n "${TUNE_OUT_SUFFIX}" ]]; then
+      SUFFIX_ARGS=(--out-suffix "${TUNE_OUT_SUFFIX}")
+    fi
+    set +e
+    "${PY}" tune_ste.py protocol "${COMMON_ARGS[@]}" \
+      --fatigue-target "${TUNE_FATIGUE_TARGET}" \
+      --benefit-targets ${TUNE_BENEFIT_TARGETS} \
+      --out-prefix "${TUNE_OUT_PREFIX}" \
+      "${SUFFIX_ARGS[@]+"${SUFFIX_ARGS[@]}"}" \
+      --scratch "${TUNE_SCRATCH}" \
+      --tol "${TUNE_TOL}" \
+      --max-iter "${TUNE_MAX_ITER}" \
+      "${STABLE_FLAG[@]}" \
+      "${OVERWRITE_FLAG[@]+"${OVERWRITE_FLAG[@]}"}"
+    proto_status=$?
+    set -e
+    if [[ "${TUNE_VALIDATE}" != "1" ]]; then
+      echo "TUNE_VALIDATE=0: skipping confirmation DiscreteCQL STE jobs."
+      exit "${proto_status}"
+    fi
+    if ! command -v sbatch >/dev/null 2>&1; then
+      echo "WARNING: sbatch is not available here; written folders (if any) are on disk."
+      exit "${proto_status}"
+    fi
+    if [[ "${proto_status}" -eq 0 || "${proto_status}" -eq 2 ]]; then
+      PROTO_DIRS=("${TUNE_OUT_PREFIX}${TUNE_FATIGUE_TARGET}${TUNE_OUT_SUFFIX}")
+      for target in ${TUNE_BENEFIT_TARGETS}; do
+        PROTO_DIRS+=("${TUNE_OUT_PREFIX}${target}${TUNE_OUT_SUFFIX}")
+      done
+      echo "Submitting confirmation DiscreteCQL jobs for protocol folders."
+      submit_validation_jobs "${PROTO_DIRS[@]}" || {
+        [[ "${proto_status}" -eq 0 ]] && exit 1
+      }
+    else
+      echo "Protocol failed (exit ${proto_status}); not submitting confirmation jobs." >&2
+    fi
+    exit "${proto_status}"
+    ;;
   diagnose)
     "${PY}" tune_ste.py diagnose --params-dir "${TUNE_PARAMS_DIR}"
     ;;
@@ -326,7 +385,8 @@ case "${TUNE_PHASE}" in
       --out-dir "${TUNE_OUT_DIR}" \
       --scratch "${TUNE_SCRATCH}" \
       "${EVAL_FLAG[@]}" \
-      "${STABLE_FLAG[@]}"
+      "${STABLE_FLAG[@]}" \
+      "${OVERWRITE_FLAG[@]+"${OVERWRITE_FLAG[@]}"}"
     apply_status=$?
     set -e
     if [[ "${TUNE_VALIDATE}" != "1" ]]; then
@@ -364,7 +424,8 @@ case "${TUNE_PHASE}" in
       --kappa0 "${TUNE_KAPPA0}" \
       --tol "${TUNE_TOL}" \
       --max-iter "${TUNE_MAX_ITER}" \
-      "${STABLE_FLAG[@]}"
+      "${STABLE_FLAG[@]}" \
+      "${OVERWRITE_FLAG[@]+"${OVERWRITE_FLAG[@]}"}"
     cal_status=$?
     set -e
     if [[ "${TUNE_VALIDATE}" != "1" ]]; then

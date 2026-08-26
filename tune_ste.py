@@ -1,101 +1,107 @@
-"""Rescale ``env_para_vanilla`` so mean *proxy* STE is near a chosen target (0.2 / 0.5 / 0.8).
+"""Build STE-tuned environment variants from ``env_para_vanilla``.
 
-This is not the DiscreteCQL estimand in ``ste_vanilla.py``. For each participant
-the proxy is ``max(0, max_arm Δ̂_i) / σ̂_i``, averaged over users: Δ̂_i is the
-paired mean total-CAE gap vs never-suggest on the **same** Monte-Carlo episodes
-used to pick the arm. Arms are Bernoulli rates (``--policy-grid``, default 0.5
-and 1.0) plus, optionally, DiscreteCQL trained in the *source* environment
-(``--dqn-exp``) and only rolled out here. Same-sample max is upward-biased for
-the oracle best-arm Δ; clipping at 0 encodes that never-suggest is in the class.
-``--proxy-to-true`` is an optional shrinkage (default 1: no adjustment).
+The scientific design (three-variant protocol)
+==============================================
+The testbed's causal chain, per week ``w`` (all coefficients per-participant,
+fitted from the ADAPT MRT)::
 
-``ste_vanilla.aggregate_ste`` is a different quantity: DiscreteCQL trained in
-the tuned folder, a deployment gate on held-out seeds, then a test Δ that can
-be negative. Hitting proxy 0.5 does not guarantee confirmation STE 0.5.
+    A ──(+)──> MY (4h steps, antic) ──(+)──> Y_{w+1}   (CAE, the outcome)
+    A ──(−)──> ME (PV, FW, PJ)      ──(+)──> E_{w+1} ──(+)──> MY_{w+1} ──> Y_{w+2}
+                                     (ME→E)             (E→MY)
 
-This script does **not** train DiscreteCQL. It multiplies a small set of
-coefficients by a scalar ``kappa`` and simulates the cheap proxy until it hits
-the target.
+Variants (``protocol`` runs 2 and 3 in one job):
 
-``burden_shift`` subtracts ``kappa`` from the *main* A→ME action coefficients
-(not the A×E_w interactions) and adds the same ``kappa`` to E_w → fourSC
-and E_w → anticipated affect, so send→engagement→E_w can reach CAE.
-Leaving the A×E_w slopes unshifted keeps the fatigue addend ``−κ A``
-rather than ``−κ A (1+E_w)``, which would change sign for ``E_w < −1``.
-Typical ``|A→ME|`` is ~0.3; start a scan at 0.2–0.5, not 2–4. This also
-moves the never-suggest arm.
+1. **vanilla** — the fitted environment, untouched.
+2. **low STE ≈ 0.2** — knob ``fatigue`` (alias ``burden_shift``): make the
+   engagement cost of sending sign-definite by *shifting* the main A→ME
+   coefficients down by ``κ`` (A×E_w interactions untouched, so the addend is
+   ``−κA``, not ``−κA(1+E_w)`` which would flip sign for ``E_w < −1``), and
+   *shifting* E_w→MY up so the fatigue chain can reach Y. ME→E_{w+1} and the
+   E→Y leg stay positive; only ``κ`` is root-found against the proxy STE.
+3. **STE 0.5 / 0.8 on top of 2** — knob ``benefit_foursc``: *scale* A→MY by
+   ``κ`` (preserves each user's fitted CATE structure — the A×wear /
+   A×interact / A×steps ratios the RL algorithm personalizes on) and *shift*
+   the fourSC→Y loading up by ``c(κ−1)`` (capped) so the amplified step
+   effect carries into CAE.
+
+Shift vs scale — the rule used throughout
+-----------------------------------------
+*Shift* (θ ← θ − κ) when the goal is a **sign-definite effect** and the fitted
+coefficients are near zero with mixed signs — a scale cannot move a ≈0
+coefficient and amplifies wrong signs. In the current vanilla fit: A→ME mains
+are mixed-sign (PV action effect positive for 23/31 users), E→fourSC is
+positive for only 10/31, fourSC→Y ≈ 0.08 with 2/31 negative. *Scale*
+(θ ← κθ) when the goal is to **amplify structure you want to keep** —
+A→MY's state-dependent CATEs. Never shift interaction terms; shifts belong on
+main effects only.
+
+The proxy STE (what "target 0.2/0.5/0.8" means here)
+----------------------------------------------------
+For each participant the proxy is ``max(0, max_arm Δ̂_i) / σ̂_i``, averaged
+over users: Δ̂_i is the paired mean total-CAE gap vs never-suggest on the
+**same** Monte-Carlo episodes used to pick the arm (Bernoulli rates from
+``--policy-grid`` plus, optionally, a source-env DiscreteCQL via
+``--dqn-exp``). The same-sample max is upward-biased for the oracle best-arm
+Δ; clipping at 0 encodes that never-suggest is in the class. This is **not**
+``ste_vanilla.aggregate_ste`` (DiscreteCQL trained in the tuned folder, gated
+on held-out seeds, test Δ can be negative); hitting proxy 0.5 does not
+guarantee confirmation STE 0.5. Report the confirmation number.
 
 Commands
+--------
+    protocol    the whole design: fatigue → 0.2, then benefit_foursc →
+                0.5/0.8 stacked on the 0.2 folder
     diagnose    E_w and CAE loop gains (no simulation)
     eval        measure proxy STE of one parameter folder
     scan        proxy STE vs a grid of ``kappa``
     apply       write a folder at a fixed ``kappa`` (no STE search)
-    calibrate   find ``kappa`` for each target and write ``env_para_ste0.2/`` etc.
+    calibrate   root-find ``kappa`` per target and write the folder(s)
 
-Burden-only variants (does **not** overwrite the original action-knob folders)::
+Cluster::
 
-    python tune_ste.py calibrate --knob burden --targets 0.2 0.5 \\
-        --out-prefix env_para_ste --out-suffix _burden
+    sbatch --export=ALL,TUNE_PHASE=protocol run_tune_ste.sh
 
-    writes ``env_para_ste0.2_burden/`` and ``env_para_ste0.5_burden/``
-    (``A→ME`` scaled up, benefit path left at vanilla). Cluster::
+or stage by stage::
 
-    sbatch --export=ALL,TUNE_KNOB=burden,TUNE_TARGETS="0.2 0.5",TUNE_OUT_SUFFIX=_burden \\
-        run_tune_ste.sh
+    sbatch --export=ALL,TUNE_KNOB=fatigue,TUNE_TARGETS=0.2 run_tune_ste.sh
+    sbatch --export=ALL,TUNE_PARAMS_DIR=env_para_ste0.2,TUNE_KNOB=benefit_foursc,\\
+TUNE_TARGETS="0.5 0.8" run_tune_ste.sh
 
-Large-fatigue stack (always-send weaker; then STE via fourSC→CAE *shift*)::
+Knob reference (``--knob``)
+---------------------------
+    fatigue (canonical; alias burden_shift)
+              A→ME mains −κ (shift); E_w→fourSC / E_w→antic +κ_e (shift,
+              κ_e = ADAPR_FATIGUE_E_SHIFT or κ). Moves the control arm.
+    benefit_foursc
+              A→MY ×κ (scale) and fourSC_ewma→Y += c(κ−1), c =
+              ADAPR_BENEFIT_FOURSC_SHIFT (0.05) capped at _CAP (0.20).
+    action / benefit / burden
+              pure multiplicative dials on A→{MY,ME} — cannot create a
+              sign-definite effect from mixed-sign fits; kept for scans.
+    foursc_to_y_shift
+              +κ on fourSC_ewma→Y alone. Caps near proxy 0.36 (CAE clips;
+              job 41048118) — not a route to 0.5/0.8.
+    my_to_y / foursc_to_y / me_to_e / e_to_my
+              structural single-pathway scales, for diagnostics only.
 
-    python tune_ste.py apply --knob burden_shift --kappa 0.4 \\
-        --out-dir env_para_burden_shift_large
+Recorded dead ends: burden_shift cannot reach STE 0.2 on the *old* vanilla
+(floor ≈0.27, job 40926808) — re-check after a refit; foursc_to_y_shift
+cannot reach 0.5/0.8 (job 41048118).
 
-    python tune_ste.py calibrate --params-dir env_para_burden_shift_large \\
-        --knob foursc_to_y_shift --targets 0.5 0.8 \\
-        --out-prefix env_para_ste --out-suffix _bs_large_foursc
-
-    Cluster: TUNE_PHASE=apply then raise STE from that folder. foursc_to_y_shift
-    alone cannot hit 0.5 / 0.8 (job 41048118: cap STE≈0.36, CAE clips).
-    Use ``benefit_foursc`` (A→MY ×κ and fourSC→Y += c(κ−1), c=0.05 capped
-    at 0.20) so mean STE can rise while CAE stays more state-dependent::
-
-    python tune_ste.py calibrate --params-dir env_para_burden_shift_large \\
-        --knob benefit_foursc --targets 0.5 0.8 \\
-        --out-prefix env_para_ste --out-suffix _bs_large_bf
-
-    ADAPR_BENEFIT_FOURSC_SHIFT / _CAP change the fourSC share (defaults
-    0.05 / 0.20). burden_shift cannot hit STE 0.2 (job 40926808).
-
-How the proxy is measured
-    Treatment arms are constant suggestion rates (``--policy-grid``, default
-    0.5 and 1.0). Optionally add an already-trained DiscreteCQL policy with
-    ``--dqn-exp``; that network is only evaluated, not retrained in the scaled
-    env. The reported number is this proxy, not a lower (or upper) bound on
-    in-env DiscreteCQL / ``aggregate_ste``.
-
-Which coefficients are scaled (``--knob``, default ``action``)
-    action    walking-suggestion effects on both benefit (step-count /
-              anticipated affect) and burden (engagement) mediators
-    benefit   benefit path only (A→MY)
-    benefit_foursc  A→MY ×κ and add c(κ−1) to fourSC_ewma → CAE
-    burden    multiply A→ME (does not flip sign)
-    burden_shift  A→ME mains more negative and E_w→steps / E_w→affect more positive
-    foursc_to_y_shift  add kappa to fourSC_ewma → CAE (does not flip sign)
-    my_to_y / foursc_to_y / me_to_e / e_to_my   structural paths; these
-              also change the control arm, so they are not the recommended
-              STE dial. ``foursc_to_y`` *multiplies* the loading (negative
-              users get more negative). Prefer ``foursc_to_y_shift`` when
-              stacking on fatigue. The fourSC CATE is the state-dependent
-              one (A x interact / wear / steps); the antic CATE is nearly
-              constant.
-
-Stability
-    ``calibrate`` writes a folder only if every participant has |loop gain| < 1
-    for both E_w and CAE, under never-suggest and always-suggest. Search will
-    not go past the largest such ``kappa``. Missed targets are skipped.
-
-Cluster
-    ``sbatch run_tune_ste.sh`` runs calibrate, then submits ``run_ste.sh`` in
-    each written folder so a fresh DiscreteCQL policy measures the confirmation
-    STE (``aggregate_ste``), which is a different estimand from this proxy.
+Guarantees and guards
+---------------------
+* Stability: a folder is written only if every participant keeps
+  |loop gain| < 1 for E_w and CAE under never- and always-suggest
+  (``--require-stable``, default on); the search never leaves that region.
+* Sign report: after writing, each variant's intended sign story is checked
+  per participant (fatigue: A→ME ≤ 0; transmission: ME→E, E→MY ≥ 0;
+  benefit: fourSC→Y, antic→Y ≥ 0) and violations are printed — fitted
+  heterogeneity, so warn-only.
+* The PV *hurdle* generator receives tuned action effects additively
+  (Δp = Δμ_A / (z̄₊ − z₀), see ``vani_env._pv_hurdle_action_shift``), so
+  shift knobs are faithful for PV too.
+* ``rl_priors.json`` is copied verbatim (RCT/vanilla priors by design);
+  ``loo_priors`` is a relative symlink to vanilla.
 
 Use a tuned folder instead of vanilla::
 
@@ -231,6 +237,25 @@ _NAME_CONSTANTS = {
 Knob = Callable[[float], dict[str, float]]
 
 
+def _fatigue_e_shift(k: float) -> float:
+    """E_w→MY transmission shift paired with the A→ME fatigue shift ``k``.
+
+    Default: tied to ``k`` (one dial, as in the original ``burden_shift``).
+    Set ``ADAPR_FATIGUE_E_SHIFT`` to decouple — e.g. fix the transmission at
+    0.4 while calibrating only the fatigue depth. Applied as a *shift*
+    because the fitted E→fourSC is mixed-sign (positive for 10/31 users):
+    a scale would leave the chain reversed for most participants.
+    """
+    raw = os.getenv("ADAPR_FATIGUE_E_SHIFT", "").strip()
+    if raw:
+        return float(raw)
+    return float(k)
+
+
+def _fatigue_multipliers(k: float) -> dict[str, float]:
+    return {"A_to_ME_main": float(k), "E_to_MY": -_fatigue_e_shift(k)}
+
+
 def _benefit_foursc_shift(k: float) -> float:
     """fourSC_ewma → CAE addend paired with an A→MY multiplier ``k``.
 
@@ -297,20 +322,21 @@ KNOBS: dict[str, KnobSpec] = {
             "sending raise PV/FW/PJ more, not less."
         ),
     ),
-    "burden_shift": KnobSpec(
-        "burden_shift",
-        lambda k: {"A_to_ME_main": k, "E_to_MY": -k},
+    "fatigue": KnobSpec(
+        "fatigue",
+        _fatigue_multipliers,
         zero_is_null=False,
         sigma_invariant=False,
         apply="subtract",
         doc=(
-            "Coherent fatigue: subtract kappa from the main A→ME action "
-            "coefficients (not A×E_w) and add kappa to E_w → fourSC and "
-            "E_w → anticipated affect (raw units; typical |A→ME| ≈ 0.3, "
-            "fitted E→MY ≈ 0.02). The fatigue addend is −κ A, independent "
-            "of E_w. Sending lowers engagement, and a lower E_w then lowers "
-            "steps and affect, so the path can reach CAE. Moves the control "
-            "arm (E→MY)."
+            "Coherent fatigue (variant 2): subtract kappa from the main A→ME "
+            "action coefficients (not A×E_w) and add κ_e to E_w → fourSC and "
+            "E_w → anticipated affect (κ_e = ADAPR_FATIGUE_E_SHIFT, default "
+            "κ; raw units; typical |A→ME| ≈ 0.3, fitted E→MY ≈ 0.02). The "
+            "fatigue addend is −κ A, independent of E_w. Sending lowers "
+            "engagement, a lower E_w then lowers steps and affect, so the "
+            "path reaches CAE. Moves the control arm (E→MY). Alias: "
+            "burden_shift."
         ),
     ),
     "my_to_y": KnobSpec(
@@ -378,6 +404,15 @@ KNOBS: dict[str, KnobSpec] = {
         doc="Structural: E_w -> step-count mediators. Moves sigma_i as well as Delta_i.",
     ),
 }
+
+# Backward-compatible alias: ``burden_shift`` was the original name of the
+# fatigue knob (same semantics when ADAPR_FATIGUE_E_SHIFT is unset). Reports
+# and ste_tuning.json now record ``knob: fatigue``; overwriting a folder whose
+# report says ``burden_shift`` therefore requires --overwrite, which is
+# intentional — pre-2026-08-25 burden_shift folders also shifted the A×E_w
+# interactions and must be regenerated, and the PV-hurdle action translation
+# changed from ratio to additive on the same date.
+KNOBS["burden_shift"] = KNOBS["fatigue"]
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +818,12 @@ def loop_gain_Ew(params: dict) -> dict[str, float]:
         vals = np.asarray(params[key], dtype=float).ravel()
         return float(vals[_names_for(key, params).index(coef)])
 
+    def pick_opt(key: str, coef: str) -> float:
+        names = _names_for(key, params)
+        if coef not in names:
+            return 0.0
+        return float(np.asarray(params[key], dtype=float).ravel()[names.index(coef)])
+
     a1 = pick("theta_penalized_Ew", "a1")
     a2 = pick("theta_penalized_Ew", "a2_PV_lag_week")
     a3 = pick("theta_penalized_Ew", "a3_FW_lag_week")
@@ -796,16 +837,29 @@ def loop_gain_Ew(params: dict) -> dict[str, float]:
     theta1 = pick("theta_penalized_PJ", "theta1_Ew")
     theta4 = pick("theta_penalized_PJ", "theta4_A0_morning_by_Ew")
     theta6 = pick("theta_penalized_PJ", "theta6_A1_afternoon_by_Ew")
+    # Lagged-J query block adds qE·J to each mediator's E-slope in J=1 weeks.
+    alpha_qE = pick_opt("theta_penalized_PV", "query_Jw_Ew")
+    beta_qE = pick_opt("theta_penalized_FW", "query_Jw_Ew")
+    theta_qE = pick_opt("theta_penalized_PJ", "query_Jw_Ew")
 
     slope = 0.25
-    g_zero = a1 + a2 * alpha1 + a3 * slope * beta1 + a4 * slope * theta1
-    g_always = (
-        a1
-        + a2 * (alpha1 + alpha4)
-        + a3 * slope * (beta1 + beta4 + beta6)
-        + a4 * slope * (theta1 + theta4 + theta6)
-    )
-    return {"g_zero": float(g_zero), "g_always": float(g_always)}
+
+    def g(action: float, j: float) -> float:
+        return (
+            a1
+            + a2 * (alpha1 + action * alpha4 + j * alpha_qE)
+            + a3 * slope * (beta1 + action * (beta4 + beta6) + j * beta_qE)
+            + a4 * slope * (theta1 + action * (theta4 + theta6) + j * theta_qE)
+        )
+
+    def worst_over_j(action: float) -> float:
+        g0, g1 = g(action, 0.0), g(action, 1.0)
+        return g0 if abs(g0) >= abs(g1) else g1
+
+    return {
+        "g_zero": float(worst_over_j(0.0)),
+        "g_always": float(worst_over_j(1.0)),
+    }
 
 
 def loop_gain_CAE(params: dict) -> dict[str, float]:
@@ -873,6 +927,79 @@ def unstable_users(
     gains: Sequence[dict], *, limit: float = GAIN_LIMIT
 ) -> list[dict]:
     return [r for r in gains if max_abs_gain(r) >= limit]
+
+
+# Pathway sign stories the tuned variants are supposed to satisfy, checked
+# per participant after writing a folder. Fitted heterogeneity means some
+# violations are expected (warn-only): the report tells you how far the
+# written environment is from the clean causal story in the module docstring.
+_SIGN_CHECKS: tuple[tuple[str, str, str, int], ...] = (
+    # (label, theta block, coefficient, required sign: -1 => <= 0, +1 => >= 0)
+    ("A->PV main <= 0", "theta_penalized_PV", "alpha3_action", -1),
+    ("A->FW main <= 0", "theta_penalized_FW", "beta3_A0_morning", -1),
+    ("A->FW main <= 0", "theta_penalized_FW", "beta5_A1_afternoon", -1),
+    ("A->PJ main <= 0", "theta_penalized_PJ", "theta3_A0_morning", -1),
+    ("A->PJ main <= 0", "theta_penalized_PJ", "theta5_A1_afternoon", -1),
+    ("PV->E >= 0", "theta_penalized_Ew", "a2_PV_lag_week", +1),
+    ("FW->E >= 0", "theta_penalized_Ew", "a3_FW_lag_week", +1),
+    ("PJ->E >= 0", "theta_penalized_Ew", "a4_PJ_lag_week", +1),
+    ("E->fourSC >= 0", "theta_fourSC", "perceived_utility_lastweek", +1),
+    ("E->antic >= 0", "theta_antic", "perceived_utility_lastweek", +1),
+    ("fourSC->Y >= 0", "theta_CAE", "fourSC_ewma", +1),
+    ("antic->Y >= 0", "theta_CAE", "anticipated_affect_ewma", +1),
+)
+
+# Which sign stories each knob is responsible for. Checks outside the knob's
+# story are still reported (as "inherited") so stacked folders show the full
+# picture.
+_KNOB_SIGN_STORY: dict[str, tuple[str, ...]] = {
+    "fatigue": (
+        "A->PV main <= 0", "A->FW main <= 0", "A->PJ main <= 0",
+        "PV->E >= 0", "FW->E >= 0", "PJ->E >= 0",
+        "E->fourSC >= 0", "E->antic >= 0",
+    ),
+    "benefit_foursc": ("fourSC->Y >= 0", "antic->Y >= 0"),
+}
+
+
+def sign_story_report(
+    params_dir: Path,
+    user_ids: Sequence[int],
+    *,
+    knob_name: str | None = None,
+    log=print,
+) -> dict[str, list[int]]:
+    """Per-participant check of the intended pathway signs; returns violators.
+
+    Warn-only: violations are fitted heterogeneity, not errors, but a large
+    count means the written folder does not implement the causal story the
+    variant claims (e.g. fatigue with κ smaller than most users' positive
+    A→ME effects).
+    """
+    story = set(_KNOB_SIGN_STORY.get(knob_name or "", ()))
+    violators: dict[str, list[int]] = {}
+    for uid in user_ids:
+        with open(params_dir / f"params_env_{uid}.json", encoding="utf-8") as f:
+            params = json.load(f)
+        for label, key, coef, sign in _SIGN_CHECKS:
+            names = _names_for(key, params)
+            if coef not in names:
+                continue
+            val = float(np.asarray(params[key], dtype=float).ravel()[names.index(coef)])
+            if (sign < 0 and val > 0.0) or (sign > 0 and val < 0.0):
+                violators.setdefault(label, []).append(int(uid))
+    n = len(list(user_ids))
+    log(f"  sign story ({params_dir.name}, n={n} participants):")
+    seen = set()
+    for label, _key, _coef, _sign in _SIGN_CHECKS:
+        if label in seen:
+            continue
+        seen.add(label)
+        bad = sorted(set(violators.get(label, [])))
+        tag = "" if not story or label in story else "  (inherited)"
+        status = "OK all" if not bad else f"violated by {len(bad)}: {bad}"
+        log(f"    {label:>18}: {status}{tag}")
+    return violators
 
 
 def loop_gains_for(
@@ -1227,6 +1354,7 @@ def cmd_scan(args) -> None:
             f"  median={result['median_ste']:7.4f}"
             f"  range=[{result['min_ste']:.3f}, {result['max_ste']:.3f}]"
         )
+    _cleanup_scratch(scratch, keep=getattr(args, "keep_scratch", False))
     if args.report:
         write_report(
             Path(args.report),
@@ -1244,6 +1372,26 @@ def cmd_scan(args) -> None:
 def calibrated_out_dir(prefix: str, target: float, suffix: str = "") -> Path:
     """``env_para_ste0.2`` or ``env_para_ste0.2_burden`` depending on suffix."""
     return PROJECT_ROOT / f"{prefix}{float(target):g}{suffix}"
+
+
+def _cleanup_scratch(scratch: Path, *, keep: bool) -> None:
+    """Remove per-kappa candidate copies unless ``--keep-scratch``.
+
+    Every candidate is a full 31-user parameter copy plus the supporting
+    files; a long calibration leaves hundreds of MB behind. Only paths whose
+    basename carries the scratch prefix are ever deleted.
+    """
+    scratch = Path(scratch)
+    if keep:
+        print(f"  keeping scratch {scratch}")
+        return
+    if not scratch.exists():
+        return
+    if not scratch.name.startswith(".ste_tune_scratch"):
+        print(f"  not deleting non-scratch path {scratch} (rename it .ste_tune_scratch_* to auto-clean)")
+        return
+    shutil.rmtree(scratch, ignore_errors=True)
+    print(f"  removed scratch {scratch}")
 
 
 def _knob_stack(src_dir: Path, knob: KnobSpec, kappa: float) -> list[dict]:
@@ -1427,6 +1575,7 @@ def cmd_calibrate(args) -> None:
                 f"wrote {out_dir} but diagnose reports it unstable -- this is a bug."
             )
         print(f"  wrote {out_dir}")
+        sign_violations = sign_story_report(out_dir, user_ids, knob_name=knob.name)
 
         report = {
             "target_mean_ste": float(target),
@@ -1443,11 +1592,14 @@ def cmd_calibrate(args) -> None:
             "loop_gains": written,
             "n_coefficients_scaled": len(audit),
             "stack": _knob_stack(base_dir, knob, kappa),
+            "sign_violations": {k: sorted(v) for k, v in sign_violations.items()},
             **result,
         }
         report["params_dir"] = str(out_dir)
         write_report(out_dir / "ste_tuning.json", report)
         solutions.append((float(target), float(kappa), float(achieved), out_dir))
+
+    _cleanup_scratch(scratch, keep=getattr(args, "keep_scratch", False))
 
     print("\nsummary")
     if solutions:
@@ -1505,6 +1657,7 @@ def cmd_apply(args) -> None:
             f"wrote {out_dir} but diagnose reports it unstable -- this is a bug."
         )
     print(f"  wrote {out_dir}  ({len(audit)} coefficients)")
+    sign_violations = sign_story_report(out_dir, user_ids, knob_name=knob.name)
 
     report = {
         "target_mean_ste": None,
@@ -1519,6 +1672,7 @@ def cmd_apply(args) -> None:
         "loop_gains": written,
         "n_coefficients_scaled": len(audit),
         "stack": _knob_stack(base_dir, knob, kappa),
+        "sign_violations": {k: sorted(v) for k, v in sign_violations.items()},
         "params_dir": str(out_dir),
     }
 
@@ -1541,6 +1695,89 @@ def cmd_apply(args) -> None:
                 report[key] = result[key]
 
     write_report(out_dir / "ste_tuning.json", report)
+
+
+def _stage_args(args, **overrides) -> argparse.Namespace:
+    """Clone the parsed protocol args into a calibrate-shaped namespace."""
+    base = dict(
+        params_dir=args.params_dir,
+        episodes=args.episodes,
+        seed=args.seed,
+        noise=args.noise,
+        policy_grid=list(args.policy_grid),
+        jobs=args.jobs,
+        proxy_to_true=args.proxy_to_true,
+        report=None,
+        dqn_exp=getattr(args, "dqn_exp", None),
+        dqn_model_dir=getattr(args, "dqn_model_dir", None),
+        scratch=args.scratch,
+        out_prefix=args.out_prefix,
+        out_suffix=args.out_suffix,
+        overwrite=args.overwrite,
+        tol=args.tol,
+        max_iter=args.max_iter,
+        require_stable=args.require_stable,
+        keep_scratch=getattr(args, "keep_scratch", False),
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def cmd_protocol(args) -> None:
+    """The three-variant design in one run.
+
+    Stage 1 (variant 2): calibrate ``fatigue`` on ``--params-dir`` (vanilla)
+    to ``--fatigue-target`` → ``<prefix><target><suffix>``.
+    Stage 2 (variant 3): calibrate ``benefit_foursc`` **on the stage-1
+    folder** to each of ``--benefit-targets`` → ``<prefix><t><suffix>``.
+    Variant 1 is the untouched vanilla folder. Each written folder carries
+    its full knob stack and sign-story report in ``ste_tuning.json``.
+    """
+    fatigue_dir = calibrated_out_dir(
+        args.out_prefix, args.fatigue_target, args.out_suffix
+    )
+    scratch = Path(args.scratch)
+
+    print("=" * 70)
+    print(f"PROTOCOL stage 1/2: fatigue -> proxy STE {args.fatigue_target:g}")
+    print("=" * 70)
+    try:
+        cmd_calibrate(_stage_args(
+            args,
+            knob="fatigue",
+            targets=[float(args.fatigue_target)],
+            kappa0=float(args.fatigue_kappa0),
+            scratch=str(scratch) + "_fatigue",
+        ))
+    except SystemExit as exc:
+        raise SystemExit(
+            f"protocol aborted: fatigue stage did not write "
+            f"{fatigue_dir.name} (exit {exc.code}). The benefit stage needs "
+            "that folder as its base."
+        ) from exc
+
+    print("\n" + "=" * 70)
+    print(
+        f"PROTOCOL stage 2/2: benefit_foursc on {fatigue_dir.name} -> "
+        f"proxy STE {' '.join(f'{t:g}' for t in args.benefit_targets)}"
+    )
+    print("=" * 70)
+    cmd_calibrate(_stage_args(
+        args,
+        params_dir=str(fatigue_dir),
+        knob="benefit_foursc",
+        targets=[float(t) for t in args.benefit_targets],
+        kappa0=float(args.benefit_kappa0),
+        scratch=str(scratch) + "_benefit",
+    ))
+    print(
+        "\nprotocol complete: vanilla + "
+        f"{fatigue_dir.name} + "
+        + ", ".join(
+            calibrated_out_dir(args.out_prefix, t, args.out_suffix).name
+            for t in args.benefit_targets
+        )
+    )
 
 
 def cmd_diagnose(args) -> None:
@@ -1615,6 +1852,11 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
                 help="Working directory for candidate parameter sets",
             )
+            sp.add_argument(
+                "--keep-scratch",
+                action="store_true",
+                help="Keep per-kappa candidate folders (default: delete when done)",
+            )
 
     sp = sub.add_parser("eval", help="Measure proxy STE for a parameter directory")
     common(sp, needs_knob=False)
@@ -1659,6 +1901,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sp.set_defaults(func=cmd_calibrate)
+
+    sp = sub.add_parser(
+        "protocol",
+        help=(
+            "Three-variant design: calibrate fatigue to --fatigue-target, "
+            "then benefit_foursc to --benefit-targets on the fatigue folder"
+        ),
+    )
+    common(sp, needs_knob=True)  # --knob is accepted but ignored (fixed per stage)
+    sp.add_argument("--fatigue-target", type=float, default=0.2)
+    sp.add_argument("--benefit-targets", type=float, nargs="+", default=[0.5, 0.8])
+    sp.add_argument("--fatigue-kappa0", type=float, default=0.2)
+    sp.add_argument("--benefit-kappa0", type=float, default=2.0)
+    sp.add_argument("--out-prefix", default="env_para_ste")
+    sp.add_argument("--out-suffix", default="")
+    sp.add_argument("--overwrite", action="store_true")
+    sp.add_argument("--tol", type=float, default=0.02)
+    sp.add_argument("--max-iter", type=int, default=10)
+    sp.add_argument(
+        "--require-stable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    sp.set_defaults(func=cmd_protocol)
 
     sp = sub.add_parser(
         "apply",

@@ -160,3 +160,66 @@ Proxy = per-user max over arms (Bernoulli 0.5/1.0 ± transferred CQL) of the pai
 4. Retrain the vanilla CQL arm (exp 5) or set `TUNE_DQN_EXP=''` (T5).
 5. Calibrate with `TUNE_KNOB=benefit_foursc` for 0.5/0.8 (T3); use `foursc_to_y_shift` only via `scan` if you want its mechanism at lower targets.
 6. Let the auto-submitted `run_ste.sh` confirmation runs define the reported STE (T4).
+
+---
+
+## 6. STE tuning reorganized (changes made on 2026-08-25 evening)
+
+Per your request, `tune_ste.py` / `vani_env.py` / `run_tune_ste.sh` were revised around the three-variant design. **Shift vs scale, grounded in the current fits:**
+
+- **A→ME (fatigue): shift, mains only.** The fitted action→engagement mains are mixed-sign (PV action effect positive for 23/31 users; FW 21/31; PJ 13/31) — a scale cannot create a sign-definite cost and amplifies wrong signs. Shifting the mains by −κ gives every user the same added cost −κA; the A×E_w interactions stay untouched so the cost never flips sign in low-E states.
+- **E→MY (transmission): shift.** Fitted E→fourSC is ≈ −0.008 on average and positive for only 10/31 users — scaling leaves the fatigue chain reversed for most participants; a +κ_e shift makes it uniformly positive. Now decoupled from the fatigue depth via `ADAPR_FATIGUE_E_SHIFT` (default: tied to κ, as before). ME→E_{w+1} (a2–a4) is left at its fitted values (mostly positive), per your spec.
+- **A→MY (benefit): scale.** The step/affect CATEs carry the state-dependent structure (A×wear, A×interact, A×steps) the RL algorithm personalizes on — ×κ preserves those ratios; a shift would flatten personalization toward "always-send wins".
+- **fourSC→Y: shift (small, capped).** Fitted loadings are ≈ +0.08 with 2/31 negative; the capped +c(κ−1) shift (benefit_foursc) raises the floor without exploding the CAE loop. Recorded dead end: shifting this loading alone caps near proxy 0.36 — not a route to 0.5/0.8.
+
+**Code changes:**
+
+1. **`vani_env.py` — hurdle translation fixed (was §5 T2).** `_pv_hurdle_action_scales` (ratio, exploding/sign-flipping under subtract knobs) replaced by `_pv_hurdle_action_shift`: the tuned-vs-vanilla change of the Gaussian PV action coefficients (Δα3, Δα4) is applied additively at occurrence time, `Δp = A·(Δα3 + Δα4·E_w)/(z̄₊ − z₀)` — the same mechanism as the lagged-J shift, valid for shift *and* multiply knobs. Fitted logistic slopes are never rescaled. Verified: vanilla → (0,0); tuned folder → finite additive shift; probabilities stay in [0,1].
+2. **`tune_ste.py` — reorganized.** New science-first module docstring (causal diagram, the 3-variant protocol, the shift-vs-scale rule, recorded dead ends). `fatigue` is the canonical knob name (`burden_shift` kept as an alias to the same spec; reports now say `knob: fatigue`, so overwriting an old `burden_shift` folder requires `--overwrite` — intentional, those folders had the old interaction-shifting semantics). New `protocol` command runs the whole design: calibrate `fatigue` → 0.2, then `benefit_foursc` → 0.5/0.8 stacked on the 0.2 folder, aborting cleanly if stage 1 misses. Every written folder now gets a per-participant **sign-story report** (fatigue: A→ME ≤ 0; transmission: ME→E, E→MY ≥ 0; benefit: fourSC/antic→Y ≥ 0; warn-only, saved into `ste_tuning.json` as `sign_violations`). `loop_gain_Ew` now includes the lagged-J query slope (worst case over J∈{0,1} per arm — closes §4.3 for the tuning side). Scratch candidate folders are deleted when done (`--keep-scratch` to keep).
+3. **`run_tune_ste.sh`** — `TUNE_PHASE=protocol` (env: `TUNE_FATIGUE_TARGET`, `TUNE_BENEFIT_TARGETS`), `TUNE_OVERWRITE=1` plumbing, `fatigue` recognized alongside `burden_shift`; on success the protocol phase auto-submits confirmation `run_ste.sh` arrays for all three folders.
+
+**Smoke-tested locally:** fatigue knob touches exactly 7 coefficients/user (5 A→ME mains − 0.4; 2 E→MY + 0.4; interactions untouched); `ADAPR_FATIGUE_E_SHIFT` decouples; q-aware loop gains compute; sign report runs (e.g. on 3 vanilla users: A→PJ ≤ 0 violated by 2 — expected pre-shift); a mini proxy evaluation runs end-to-end on the tuned folder; shell and argparse parse.
+
+**Run it as:**
+
+    sbatch --export=ALL,TUNE_PHASE=protocol run_tune_ste.sh
+    # → env_para_ste0.2 (fatigue), env_para_ste0.5 / env_para_ste0.8 (benefit on 0.2)
+
+**Sequencing caveats (unchanged from §5):** regenerate everything only after the pipeline refit lands, from the *new* vanilla; retrain the exp-5 CQL proxy arm or set `TUNE_DQN_EXP=''`; the proxy targets remain the documented same-sample-max estimand — report `ste_vanilla aggregate` numbers.
+
+**Observed during testing:** the in-refit `env_para_vanilla/df_fit_11week.csv` and `user_ids.txt` now contain **24 users**, down from 31 — presumably the corrected extraction/eligibility rules changed the cohort. Please confirm that's expected; every tuned folder, prior bundle, and `run_ste.sh --array` bound derives its width from `user_ids.txt`, so a deliberate cohort change flows through automatically once folders are regenerated (the stale 31-user folders on disk will disagree until then).
+
+---
+
+## 7. Instrumented tensor trace of the main execution path (2026-08-26)
+
+Method: not a re-read — a **live traced episode** (uid 18, nweek=6, J=12 particles, B=8 ensembles, zero/identity priors) through `experiment.py → vani_env.Env/OnlineEnv → algorithm_helpers + agents → aggregate.py`, with 46 invariants asserted inside `get_context`, at every weekly hand-off, and on reconstructed training data. A hooked `TracedEnv` checked the mediator mask element-by-element at **every one of the 72 decision points**; `gen_week_present` was wrapped to capture its argument at all 6 Sundays. Adaptive (base RLSVI), V4 (redistributed), MTD (bottleneck), and the three fixed policies were all exercised; aggregation math was verified on hand-computable synthetics. **All 46 invariants passed.** Traced on `env_para_burden_shift_large` (structurally complete) because `env_para_vanilla` is mid-refit — see the warning at the end.
+
+### Object ledger (shape → index meaning → written → read)
+
+| Object | Shape | Index meaning | Written at | Read at / availability |
+|---|---|---|---|---|
+| `stepCountNext4HourAll`, `pageViewNext4HourAll`, `action_all` | `(T,)`, T = nweek·14 | `idx = w·14 + d·2 + t`, d∈0..6 (Sunday = 6, A≡0 ✓) | `step_action` / `_finalize_week` slot loop | `get_context` M-blocks (strictly `(dd,tt) < (d,t)` ✓ verified per-element ×72), PF rows |
+| `prior2HourStepCountAll` | `(T,)` | pre-decision covariate of slot idx | `_generate_prior2hour_for_slot`, **before** `act()` | finite at the current slot, NaN at the not-yet-visited next slot ✓ |
+| `dailyAnticipatedAffect{All,ObsAll,AgentAll}` | `(D,)`, D = nweek·7 | end-of-day d_global | `_end_day` | latent always finite; Obs NaN exactly on missed-survey days (29/42 matched ✓); Agent = LOCF, finite ✓ |
+| `CAE_all, CAE_short_all, pu_all, wp_all, U1/U2_all, E_known_all` | `(nweek+1,)` | **index k = baseline-offset**: slot k holds the value materialized on the Sunday ending sim week k−1; slot 0 = pre-study baseline (`wp_all[0]=1, pu_all[0]=2.0`) ✓ | `_finalize_week(k−1)` | `CAE_all[k]` = CAE of week k−1, gated by `wp_all[k]`; `E_known_all[k]` finite at week-k start and `E_known_all[k+1]` NaN at every within-week decision ✓ (no future Ê) |
+| `gen_week_present` argument | scalar | emission of the **pre-transition** E: arg == `pu_all[sim_w]` at all 6 Sundays ✓ (§4 N3 fix confirmed live) | `_finalize_week` | J_k ~ E_{k−1→k boundary, pre-transition} |
+| `WeekPacket(k)` | — | `Y_prev=CAE_all[k]`, `tY_prev=CAE_short_all[k]`, `J_w=wp_all[k]` ✓ | `get_week_packet(k)` | consumed by `update_standard(k)` Monday of week k — all quantities finalized the previous Sunday ✓ |
+| PF cumulative designs (k=3) | fourSC `(12·(k−1), 19)` all-observed ✓; antic `(n_obs Mon–Sat, 15)` (5 of 12 observed ✓); CAE `(k−1, 4)`; tY `(#J=1 weeks, 2)` ✓ | `week_idx_cumul` ∈ [0, k−2] | `build_pf_data(k)` | week-0 Monday-AM row uses the **frozen** initial fourSC lag ✓ (M8 fix confirmed live) |
+| `y_hat` (particles) | **`(J, nweek)`** final | col 0 = Y₁ placeholder; col j = draw for sim week j−1 | `update_standard(k)`, k=1..nweek−1 | **Convention (verified, not a bug):** the last update is at `begin_week(nweek−1)`, so the final week's CAE never receives a belief column — it is generated for evaluation (`CAE_all[nweek]`) but is never a training reward (max `k_cur = nweek−1` uses weeks 0..nweek−2). |
+| `b_hat_hist, b_tilde_hist` | `(nweek,)` | `b_hat[k]` = Monday-of-week-k belief of CAE_{k−1} | PF | snap check: on every I=1∧J=1 week `b_hat[k] == CAE_all[k]` and `b_tilde[k] == 0` exactly; on the one non-snapped week it differed ✓ |
+| `dataset.state_hist` | 78 = nweek·(1+12) snapshots | keys `{k:−1:−1}` ∪ `{k:d:t}` exactly ✓ | pre-action at each decision | replayed by all training builders — historical φ are the as-seen states |
+| RLSVI `Phi, targets` (k_cur=4) | `(48, 25)`, B×`(48,)` ✓ | row 12·kp+11 = week-kp terminal | `build_rl_training_data` | **terminal target independently reconstructed**: `b_hat[kp+1] + 0.9·Q(S_{kp+1,0,0}, a*)` matched to 1e−10 ✓; non-terminal = `1.0·Q(next slot, a*)`, no reward term ✓; γ-matrix: all ones except `[5,1]=γ̄` ✓ |
+| V4 stage-1/2 | AA/FW/PJ η: `(23,)` each; stage-2 η: `(20,)` ✓ | — | `prepare_week(k)` | **return preservation re-derived independently**: Σ_slots redistributed r + terminal leftover == weekly target `b̂[kp+1] + F`, all 4 trained weeks, to 1e−9 ✓; potential `F = γ̄Ê_{k+1} − Ê_k` uses `E_known` only (agent-visible) ✓ |
+| MTD joint blocks (k=4) | B `(44, 25)`, A `(4,4)` + per-b `(4,25)`, C `(4,25)`+`(4,4)`, `Y_terminal (4,)` ✓ | — | `build_rl_training_data_with_bottleneck` | `Y_terminal[kp] == b_hat[kp+1]` ✓; bottleneck φ = `[1, Ê_w, b̂_w, b̃_w]` at week start ✓ |
+| `_snapshot_oenv` (evaluation input) | slot `(504,)`, daily `(252,)`, weekly `(37,)` at nweek=36 ✓ | — | end of each runner | `aggregate.compute_stats` drops col 0 (baseline) ✓ |
+| `aggregate` pairing | `(n_exp, n_slot, nweek)` | axes = (seed, participant draw, week) | — | synthetic check: constant per-episode lift of 0.5 → paired cumulative difference exactly `0.5·week` with **SE exactly 0** (noise cancels in pairs), while the unpaired SE would be ≫0; `_se_across_replications` == sd of per-seed means/√n_exp exactly ✓ |
+
+Other live confirmations: same seed ⇒ bit-identical CAE trajectory and π_A (reproducibility); adaptive π_A ∈ [0.1, 0.9] every slot (clipping); fixed policies emit hard 0 / 0.5 / 1 with matching action rates; never- vs random-send share the same baseline `CAE_all[0]` and diverge only in simulated weeks (paired inputs).
+
+### Findings from the trace
+
+No new correctness defects on this path. Two items to record:
+
+1. **Verified convention, document it:** the final simulated week's CAE exists only as an evaluation outcome — it never enters the PF belief, any TD target, or any reward. Nothing is wrong, but `y_hat` being `(J, nweek)` rather than `(J, nweek+1)` will surprise anyone extending the agent; a one-line comment in `ParticleFilterRuntime` would prevent that.
+2. **WARNING — `env_para_vanilla` is currently mid-refit and structurally inconsistent:** script-4 outputs are new (query suffix, 24-user cohort) but at least uid 18's `params_env_18.json` has an empty `theta_ws_interaction`, so `EnvConfig` raises and `tune_ste.require_fitted_blocks` would abort — loud, which is good. Do not point any run at vanilla until scripts 5–6 and `est_prior` have completed on the new cohort.

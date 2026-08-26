@@ -1,10 +1,10 @@
 {
-  "intercept": 0.001,
-  "J_w": 0.139,
-  "half_J_tool8": 0.017,
-  "PV_sum": 0.387,
-  "FW_sum": 0.097,
-  "PJ_sum": 0.488,
-  "U1_impute_mean": 4.536231884057971,
-  "U2_impute_mean": 4.5893719806763285
+  "intercept": 0.014,
+  "J_w": 0.051,
+  "half_J_tool8": 0.0,
+  "PV_sum": 0.311,
+  "FW_sum": 0.326,
+  "PJ_sum": 0.524,
+  "U1_impute_mean": 4.5,
+  "U2_impute_mean": 4.551724137931035
 }

@@ -18,8 +18,11 @@ Set ``ADAPR_FOURSC_CLOSED_LOOP_PROXY=0`` to keep the untranslated JSON.
 Page views are a two-part hurdle: logistic ``P(count>0)`` on current ``E_w``
 plus a resample from that person's observed positive counts. The J_w-estimated
 query suffix is *added* when ``J_w = 1`` (``Δp = Δμ / (z̄₊ − z₀)`` on the
-hurdle). ``I_w`` is not in this model. Set ``ADAPR_PV_HURDLE=0`` to keep the
-Gaussian generator. FW/PJ stay on their original logits.
+hurdle). ``I_w`` is not in this model. STE-tuned changes to the Gaussian PV
+action coefficients enter the hurdle the same additive way
+(``A · Δμ_A / (z̄₊ − z₀)``, see ``_pv_hurdle_action_shift``) — never as a
+rescaling of the fitted logistic slopes. Set ``ADAPR_PV_HURDLE=0`` to keep
+the Gaussian generator. FW/PJ stay on their original logits.
 """
 from __future__ import annotations
 
@@ -1078,19 +1081,32 @@ def _pv_hurdle_bundle_for_params_dir(params_dir) -> dict:
     return bundle
 
 
-def _pv_hurdle_action_scales(params_dir, uid, theta_ml_PV) -> tuple[float, float]:
-    """Map STE A→ME scaling of Gaussian α3/α4 onto hurdle A / A×E slopes."""
-    one = (1.0, 1.0)
+def _pv_hurdle_action_shift(params_dir, uid, theta_ml_PV) -> tuple[float, float]:
+    """Additive change of the Gaussian PV action effect vs vanilla: (Δα3, Δα4).
+
+    STE tuning edits the *Gaussian* PV model's action coefficients (α3, α4).
+    The hurdle generator cannot absorb that as a multiplicative rescaling of
+    its fitted logistic slopes: an additive knob (e.g. ``fatigue`` /
+    ``burden_shift``, α3 ← α3 − κ) turns the ratio ``α3_new/α3_van`` into an
+    exploding or sign-flipping factor whenever the fitted α3 is near zero
+    (observed range −6.3 … +58 on the κ=0.4 folder). Instead we return the
+    intended *mean shift* Δμ_A(E) = Δα3 + Δα4·E_w in standardized-PV units;
+    ``_pv_hurdle_occurrence`` converts it to an occurrence-probability shift
+    ``A · Δμ_A / (z̄₊ − z₀)`` — the same mechanism as the lagged-J query
+    shift. Multiplicative knobs are covered too: κ·α3 − α3 = (κ−1)·α3 is
+    just another Δα3. Returns (0, 0) for the vanilla folder itself.
+    """
+    zero = (0.0, 0.0)
     vanilla_dir = (PROJECT_ROOT / "env_para_vanilla").resolve()
     params_dir = Path(params_dir).expanduser().resolve()
     if params_dir == vanilla_dir:
-        return one
+        return zero
     vanilla_path = vanilla_dir / f"params_env_{_uid_key(uid)}.json"
     if not vanilla_path.is_file():
-        return one
+        return zero
     base_now, _ = _split_ml_pv_full(np.asarray(theta_ml_PV, dtype=float).ravel())
     if base_now.size < 8:
-        return one
+        return zero
     p_van = _load_json(vanilla_path)
     theta_van = np.asarray(
         p_van.get("theta_penalized_PV") or p_van.get("theta_ml_PV") or [],
@@ -1098,16 +1114,14 @@ def _pv_hurdle_action_scales(params_dir, uid, theta_ml_PV) -> tuple[float, float
     ).ravel()
     base_van, _ = _split_ml_pv_full(theta_van)
     if base_van.size < 8:
-        return one
-    a3_now, a4_now = float(base_now[6]), float(base_now[7])
-    a3_van, a4_van = float(base_van[6]), float(base_van[7])
-    s_a = a3_now / a3_van if abs(a3_van) > 1e-12 else 1.0
-    s_ae = a4_now / a4_van if abs(a4_van) > 1e-12 else 1.0
-    if not np.isfinite(s_a):
-        s_a = 1.0
-    if not np.isfinite(s_ae):
-        s_ae = 1.0
-    return float(s_a), float(s_ae)
+        return zero
+    d_a3 = float(base_now[6]) - float(base_van[6])
+    d_a4 = float(base_now[7]) - float(base_van[7])
+    if not np.isfinite(d_a3):
+        d_a3 = 0.0
+    if not np.isfinite(d_a4):
+        d_a4 = 0.0
+    return float(d_a3), float(d_a4)
 
 
 def _pv_hurdle_positive_pool(rec: dict, Ah: float, population: np.ndarray) -> np.ndarray:
@@ -1360,14 +1374,15 @@ class EnvConfig:
         coef = rec["coef"]
         if coef is not None:
             coef = np.asarray(coef, dtype=float).copy()
-            s_a, s_ae = _pv_hurdle_action_scales(
-                self.params_dir, self.userid, self.theta_ml_PV
-            )
-            if coef.size >= 7:
-                coef[5] *= s_a
-                coef[6] *= s_ae
+        # Tuned-folder action effect enters additively at occurrence time
+        # (see _pv_hurdle_action_shift); the fitted logistic slopes stay as
+        # estimated from the MRT data.
+        d_a3, d_a4 = _pv_hurdle_action_shift(
+            self.params_dir, self.userid, self.theta_ml_PV
+        )
         self.pv_hurdle = {
             "coef": coef,
+            "action_shift": (float(d_a3), float(d_a4)),
             "intercept": rec["intercept"],
             "const": rec["const"],
             "positive_pool": np.asarray(rec["positive_pool"], dtype=int).copy(),
@@ -1696,7 +1711,15 @@ class Env:
         )
         mean_z_pos = float(np.mean(z_pos)) if z_pos.size else z_zero
         denom = mean_z_pos - z_zero
+        # Intended mean shifts in standardized-PV units, converted to an
+        # occurrence-probability shift via Δp = Δμ / (z̄₊ − z₀):
+        #   - lagged-J query effect (J_w gated), and
+        #   - the tuned-folder action-effect change Δα3 + Δα4·E_w (A gated).
         intended = self._ml_pv_query_shift(s, Jw)
+        d_a3, d_a4 = rec.get("action_shift", (0.0, 0.0))
+        if d_a3 != 0.0 or d_a4 != 0.0:
+            ew = float(s["perceivedUtilityLastWeek"])
+            intended += float(Ah) * (float(d_a3) + float(d_a4) * ew)
         if abs(denom) < 1e-12:
             p_adj = p_base
         else:

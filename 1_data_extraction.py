@@ -3,8 +3,8 @@
 #
 # Reads the ADAPTS MRT source tables under `DATA_FOLDER` and writes one CSV per
 # stream (surveys, schedule, page views, walking suggestions, wearables, steps).
-# Cohort rules (completers, wear/FourSC availability, survey response) are the
-# constants in the setup cell below — not a hand-picked ID list.
+# Cohort rules (completers, wear/FourSC, weekly/daily response, ≥1 CAE week)
+# are the constants in the setup cell below — not a hand-picked ID list.
 # Next: `2_combine_data_frame.py`.
 
 # %% [markdown]
@@ -46,6 +46,12 @@ MIN_ACTIVE_SPAN_DAYS = 83
 # Staff / engineering accounts are not analysis units.
 EXTRA_TESTER_IDS = ("test-Yuxuan",)
 
+# When ProjectDeviceData has no IANA zone or UTC offset (empty placeholder
+# rows, or the participant is missing from that table), treat stamps as
+# US Eastern. Do not use UTC wall clock (shifts evening local dates) and
+# do not leave NaT (drops otherwise span-eligible completers).
+DEFAULT_IANA_TIMEZONE = "America/New_York"
+
 # ---------------------------------------------------------------------------
 # B. Analysis-sample restriction: wearable primary-outcome availability
 # ---------------------------------------------------------------------------
@@ -70,10 +76,16 @@ MIN_FOURSC_NON_NAN = 20           # require ≥ this many non-missing FourSC
 # or zero observed daily EOD surveys (all daily_present==0). With no responses
 # they contribute no information to survey-based analyses / missingness models
 # for those panels.
+# Also require ≥1 week with a non-missing CAE item. week_present can be 1 from
+# a check-in that skipped CAE; a all-NaN CAE_avg makes the script-5 CAE model
+# a fallback-zero and was the Jun-2026 "no CAE obs" drop (users 251, 257).
 EXCLUDE_IF_ALL_WEEKLY_SURVEYS_MISSING = True
 EXCLUDE_IF_ALL_DAILY_SURVEYS_MISSING = True
+EXCLUDE_IF_ALL_CAE_MISSING = True
 MIN_WEEKLY_SURVEYS_PRESENT = 1
 MIN_DAILY_SURVEYS_PRESENT = 1
+MIN_CAE_WEEKS_PRESENT = 1
+_CAE_ITEM_COLS = tuple(f"CAE-{i}" for i in range(1, 13))
 
 # Rare protocol overrides only (empty by default).
 MANUAL_EXCLUSION_OVERRIDE_IDS = ()
@@ -81,6 +93,13 @@ MANUAL_EXCLUSION_OVERRIDE_IDS = ()
 # Backward-compatible name: filled later by rule-based wearable exclusions.
 # Do not hand-edit participant IDs here.
 EXCLUDED_PARTICIPANT_IDS: tuple[str, ...] = ()
+
+# Analysis sample as of 2026-08-25 (Eastern default for missing device TZ):
+# 43 span-eligible (≥83-day EOD-task span) → 8 excluded → 35 fitted.
+# Wear/FourSC < 20: 112, 117, 138, 219.
+# No weekly and/or no daily (and/or no CAE week): 82, 112, 251, 257, 259.
+# Both: 112. July 26 extract had 31 after also dropping 248, 259, 291, 327,
+# 339 for FourSC < 20 under UTC wall-clock conversion; 259 still fails daily.
 
 # %%
 # Device metadata (timezone lookup source)
@@ -162,7 +181,7 @@ def _convert_one_utc_to_local(ts_utc, tz_name, utc_offset):
     # Fallback: static UTC offset (no DST logic)
     delta = _offset_cache.get(str(utc_offset), _offset_to_timedelta(utc_offset))
     if pd.isna(delta):
-        return pd.NaT  # unknown offset: do not pretend UTC wall clock is local
+        return ts_utc.tz_convert(DEFAULT_IANA_TIMEZONE).tz_localize(None)
     return (ts_utc + delta).tz_localize(None)
 
 
@@ -227,7 +246,7 @@ def convert_utc_columns_to_user_local(
         out.loc[miss, "timeZone"] = prev["timeZone"]
         out.loc[miss, "utcOffset"] = prev["utcOffset"]
 
-    # Last resort: this participant's usual zone (not UTC wall clock).
+    # Last resort: this participant's usual zone, then study Eastern.
     miss = out["timeZone"].isna() & out["utcOffset"].isna()
     if miss.any():
         pid_fb = (
@@ -240,6 +259,16 @@ def convert_utc_columns_to_user_local(
         fb.index = out.index[miss]
         out.loc[miss, "timeZone"] = fb["timeZone"]
         out.loc[miss, "utcOffset"] = fb["utcOffset"]
+
+    miss = out["timeZone"].isna() & out["utcOffset"].isna()
+    if miss.any():
+        n_default = int(miss.sum())
+        n_pid = int(out.loc[miss, "_pid"].nunique())
+        print(
+            f"WARNING: {n_default} timestamps ({n_pid} participants) have no "
+            f"device timezone/offset; using {DEFAULT_IANA_TIMEZONE}."
+        )
+        out.loc[miss, "timeZone"] = DEFAULT_IANA_TIMEZONE
 
     for col in datetime_cols:
         ts = pd.to_datetime(out[col], errors="coerce", utc=True)
@@ -275,10 +304,13 @@ def convert_utc_columns_to_user_local(
             if still.any():
                 n_unknown = int(still.sum())
                 print(
-                    f"WARNING: {n_unknown} timestamps have unknown timezone/"
-                    "offset; left as NaT (not UTC wall clock)."
+                    f"WARNING: {n_unknown} timestamps still unconverted after "
+                    f"offset lookup; using {DEFAULT_IANA_TIMEZONE}."
                 )
-                local.loc[still] = pd.NaT
+                local.loc[still] = (
+                    ts.loc[still].dt.tz_convert(DEFAULT_IANA_TIMEZONE).dt.tz_localize(None)
+                )
+                converted.loc[still] = True
 
         out[col] = local
 
@@ -984,6 +1016,7 @@ def audit_analysis_sample_exclusions(
          < MIN_FOURSC_NON_NAN
       3) Weekly surveys: sum(week_present) < MIN_WEEKLY_SURVEYS_PRESENT
       4) Daily surveys: sum(daily_present) < MIN_DAILY_SURVEYS_PRESENT
+      5) CAE: weeks with any non-missing CAE-1..12 < MIN_CAE_WEEKS_PRESENT
     """
     override = {str(pid) for pid in MANUAL_EXCLUSION_OVERRIDE_IDS}
 
@@ -1009,6 +1042,19 @@ def audit_analysis_sample_exclusions(
     today_ok = _non_nan_counts(df_today, "TodayStepCount")
     weekly_present = _present_sums(df_weekly_filled, "week_present")
     daily_present = _present_sums(df_daily_filled, "daily_present")
+    cae_weeks = pd.Series(dtype=int)
+    if df_weekly_filled is not None and len(df_weekly_filled) > 0:
+        cae_cols = [c for c in _CAE_ITEM_COLS if c in df_weekly_filled.columns]
+        if cae_cols:
+            cae_weeks = (
+                df_weekly_filled.assign(
+                    _pid=df_weekly_filled["ParticipantIdentifier"].astype(str),
+                    _cae_any=df_weekly_filled[cae_cols].notna().any(axis=1),
+                )
+                .groupby("_pid")["_cae_any"]
+                .sum()
+                .astype(int)
+            )
 
     if df_missing_hours is None or len(df_missing_hours) == 0:
         raise ValueError(
@@ -1037,6 +1083,7 @@ def audit_analysis_sample_exclusions(
         n_foursc = int(hourly_ok.get(pid_key, 0))
         n_weekly = int(weekly_present.get(pid_key, 0))
         n_daily = int(daily_present.get(pid_key, 0))
+        n_cae = int(cae_weeks.get(pid_key, 0))
 
         reasons = []
         if n_wear < MIN_DECISION_WINDOW_WEAR_SUM:
@@ -1053,6 +1100,8 @@ def audit_analysis_sample_exclusions(
             and n_daily < MIN_DAILY_SURVEYS_PRESENT
         ):
             reasons.append("all_daily_surveys_missing")
+        if EXCLUDE_IF_ALL_CAE_MISSING and n_cae < MIN_CAE_WEEKS_PRESENT:
+            reasons.append("all_cae_missing")
         if pid_key in override and not reasons:
             reasons.append("manual_override")
 
@@ -1064,6 +1113,7 @@ def audit_analysis_sample_exclusions(
                 "decision_window_n": n_windows,
                 "weekly_present_sum": n_weekly,
                 "daily_present_sum": n_daily,
+                "cae_weeks_present": n_cae,
                 "prior2hour_non_nan": int(prior_ok.get(pid_key, 0)),
                 "hourly_non_nan": n_foursc,
                 "today_non_nan": int(today_ok.get(pid_key, 0)),
@@ -3129,7 +3179,8 @@ else:
         f"(wear≥{MIN_DECISION_WINDOW_WEAR_SUM}; "
         f"FourSC≥{MIN_FOURSC_NON_NAN}; "
         f"weekly≥{MIN_WEEKLY_SURVEYS_PRESENT}; "
-        f"daily≥{MIN_DAILY_SURVEYS_PRESENT}):"
+        f"daily≥{MIN_DAILY_SURVEYS_PRESENT}; "
+        f"CAE≥{MIN_CAE_WEEKS_PRESENT}):"
     )
     for _, row in _analysis_exclude_df.iterrows():
         print(
@@ -3138,6 +3189,7 @@ else:
             f"fourSC={row['hourly_non_nan']}, "
             f"weekly={row['weekly_present_sum']}, "
             f"daily={row['daily_present_sum']}, "
+            f"cae={row['cae_weeks_present']}, "
             f"reason={row['exclude_reason']}"
         )
     print(f"Wrote exclusion table to {_exclusion_path}")
