@@ -1,10 +1,13 @@
 # %% [markdown]
 # # Standardize the merged panel
 #
-# Reads `df_merged.csv`, log-transforms counts, z-scores continuous features,
-# maps Likert items to [-1, 1], and writes `df_fit.csv` plus `std_params.json`
-# (shifts, scales, clip limits) under `env_para_vanilla/`.
-# Next: `4_perceived_utility.py`.
+# Reads `df_merged.csv`, log-transforms most counts in place, z-scores
+# continuous features, maps Likert items to [-1, 1], and writes `df_fit.csv`
+# plus `std_params.json` (shifts, scales, clip limits) under
+# `env_para_vanilla/`. ``HourlyPageviewCount`` (and its lag) stay raw.
+# ``HourlyPageviewCount_norm`` is ``log(x)`` then z-scored among positives
+# (no ``+1``); count 0 sits at ``log(0.5)`` so PV_sum / lag1 stay below 1.
+# Next: ``4_perceived_utility.py``.
 
 # %% [markdown]
 # ## 0. Setup
@@ -87,6 +90,8 @@ FIT_COLUMNS = [
     "Exp-tool-2",
 ]
 
+# In-place ``log(x+1)`` overwrite. Hourly pageview is excluded: the raw
+# integer count is kept, and log-then-z is written only to ``*_norm``.
 LOG_COLUMNS = [
     "4hour_step",
     "TodayStepCount",
@@ -94,10 +99,13 @@ LOG_COLUMNS = [
     "prior2hour_step",
     "DailyPageviewCount",
     "Past7DaysPageviewEMA",
-    "HourlyPageviewCount",
-    "HourlyPageviewCount_lag1",
     "Past7DaysHourlyPageviewEMA",
 ]
+
+# Source columns whose z-score is of ``log(x)`` for x>0, without mutating ``x``.
+# Count 0 is mapped to ``PV_ZERO_ON_LOG_AXIS`` (not ``log(x+1)`` on positives).
+KEEP_RAW_LOG_THEN_Z = frozenset({"HourlyPageviewCount"})
+PV_ZERO_ON_LOG_AXIS = 0.5
 
 ZSCORE_SPECS = [
     # (source_col, norm_col, json_shift_key, json_scale_key, json_limit_key)
@@ -187,6 +195,18 @@ def _likert_norm(
     return norm, limit
 
 
+def _hourly_pv_log_axis(raw, zero_count=PV_ZERO_ON_LOG_AXIS):
+    """Log axis for hourly pageview: ``log(x)`` if ``x>0``, else ``log(zero_count)``."""
+    vals = pd.to_numeric(raw, errors="coerce")
+    out = np.full(len(vals), np.nan, dtype=float)
+    v = vals.to_numpy(dtype=float, copy=False)
+    pos = np.isfinite(v) & (v > 0.0)
+    zero = np.isfinite(v) & (v <= 0.0)
+    out[pos] = np.log(v[pos])
+    out[zero] = np.log(float(zero_count))
+    return out, v, pos
+
+
 # %% [markdown]
 # ## 1. Load merged panel
 
@@ -214,6 +234,11 @@ df_fit["dow_norm"] = (df_fit["dow"] - (1 + 7) / 2) / ((7 - 1) / 2)
 
 # %% [markdown]
 # ## 3. Log transforms (counts / pageviews)
+#
+# Most count columns are overwritten with ``log(x+1)``. Hourly pageview
+# stays raw. Its ``*_norm`` is ``log(x)`` for positive counts (hurdle
+# intensity does not need ``+1``); zeros sit at ``log(0.5)`` so the weekly
+# PV summary still has a point below count 1.
 
 # %%
 for col in LOG_COLUMNS:
@@ -229,17 +254,36 @@ std_params = {}
 for src, norm, shift_key, scale_key, limit_key in ZSCORE_SPECS:
     if src not in df_fit.columns:
         continue
+    if src in KEEP_RAW_LOG_THEN_Z:
+        log_axis, _, pos = _hourly_pv_log_axis(df_fit[src])
+        log_pos = log_axis[pos]
+        shift = float(np.round(np.nanmean(log_pos), DIGITS)) if pos.any() else 0.0
+        scale = float(np.round(np.nanstd(log_pos, ddof=0), DIGITS)) if pos.sum() > 1 else 1.0
+        if scale == 0 or np.isnan(scale):
+            scale = 1.0
+        series_norm = (log_axis - shift) / scale
+        finite = series_norm[np.isfinite(series_norm)]
+        limit = [
+            float(np.round(np.nanmin(finite), DIGITS)) if finite.size else -1.0,
+            float(np.round(np.nanmax(finite), DIGITS)) if finite.size else 1.0,
+        ]
+        df_fit[norm] = series_norm
+        std_params[shift_key] = shift
+        std_params[scale_key] = scale
+        std_params[limit_key] = limit
+        std_params["HourlyPageviewCount_zero_count"] = PV_ZERO_ON_LOG_AXIS
+        continue
     df_fit[norm], shift, scale, limit = _zscore(df_fit[src])
     std_params[shift_key] = shift
     std_params[scale_key] = scale
     std_params[limit_key] = limit
 
-# This lag was constructed on the padded pageview panel before the 84-day
-# analysis filter. Put it on exactly the same log/z-score scale as its outcome.
+# Keep ``HourlyPageviewCount_lag1`` as a raw count and put it on the same
+# log-then-z axis as the outcome (``log(x)`` if x>0, else ``log(0.5)``).
 if "HourlyPageviewCount_lag1" in df_fit.columns:
+    lag_log, _, _ = _hourly_pv_log_axis(df_fit["HourlyPageviewCount_lag1"])
     df_fit["hourly_pageview_count_lag1"] = (
-        df_fit["HourlyPageviewCount_lag1"]
-        - std_params["HourlyPageviewCount_shift"]
+        lag_log - std_params["HourlyPageviewCount_shift"]
     ) / std_params["HourlyPageviewCount_scale"]
 
 for src, norm, limit_key in LIKERT_SPECS:

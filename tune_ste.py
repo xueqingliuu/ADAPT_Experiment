@@ -97,9 +97,8 @@ Guarantees and guards
   per participant (fatigue: A→ME ≤ 0; transmission: ME→E, E→MY ≥ 0;
   benefit: fourSC→Y, antic→Y ≥ 0) and violations are printed — fitted
   heterogeneity, so warn-only.
-* The PV *hurdle* generator receives tuned action effects additively
-  (Δp = Δμ_A / (z̄₊ − z₀), see ``vani_env._pv_hurdle_action_shift``), so
-  shift knobs are faithful for PV too.
+* The PV hurdle occurrence logit is script 4's PV emission, so STE knobs
+  that edit ``alpha3``/``alpha4`` in JSON enter ``P(count>0)`` directly.
 * ``rl_priors.json`` is copied verbatim (RCT/vanilla priors by design);
   ``loo_priors`` is a relative symlink to vanilla.
 
@@ -136,6 +135,7 @@ from vani_env import (
     THETA_CAE_NAMES,
     THETA_FOURSC_NAMES,
     EnvConfig,
+    pv_hurdle_occurrence_z_gap,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -191,7 +191,12 @@ PATHWAYS: dict[str, dict[str, tuple[str, ...]]] = {
         "theta_CAE": ("anticipated_affect_ewma",),
     },
     "A_to_ME": {
-        "theta_penalized_PV": ("alpha3_action", "alpha4_action_by_Ew"),
+        "theta_penalized_PV": (
+            "alpha3_action",
+            "alpha4_action_by_Ew",
+            "gamma3_action",
+            "gamma4_action_by_Ew",
+        ),
         "theta_penalized_FW": (
             "beta3_A0_morning",
             "beta4_A0_morning_by_Ew",
@@ -209,7 +214,7 @@ PATHWAYS: dict[str, dict[str, tuple[str, ...]]] = {
     # intercept. Subtracting κ from the A×E_w terms as well would change
     # the action effect by −κ(1+E_w) and flip sign for E_w < −1.
     "A_to_ME_main": {
-        "theta_penalized_PV": ("alpha3_action",),
+        "theta_penalized_PV": ("alpha3_action", "gamma3_action"),
         "theta_penalized_FW": ("beta3_A0_morning", "beta5_A1_afternoon"),
         "theta_penalized_PJ": ("theta3_A0_morning", "theta5_A1_afternoon"),
     },
@@ -802,17 +807,22 @@ def zero_cache_from(result: dict) -> dict[int, list[float]]:
 # ---------------------------------------------------------------------------
 # Diagnostics
 # ---------------------------------------------------------------------------
-def loop_gain_Ew(params: dict) -> dict[str, float]:
+def loop_gain_Ew(
+    params: dict,
+    *,
+    std: dict | None = None,
+    params_dir: Path | None = None,
+) -> dict[str, float]:
     """Compound ``E_w`` loop gain under never-suggest and always-suggest.
 
     ``E_w`` is linear in the weekly mediator summaries, and those summaries are
     fixed-denominator *averages* (``nansum(pv)/14``, ``nansum(FW|PJ)/7``) in both
     the estimator and ``vani_env._week_means_from_arrays``. A unit shift in
     ``E_{w-1}`` shifts every slot of the week, so the average shifts by the
-    per-slot slope -- no 14x / 7x factor. (The training-time barrier in
-    ``4_perceived_utility.py`` multiplies by 14 and 7 and is therefore a strictly
-    more conservative bound than this one.) Logistic mediators use the
-    worst-case slope ``pi(1-pi) = 0.25``.
+    per-slot slope -- no 14x / 7x factor. FW and PJ are logistic (worst-case
+    slope ``pi(1-pi) = 0.25``). PV is a hurdle: ``0.25 α_E (z̄₊ - z_0) + γ_E``,
+    with ``(z̄₊ - z_0)`` from ``std_params.json`` (positives mean 0; zeros at
+    ``log(0.5)`` on that axis) and ``p ≤ 1`` on the intensity path.
     """
     def pick(key: str, coef: str) -> float:
         vals = np.asarray(params[key], dtype=float).ravel()
@@ -831,6 +841,8 @@ def loop_gain_Ew(params: dict) -> dict[str, float]:
 
     alpha1 = pick("theta_penalized_PV", "alpha1_Ew")
     alpha4 = pick("theta_penalized_PV", "alpha4_action_by_Ew")
+    gamma1 = pick_opt("theta_penalized_PV", "gamma1_Ew")
+    gamma4 = pick_opt("theta_penalized_PV", "gamma4_action_by_Ew")
     beta1 = pick("theta_penalized_FW", "beta1_Ew")
     beta4 = pick("theta_penalized_FW", "beta4_A0_morning_by_Ew")
     beta6 = pick("theta_penalized_FW", "beta6_A1_afternoon_by_Ew")
@@ -839,15 +851,24 @@ def loop_gain_Ew(params: dict) -> dict[str, float]:
     theta6 = pick("theta_penalized_PJ", "theta6_A1_afternoon_by_Ew")
     # Lagged-J query block adds qE·J to each mediator's E-slope in J=1 weeks.
     alpha_qE = pick_opt("theta_penalized_PV", "query_Jw_Ew")
+    gamma_qE = pick_opt("theta_penalized_PV", "intensity_query_Jw_Ew")
     beta_qE = pick_opt("theta_penalized_FW", "query_Jw_Ew")
     theta_qE = pick_opt("theta_penalized_PJ", "query_Jw_Ew")
 
     slope = 0.25
+    if std is None:
+        std_path = Path(params_dir) if params_dir is not None else PARAMS_DIR
+        with open(std_path / "std_params.json", encoding="utf-8") as f:
+            std = json.load(f)
+    occ_gap = float(pv_hurdle_occurrence_z_gap(std))
 
     def g(action: float, j: float) -> float:
         return (
             a1
-            + a2 * (alpha1 + action * alpha4 + j * alpha_qE)
+            + a2 * (
+                slope * occ_gap * (alpha1 + action * alpha4 + j * alpha_qE)
+                + (gamma1 + action * gamma4 + j * gamma_qE)
+            )
             + a3 * slope * (beta1 + action * (beta4 + beta6) + j * beta_qE)
             + a4 * slope * (theta1 + action * (theta4 + theta6) + j * theta_qE)
         )
@@ -897,6 +918,8 @@ def loop_gain_CAE(params: dict) -> dict[str, float]:
 
 
 def diagnose(params_dir: Path, user_ids: Sequence[int]) -> list[dict]:
+    with open(params_dir / "std_params.json", encoding="utf-8") as f:
+        std = json.load(f)
     rows = []
     for uid in user_ids:
         with open(params_dir / f"params_env_{uid}.json", encoding="utf-8") as f:
@@ -904,7 +927,7 @@ def diagnose(params_dir: Path, user_ids: Sequence[int]) -> list[dict]:
         rows.append(
             {
                 "userid": int(uid),
-                **loop_gain_Ew(params),
+                **loop_gain_Ew(params, std=std),
                 **loop_gain_CAE(params),
             }
         )
@@ -936,6 +959,7 @@ def unstable_users(
 _SIGN_CHECKS: tuple[tuple[str, str, str, int], ...] = (
     # (label, theta block, coefficient, required sign: -1 => <= 0, +1 => >= 0)
     ("A->PV main <= 0", "theta_penalized_PV", "alpha3_action", -1),
+    ("A->PV intensity main <= 0", "theta_penalized_PV", "gamma3_action", -1),
     ("A->FW main <= 0", "theta_penalized_FW", "beta3_A0_morning", -1),
     ("A->FW main <= 0", "theta_penalized_FW", "beta5_A1_afternoon", -1),
     ("A->PJ main <= 0", "theta_penalized_PJ", "theta3_A0_morning", -1),
@@ -954,7 +978,8 @@ _SIGN_CHECKS: tuple[tuple[str, str, str, int], ...] = (
 # picture.
 _KNOB_SIGN_STORY: dict[str, tuple[str, ...]] = {
     "fatigue": (
-        "A->PV main <= 0", "A->FW main <= 0", "A->PJ main <= 0",
+        "A->PV main <= 0", "A->PV intensity main <= 0",
+        "A->FW main <= 0", "A->PJ main <= 0",
         "PV->E >= 0", "FW->E >= 0", "PJ->E >= 0",
         "E->fourSC >= 0", "E->antic >= 0",
     ),
@@ -1010,6 +1035,8 @@ def loop_gains_for(
     apply: str | dict[str, str] = "multiply",
 ) -> list[dict]:
     """E_w and CAE loop gains after applying ``multipliers``, without writing."""
+    with open(src_dir / "std_params.json", encoding="utf-8") as f:
+        std = json.load(f)
     rows = []
     for uid in user_ids:
         with open(src_dir / f"params_env_{uid}.json", encoding="utf-8") as f:
@@ -1020,7 +1047,7 @@ def loop_gains_for(
         rows.append(
             {
                 "userid": int(uid),
-                **loop_gain_Ew(scaled),
+                **loop_gain_Ew(scaled, std=std),
                 **loop_gain_CAE(scaled),
             }
         )

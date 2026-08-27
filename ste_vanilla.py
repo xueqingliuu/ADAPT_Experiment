@@ -10,7 +10,7 @@ STE for user i is (mean total CAE under DiscreteCQL minus never-suggest)
 divided by the never-suggest SD; ``aggregate`` averages that over users.
 The policy treats only when ``Q(s,1) - Q(s,0) > ADVANTAGE_MARGIN``.
 Training data are simulated under a random walking policy. Discount is 1
-within the week and 0.5 only at Saturday afternoon. Default residual noise
+within the week and 0.9 only at Saturday afternoon. Default residual noise
 is AR(1) bootstrap (``--noise ar1``).
 
 Seed split (do not overlap these ranges)::
@@ -79,7 +79,7 @@ def _resolve_params_dir(params_dir=None) -> Path:
     return Path(PARAMS_DIR if params_dir is None else params_dir).expanduser().resolve()
 
 SLOTS_PER_WEEK = N_RL_DAYS * N_RL_SLOTS
-DQN_WEEKLY_GAMMA = 0.5
+DQN_WEEKLY_GAMMA = 0.9
 # Non-terminal within-week slots use discount 1; the week-terminal slot uses
 # ``DQN_WEEKLY_GAMMA``. d3rlpy applies ``gamma ** interval``, so we set
 # ``gamma = DQN_WEEKLY_GAMMA`` and ``interval ∈ {0, 1}``.

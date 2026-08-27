@@ -19,6 +19,14 @@ Writes, under ``env_para_vanilla/``:
     pred_<uid>.json           filtered E_w trajectory
     df_fit.csv columns        perceived_utility, perceived_utility_lastweek
 
+PV is a two-part hurdle: Bernoulli occurrence ``P(raw count > 0)`` and,
+given a positive count, a Gaussian on ``log(x)`` then z-scored among
+positives (``HourlyPageviewCount_norm``). Count 0 is placed at
+``log(0.5)`` on that same axis so the 14-slot PV summary still sits
+below count 1. Both parts share the same covariate
+design (``E_w``, weekend, slot, burden, lag1, ``A``, ``A×E_w``, lagged-J
+query). FW / PJ stay Bernoulli on wear / daily check-in.
+
 PV / FW / PJ emissions include a lagged-J query block
 ``J_{w-1} · [1, E_w, recent_burden]`` (last Sunday's ``week_present``),
 written as the ``query_Jw_*`` suffix on ``theta_penalized_{PV,FW,PJ}``.
@@ -43,6 +51,8 @@ from scipy.optimize import minimize
 from scipy.special import logsumexp
 import json
 
+from vani_env import E_QUAD_HI, E_QUAD_LO, pv_hurdle_occurrence_z_gap
+
 logger = logging.getLogger(__name__)
 
 # Suffix names on theta_penalized_{PV,FW,PJ}. Same layout vani_env splits.
@@ -51,9 +61,25 @@ QUERY_JW_NAMES = (
     "query_Jw_Ew",
     "query_Jw_recent_burden",
 )
-# Packed theta: 41 emission/AR coeffs + 9 lagged-J query coeffs
-# (PV/FW/PJ × intercept, E_w, recent_burden).
-_THETA_DIM_BASE = 50
+QUERY_JW_INTENSITY_NAMES = (
+    "intensity_query_Jw_intercept",
+    "intensity_query_Jw_Ew",
+    "intensity_query_Jw_recent_burden",
+)
+# Packed theta: 49 emission/AR coeffs + 12 lagged-J query coeffs
+# (PV occurrence, PV intensity, FW, PJ × intercept, E_w, recent_burden).
+_THETA_DIM_BASE = 61
+# Packed log-σ indices (unpack_theta exponentiates these). σ_E, σ_U1, σ_U2, σ_PV.
+_LOG_SIGMA_INDICES = (5, 10, 13, 32)
+# Baseline levels / prevalences. Ridge does not shrink these (or log-σ).
+_RIDGE_FREE_INTERCEPTS = (
+    "a0", "b0", "c0", "d0", "alpha0", "gamma0", "beta0", "theta0",
+)
+# Quadrature support for E_w. Interval is ``vani_env.E_QUAD_LO`` / ``E_QUAD_HI``
+# (same as ``EnvConfig.limits_perceivedUtility``). Spacing matches the old
+# [-3, 3] grids (0.05 pooled / 0.025 per-user).
+E_QUAD_POOLED_N = 161
+E_QUAD_USER_N = 321
 
 # %%
 # read data
@@ -97,6 +123,11 @@ def trapezoid_weights(grid):
     w[0] = 0.5 * (grid[1] - grid[0])
     w[-1] = 0.5 * (grid[-1] - grid[-2])
     return w
+
+
+def e_quadrature_grid(*, pooled: bool) -> np.ndarray:
+    n = E_QUAD_POOLED_N if pooled else E_QUAD_USER_N
+    return np.linspace(E_QUAD_LO, E_QUAD_HI, n)
 
 
 def validate_quadrature_support(
@@ -245,8 +276,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     i += 1
     alpha4 = theta[i]
     i += 1
-    sigma_PV = np.exp(theta[i])
-    i += 1
     alpha_ar1 = theta[i]
     i += 1
     alpha_q0 = theta[i]
@@ -254,6 +283,31 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     alpha_qE = theta[i]
     i += 1
     alpha_qrb = theta[i]
+    i += 1
+
+    gamma0 = theta[i]
+    i += 1
+    gamma1 = theta[i]
+    i += 1
+    gamma2_is_weekend = theta[i]
+    i += 1
+    gamma2_dt = theta[i]
+    i += 1
+    gamma2_rb = theta[i]
+    i += 1
+    gamma3 = theta[i]
+    i += 1
+    gamma4 = theta[i]
+    i += 1
+    sigma_PV = np.exp(theta[i])
+    i += 1
+    gamma_ar1 = theta[i]
+    i += 1
+    gamma_q0 = theta[i]
+    i += 1
+    gamma_qE = theta[i]
+    i += 1
+    gamma_qrb = theta[i]
     i += 1
 
     beta0 = theta[i]
@@ -328,11 +382,22 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "alpha2_rb": alpha2_rb,
         "alpha3": alpha3,
         "alpha4": alpha4,
-        "sigma_PV": sigma_PV,
         "alpha_ar1": alpha_ar1,
         "alpha_q0": alpha_q0,
         "alpha_qE": alpha_qE,
         "alpha_qrb": alpha_qrb,
+        "gamma0": gamma0,
+        "gamma1": gamma1,
+        "gamma2_is_weekend": gamma2_is_weekend,
+        "gamma2_dt": gamma2_dt,
+        "gamma2_rb": gamma2_rb,
+        "gamma3": gamma3,
+        "gamma4": gamma4,
+        "sigma_PV": sigma_PV,
+        "gamma_ar1": gamma_ar1,
+        "gamma_q0": gamma_q0,
+        "gamma_qE": gamma_qE,
+        "gamma_qrb": gamma_qrb,
         "beta0": beta0,
         "beta1": beta1,
         "beta3": beta3,
@@ -383,13 +448,12 @@ def build_penalized_prior_center(*, e1_known: bool) -> np.ndarray:
     the old approach, potentially reflected to a large value of the wrong
     sign). Every coefficient not listed here keeps the original zero-centered
     penalty (nudge = 0), including the lagged-J query block
-    ``(alpha|beta|theta)_q*``.
+    ``(alpha|gamma|beta|theta)_q*``.
 
     Indices are recovered by unpacking a probe vector of its own positions
     through ``unpack_theta``, so this stays correct if that function's field
-    order ever changes -- except for the log-sigma fields (exponentiated in
-    ``unpack_theta``), which are intentionally left untouched (no
-    informative prior on noise scales).
+    order ever changes. Intercepts and log-σ are not in this vector and are
+    excluded from the ridge entirely (see ``ridge_penalty_weights``).
     """
     n = theta_dim(e1_known=e1_known)
     idx = unpack_theta(np.arange(n, dtype=float), e1_known=e1_known)
@@ -401,17 +465,47 @@ def build_penalized_prior_center(*, e1_known: bool) -> np.ndarray:
     for name in ("a2", "a3", "a4"):
         center[int(round(idx[name]))] = nudge
     # E_w -> M^E: higher perceived utility -> more engagement.
-    for name in ("alpha1", "beta1", "theta1"):
+    for name in ("alpha1", "gamma1", "beta1", "theta1"):
         center[int(round(idx[name]))] = nudge
     # A -> M^E (intercept-only): sending a suggestion is a direct
     # engagement/attention cost, absent any offsetting utility.
-    for name in ("alpha3", "beta3", "beta5", "theta3", "theta5"):
+    for name in ("alpha3", "gamma3", "beta3", "beta5", "theta3", "theta5"):
         center[int(round(idx[name]))] = -nudge
     # A * E_w -> M^E: that cost should be offset for participants who find
     # the app more useful.
-    for name in ("alpha4", "beta4", "beta6", "theta4", "theta6"):
+    for name in ("alpha4", "gamma4", "beta4", "beta6", "theta4", "theta6"):
         center[int(round(idx[name]))] = nudge
     return center
+
+
+def ridge_penalty_weights(*, e1_known: bool) -> np.ndarray:
+    """Per-coordinate ridge weights: 1 = penalized, 0 = free.
+
+    Intercepts (baseline prevalence / level) and packed log-σ stay at the
+    likelihood MLE. Query-block intercepts (``*_q0``) are slopes on lagged J
+    and remain penalized.
+    """
+    n = theta_dim(e1_known=e1_known)
+    w = np.ones(n, dtype=float)
+    idx = unpack_theta(np.arange(n, dtype=float), e1_known=e1_known)
+    for name in _RIDGE_FREE_INTERCEPTS:
+        w[int(round(idx[name]))] = 0.0
+    for i in _LOG_SIGMA_INDICES:
+        w[i] = 0.0
+    if not e1_known:
+        w[int(round(idx["m0"]))] = 0.0
+        w[-1] = 0.0  # log σ0
+    return w
+
+
+def _ridge_penalty(theta: np.ndarray, lam: float, e1_known: bool, prior_center=None) -> float:
+    theta = np.asarray(theta, dtype=float)
+    w = ridge_penalty_weights(e1_known=e1_known)
+    if prior_center is None:
+        center = np.zeros_like(theta)
+    else:
+        center = np.asarray(prior_center, dtype=float)
+    return float(lam * np.sum(w * (theta - center) ** 2))
 
 
 def log_pooled_theta(
@@ -441,10 +535,15 @@ def log_pooled_theta(
         ("J_week", ["b0", "b1"]),
         ("U1", ["c0", "c1", "sigma_U1"]),
         ("U2", ["d0", "d1", "sigma_U2"]),
-        ("PV", [
+        ("PV hurdle occurrence", [
             "alpha0", "alpha1", "alpha2_is_weekend", "alpha2_dt", "alpha2_rb",
-            "alpha3", "alpha4", "sigma_PV", "alpha_ar1",
+            "alpha3", "alpha4", "alpha_ar1",
             "alpha_q0", "alpha_qE", "alpha_qrb",
+        ]),
+        ("PV hurdle intensity", [
+            "gamma0", "gamma1", "gamma2_is_weekend", "gamma2_dt", "gamma2_rb",
+            "gamma3", "gamma4", "sigma_PV", "gamma_ar1",
+            "gamma_q0", "gamma_qE", "gamma_qrb",
         ]),
         ("FW", [
             "beta0", "beta1", "beta3", "beta4", "beta5", "beta6",
@@ -482,14 +581,26 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         if blocks
         else np.array([0.0])
     )
+    z_pos_parts = []
+    for b in blocks:
+        y = np.asarray(b.get("pv_y", []), dtype=float)
+        z = np.asarray(b.get("pv_z", []), dtype=float)
+        if y.size == 0 or z.size == 0:
+            continue
+        n = min(y.size, z.size)
+        mask = (y[:n] == 1.0) & np.isfinite(z[:n])
+        if np.any(mask):
+            z_pos_parts.append(z[:n][mask])
+    z_pos = np.concatenate(z_pos_parts) if z_pos_parts else np.array([], dtype=float)
 
     pJ = np.clip(np.mean(all_J) if len(all_J) else 0.5, 1e-4, 1 - 1e-4)
     muU1 = np.mean(all_U1) if len(all_U1) else 0.0
     muU2 = np.mean(all_U2) if len(all_U2) else 0.0
     sdU1 = np.std(all_U1) if len(all_U1) > 1 else 1.0
     sdU2 = np.std(all_U2) if len(all_U2) > 1 else 1.0
-    muPV = np.mean(all_PV) if len(all_PV) else 0.0
-    sdPV = np.std(all_PV) if len(all_PV) > 1 else 1.0
+    pPV = np.clip(np.mean(all_PV) if len(all_PV) else 0.5, 1e-4, 1 - 1e-4)
+    muZ = float(np.mean(z_pos)) if z_pos.size else 0.0
+    sdZ = float(np.std(z_pos)) if z_pos.size > 1 else 0.5
 
     parts = [
         0.0,
@@ -507,16 +618,25 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         muU2,
         0.1,
         np.log(max(sdU2, 0.1)),
-        muPV,
+        np.log(pPV / (1.0 - pPV)),
         0.1,
         0.0,
         0.0,
         0.0,
         0.0,
         0.0,
-        np.log(max(sdPV, 0.1)),
         0.0,  # alpha_ar1
         0.0, 0.0, 0.0,  # alpha_q0, alpha_qE, alpha_qrb (lagged J)
+        muZ,  # gamma0 intensity intercept on log-then-z
+        0.1,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        np.log(max(sdZ, 0.1)),
+        0.0,  # gamma_ar1
+        0.0, 0.0, 0.0,  # gamma_q0, gamma_qE, gamma_qrb
         0.0,
         0.1,
         0.0,
@@ -558,6 +678,7 @@ def build_user_blocks(
                       U1_col="Exp-tool-1_norm",
                       U2_col="Exp-tool-2_norm",
     PV_col="HourlyPageviewCount_norm",
+    PV_log_col="HourlyPageviewCount",
     FW_col="nextday_wearing",
                       PJ_col="daily_present",
     a_col="WalkingSuggestion",
@@ -579,10 +700,12 @@ def build_user_blocks(
 
     Key design:
       - The within-week likelihood uses only actually observed rows:
-            pv_y, FW_daily, PJ_daily
+            pv_y (hurdle occurrence 0/1 from raw ``PV_log_col`` count ``> 0``),
+            FW_daily, PJ_daily
         plus ``day_is_weekend`` and ``day_burden`` (aligned with each calendar day, from the
         afternoon row) for FW/PJ logit covariates.
-        AR coefficients multiply precomputed lag columns: ``PV_lag1_col`` per hour,
+        AR coefficients multiply precomputed lag columns: ``PV_lag1_col`` per hour
+        (z-scored log pageview, same scale as the simulator state),
         ``FW_lag_col`` / ``PJ_lag_col`` per day (NaNs treated as 0 in the likelihood).
         ``J_lag`` is last Sunday's ``week_present`` (``J_lag_col``), used as
         ``J_{w-1} · [1, E_w, rb]`` on this week's PV/FW/PJ. Missing weeks keep
@@ -606,7 +729,12 @@ def build_user_blocks(
 
     if PV_col not in dat.columns:
         raise KeyError(
-            f"{PV_col!r} not in dataframe (use HourlyPageviewCount_norm like 2_fit_vanilla_testbed.py)"
+            f"{PV_col!r} not in dataframe (use HourlyPageviewCount_norm)"
+        )
+    if PV_log_col not in dat.columns:
+        raise KeyError(
+            f"{PV_log_col!r} not in dataframe (raw hourly pageview count; "
+            "used to code hurdle occurrence)"
         )
     for _label, _col in (
         ("PV_lag1_col", PV_lag1_col),
@@ -638,7 +766,7 @@ def build_user_blocks(
         else:
             J_lag = np.nan
 
-        pv_y_list, pv_a_list = [], []
+        pv_y_list, pv_z_list, pv_a_list = [], [], []
         pv_lag1_list = []
         pv_ctx_rows = []
         a0_list, a1_list = [], []
@@ -651,6 +779,7 @@ def build_user_blocks(
 
             aa = g_day[a_col].to_numpy(dtype=float)
             pv = g_day[PV_col].to_numpy(dtype=float)
+            pv_log = g_day[PV_log_col].to_numpy(dtype=float)
             weekendv = g_day[weekend_col].to_numpy(dtype=float)
             burden = g_day[burden_col].to_numpy(dtype=float)
             dtv = g_day[decision_col].to_numpy(dtype=float)
@@ -661,7 +790,14 @@ def build_user_blocks(
             )
 
             for k in range(len(g_day)):
-                pv_y_list.append(float(pv[k]) if not np.isnan(pv[k]) else np.nan)
+                z_k = float(pv[k]) if not np.isnan(pv[k]) else np.nan
+                pv_z_list.append(z_k)
+                lv = float(pv_log[k]) if k < len(pv_log) and not np.isnan(pv_log[k]) else np.nan
+                if np.isnan(lv):
+                    pv_y_list.append(np.nan)
+                else:
+                    # Raw count > 0. Also true of a leftover log column.
+                    pv_y_list.append(1.0 if lv > 0.0 else 0.0)
                 pv_a_list.append(float(aa[k]) if not np.isnan(aa[k]) else np.nan)
                 pv_lag1_list.append(
                     float(lag1v[k]) if not np.isnan(lag1v[k]) else np.nan
@@ -706,6 +842,7 @@ def build_user_blocks(
                 day_pj_lag_list.append(np.nan)
 
         pv_y = np.asarray(pv_y_list, dtype=float)
+        pv_z = np.asarray(pv_z_list, dtype=float)
         pv_lag1 = np.asarray(pv_lag1_list, dtype=float)
         pv_c_ctx = np.asarray(pv_ctx_rows, dtype=float) if len(pv_ctx_rows) else np.zeros((0, 3), dtype=float)
         day_A0 = np.asarray(a0_list, dtype=float)
@@ -719,7 +856,7 @@ def build_user_blocks(
 
         # Fixed 14/7 denominators: NaN slot → 0. FW missingness is treated as
         # not wearing (same convention as vani_env / script 6 / ew_hat).
-        PV_sum = float(np.nansum(pv_y) / 14.0) if np.any(~np.isnan(pv_y)) else np.nan
+        PV_sum = float(np.nansum(pv_z) / 14.0) if np.any(~np.isnan(pv_z)) else np.nan
         FW_sum = float(np.nansum(FW_daily) / 7.0) if np.any(~np.isnan(FW_daily)) else np.nan
         PJ_sum = float(np.nansum(PJ_daily) / 7.0) if np.any(~np.isnan(PJ_daily)) else np.nan
         return {
@@ -730,6 +867,7 @@ def build_user_blocks(
             "U1": U1,
             "U2": U2,
             "pv_y": pv_y,
+            "pv_z": pv_z,
             "pv_lag1": pv_lag1,
             "pv_c_ctx": pv_c_ctx,
             "pv_a": np.asarray(pv_a_list, dtype=float),
@@ -788,6 +926,7 @@ def build_user_blocks(
                 "U1": np.nan,
                 "U2": np.nan,
                 "pv_y": np.asarray([], dtype=float),
+                "pv_z": np.asarray([], dtype=float),
                 "pv_lag1": np.asarray([], dtype=float),
                 "pv_c_ctx": np.zeros((0, 3), dtype=float),
                 "pv_a": np.asarray([], dtype=float),
@@ -834,6 +973,25 @@ def _jw_query_shift(q0, qE, qrb, j_lag, e, rb):
     return j * (q0 + qE * e + qrb * rb_f)
 
 
+def _pv_linpred(par, pfx, grid, row, a, y_lag, j_lag):
+    """Linear predictor for PV occurrence (``alpha``) or intensity (``gamma``)."""
+    coef2 = np.array(
+        [par[f"{pfx}2_is_weekend"], par[f"{pfx}2_dt"], par[f"{pfx}2_rb"]],
+        dtype=float,
+    )
+    return (
+        par[f"{pfx}0"]
+        + par[f"{pfx}1"] * grid
+        + float(row @ coef2)
+        + par[f"{pfx}_ar1"] * y_lag
+        + a * (par[f"{pfx}3"] + par[f"{pfx}4"] * grid)
+        + _jw_query_shift(
+            par[f"{pfx}_q0"], par[f"{pfx}_qE"], par[f"{pfx}_qrb"],
+            j_lag, grid, row[2],
+        )
+    )
+
+
 def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) -> np.ndarray:
     """log p(Y_w | E_w = grid, par) for each grid point; vector of shape grid.shape."""
     grid = np.asarray(grid, dtype=float)
@@ -855,12 +1013,9 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             ll += normal_logpdf(block["U2"], mu, par["sigma_U2"])
 
     pv_y = block["pv_y"]
+    pv_z = block.get("pv_z")
     pv_ctx = block["pv_c_ctx"]
     pv_a = block["pv_a"]
-    coef2 = np.array(
-        [par["alpha2_is_weekend"], par["alpha2_dt"], par["alpha2_rb"]],
-        dtype=float,
-    )
 
     for j in range(len(pv_y)):
         y = pv_y[j]
@@ -868,7 +1023,6 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             continue
         row = np.asarray(pv_ctx[j], dtype=float)
         row = np.where(np.isnan(row), 0.0, row)
-        dotc = float(row @ coef2)
         a = pv_a[j]
         a = 0.0 if np.isnan(a) else a
         pl1 = block.get("pv_lag1")
@@ -877,18 +1031,17 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             if pl1 is not None and len(pl1) > j and not np.isnan(pl1[j])
             else 0.0
         )
-        mu = (
-            par["alpha0"]
-            + par["alpha1"] * grid
-            + dotc
-            + par["alpha_ar1"] * y_lag
-            + a * (par["alpha3"] + par["alpha4"] * grid)
-            + _jw_query_shift(
-                par["alpha_q0"], par["alpha_qE"], par["alpha_qrb"],
-                block.get("J_lag"), grid, row[2],
-            )
+        eta = _pv_linpred(
+            par, "alpha", grid, row, a, y_lag, block.get("J_lag"),
         )
-        ll += normal_logpdf(y, mu, par["sigma_PV"])
+        ll += bernoulli_logpmf(y, eta)
+        if int(round(float(y))) == 1 and pv_z is not None and j < len(pv_z):
+            z = float(pv_z[j])
+            if np.isfinite(z):
+                mu_z = _pv_linpred(
+                    par, "gamma", grid, row, a, y_lag, block.get("J_lag"),
+                )
+                ll += normal_logpdf(z, mu_z, par["sigma_PV"])
 
     for d in range(len(block["FW_daily"])):
         y = block["FW_daily"][d]
@@ -1067,10 +1220,21 @@ def penalized_json_export(
             r3(par["alpha_ar1"]),
             r3(par["alpha3"]),
             r3(par["alpha4"]),
-            r3(par["sigma_PV"]),
             r3(par["alpha_q0"]),
             r3(par["alpha_qE"]),
             r3(par["alpha_qrb"]),
+            r3(par["gamma0"]),
+            r3(par["gamma1"]),
+            r3(par["gamma2_is_weekend"]),
+            r3(par["gamma2_dt"]),
+            r3(par["gamma2_rb"]),
+            r3(par["gamma_ar1"]),
+            r3(par["gamma3"]),
+            r3(par["gamma4"]),
+            r3(par["gamma_q0"]),
+            r3(par["gamma_qE"]),
+            r3(par["gamma_qrb"]),
+            r3(par["sigma_PV"]),
         ],
         "theta_penalized_PV_names": [
             "alpha0",
@@ -1081,8 +1245,17 @@ def penalized_json_export(
             "alpha_ar1_hourly_pageview_lag1",
             "alpha3_action",
             "alpha4_action_by_Ew",
-            "sigma_PV",
             *QUERY_JW_NAMES,
+            "gamma0",
+            "gamma1_Ew",
+            "gamma2_is_weekend",
+            "gamma2_decision_time",
+            "gamma2_recent_burden",
+            "gamma_ar1_hourly_pageview_lag1",
+            "gamma3_action",
+            "gamma4_action_by_Ew",
+            *QUERY_JW_INTENSITY_NAMES,
+            "sigma_PV",
         ],
 
         "theta_penalized_FW": [
@@ -1148,7 +1321,7 @@ def penalized_json_export(
                 "joint lagged-J in script-4 PV/FW/PJ emissions "
                 "(week_present_lastweek)"
             ),
-            "apply": "add J_w * (q @ z); I_w not in model",
+            "apply": "add J_w * (q @ z) on the PV/FW/PJ linear predictor; I_w not in model",
         },
     }
 
@@ -1214,16 +1387,12 @@ def penalized_json_export(
             rU2.append(None)
 
         # ------------------------------------------------------------
-        # Hourly PV: one entry per included PV row
-        # Prediction is computed for every PV row.
-        # Residual is None if observed PV is missing.
-        # ------------------------------------------------------------
-        coef2 = np.array(
-            [par["alpha2_is_weekend"], par["alpha2_dt"], par["alpha2_rb"]],
-            dtype=float,
-        )
-
+        # Hourly PV hurdle: one entry per included PV row.
+        # Prediction is P(count>0). Residual is the intensity leftover
+        # (z − μ | count>0) for the simulator bootstrap; None if the slot
+        # is zero or missing.
         pv_y = block["pv_y"]
+        pv_z = block.get("pv_z")
         pv_ctx = block["pv_c_ctx"]
         pv_a = block["pv_a"]
         pv_lag1 = block.get("pv_lag1")
@@ -1233,11 +1402,8 @@ def penalized_json_export(
 
             row = np.asarray(pv_ctx[j], dtype=float)
             row = np.where(np.isnan(row), 0.0, row)
-            dotc = float(row @ coef2)
-
             A = pv_a[j]
             A = 0.0 if np.isnan(A) else float(A)
-
             y_lag = (
                 float(pv_lag1[j])
                 if pv_lag1 is not None
@@ -1245,25 +1411,23 @@ def penalized_json_export(
                 and not np.isnan(pv_lag1[j])
                 else 0.0
             )
-
-            mu = float(
-                par["alpha0"]
-                + par["alpha1"] * e
-                + dotc
-                + par["alpha_ar1"] * y_lag
-                + A * (par["alpha3"] + par["alpha4"] * e)
-                + _jw_query_shift(
-                    par["alpha_q0"], par["alpha_qE"], par["alpha_qrb"],
-                    block.get("J_lag"), e, row[2],
-                )
+            eta = float(
+                _pv_linpred(par, "alpha", e, row, A, y_lag, block.get("J_lag"))
             )
-
-            pPV.append(r3(mu))
-
-            if np.isnan(y):
-                rPV.append(None)
+            pPV.append(r3(float(_sigm(eta))))
+            occ = (not np.isnan(y)) and int(round(float(y))) == 1
+            z = (
+                float(pv_z[j])
+                if occ and pv_z is not None and j < len(pv_z)
+                else np.nan
+            )
+            if occ and np.isfinite(z):
+                mu_z = float(
+                    _pv_linpred(par, "gamma", e, row, A, y_lag, block.get("J_lag"))
+                )
+                rPV.append(r3(z - mu_z))
             else:
-                rPV.append(r3(float(y) - mu))
+                rPV.append(None)
 
         # ------------------------------------------------------------
         # Daily FW: one entry per included day
@@ -1433,25 +1597,32 @@ def attach_filtered_Ew_to_df_fit(
     pu_last_col: str = "perceived_utility_lastweek",
     week_col: str = "week",
 ) -> pd.DataFrame:
-    """Add exported \\hat E_{w+1} and its literal one-week lag \\hat E_w to ``df_fit``.
+    """Write the quadrature-filtered E_w plug-in into ``df_fit``.
 
-    ``filtered_states[uid]['filtered_means']`` is indexed ``0..T-1`` for study
-    weeks ``1..T`` (``full_weeks=range(1, 13)`` → T=12), with ``fm[w-1]`` =
-    filtered \\hat E_w for week w (``fm[0]`` = the fixed baseline E_1 = v).
+    ``filtered_states[uid]['filtered_means']`` has length T (study weeks 1..T).
+    With the production pin ``e1_known=v``:
+      - ``fm[0]`` = v. E_1 is not updated with week-1 emissions.
+      - ``fm[t]`` for t >= 1 is the filtered mean of E_{t+1} given Y_{1:t+1},
+        so it conditions on week t+1's own emissions (J, U1/U2, PV, FW, PJ).
 
-    Each existing row at study week w (1..T) gets, with ``e1_known=v``:
-      - ``perceived_utility_lastweek`` = \\hat E_w = ``fm[w-1]`` (the state
-        entering week w, known before week w's own data — this is exactly the
-        state that governs week w's likelihood in the model). Spans
-        E_1,...,E_T over weeks 1..T.
-      - ``perceived_utility`` = \\hat E_{w+1} = ``fm[w]`` for w<T, or the
-        predictive ``terminal_predicted_mean`` (E_{T+1}) for w=T (end of week
-        T, one AR step past the last filtered state). Spans E_2,...,E_{T+1}
-        over weeks 1..T.
+    On a row with study week w (1..T):
+      - ``perceived_utility_lastweek`` = ``fm[w-1]``. This is the plug-in for
+        the latent E_w that governs week w's SSM likelihood. For w = 1 it is
+        the pin v (truly pre-week). For w >= 2 it is Ê_{w|w}, which uses week
+        w's own emissions — not information known before week w.
+      - ``perceived_utility`` = ``fm[w]`` for w < T (Ê_{w+1|w+1}), or the
+        one-step predictive ``terminal_predicted_mean`` (E_{T+1} | Y_{1:T})
+        on week T.
 
-    By construction ``perceived_utility_lastweek`` on week w equals
-    ``perceived_utility`` on week w-1 (literal weekly lag), with week 1's
-    lastweek anchored to the E_1 baseline v (no week-0 row exists).
+    The two columns are still a literal weekly lag: lastweek on week w equals
+    ``perceived_utility`` on week w-1 (week 1 lastweek is the pin; no week-0
+    row). Script 5 uses ``perceived_utility_lastweek`` as a generated
+    regressor for fourSC / anticipated affect — a contemporaneous plug-in
+    for E_w, not a pre-week covariate. The agent never sees this column;
+    runtime ``E_known`` comes from script 6.
+
+    One-step predictives Ê_{w|w-1} are already in ``filt['predicted_means']``
+    (NaN at t = 0 when E_1 is pinned). A smoother Ê_{w|T} is not computed.
 
     Returns a new dataframe; the input is not modified.
     """
@@ -1494,12 +1665,12 @@ def save_df_fit_with_perceived_utility(
     pu_last_col: str = "perceived_utility_lastweek",
     week_col: str = "week",
 ) -> pd.DataFrame:
-    """Attach exported E_w columns to ``df_fit`` and write the result to ``out_path``.
+    """Attach filtered E_w columns to ``df_fit`` and write ``out_path``.
 
-    Expects study weeks 1–12 in ``df_fit``. On row week=w (1..12):
-    ``perceived_utility`` = \\hat E_{w+1} (E_2..E_13 over weeks 1..12, terminal
-    E_13 on week 12 is predictive); ``perceived_utility_lastweek`` = \\hat E_w
-    (E_1..E_12 over weeks 1..12).
+    Expects study weeks 1–12. On row week=w: ``perceived_utility_lastweek``
+    is the contemporaneous plug-in Ê_{w|w} (E_1 pin on week 1);
+    ``perceived_utility`` is Ê_{w+1|w+1} (terminal predictive E_{13} on
+    week 12). See :func:`attach_filtered_Ew_to_df_fit`.
     """
     out = attach_filtered_Ew_to_df_fit(
         df_fit,
@@ -1617,6 +1788,11 @@ def quadrature_loglik(
     hat c_w = sum_k ell_w(e_k) hat q_w(e_k) omega_k; log L ~= sum_w log hat c_w
     (with w=1 either ell_1(E_1) at a point or integrated against a prior on E_1).
 
+    Each increment also includes ``log_grid_mass``, the log integral of the
+    unnormalized Gaussian predictive over the grid (``<= 0``). That charges
+    transition mass that would have landed off-grid; filtered densities are
+    still renormalized on the grid.
+
     If e1_known is float: E_1 is the fixed baseline (week-1 start / lastweek);
     first term is log p(Y_1|E_1=e1) and hat q_2 transitions from that baseline
     to E_2 (end of week 1 / start of week 2). If None: week 1 uses prior
@@ -1696,7 +1872,8 @@ def quadrature_loglik(
             den = np.sum(num * weights)
             if (not np.isfinite(den)) or (den <= 0):
                 raise FloatingPointError(f"invalid c_{t+1}")
-            log_c = float(m + np.log(den))
+            # Defective Gaussian: charge off-grid predictive mass (log m <= 0).
+            log_c = float(m + np.log(den) + log_grid_mass)
             if not np.isfinite(log_c):
                 raise FloatingPointError(f"invalid log c_{t+1}")
 
@@ -1735,7 +1912,8 @@ def quadrature_loglik(
             den = np.sum(num * weights)
             if (not np.isfinite(den)) or (den <= 0):
                 raise FloatingPointError(f"invalid c_{t+1}")
-            log_c = float(m + np.log(den))
+            # Defective Gaussian: charge off-grid predictive mass (log m <= 0).
+            log_c = float(m + np.log(den) + log_grid_mass)
             if not np.isfinite(log_c):
                 raise FloatingPointError(f"invalid log c_{t+1}")
 
@@ -1799,10 +1977,15 @@ def quadrature_loglik(
 # and ``vani_env._week_means_from_arrays`` uses the identical convention at
 # simulation time. A unit shift in E_w shifts every slot (day) of the week by
 # the same per-slot slope, so the weekly average shifts by exactly that slope
-# -- there is no 14x or 7x accumulation. dFW_w/dE_w and dPJ_w/dE_w additionally
-# carry the logistic slope pi*(1-pi), fixed at its largest-magnitude value 0.25
-# at pi=0.5, so the penalty errs toward extra stability rather than needing a
-# nested per-user prevalence estimate solved inside the optimizer. Both a
+# -- there is no 14x or 7x accumulation. FW and PJ are Bernoulli, so
+# dFW_w/dE_w and dPJ_w/dE_w carry the logistic slope pi*(1-pi), fixed at its
+# largest-magnitude value 0.25 at pi=0.5. PV is a hurdle on the z-scale:
+# dE[z]/dE = p(1-p) α_E (z̄₊ - z_0) + p γ_E. The proxy uses 0.25 and p ≤ 1,
+# and multiplies the occurrence term by (z̄₊ - z_0) from std_params (z̄₊ = 0
+# among positives; z_0 is log(0.5) on that axis). That gap is ~2.85 in the
+# current folder; omitting it understates the occurrence path. The penalty
+# errs toward extra stability rather than needing a nested per-user
+# prevalence estimate solved inside the optimizer. Both a
 # "never suggest" (A=0) and "always suggest" (A=1) week are penalized, since g
 # is close to affine in the fraction of slots suggested and these two bracket
 # the range seen in simulation.
@@ -1824,6 +2007,18 @@ LOOP_GAIN_BARRIER_WEIGHT = 3.0
 LOOP_GAIN_DENOM_FLOOR = 1e-3  # keeps the barrier finite (no NaNs) even if |g| overshoots 1 mid-optimization
 A1_INDEX = 1
 A1_LIGHT_BARRIER_WEIGHT = 1.0  # weaker than the compound barrier's effective weight; a secondary guard, not the primary defense
+_PV_OCCURRENCE_Z_GAP: Optional[float] = None
+
+
+def _pv_occurrence_z_gap() -> float:
+    """``z̄₊ - z_0`` from this folder's ``std_params.json`` (cached)."""
+    global _PV_OCCURRENCE_Z_GAP
+    if _PV_OCCURRENCE_Z_GAP is None:
+        path = WORK_DIR / "std_params.json"
+        with open(path, encoding="utf-8") as f:
+            std = json.load(f)
+        _PV_OCCURRENCE_Z_GAP = float(pv_hurdle_occurrence_z_gap(std))
+    return _PV_OCCURRENCE_Z_GAP
 
 
 def _loop_gain_barrier_term(g: float) -> float:
@@ -1857,18 +2052,29 @@ def _loop_gain_penalty(theta: np.ndarray, e1_known: bool) -> float:
 
     # Weekly summaries are fixed-denominator averages, so each derivative is the
     # per-slot (per-day) slope itself; see the note above the constants.
-    dPV_zero = alpha1
-    dPV_always = alpha1 + alpha4
-    dFW_zero = LOGISTIC_SLOPE_PROXY * beta1
-    dFW_always = LOGISTIC_SLOPE_PROXY * (beta1 + beta4 + beta6)
-    dPJ_zero = LOGISTIC_SLOPE_PROXY * theta1
-    dPJ_always = LOGISTIC_SLOPE_PROXY * (theta1 + theta4 + theta6)
+    # PV: 0.25 α_E (z̄₊ - z_0) + γ_E. FW/PJ: 0.25 times the logit E-slope.
+    # Worst |g| over J∈{0,1} matches tune_ste.loop_gain_Ew.
+    occ_gap = _pv_occurrence_z_gap()
 
-    g_zero = a1 + a2 * dPV_zero + a3 * dFW_zero + a4 * dPJ_zero
-    g_always = a1 + a2 * dPV_always + a3 * dFW_always + a4 * dPJ_always
+    def g(action: float, j: float) -> float:
+        dPV = LOGISTIC_SLOPE_PROXY * occ_gap * (
+            alpha1 + action * alpha4 + j * p["alpha_qE"]
+        ) + (p["gamma1"] + action * p["gamma4"] + j * p["gamma_qE"])
+        dFW = LOGISTIC_SLOPE_PROXY * (
+            beta1 + action * (beta4 + beta6) + j * p["beta_qE"]
+        )
+        dPJ = LOGISTIC_SLOPE_PROXY * (
+            theta1 + action * (theta4 + theta6) + j * p["theta_qE"]
+        )
+        return a1 + a2 * dPV + a3 * dFW + a4 * dPJ
+
+    def worst_over_j(action: float) -> float:
+        g0, g1 = g(action, 0.0), g(action, 1.0)
+        return g0 if abs(g0) >= abs(g1) else g1
+
     return (
-        _loop_gain_barrier_term(g_zero)
-        + _loop_gain_barrier_term(g_always)
+        _loop_gain_barrier_term(worst_over_j(0.0))
+        + _loop_gain_barrier_term(worst_over_j(1.0))
         + _a1_light_barrier_penalty(theta)
     )
 
@@ -1882,7 +2088,8 @@ def neg_loglik_blocks(theta, blocks, grid, weights, e1_known, lam=0.5, prior_cen
     assumptions (e.g. "an intervention should not increase burden-adjusted
     engagement") as a *population-level nudge* baked into every participant's
     own ridge penalty, rather than fitting freely and sign-flipping the
-    result post-hoc. See PENALIZED_PRIOR_CENTER.
+    result post-hoc. See ``build_penalized_prior_center``. Intercepts and
+    log-σ are omitted from the ridge (``ridge_penalty_weights``).
 
     In addition to that per-coefficient ridge, the *compound* loop gain
     through E_w's own persistence (a1) and its indirect PV/FW/PJ feedback
@@ -1895,9 +2102,8 @@ def neg_loglik_blocks(theta, blocks, grid, weights, e1_known, lam=0.5, prior_cen
         out = quadrature_loglik(blocks, theta, grid, weights, e1_known=e1_known)
         if not np.isfinite(out["loglik"]):
             return 1e100
-        center = 0.0 if prior_center is None else prior_center
         penalty = (
-            lam * np.sum((theta - center) ** 2)
+            _ridge_penalty(theta, lam, bool(e1_known), prior_center)
             + _loop_gain_penalty(theta, e1_known)
         )
         return -out["loglik"] + penalty
@@ -1925,8 +2131,9 @@ def neg_loglik_all_users(theta, user_blocks, grid, weights, e1_known, lam=0.5):
             return 1e100
         total_nll += val
 
-    # Apply ridge penalty once, not once per participant
-    penalty = lam * np.sum(theta ** 2)
+    # Apply ridge penalty once, not once per participant. Intercepts and
+    # log-σ are unpenalized (same mask as the per-user fits).
+    penalty = _ridge_penalty(theta, lam, bool(e1_known), prior_center=None)
     return total_nll + penalty
 
 
@@ -2038,9 +2245,8 @@ def make_bounds(*, e1_known: bool):
     # State AR coefficient a1
     bounds[1] = (-0.98, 0.98)
 
-    # log sigma parameters:
-    # 5: sigma_E, 10: sigma_U1, 13: sigma_U2, 21: sigma_PV
-    for idx in [5, 10, 13, 21]:
+    # log sigma parameters: σ_E, σ_U1, σ_U2, σ_PV (intensity)
+    for idx in _LOG_SIGMA_INDICES:
         bounds[idx] = (np.log(0.03), np.log(10.0))
 
     # If E1 prior is estimated, bound log sigma0 too
@@ -2172,7 +2378,7 @@ def fit_pooled_model(
     progress_min_interval_s: float = 15.0,
 ):
     if grid is None:
-        grid = np.linspace(-3.0, 3.0, 121)
+        grid = e_quadrature_grid(pooled=True)
 
     e1_fixed = e1_known is not None
     weights = trapezoid_weights(grid)
@@ -2419,7 +2625,7 @@ def fit_all_users(
     n_jobs: Optional[int] = None,
 ):
     if grid is None:
-        grid = np.linspace(-3.0, 3.0, 241)
+        grid = e_quadrature_grid(pooled=False)
 
     user_data = [
         (
@@ -2704,7 +2910,7 @@ def plot_quadrature_diagnostics(
     _maybe_save_close(fig_d, "params_group_d.png")
 
     # --- log(sigma_U^2) ---
-    fig_n, axes_n = plt.subplots(1, 2, figsize=(10, 3.2), squeeze=False)
+    fig_n, axes_n = plt.subplots(1, 3, figsize=(14, 3.2), squeeze=False)
     _bar_users_one_series(
         axes_n[0][0],
         "Estimate",
@@ -2723,12 +2929,21 @@ def plot_quadrature_diagnostics(
             for u in _users
         ],
     )
-    fig_n.suptitle(r"Gaussian emission noise (weekly surveys)", fontsize=11, y=1.05)
+    _bar_users_one_series(
+        axes_n[0][2],
+        "Estimate",
+        r"$\log(\sigma_{\mathrm{PV}}^2)$ (intensity)",
+        [
+            float(np.log(filtered_states[u]["params"]["sigma_PV"] ** 2))
+            for u in _users
+        ],
+    )
+    fig_n.suptitle(r"Gaussian emission noise", fontsize=11, y=1.05)
     fig_n.tight_layout()
     _maybe_save_close(fig_n, "params_group_log_sigma2.png")
 
-    # --- PV model: alpha, AR(1), sigma_PV ---
-    fig_pv, axes_pv = plt.subplots(3, 3, figsize=(12, 8.0), squeeze=False)
+    # --- PV hurdle: alpha, AR(1) ---
+    fig_pv, axes_pv = plt.subplots(2, 4, figsize=(14, 6.0), squeeze=False)
     flat = np.ravel(axes_pv)
     _pv_specs = [
         (r"$\alpha_0$", lambda p: p["alpha0"]),
@@ -2742,16 +2957,40 @@ def plot_quadrature_diagnostics(
         ),
         (r"$\alpha_3$ ($A$)", lambda p: p["alpha3"]),
         (r"$\alpha_4$ ($A\cdot E_w$)", lambda p: p["alpha4"]),
-        (r"$\log(\sigma_{\mathrm{PV}}^2)$", lambda p: np.log(p["sigma_PV"] ** 2)),
     ]
     for k, (tit, fn) in enumerate(_pv_specs):
         vals = [float(fn(filtered_states[u]["params"])) for u in _users]
         _bar_users_one_series(flat[k], "Estimate", tit, vals)
     fig_pv.suptitle(
-        r"Hourly pageview (Gaussian) — context, lag1 column, action", fontsize=11, y=1.02
+        r"Hourly pageview hurdle logit $P(\mathrm{count}>0)$ — context, lag1, action",
+        fontsize=11,
+        y=1.02,
     )
     fig_pv.tight_layout()
     _maybe_save_close(fig_pv, "params_group_pv.png")
+
+    fig_pv_z, axes_pv_z = plt.subplots(2, 4, figsize=(14, 6.0), squeeze=False)
+    flat_z = np.ravel(axes_pv_z)
+    _pv_z_specs = [
+        (r"$\gamma_0$", lambda p: p["gamma0"]),
+        (r"$\gamma_1$ ($E_w$)", lambda p: p["gamma1"]),
+        (r"$\gamma_{2,\mathrm{we}}$", lambda p: p["gamma2_is_weekend"]),
+        (r"$\gamma_{2,\mathrm{dt}}$", lambda p: p["gamma2_dt"]),
+        (r"$\gamma_{2,\mathrm{rb}}$", lambda p: p["gamma2_rb"]),
+        (r"$\gamma_{\mathrm{AR}}$", lambda p: p["gamma_ar1"]),
+        (r"$\gamma_3$ ($A$)", lambda p: p["gamma3"]),
+        (r"$\gamma_4$ ($A\cdot E_w$)", lambda p: p["gamma4"]),
+    ]
+    for k, (tit, fn) in enumerate(_pv_z_specs):
+        vals = [float(fn(filtered_states[u]["params"])) for u in _users]
+        _bar_users_one_series(flat_z[k], "Estimate", tit, vals)
+    fig_pv_z.suptitle(
+        r"Hourly pageview hurdle intensity (Gaussian on log-then-z $\mid$ count$>0$)",
+        fontsize=11,
+        y=1.02,
+    )
+    fig_pv_z.tight_layout()
+    _maybe_save_close(fig_pv_z, "params_group_pv_intensity.png")
 
     # --- FW / PJ: intercept, E_w, is_weekend, burden, AR(1) within week ---
     fig_ft, axes_ft = plt.subplots(2, 5, figsize=(16, 6.0), squeeze=False)
@@ -2840,7 +3079,7 @@ if __name__ == "__main__":
     # Stage 1: pooled fit on a coarser grid
     pooled_res, pooled_blocks = fit_pooled_model(
         df_fit,
-        grid=np.linspace(-3.0, 3.0, 121),
+        grid=e_quadrature_grid(pooled=True),
         e1_known=2.0,
         maxiter=500,
         lam=0.5,
@@ -2871,7 +3110,7 @@ if __name__ == "__main__":
     _e1_known = 2.0
     results, filtered_states, blocks_by_user = fit_all_users(
         df_fit,
-        grid=np.linspace(-3.0, 3.0, 241),
+        grid=e_quadrature_grid(pooled=False),
         e1_known=_e1_known,
         maxiter=500,
         pooled_x0=pooled_x0,
@@ -2883,8 +3122,8 @@ if __name__ == "__main__":
         n_jobs=None,
     )
 
-    # Write filtered E_w (perceived utility) back to df_fit.csv so that
-    # 2_fit_vanilla_testbed.py can read perceived_utility / perceived_utility_lastweek.
+    # Write filtered E_w plug-in back to df_fit.csv for script 5
+    # (contemporaneous Ê_{w|w} in perceived_utility_lastweek; not pre-week).
     df_fit_out = save_df_fit_with_perceived_utility(
         df_fit,
         filtered_states,

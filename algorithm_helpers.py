@@ -677,9 +677,11 @@ def weekly_pv_sum_for_ew(slot_pv, *, shift=None, scale=None):
     Matches ``4_perceived_utility.build_user_blocks``:
 
     1. Each of the 14 decision slots (7 days × 2 times) has a 4-hour-window
-       pageview count. In ``3_standardization.py`` that count is log-transformed
-       and z-scored per slot → ``HourlyPageviewCount_norm``.
-    2. ``PV_sum`` is the **mean** over those 14 normalized slot values:
+       pageview count. Script 3 keeps the raw count in
+       ``HourlyPageviewCount`` and writes log-then-z to
+       ``HourlyPageviewCount_norm``: ``log(x)`` for ``x>=1`` (no ``+1``),
+       and ``log(0.5)`` for count 0 so zeros still sit below 1.
+   2. ``PV_sum`` is the **mean** over those 14 normalized slot values:
 
            PV_sum = (1/14) * sum_i HourlyPageviewCount_norm_i
 
@@ -689,14 +691,14 @@ def weekly_pv_sum_for_ew(slot_pv, *, shift=None, scale=None):
         Length-14 (or flattened week) slot values. Pass ``HourlyPageviewCount_norm``
         directly, **or** raw counts with ``shift`` / ``scale`` from
         ``std_params.json`` (``HourlyPageviewCount_shift`` / ``scale``) to apply
-        log(x+1) and z-score per slot before averaging.
+        log(x) per positive slot (count 0 uses log(0.5)) and z-score before averaging.
     """
     v = np.asarray(slot_pv, dtype=float).ravel()
     if v.size == 0:
         return 0.0
     if shift is not None and scale is not None:
         v = np.where(np.isfinite(v), v, 0.0)
-        logged = np.log(v + 1.0)
+        logged = np.where(v > 0.0, np.log(v), np.log(0.5))
         v = (logged - float(shift)) / float(scale)
     if not np.any(np.isfinite(v)):
         return 0.0

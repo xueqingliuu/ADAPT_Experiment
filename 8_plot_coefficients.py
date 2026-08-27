@@ -52,7 +52,7 @@ _THETA_BLOCK_TITLES = {
 }
 
 # Names skipped as non-structural (noise scales / imputation hooks).
-_SKIP_NAME_PREFIXES = ("sigma_", "query_imputed_", "query_Jw_")
+_SKIP_NAME_PREFIXES = ("sigma_", "query_imputed_", "query_Jw_", "intensity_query_Jw_")
 
 SHORT_LABELS = {
     "perceived_utility_lastweek": "E_w",
@@ -92,6 +92,14 @@ SHORT_LABELS = {
     "alpha_ar1_hourly_pageview_lag1": "AR1",
     "alpha3_action": "A",
     "alpha4_action_by_Ew": "A×E_w",
+    "gamma0": "γ0",
+    "gamma1_Ew": "E_w (int.)",
+    "gamma2_is_weekend": "wknd (int.)",
+    "gamma2_decision_time": "slot (int.)",
+    "gamma2_recent_burden": "burden (int.)",
+    "gamma_ar1_hourly_pageview_lag1": "AR1 (int.)",
+    "gamma3_action": "A (int.)",
+    "gamma4_action_by_Ew": "A×E_w (int.)",
     "beta0": "β0",
     "beta1_Ew": "E_w",
     "beta2_is_weekend": "wknd",

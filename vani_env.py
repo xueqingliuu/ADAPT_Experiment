@@ -15,14 +15,14 @@ regenerate (yesterday = sum of the prior day's two 4-hour step z-scores;
 7-day page-view EMA = EWM of daily means of 4-hour page-view z-scores).
 Set ``ADAPR_FOURSC_CLOSED_LOOP_PROXY=0`` to keep the untranslated JSON.
 
-Page views are a two-part hurdle: logistic ``P(count>0)`` on current ``E_w``
-plus a resample from that person's observed positive counts. The J_w-estimated
-query suffix is *added* when ``J_w = 1`` (``Δp = Δμ / (z̄₊ − z₀)`` on the
-hurdle). ``I_w`` is not in this model. STE-tuned changes to the Gaussian PV
-action coefficients enter the hurdle the same additive way
-(``A · Δμ_A / (z̄₊ − z₀)``, see ``_pv_hurdle_action_shift``) — never as a
-rescaling of the fitted logistic slopes. Set ``ADAPR_PV_HURDLE=0`` to keep
-the Gaussian generator. FW/PJ stay on their original logits.
+Page views are a two-part hurdle whose coefficients come from script 4
+(``theta_penalized_PV``): logistic ``P(count>0)`` and, given a positive
+count, a Gaussian on ``log(x)`` then z-scored among positives. Count 0
+sits at ``log(0.5)`` on that axis. Both parts include ``E_w``,
+weekend, slot, burden, lag1, ``A``, ``A×E_w``, and the lagged-J query on
+the linear predictor. ``I_w`` is not in this model. STE-tuned folders
+carry edited action slopes in JSON, so they enter both parts directly.
+FW/PJ stay on their original logits.
 """
 from __future__ import annotations
 
@@ -48,6 +48,11 @@ PROJECT_ROOT = Path(
 PARAMS_DIR = (
     PROJECT_ROOT / os.environ.get("ADAPR_PARAMS_DIR", "env_para_vanilla")
 ).expanduser().resolve()
+
+# Latent E_w support: script-4 quadrature and the simulator clip share this
+# interval. Change it here only (``4_perceived_utility`` imports these names).
+E_QUAD_LO = -4.0
+E_QUAD_HI = 4.0
 
 
 def _load_json(path: Path):
@@ -249,12 +254,14 @@ CAE_FOURSC_SLOTS_RL = 12
 CAE_ANTIC_DAYS = 7
 CAE_ANTIC_DAYS_RL = 6
 _CAE_WEEK_IDX = THETA_CAE_NAMES.index("week")
-PV_ML_BASE = 9
+PV_ML_BASE = 8
+PV_ML_QUERY = 3
+# Full hurdle JSON: occurrence (8+3) + intensity (8+3) + sigma_PV.
+PV_ML_HURDLE = PV_ML_BASE + PV_ML_QUERY + PV_ML_BASE + PV_ML_QUERY + 1
 FW_ML_BASE = 9
 PJ_ML_BASE = 9
 # Query suffix: J_w × (intercept, E_w, recent_burden), jointly fit in script 4.
-# Added when J_w=1; I_w is not in the PV/FW/PJ model.
-PV_ML_QUERY = 3
+# Added to the linear predictor when J_w=1; I_w is not in the PV/FW/PJ model.
 FW_ML_QUERY = 3
 PJ_ML_QUERY = 3
 # Legacy suffixes (before weekend/decision-time were removed from the query block).
@@ -654,8 +661,31 @@ def _split_ml_query(
     return base, q
 
 
+def _split_ml_pv_hurdle(theta: np.ndarray):
+    """Split script-4 PV hurdle theta.
+
+    Current JSON (23): occurrence 8+3, intensity 8+3, ``sigma_PV``.
+    Legacy occurrence-only (11, or 12 with a trailing Gaussian σ dropped)
+    returns ``int_base is None`` so the generator can fall back to resampling.
+    """
+    t = np.asarray(theta, dtype=float).ravel()
+    if t.size >= PV_ML_HURDLE:
+        occ, rest = t[:11], t[11:]
+        occ_base, occ_q = occ[:PV_ML_BASE], occ[PV_ML_BASE:]
+        int_base, int_q = rest[:PV_ML_BASE], rest[PV_ML_BASE:PV_ML_BASE + PV_ML_QUERY]
+        sigma = float(rest[PV_ML_BASE + PV_ML_QUERY]) if rest.size > PV_ML_BASE + PV_ML_QUERY else 0.1
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            sigma = 0.1
+        return occ_base, occ_q, int_base, int_q, sigma
+    if t.size in (9, 12) and t.size > PV_ML_BASE:
+        t = np.concatenate([t[:PV_ML_BASE], t[PV_ML_BASE + 1 :]])
+    occ_base, occ_q = _split_ml_query(t, PV_ML_BASE, PV_ML_QUERY, _PV_QUERY_LEGACY_KEEP)
+    return occ_base, occ_q, None, None, None
+
+
 def _split_ml_pv_full(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    return _split_ml_query(theta, PV_ML_BASE, PV_ML_QUERY, _PV_QUERY_LEGACY_KEEP)
+    occ_base, occ_q, _int_base, _int_q, _sigma = _split_ml_pv_hurdle(theta)
+    return occ_base, occ_q
 
 
 def _split_ml_fw(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -679,7 +709,7 @@ def _ml_query_features(s) -> np.ndarray:
 
 
 def _ml_query_applied_shift(q, s, Jw: int) -> float:
-    """``mu += J_w * (q @ z)``. ``I_w`` is not in this model."""
+    """Add ``J_w * (q @ z)`` to the linear predictor. ``I_w`` is not in this model."""
     q = np.asarray(q, dtype=float).ravel()
     if q.size == 0 or int(Jw) == 0:
         return 0.0
@@ -954,85 +984,54 @@ def _foursc_proxy_initials_from_csv(df_path, participant_id):
     return _proxy_init_from_user_df(g)
 
 
-def _pv_hurdle_enabled() -> bool:
-    raw = os.environ.get("ADAPR_PV_HURDLE", "1").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
-
-
-def _pv_hurdle_features_state(s, Ah: float) -> np.ndarray:
-    """Occurrence design: E_w, weekend, slot, burden, lag1, A, A×E_w."""
-    ew = float(s["perceivedUtilityLastWeek"])
-    ah = float(Ah)
-    return np.array(
-        [
-            ew,
-            float(s["isWeekend"]),
-            float(s["decisionTimeSlot"]),
-            float(s["activitySuggestionsSentLast7Days"]),
-            float(s["pageViewNext4HourLag1"]),
-            ah,
-            ah * ew,
-        ],
-        dtype=float,
-    )
-
-
-def _pv_hurdle_features_df(g: pd.DataFrame) -> np.ndarray:
-    ew = _fill_nan_with_mean(_df_numeric_col(g, "perceived_utility_lastweek"))
-    weekend = _fill_nan_with_mean(_df_numeric_col(g, "is_weekend", "isWeekend"), default=0.0)
-    dt = _fill_nan_with_mean(_df_numeric_col(g, "DecisionTime"), default=0.0)
-    rb = _fill_nan_with_mean(_df_numeric_col(g, "recent_burden_norm", "recent_burden"))
-    lag1 = _fill_nan_with_mean(
-        _df_numeric_col(g, "hourly_pageview_count_lag1")
-    )
-    ah = _fill_nan_with_mean(_df_numeric_col(g, "WalkingSuggestion"), default=0.0)
-    return np.column_stack([ew, weekend, dt, rb, lag1, ah, ah * ew])
-
-
 def _raw_pageview_counts(g: pd.DataFrame) -> np.ndarray:
-    """Undo script-3 ``log(x+1)`` overwrite of ``HourlyPageviewCount``."""
-    log1p = _df_numeric_col(g, "HourlyPageviewCount")
-    raw = np.expm1(log1p)
+    """Integer 4-hour pageview counts from ``HourlyPageviewCount``.
+
+    Script 3 keeps this column raw. Older ``df_fit`` files overwrote it with
+    ``log(x+1)``; those are recovered with ``expm1`` when the values are not
+    integer-like.
+    """
+    vals = _df_numeric_col(g, "HourlyPageviewCount")
+    finite = vals[np.isfinite(vals)]
+    if finite.size == 0:
+        return np.zeros(vals.size, dtype=int)
+    frac = np.abs(finite - np.rint(finite))
+    looks_raw = float(np.mean(frac < 1e-6)) >= 0.9
+    raw = vals if looks_raw else np.expm1(vals)
     raw = np.where(np.isfinite(raw), raw, 0.0)
     return np.rint(np.clip(raw, 0.0, None)).astype(int)
 
 
-def _fit_one_pv_hurdle(X: np.ndarray, y: np.ndarray, raw: np.ndarray) -> dict:
-    from sklearn.linear_model import LogisticRegression
-
+def _pv_positive_pool_record(g: pd.DataFrame) -> dict:
+    """Empirical positive integer counts, optionally split by walking suggestion."""
+    raw = _raw_pageview_counts(g)
+    ah = np.rint(
+        np.clip(
+            _fill_nan_with_mean(
+                _df_numeric_col(g, "WalkingSuggestion"), default=0.0
+            ),
+            0.0,
+            1.0,
+        )
+    ).astype(int)
+    n = min(raw.size, ah.size)
+    raw, ah = raw[:n], ah[:n]
     positive = raw[raw > 0].astype(int)
-    ah = np.rint(np.clip(X[:, 5], 0.0, 1.0)).astype(int)
-    pools = {
-        a: raw[(ah == a) & (raw > 0)].astype(int)
-        for a in (0, 1)
-    }
-    rec = {
-        "coef": None,
-        "intercept": None,
-        "const": float(y.mean()) if y.size else 0.0,
+    pools = {a: raw[(ah == a) & (raw > 0)].astype(int) for a in (0, 1)}
+    return {
         "positive_pool": positive,
         "action_positive_pools": pools,
-        "n": int(y.size),
+        "n": int(raw.size),
         "n_pos": int(positive.size),
-        "p_hat": float(y.mean()) if y.size else 0.0,
+        "p_hat": float(np.mean(raw > 0)) if raw.size else 0.0,
     }
-    if y.size == 0 or np.unique(y).size < 2:
-        return rec
-    model = LogisticRegression(C=10.0, solver="lbfgs", max_iter=5000)
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=FutureWarning)
-        model.fit(X, y)
-    rec["coef"] = model.coef_.ravel().copy()
-    rec["intercept"] = float(model.intercept_[0])
-    rec["const"] = None
-    return rec
 
 
 _PV_HURDLE_BUNDLE: dict = {}
 
 
 def _pv_hurdle_bundle_for_params_dir(params_dir) -> dict:
-    """Per-user page-view occurrence models + positive-count pools (cached)."""
+    """Per-user positive page-view count pools (cached). Occurrence logit is script 4."""
     params_dir = Path(params_dir).expanduser().resolve()
     cached = _PV_HURDLE_BUNDLE.get(params_dir)
     if cached is not None:
@@ -1045,12 +1044,7 @@ def _pv_hurdle_bundle_for_params_dir(params_dir) -> dict:
         return bundle
 
     df = pd.read_csv(df_path)
-    need = {
-        "ParticipantIdentifier",
-        "HourlyPageviewCount",
-        "perceived_utility_lastweek",
-        "WalkingSuggestion",
-    }
+    need = {"ParticipantIdentifier", "HourlyPageviewCount", "WalkingSuggestion"}
     if not need.issubset(df.columns):
         _PV_HURDLE_BUNDLE[params_dir] = bundle
         return bundle
@@ -1059,12 +1053,7 @@ def _pv_hurdle_bundle_for_params_dir(params_dir) -> dict:
     population = []
     for uid, g in df.groupby("ParticipantIdentifier", sort=False):
         uid = _uid_key(uid)
-        X = _pv_hurdle_features_df(g)
-        raw = _raw_pageview_counts(g)
-        ok = np.all(np.isfinite(X), axis=1)
-        X, raw = X[ok], raw[ok]
-        y = (raw > 0).astype(int)
-        rec = _fit_one_pv_hurdle(X, y, raw)
+        rec = _pv_positive_pool_record(g)
         bundle[uid] = rec
         population.extend(rec["positive_pool"].tolist())
     bundle["_population"] = np.asarray(population, dtype=int)
@@ -1074,54 +1063,11 @@ def _pv_hurdle_bundle_for_params_dir(params_dir) -> dict:
         npos = [v["n_pos"] for v in bundle.values() if isinstance(v, dict) and "n_pos" in v]
         if phats:
             print(
-                f"Page-view hurdle: n={len(phats)} "
+                f"Page-view hurdle pools: n={len(phats)} "
                 f"median P(PV>0)={float(np.median(phats)):.3f} "
                 f"median n_pos={float(np.median(npos)):.0f}"
             )
     return bundle
-
-
-def _pv_hurdle_action_shift(params_dir, uid, theta_ml_PV) -> tuple[float, float]:
-    """Additive change of the Gaussian PV action effect vs vanilla: (Δα3, Δα4).
-
-    STE tuning edits the *Gaussian* PV model's action coefficients (α3, α4).
-    The hurdle generator cannot absorb that as a multiplicative rescaling of
-    its fitted logistic slopes: an additive knob (e.g. ``fatigue`` /
-    ``burden_shift``, α3 ← α3 − κ) turns the ratio ``α3_new/α3_van`` into an
-    exploding or sign-flipping factor whenever the fitted α3 is near zero
-    (observed range −6.3 … +58 on the κ=0.4 folder). Instead we return the
-    intended *mean shift* Δμ_A(E) = Δα3 + Δα4·E_w in standardized-PV units;
-    ``_pv_hurdle_occurrence`` converts it to an occurrence-probability shift
-    ``A · Δμ_A / (z̄₊ − z₀)`` — the same mechanism as the lagged-J query
-    shift. Multiplicative knobs are covered too: κ·α3 − α3 = (κ−1)·α3 is
-    just another Δα3. Returns (0, 0) for the vanilla folder itself.
-    """
-    zero = (0.0, 0.0)
-    vanilla_dir = (PROJECT_ROOT / "env_para_vanilla").resolve()
-    params_dir = Path(params_dir).expanduser().resolve()
-    if params_dir == vanilla_dir:
-        return zero
-    vanilla_path = vanilla_dir / f"params_env_{_uid_key(uid)}.json"
-    if not vanilla_path.is_file():
-        return zero
-    base_now, _ = _split_ml_pv_full(np.asarray(theta_ml_PV, dtype=float).ravel())
-    if base_now.size < 8:
-        return zero
-    p_van = _load_json(vanilla_path)
-    theta_van = np.asarray(
-        p_van.get("theta_penalized_PV") or p_van.get("theta_ml_PV") or [],
-        dtype=float,
-    ).ravel()
-    base_van, _ = _split_ml_pv_full(theta_van)
-    if base_van.size < 8:
-        return zero
-    d_a3 = float(base_now[6]) - float(base_van[6])
-    d_a4 = float(base_now[7]) - float(base_van[7])
-    if not np.isfinite(d_a3):
-        d_a3 = 0.0
-    if not np.isfinite(d_a4):
-        d_a4 = 0.0
-    return float(d_a3), float(d_a4)
 
 
 def _pv_hurdle_positive_pool(rec: dict, Ah: float, population: np.ndarray) -> np.ndarray:
@@ -1136,9 +1082,33 @@ def _pv_hurdle_positive_pool(rec: dict, Ah: float, population: np.ndarray) -> np
     return pool
 
 
-def _standardize_pageview_count(raw, shift: float, scale: float) -> float:
+def _standardize_pageview_count(raw, shift: float, scale: float, zero_count: float = 0.5) -> float:
+    """Map a raw hourly pageview count onto script-3 ``HourlyPageviewCount_norm``.
+
+    Positives use ``log(x)`` (hurdle intensity is ``x>=1``, so no ``+1``).
+    Count 0 is placed at ``log(zero_count)`` so it sits below count 1.
+    """
     s = float(scale) if float(scale) != 0.0 and math.isfinite(float(scale)) else 1.0
-    return (math.log1p(max(0.0, float(raw))) - float(shift)) / s
+    try:
+        x = float(raw)
+    except (TypeError, ValueError):
+        x = 0.0
+    if not math.isfinite(x) or x <= 0.0:
+        x = float(zero_count) if float(zero_count) > 0.0 else 0.5
+    return (math.log(x) - float(shift)) / s
+
+
+def pv_hurdle_occurrence_z_gap(std: dict) -> float:
+    """``z̄₊ - z_0`` on ``HourlyPageviewCount_norm``.
+
+    Positives are z-scored among themselves, so ``z̄₊ = 0``. Count 0 sits at
+    ``(log(zero_count) - shift) / scale``. The E_w loop-gain proxy multiplies
+    the occurrence slope by this gap (script 4 and ``tune_ste.loop_gain_Ew``).
+    """
+    shift = float(std["HourlyPageviewCount_shift"])
+    scale = float(std["HourlyPageviewCount_scale"])
+    zc = float(std.get("HourlyPageviewCount_zero_count", 0.5))
+    return float(-_standardize_pageview_count(0.0, shift, scale, zero_count=zc))
 
 
 # %%
@@ -1163,6 +1133,7 @@ class EnvConfig:
         self.limits_pageview = std["HourlyPageviewCount_limit"]
         self.pageview_log_shift = float(std["HourlyPageviewCount_shift"])
         self.pageview_log_scale = float(std["HourlyPageviewCount_scale"])
+        self.pageview_zero_count = float(std.get("HourlyPageviewCount_zero_count", 0.5))
         self.limits_CAE = std["CAE_avg_limit"]
         self.limits_CAE_short = std["CAE_short_avg_limit"]
         # Affine map back to the raw (pre-normalization) CAE level:
@@ -1172,10 +1143,8 @@ class EnvConfig:
         self.limits_antic = std["anticipated_affect_yesterday_limit"]
         self.limits_fitbitwearing = [0.0, 1.0]
         self.limits_dailysurvey = [0.0, 1.0]
-        # Empirical range of fitted filtered E_w (pred_penalized_filtered_Ew)
-        # over the N=31 MRT types / training weeks, not the quadrature grid
-        # [-3, 3] used only at estimation time.
-        self.limits_perceivedUtility = [-2.657, 2.953]
+        # Same interval as script-4 quadrature (``E_QUAD_LO`` / ``E_QUAD_HI``).
+        self.limits_perceivedUtility = [E_QUAD_LO, E_QUAD_HI]
         self.limits_week_present = [0.0, 1.0]
         self.limits_prior2hour_step_count = std["prior2hour_step_count_limit"]
         self.prior2hour_log_shift = float(std["prior2hour_step_count_shift"])
@@ -1361,30 +1330,21 @@ class EnvConfig:
         }
 
     def _apply_pv_hurdle(self) -> None:
-        """Fit/load the page-view occurrence model for this participant."""
+        """Load this participant's empirical positive page-view count pool."""
         self.pv_hurdle = None
         self.pv_hurdle_population = np.array([], dtype=int)
-        if not _pv_hurdle_enabled():
-            return
         bundle = _pv_hurdle_bundle_for_params_dir(self.params_dir)
         rec = bundle.get(_uid_key(self.userid))
-        if rec is None:
-            return
         pop = np.asarray(bundle.get("_population", []), dtype=int)
-        coef = rec["coef"]
-        if coef is not None:
-            coef = np.asarray(coef, dtype=float).copy()
-        # Tuned-folder action effect enters additively at occurrence time
-        # (see _pv_hurdle_action_shift); the fitted logistic slopes stay as
-        # estimated from the MRT data.
-        d_a3, d_a4 = _pv_hurdle_action_shift(
-            self.params_dir, self.userid, self.theta_ml_PV
-        )
+        if rec is None:
+            rec = {
+                "positive_pool": pop.copy(),
+                "action_positive_pools": {0: pop.copy(), 1: pop.copy()},
+                "n": 0,
+                "n_pos": int(pop.size),
+                "p_hat": float("nan"),
+            }
         self.pv_hurdle = {
-            "coef": coef,
-            "action_shift": (float(d_a3), float(d_a4)),
-            "intercept": rec["intercept"],
-            "const": rec["const"],
             "positive_pool": np.asarray(rec["positive_pool"], dtype=int).copy(),
             "action_positive_pools": {
                 int(a): np.asarray(p, dtype=int).copy()
@@ -1660,108 +1620,118 @@ class Env:
         noise = self._sample_noise(self.cfg.resid_fourSC, step_idx, name="fourSC")
         return float(np.clip(mean + noise, *self.cfg.limits_fourSC))
 
-    def _ml_pv_query_shift(self, s, Jw: int) -> float:
-        _, q = _split_ml_pv_full(self.cfg.theta_ml_PV)
+    def _ml_pv_query_shift(self, s, Jw: int, q=None) -> float:
+        if q is None:
+            _, q = _split_ml_pv_full(self.cfg.theta_ml_PV)
         return _ml_query_applied_shift(q, s, Jw)
 
-    def _ml_pv_mean(self, s, Ah: float, Jw: int) -> float:
+    def _ml_pv_linpred(self, s, Ah: float, Jw: int, base, q) -> float:
+        Ew = float(s["perceivedUtilityLastWeek"])
+        (
+            b0,
+            b1,
+            b2_isWeekend,
+            b2_dt,
+            b2_rb,
+            b_ar1,
+            b3,
+            b4,
+        ) = np.asarray(base, dtype=float).ravel()
+        lag1 = float(s["pageViewNext4HourLag1"])
+        eta = (
+            b0
+            + b1 * Ew
+            + b2_isWeekend * float(s["isWeekend"])
+            + b2_dt * float(s["decisionTimeSlot"])
+            + b2_rb * float(s["activitySuggestionsSentLast7Days"])
+            + b_ar1 * lag1
+            + Ah * (b3 + b4 * Ew)
+        )
+        return float(eta + self._ml_pv_query_shift(s, Jw, q=q))
+
+    def _ml_pv_logit(self, s, Ah: float, Jw: int) -> float:
+        """Script-4 hurdle logit for ``P(pageview count > 0)``."""
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
-        Ew = float(s["perceivedUtilityLastWeek"])
-        base, _ = _split_ml_pv_full(self.cfg.theta_ml_PV)
-        (
-            alpha0,
-            alpha1,
-            a2_isWeekend,
-            a2_dt,
-            a2_rb,
-            alpha_ar1,
-            alpha3,
-            alpha4,
-            _sigma_pv,
-        ) = base
-        lag1 = float(s["pageViewNext4HourLag1"])
-        mu = (
-            alpha0
-            + alpha1 * Ew
-            + a2_isWeekend * float(s["isWeekend"])
-            + a2_dt * float(s["decisionTimeSlot"])
-            + a2_rb * float(s["activitySuggestionsSentLast7Days"])
-            + alpha_ar1 * lag1
-            + Ah * (alpha3 + alpha4 * Ew)
+        occ_base, occ_q, _int_base, _int_q, _sigma = _split_ml_pv_hurdle(
+            self.cfg.theta_ml_PV
         )
-        return float(mu + self._ml_pv_query_shift(s, Jw))
+        return self._ml_pv_linpred(s, float(Ah), int(Jw), occ_base, occ_q)
+
+    def _ml_pv_intensity_mean(self, s, Ah: float, Jw: int):
+        """Mean log-then-z pageview given count>0, or None if not in JSON."""
+        if not self.cfg.has_ml_stack:
+            raise RuntimeError("ML parameters missing from params JSON")
+        _occ_base, _occ_q, int_base, int_q, sigma = _split_ml_pv_hurdle(
+            self.cfg.theta_ml_PV
+        )
+        if int_base is None:
+            return None, None
+        mu = self._ml_pv_linpred(s, float(Ah), int(Jw), int_base, int_q)
+        return float(mu), float(sigma)
 
     def _pv_hurdle_occurrence(self, s, Ah: float, Jw: int):
         rec = self.cfg.pv_hurdle
-        x = _pv_hurdle_features_state(s, Ah)
-        if rec["coef"] is None:
-            p_base = float(np.clip(rec["const"] if rec["const"] is not None else 0.0, 0.0, 1.0))
-        else:
-            eta = float(rec["intercept"] + x @ rec["coef"])
-            p_base = self._sigmoid(eta)
-
+        p = float(self._sigmoid(self._ml_pv_logit(s, float(Ah), int(Jw))))
         pool = _pv_hurdle_positive_pool(rec, Ah, self.cfg.pv_hurdle_population)
         shift = float(self.cfg.pageview_log_shift)
         scale = float(self.cfg.pageview_log_scale)
-        z_zero = _standardize_pageview_count(0.0, shift, scale)
-        z_pos = np.array(
-            [_standardize_pageview_count(v, shift, scale) for v in pool],
-            dtype=float,
-        )
-        mean_z_pos = float(np.mean(z_pos)) if z_pos.size else z_zero
-        denom = mean_z_pos - z_zero
-        # Intended mean shifts in standardized-PV units, converted to an
-        # occurrence-probability shift via Δp = Δμ / (z̄₊ − z₀):
-        #   - lagged-J query effect (J_w gated), and
-        #   - the tuned-folder action-effect change Δα3 + Δα4·E_w (A gated).
-        intended = self._ml_pv_query_shift(s, Jw)
-        d_a3, d_a4 = rec.get("action_shift", (0.0, 0.0))
-        if d_a3 != 0.0 or d_a4 != 0.0:
-            ew = float(s["perceivedUtilityLastWeek"])
-            intended += float(Ah) * (float(d_a3) + float(d_a4) * ew)
-        if abs(denom) < 1e-12:
-            p_adj = p_base
-        else:
-            p_adj = float(np.clip(p_base + intended / denom, 0.0, 1.0))
-        return p_adj, pool, z_zero, mean_z_pos
+        zc = float(self.cfg.pageview_zero_count)
+        z_zero = _standardize_pageview_count(0.0, shift, scale, zero_count=zc)
+        z_one = _standardize_pageview_count(1.0, shift, scale, zero_count=zc)
+        mu_int, sigma_int = self._ml_pv_intensity_mean(s, float(Ah), int(Jw))
+        if mu_int is None:
+            z_pos = np.array(
+                [
+                    _standardize_pageview_count(v, shift, scale, zero_count=zc)
+                    for v in pool
+                ],
+                dtype=float,
+            )
+            mu_int = float(np.mean(z_pos)) if z_pos.size else z_one
+            sigma_int = 0.1
+        return p, pool, z_zero, z_one, float(mu_int), float(sigma_int)
 
     def gen_pageview_mean(self, s, Ah, Jw=0):
-        if self.cfg.pv_hurdle is not None:
-            p_adj, _pool, z_zero, mean_z_pos = self._pv_hurdle_occurrence(
-                s, float(Ah), int(Jw)
-            )
-            mu = (1.0 - p_adj) * z_zero + p_adj * mean_z_pos
-            return float(np.clip(mu, *self.cfg.limits_pageview))
-        return self._ml_pv_mean(s, float(Ah), int(Jw))
+        p_hat, _pool, z_zero, _z_one, mu_int, _sigma = self._pv_hurdle_occurrence(
+            s, float(Ah), int(Jw)
+        )
+        mu = (1.0 - p_hat) * z_zero + p_hat * mu_int
+        return float(np.clip(mu, *self.cfg.limits_pageview))
 
     def gen_pageview(self, s, Ah, Jw, step_idx):
-        if self.cfg.pv_hurdle is not None:
-            p_adj, pool, _z_zero, _mean_z_pos = self._pv_hurdle_occurrence(
-                s, float(Ah), int(Jw)
-            )
-            # Always consume one uniform and one choice so policies that
-            # differ on P(count=0) stay aligned on the global RNG stream.
-            u = rd.random()
-            pick = int(rd.choice(pool))
-            raw_count = 0 if u >= p_adj else pick
-            z = _standardize_pageview_count(
-                raw_count,
-                self.cfg.pageview_log_shift,
-                self.cfg.pageview_log_scale,
-            )
-            return float(np.clip(z, *self.cfg.limits_pageview))
-
-        mu = self._ml_pv_mean(s, float(Ah), int(Jw))
-        base, _ = _split_ml_pv_full(self.cfg.theta_ml_PV)
-        sigma = float(base[8]) if base.size > 8 else 0.1
-        if self.cfg.resid_ml_hourly_pageview.size > 0 and np.any(np.isfinite(self.cfg.resid_ml_hourly_pageview)):
+        p_hat, pool, z_zero, z_one, mu_int, sigma_int = self._pv_hurdle_occurrence(
+            s, float(Ah), int(Jw)
+        )
+        u = rd.random()
+        # Always consume intensity noise so policies that differ on P(count=0)
+        # stay aligned on the global RNG stream.
+        if (
+            self.cfg.resid_ml_hourly_pageview.size > 0
+            and np.any(np.isfinite(self.cfg.resid_ml_hourly_pageview))
+        ):
             noise = self._sample_noise(
                 self.cfg.resid_ml_hourly_pageview, step_idx, name="hourly_pageview"
             )
         else:
-            noise = float(rd.normal(0.0, sigma))
-        return float(np.clip(mu + noise, *self.cfg.limits_pageview))
+            noise = float(rd.normal(0.0, sigma_int))
+        if u >= p_hat:
+            return float(np.clip(z_zero, *self.cfg.limits_pageview))
+        _occ_base, _occ_q, int_base, _int_q, _sig = _split_ml_pv_hurdle(
+            self.cfg.theta_ml_PV
+        )
+        if int_base is None:
+            pick = int(rd.choice(pool)) if pool.size else 1
+            z = _standardize_pageview_count(
+                pick,
+                self.cfg.pageview_log_shift,
+                self.cfg.pageview_log_scale,
+                zero_count=self.cfg.pageview_zero_count,
+            )
+            return float(np.clip(z, *self.cfg.limits_pageview))
+        z = mu_int + (0.0 if not np.isfinite(noise) else float(noise))
+        z = max(z, z_one)
+        return float(np.clip(z, *self.cfg.limits_pageview))
 
     # ----- daily mediators -----
 
@@ -2086,7 +2056,7 @@ def _read_first_csv_row_for_participant(path, participant_id):
 # backward compatibility. ``_float_csv_cell`` uses the first finite match.
 _STATE_FROM_DF_FIT_ROW = (
     ("stepCountNext4HourLag1", ("FourSC_lag1", "fourSC_lag1")),
-    ("pageViewNext4HourLag1", ("hourly_pageview_count_lag1", "HourlyPageviewCount_lag1")),
+    ("pageViewNext4HourLag1", ("hourly_pageview_count_lag1",)),
     ("prior2HourStepCountEma7d", ("EMA_Prior2HourStepCount_norm", "EMA_Prior2HourStepCount")),
     ("prior2HourStepCountLag1", ("prior2hour_step_count_lag1", "prior2HourStepCountLag1")),
     ("prior2HourStepCount", (
