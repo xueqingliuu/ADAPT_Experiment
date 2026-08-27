@@ -1368,7 +1368,21 @@ TARGET_C     = 1
 # (ADAPR_ENSEMBLE_ACTION=softmax, temperature ADAPR_SOFTMAX_TAU).
 J_PARTICLES  = 50
 B_ENSEMBLES  = 50
-NWEEK        = 36
+DEFAULT_NWEEK = 36
+
+
+def _resolve_nweek(cli_value=None) -> int:
+    """CLI ``--nweek`` overrides ``NWEEK`` env, else 36."""
+    if cli_value is not None:
+        n = int(cli_value)
+    else:
+        n = int(os.getenv("NWEEK", str(DEFAULT_NWEEK)))
+    if n < 1:
+        raise ValueError(f"nweek must be >= 1, got {n}")
+    return n
+
+
+NWEEK = _resolve_nweek()
 # V1/V2 bonus weight: λ = ρ · sd(b̂) / sd(ê) from agent-visible histories
 # (default ρ=0.5). Override ρ with ENGAGEMENT_RHO / --engagement-rho, or
 # skip scale-matching and set λ directly with ENGAGEMENT_BONUS /
@@ -1776,7 +1790,7 @@ def _episode_seed(exp_seed: int, draw_idx: int) -> int:
 
 def _make_online_env(uid, seed=42, params_dir=None):
     params_dir = resolve_params_dir(params_dir)
-    cfg = EnvConfig(uid, params_dir=params_dir)
+    cfg = EnvConfig(uid, params_dir=params_dir, nweek=NWEEK)
     nweek = cfg.nweek
     env = Env(cfg, noise="ar1")
     oenv = OnlineEnv(env, nweek=nweek, seed=seed, params_dir=params_dir)
@@ -2146,7 +2160,17 @@ if __name__ == "__main__":
             "participant; saved: use the folder's shared rl_priors.json."
         ),
     )
+    parser.add_argument(
+        "--nweek",
+        type=int,
+        default=None,
+        help=(
+            "Simulated RL weeks (default: NWEEK env or 36). Also passed to "
+            "EnvConfig so the env horizon matches config.json."
+        ),
+    )
     args = parser.parse_args()
+    NWEEK = _resolve_nweek(args.nweek)
 
     include_action_c = ACTION_BLOCK_INCLUDE_C and (not args.no_action_c)
     set_action_block_include_c(include_action_c)
@@ -2160,6 +2184,7 @@ if __name__ == "__main__":
     _configure_priors(params_dir=params_dir, force=True)
     print(f"Using parameter directory: {params_dir}")
     print(f"Prior mode: {args.prior_mode}")
+    print(f"nweek={NWEEK}")
 
     if args.engagement_rho is not None:
         ENGAGEMENT_RHO = float(args.engagement_rho)

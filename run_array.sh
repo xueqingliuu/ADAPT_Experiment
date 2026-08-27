@@ -12,6 +12,9 @@
 # Fitted environment folder under the repo root. Switch later, e.g.:
 #   ENV_VARIANT=env_para_ste0.5 sbatch run_array.sh
 ENV_VARIANT="${ENV_VARIANT:-env_para_vanilla}"
+# Simulated weeks (experiment.py --nweek). Default 36.
+#   sbatch --export=ALL,PRIOR_MODE=loo,NWEEK=300,RESULTS_ROOT=results_vanilla_w300_loo run_array.sh
+NWEEK="${NWEEK:-36}"
 # saved = shared ${ENV_VARIANT}/rl_priors.json, or zeros if USE_ESTIMATED_PRIORS=0.
 # loo   = ${ENV_VARIANT}/loo_priors/held_out_<uid>.json (python est_prior.py --loo first).
 # Keep saved as the cluster default so USE_ESTIMATED_PRIORS=0 still means zeros.
@@ -77,6 +80,7 @@ echo "PARAMS_DIR=${ADAPR_EXPERIMENT_PARAMS_DIR}"
 echo "PRIOR_MODE=${PRIOR_MODE}"
 echo "USE_ESTIMATED_PRIORS=${USE_ESTIMATED_PRIORS}"
 echo "ACTION_BLOCK_C=${ACTION_BLOCK_C}"
+echo "NWEEK=${NWEEK}"
 echo "RESULTS_ROOT=${RESULTS_ROOT}"
 echo "SAVE_MODE=${SAVE_MODE}"
 echo "seed-idx=${SLURM_ARRAY_TASK_ID}"
@@ -90,6 +94,7 @@ python experiment.py \
   --seed-idx "$SLURM_ARRAY_TASK_ID" \
   --params-dir "$ADAPR_EXPERIMENT_PARAMS_DIR" \
   --prior-mode "$PRIOR_MODE" \
+  --nweek "$NWEEK" \
   --save-mode compact \
   --results-root "$RESULTS_ROOT" \
   "${EXTRA_ARGS[@]}"
