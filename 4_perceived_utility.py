@@ -24,14 +24,21 @@ given a positive count, a Gaussian on ``log(x)`` then z-scored among
 positives (``HourlyPageviewCount_norm``). Count 0 is placed at
 ``log(0.5)`` on that same axis so the 14-slot PV summary still sits
 below count 1. Both parts share the same covariate
-design (``E_w``, weekend, slot, burden, lag1, ``A``, ``A×E_w``, lagged-J
+design (``E_w``, weekend, slot, burden, lag1, ``A``, ``A×E_w``, ``J_w``
 query). FW / PJ stay Bernoulli on wear / daily check-in.
 
-PV / FW / PJ emissions include a lagged-J query block
-``J_{w-1} · [1, E_w, recent_burden]`` (last Sunday's ``week_present``),
-written as the ``query_Jw_*`` suffix on ``theta_penalized_{PV,FW,PJ}``.
-Ridge centers for those three coefficients are 0. ``I_w`` is not in the
-model. Next: ``5_fit_vanilla_testbed.py``.
+Index: ``J_w``, ``E_w``, ``U_{w,1}``, ``U_{w,2}`` sit at the end of week
+``w-1`` / start of week ``w``. In the MRT table that is
+``week_present_lastweek`` (not this week's Sunday ``week_present``, which
+is ``J_{w+1}``). Then ``J_w | E_w``, ``M_w | E_w, J_w``, and at the end
+of week ``w`` the transition writes ``E_{w+1}``, ``J_{w+1}``. The last
+Sunday of week ``W`` is scored as ``J_{W+1} | E_{W+1}``.
+
+PV / FW / PJ emissions include the opening-check-in query
+``J_w · [1, E_w, recent_burden]``, written as the ``query_Jw_*`` suffix
+on ``theta_penalized_{PV,FW,PJ}``. Ridge centers for those three
+coefficients are 0. ``I_w`` is not in the model. Next:
+``5_fit_vanilla_testbed.py``.
 """
 from __future__ import annotations
 
@@ -66,7 +73,7 @@ QUERY_JW_INTENSITY_NAMES = (
     "intensity_query_Jw_Ew",
     "intensity_query_Jw_recent_burden",
 )
-# Packed theta: 49 emission/AR coeffs + 12 lagged-J query coeffs
+# Packed theta: 49 emission/AR coeffs + 12 J_w query coeffs
 # (PV occurrence, PV intensity, FW, PJ × intercept, E_w, recent_burden).
 _THETA_DIM_BASE = 61
 # Packed log-σ indices (unpack_theta exponentiates these). σ_E, σ_U1, σ_U2, σ_PV.
@@ -447,7 +454,7 @@ def build_penalized_prior_center(*, e1_known: bool) -> np.ndarray:
     plausible value in the expected direction instead of toward 0 (and, on
     the old approach, potentially reflected to a large value of the wrong
     sign). Every coefficient not listed here keeps the original zero-centered
-    penalty (nudge = 0), including the lagged-J query block
+    penalty (nudge = 0), including the J_w query block
     ``(alpha|gamma|beta|theta)_q*``.
 
     Indices are recovered by unpacking a probe vector of its own positions
@@ -482,8 +489,8 @@ def ridge_penalty_weights(*, e1_known: bool) -> np.ndarray:
     """Per-coordinate ridge weights: 1 = penalized, 0 = free.
 
     Intercepts (baseline prevalence / level) and packed log-σ stay at the
-    likelihood MLE. Query-block intercepts (``*_q0``) are slopes on lagged J
-    and remain penalized.
+    likelihood MLE. Query-block intercepts (``*_q0``) are slopes on opening
+    ``J_w`` and remain penalized.
     """
     n = theta_dim(e1_known=e1_known)
     w = np.ones(n, dtype=float)
@@ -573,9 +580,24 @@ def theta_dim(*, e1_known: bool) -> int:
 
 
 def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
-    all_J = np.array([b["J_week"] for b in blocks if not np.isnan(b["J_week"])], dtype=float)
-    all_U1 = np.array([b["U1"] for b in blocks if not np.isnan(b["U1"])], dtype=float)
-    all_U2 = np.array([b["U2"] for b in blocks if not np.isnan(b["U2"])], dtype=float)
+    j_open = [b["J_lag"] for b in blocks if not np.isnan(b.get("J_lag", np.nan))]
+    u1_open = [b.get("U1_open", np.nan) for b in blocks if not np.isnan(b.get("U1_open", np.nan))]
+    u2_open = [b.get("U2_open", np.nan) for b in blocks if not np.isnan(b.get("U2_open", np.nan))]
+    if blocks:
+        last = blocks[-1]
+        j_close = last.get("J_week", np.nan)
+        if np.isfinite(j_close):
+            j_open.append(j_close)
+            if int(round(float(j_close))) == 1:
+                u1_c = last.get("U1", np.nan)
+                u2_c = last.get("U2", np.nan)
+                if np.isfinite(u1_c):
+                    u1_open.append(u1_c)
+                if np.isfinite(u2_c):
+                    u2_open.append(u2_c)
+    all_J = np.array(j_open, dtype=float)
+    all_U1 = np.array(u1_open, dtype=float)
+    all_U2 = np.array(u2_open, dtype=float)
     all_PV = (
         np.concatenate([b["pv_y"][~np.isnan(b["pv_y"])] for b in blocks])
         if blocks
@@ -626,7 +648,7 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         0.0,
         0.0,
         0.0,  # alpha_ar1
-        0.0, 0.0, 0.0,  # alpha_q0, alpha_qE, alpha_qrb (lagged J)
+        0.0, 0.0, 0.0,  # alpha_q0, alpha_qE, alpha_qrb (J_w)
         muZ,  # gamma0 intensity intercept on log-then-z
         0.1,
         0.0,
@@ -707,9 +729,20 @@ def build_user_blocks(
         AR coefficients multiply precomputed lag columns: ``PV_lag1_col`` per hour
         (z-scored log pageview, same scale as the simulator state),
         ``FW_lag_col`` / ``PJ_lag_col`` per day (NaNs treated as 0 in the likelihood).
-        ``J_lag`` is last Sunday's ``week_present`` (``J_lag_col``), used as
-        ``J_{w-1} · [1, E_w, rb]`` on this week's PV/FW/PJ. Missing weeks keep
-        these as empty arrays.
+        ``J_w`` is ``week_present_lastweek`` (``J_lag_col``): the Sunday
+        check-in at the end of week ``w-1`` / start of week ``w``. It is
+        modeled as ``J_w | E_w`` and enters PV/FW/PJ as
+        ``J_w · [1, E_w, rb]``. This week's Sunday ``week_present`` is
+        ``J_{w+1}`` (copied forward as next week's ``J_lag``). The last
+        block's Sunday ``week_present`` is scored as ``J_{W+1} | E_{W+1}``
+        on the terminal predictive after the final transition (no extra
+        mediator week). Missing ``J_lag`` is filled from the previous
+        block's ``J_week`` when that exists; otherwise it stays NaN and the
+        J/U Bernoulli terms are skipped (week 1 has no prior Sunday in the
+        panel — do not score a fake ``J_1=0`` Bernoulli). On the PV/FW/PJ
+        query, missing ``J_lag`` is 0, including week 1. Opening ``U_w`` is
+        last week's Sunday tools. Missing weeks keep the mediator arrays
+        empty.
 
       - Weekly intensity summaries for the transition use fixed denominators
         (``nansum(pv)/14``, ``nansum(FW|PJ)/7``): each slot contributes 0 if
@@ -925,6 +958,8 @@ def build_user_blocks(
                 "J_lag": np.nan,
                 "U1": np.nan,
                 "U2": np.nan,
+                "U1_open": np.nan,
+                "U2_open": np.nan,
                 "pv_y": np.asarray([], dtype=float),
                 "pv_z": np.asarray([], dtype=float),
                 "pv_lag1": np.asarray([], dtype=float),
@@ -959,21 +994,39 @@ def build_user_blocks(
         if np.isfinite(b.get("J_lag", np.nan)):
             continue
         prev = j_week_by_w.get(int(b["week"]) - 1, np.nan)
-        b["J_lag"] = float(prev) if np.isfinite(prev) else 0.0
+        if np.isfinite(prev):
+            b["J_lag"] = float(prev)
+        # else leave NaN: no fabricated J=0 Bernoulli at study entry.
+
+    prev_u1, prev_u2 = np.nan, np.nan
+    for b in blocks:
+        # Opening U_w is last Sunday's tools (same survey as J_w).
+        b["U1_open"] = prev_u1
+        b["U2_open"] = prev_u2
+        prev_u1 = b.get("U1", np.nan)
+        prev_u2 = b.get("U2", np.nan)
 
     return blocks
 
 
-def _jw_query_shift(q0, qE, qrb, j_lag, e, rb):
-    """``J_lag * (q0 + qE * E + qrb * rb)``. ``e`` may be a quadrature grid."""
-    j = 0.0 if j_lag is None or not np.isfinite(j_lag) else float(j_lag)
+def _block_jw(block) -> float:
+    """Opening ``J_w`` on PV/FW/PJ. Missing ``J_lag`` (including week 1) → 0."""
+    j = block.get("J_lag", np.nan)
+    if j is None or not np.isfinite(j):
+        return 0.0
+    return float(j)
+
+
+def _jw_query_shift(q0, qE, qrb, j_w, e, rb):
+    """``J_w * (q0 + qE * E + qrb * rb)``. ``e`` may be a quadrature grid."""
+    j = 0.0 if j_w is None or not np.isfinite(j_w) else float(j_w)
     if j == 0.0:
         return 0.0 * e
     rb_f = 0.0 if rb is None or not np.isfinite(rb) else float(rb)
     return j * (q0 + qE * e + qrb * rb_f)
 
 
-def _pv_linpred(par, pfx, grid, row, a, y_lag, j_lag):
+def _pv_linpred(par, pfx, grid, row, a, y_lag, j_w):
     """Linear predictor for PV occurrence (``alpha``) or intensity (``gamma``)."""
     coef2 = np.array(
         [par[f"{pfx}2_is_weekend"], par[f"{pfx}2_dt"], par[f"{pfx}2_rb"]],
@@ -987,9 +1040,27 @@ def _pv_linpred(par, pfx, grid, row, a, y_lag, j_lag):
         + a * (par[f"{pfx}3"] + par[f"{pfx}4"] * grid)
         + _jw_query_shift(
             par[f"{pfx}_q0"], par[f"{pfx}_qE"], par[f"{pfx}_qrb"],
-            j_lag, grid, row[2],
+            j_w, grid, row[2],
         )
     )
+
+
+def _ju_loglik_on_grid(grid, j, u1, u2, par) -> np.ndarray:
+    """log p(J, U | E = grid). Missing ``j`` contributes 0."""
+    ll = np.zeros_like(grid)
+    if j is None or not np.isfinite(j):
+        return ll
+    eta = par["b0"] + par["b1"] * grid
+    ll += bernoulli_logpmf(j, eta)
+    if int(round(float(j))) != 1:
+        return ll
+    if u1 is not None and np.isfinite(u1):
+        mu = par["c0"] + par["c1"] * grid
+        ll += normal_logpdf(u1, mu, par["sigma_U1"])
+    if u2 is not None and np.isfinite(u2):
+        mu = par["d0"] + par["d1"] * grid
+        ll += normal_logpdf(u2, mu, par["sigma_U2"])
+    return ll
 
 
 def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) -> np.ndarray:
@@ -997,20 +1068,16 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
     grid = np.asarray(grid, dtype=float)
     ll = np.zeros_like(grid)
 
-    # J_week is always modeled when observed
-    if not np.isnan(block["J_week"]):
-        eta = par["b0"] + par["b1"] * grid
-        ll += bernoulli_logpmf(block["J_week"], eta)
-
-    # U1/U2 are structurally present only when J_week == 1
-    if (not np.isnan(block["J_week"])) and (int(round(block["J_week"])) == 1):
-        if not np.isnan(block["U1"]):
-            mu = par["c0"] + par["c1"] * grid
-            ll += normal_logpdf(block["U1"], mu, par["sigma_U1"])
-
-        if not np.isnan(block["U2"]):
-            mu = par["d0"] + par["d1"] * grid
-            ll += normal_logpdf(block["U2"], mu, par["sigma_U2"])
+    # Opening J_w (week_present_lastweek) | E_w. This week's Sunday
+    # week_present is J_{w+1}: scored on the next block, or as the
+    # terminal J_{W+1} | E_{W+1} increment after the last transition.
+    ll += _ju_loglik_on_grid(
+        grid,
+        block.get("J_lag", np.nan),
+        block.get("U1_open", np.nan),
+        block.get("U2_open", np.nan),
+        par,
+    )
 
     pv_y = block["pv_y"]
     pv_z = block.get("pv_z")
@@ -1032,14 +1099,14 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             else 0.0
         )
         eta = _pv_linpred(
-            par, "alpha", grid, row, a, y_lag, block.get("J_lag"),
+            par, "alpha", grid, row, a, y_lag, _block_jw(block),
         )
         ll += bernoulli_logpmf(y, eta)
         if int(round(float(y))) == 1 and pv_z is not None and j < len(pv_z):
             z = float(pv_z[j])
             if np.isfinite(z):
                 mu_z = _pv_linpred(
-                    par, "gamma", grid, row, a, y_lag, block.get("J_lag"),
+                    par, "gamma", grid, row, a, y_lag, _block_jw(block),
                 )
                 ll += normal_logpdf(z, mu_z, par["sigma_PV"])
 
@@ -1073,7 +1140,7 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             + a1 * (par["beta5"] + par["beta6"] * grid)
             + _jw_query_shift(
                 par["beta_q0"], par["beta_qE"], par["beta_qrb"],
-                block.get("J_lag"), grid, bd_d,
+                _block_jw(block), grid, bd_d,
             )
         )
         ll += bernoulli_logpmf(y, eta)
@@ -1108,7 +1175,7 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             + a1 * (par["theta5"] + par["theta6"] * grid)
             + _jw_query_shift(
                 par["theta_q0"], par["theta_qE"], par["theta_qrb"],
-                block.get("J_lag"), grid, bd_d,
+                _block_jw(block), grid, bd_d,
             )
         )
         ll += bernoulli_logpmf(y, eta)
@@ -1318,8 +1385,8 @@ def penalized_json_export(
         "penalized_opt_nit": int(res.nit) if hasattr(res, "nit") else None,
         "_query_Jw_effect": {
             "source": (
-                "joint lagged-J in script-4 PV/FW/PJ emissions "
-                "(week_present_lastweek)"
+                "J_w = week_present_lastweek (end of week w-1 / start of "
+                "week w) on script-4 PV/FW/PJ emissions"
             ),
             "apply": "add J_w * (q @ z) on the PV/FW/PJ linear predictor; I_w not in model",
         },
@@ -1348,40 +1415,36 @@ def penalized_json_export(
     for t, block in enumerate(blocks):
         e = float(E[t]) if t < len(E) and np.isfinite(E[t]) else 0.0
 
-        # ------------------------------------------------------------
-        # Weekly J: one entry per week
-        # ------------------------------------------------------------
+        # Weekly J_w: week_present_lastweek, one entry per week
         eta_J = par["b0"] + par["b1"] * e
         ph_J = float(_sigm(eta_J))
 
-        if not np.isnan(block.get("J_week", np.nan)):
+        j_w = block.get("J_lag", np.nan)
+        if not np.isnan(j_w):
             pJ.append(r3(ph_J))
-            rJ.append(r3(float(block["J_week"]) - ph_J))
+            rJ.append(r3(float(j_w) - ph_J))
         else:
             pJ.append(r3(ph_J))
             rJ.append(None)
 
-        # ------------------------------------------------------------
-        # Weekly U1/U2: one entry per week
-        # Residual is None if U is missing or J_week != 1.
-        # ------------------------------------------------------------
-        j1 = (
-            not np.isnan(block.get("J_week", np.nan))
-            and int(round(block["J_week"])) == 1
-        )
+        # Weekly U_w: last Sunday's tools. Residual is None if U is
+        # missing or J_w != 1.
+        j1 = (not np.isnan(j_w)) and int(round(float(j_w))) == 1
 
         mu_U1 = float(par["c0"] + par["c1"] * e)
-        if j1 and not np.isnan(block.get("U1", np.nan)):
+        u1 = block.get("U1_open", np.nan)
+        if j1 and not np.isnan(u1):
             pU1.append(r3(mu_U1))
-            rU1.append(r3(float(block["U1"]) - mu_U1))
+            rU1.append(r3(float(u1) - mu_U1))
         else:
             pU1.append(r3(mu_U1))
             rU1.append(None)
 
         mu_U2 = float(par["d0"] + par["d1"] * e)
-        if j1 and not np.isnan(block.get("U2", np.nan)):
+        u2 = block.get("U2_open", np.nan)
+        if j1 and not np.isnan(u2):
             pU2.append(r3(mu_U2))
-            rU2.append(r3(float(block["U2"]) - mu_U2))
+            rU2.append(r3(float(u2) - mu_U2))
         else:
             pU2.append(r3(mu_U2))
             rU2.append(None)
@@ -1412,7 +1475,7 @@ def penalized_json_export(
                 else 0.0
             )
             eta = float(
-                _pv_linpred(par, "alpha", e, row, A, y_lag, block.get("J_lag"))
+                _pv_linpred(par, "alpha", e, row, A, y_lag, _block_jw(block))
             )
             pPV.append(r3(float(_sigm(eta))))
             occ = (not np.isnan(y)) and int(round(float(y))) == 1
@@ -1423,7 +1486,7 @@ def penalized_json_export(
             )
             if occ and np.isfinite(z):
                 mu_z = float(
-                    _pv_linpred(par, "gamma", e, row, A, y_lag, block.get("J_lag"))
+                    _pv_linpred(par, "gamma", e, row, A, y_lag, _block_jw(block))
                 )
                 rPV.append(r3(z - mu_z))
             else:
@@ -1486,7 +1549,7 @@ def penalized_json_export(
                 + A1 * (par["beta5"] + par["beta6"] * e)
                 + _jw_query_shift(
                     par["beta_q0"], par["beta_qE"], par["beta_qrb"],
-                    block.get("J_lag"), e, burden_d,
+                    _block_jw(block), e, burden_d,
                 )
             )
 
@@ -1555,7 +1618,7 @@ def penalized_json_export(
                 + A1 * (par["theta5"] + par["theta6"] * e)
                 + _jw_query_shift(
                     par["theta_q0"], par["theta_qE"], par["theta_qrb"],
-                    block.get("J_lag"), e, burden_d,
+                    _block_jw(block), e, burden_d,
                 )
             )
 
@@ -1566,6 +1629,36 @@ def penalized_json_export(
                 rPJ.append(None)
             else:
                 rPJ.append(r3(float(y) - ph))
+
+    # Closing Sunday J_{W+1}, U_{W+1} | E_{W+1} (no extra mediator week).
+    if blocks:
+        e_term = filt.get("terminal_predicted_mean", np.nan)
+        e_term = float(e_term) if e_term is not None and np.isfinite(e_term) else 0.0
+        last = blocks[-1]
+        j_close = last.get("J_week", np.nan)
+        eta_J = par["b0"] + par["b1"] * e_term
+        ph_J = float(_sigm(eta_J))
+        pJ.append(r3(ph_J))
+        rJ.append(
+            r3(float(j_close) - ph_J) if np.isfinite(j_close) else None
+        )
+        j1_close = np.isfinite(j_close) and int(round(float(j_close))) == 1
+        mu_U1 = float(par["c0"] + par["c1"] * e_term)
+        u1_close = last.get("U1", np.nan)
+        pU1.append(r3(mu_U1))
+        rU1.append(
+            r3(float(u1_close) - mu_U1)
+            if j1_close and np.isfinite(u1_close)
+            else None
+        )
+        mu_U2 = float(par["d0"] + par["d1"] * e_term)
+        u2_close = last.get("U2", np.nan)
+        pU2.append(r3(mu_U2))
+        rU2.append(
+            r3(float(u2_close) - mu_U2)
+            if j1_close and np.isfinite(u2_close)
+            else None
+        )
 
     env_penalized["resid_penalized_J_week"] = rJ
     env_penalized["resid_penalized_U1"] = rU1
@@ -1611,8 +1704,9 @@ def attach_filtered_Ew_to_df_fit(
         the pin v (truly pre-week). For w >= 2 it is Ê_{w|w}, which uses week
         w's own emissions — not information known before week w.
       - ``perceived_utility`` = ``fm[w]`` for w < T (Ê_{w+1|w+1}), or the
-        one-step predictive ``terminal_predicted_mean`` (E_{T+1} | Y_{1:T})
-        on week T.
+        filtered ``terminal_predicted_mean`` (E_{T+1} | Y_{1:T}, J_{T+1},
+        U_{T+1}) on week T. If the last Sunday is missing, this falls back
+        to the one-step predictive E_{T+1} | Y_{1:T}.
 
     The two columns are still a literal weekly lag: lastweek on week w equals
     ``perceived_utility`` on week w-1 (week 1 lastweek is the pin; no week-0
@@ -1669,7 +1763,7 @@ def save_df_fit_with_perceived_utility(
 
     Expects study weeks 1–12. On row week=w: ``perceived_utility_lastweek``
     is the contemporaneous plug-in Ê_{w|w} (E_1 pin on week 1);
-    ``perceived_utility`` is Ê_{w+1|w+1} (terminal predictive E_{13} on
+    ``perceived_utility`` is Ê_{w+1|w+1} (E_{13} given last Sunday on
     week 12). See :func:`attach_filtered_Ew_to_df_fit`.
     """
     out = attach_filtered_Ew_to_df_fit(
@@ -1706,7 +1800,7 @@ def write_joint_penalized_into_vanilla_json_files(
       pred_<id>.json
 
     The files are **overwritten** with the penalized-fit keys (any stale vanilla
-    keys from a prior run are wiped). The lagged-J ``query_Jw_*`` suffix is
+    keys from a prior run are wiped). The ``J_w`` ``query_Jw_*`` suffix is
     part of this write. Downstream ``5_fit_vanilla_testbed.py`` then merges
     its vanilla keys into the same JSONs while preserving the penalized-fit
     keys written here.
@@ -1730,6 +1824,73 @@ def write_joint_penalized_into_vanilla_json_files(
         json.dump(pred_penalized, f, allow_nan=False)
 
 
+def _predict_after_last_block(
+    grid: np.ndarray,
+    weights: np.ndarray,
+    blocks: list,
+    p_list: list[np.ndarray],
+    par: dict,
+    *,
+    e1_known: Optional[float] = None,
+) -> tuple[np.ndarray, float]:
+    """Predictive density of E_{T+1} given Y_{1:T} (transition after week T)."""
+    if p_list:
+        return _predict_density_log(
+            grid, weights, p_list[-1], blocks[-1], par,
+        )
+    if e1_known is None or not blocks:
+        raise FloatingPointError("cannot form terminal predictive E_{T+1}")
+    e1 = float(e1_known)
+    b0 = blocks[0]
+    mu = (
+        par["a0"]
+        + par["a1"] * e1
+        + par["a2"] * b0["PV_sum_trans"]
+        + par["a3"] * b0["FW_sum_trans"]
+        + par["a4"] * b0["PJ_sum_trans"]
+    )
+    return _normalize_log_density(
+        normal_logpdf(grid, mu, par["sigma_E"]),
+        weights,
+        label="predictive E_2",
+    )
+
+
+def _score_closing_sunday(
+    grid: np.ndarray,
+    weights: np.ndarray,
+    blocks: list,
+    p_list: list[np.ndarray],
+    par: dict,
+    loglik: float,
+    *,
+    e1_known: Optional[float] = None,
+) -> tuple[float, float]:
+    """Add log p(J_{W+1}, U_{W+1} | E_{W+1}) and return the posterior mean of E_{W+1}."""
+    last = blocks[-1]
+    j = last.get("J_week", np.nan)
+    q, log_grid_mass = _predict_after_last_block(
+        grid, weights, blocks, p_list, par, e1_known=e1_known,
+    )
+    terminal_mean = float(np.sum(grid * q * weights))
+    if not np.isfinite(j):
+        return loglik, terminal_mean
+    log_ell = _ju_loglik_on_grid(
+        grid, j, last.get("U1", np.nan), last.get("U2", np.nan), par,
+    )
+    m = np.max(log_ell)
+    num = np.exp(log_ell - m) * q
+    den = np.sum(num * weights)
+    if (not np.isfinite(den)) or (den <= 0):
+        raise FloatingPointError("invalid closing-Sunday c_{W+1}")
+    log_c = float(m + np.log(den) + log_grid_mass)
+    if not np.isfinite(log_c):
+        raise FloatingPointError("invalid closing-Sunday log c_{W+1}")
+    p = num / den
+    terminal_mean = float(np.sum(grid * p * weights))
+    return loglik + log_c, terminal_mean
+
+
 def _terminal_predicted_mean(
     grid: np.ndarray,
     weights: np.ndarray,
@@ -1751,7 +1912,7 @@ def _terminal_predicted_mean(
 
 
 def build_exported_Ew_series(filt: dict) -> np.ndarray:
-    """Build E_2,...,E_{T+1} for export (filtered through E_T, terminal predictive)."""
+    """Build E_2,...,E_{T+1} for export (filtered through E_T, then last Sunday)."""
     fm = np.asarray(filt.get("filtered_means", []), dtype=float)
     terminal = float(filt.get("terminal_predicted_mean", np.nan))
     if fm.size < 2:
@@ -1797,6 +1958,11 @@ def quadrature_loglik(
     first term is log p(Y_1|E_1=e1) and hat q_2 transitions from that baseline
     to E_2 (end of week 1 / start of week 2). If None: week 1 uses prior
     N(m0,sigma0^2) on E_1.
+
+    After week T, the last Sunday ``week_present`` (``J_{T+1}``) and its
+    tools are scored on the predictive of ``E_{T+1}``; the returned
+    ``terminal_predicted_mean`` is the posterior mean given that Sunday
+    when it is observed.
     """
     e1_fixed = e1_known is not None
     par = unpack_theta(theta, e1_known=e1_fixed)
@@ -1827,10 +1993,10 @@ def quadrature_loglik(
         filt_mean[0] = e1
 
         if T == 1:
-            log_increments = np.asarray(log_c_list, dtype=float)
-            terminal_predicted_mean = _terminal_predicted_mean(
-                grid, weights, blocks, p_list, par
+            loglik, terminal_predicted_mean = _score_closing_sunday(
+                grid, weights, blocks, p_list, par, loglik, e1_known=e1,
             )
+            log_increments = np.asarray(log_c_list, dtype=float)
             return {
                 "loglik": float(loglik),
                 "predicted_densities": np.zeros((0, len(grid))),
@@ -1936,10 +2102,11 @@ def quadrature_loglik(
                 )
                 predictive_grid_mass[t + 1] = np.exp(log_grid_mass)
 
-    log_increments = np.asarray(log_c_list, dtype=float)
-    terminal_predicted_mean = _terminal_predicted_mean(
-        grid, weights, blocks, p_list, par
+    loglik, terminal_predicted_mean = _score_closing_sunday(
+        grid, weights, blocks, p_list, par, loglik,
+        e1_known=float(e1_known) if e1_fixed else None,
     )
+    log_increments = np.asarray(log_c_list, dtype=float)
     return {
         "loglik": float(loglik),
         "predicted_densities": np.vstack(q_list),
@@ -2855,7 +3022,7 @@ def plot_quadrature_diagnostics(
     fig_s.tight_layout()
     _maybe_save_close(fig_s, "params_group_sigma.png")
 
-    # --- b_0, b_1 (J_week) ---
+    # --- b_0, b_1 (J_w = week_present_lastweek) ---
     fig_b, axes_b = plt.subplots(1, 2, figsize=(10, 3.2), squeeze=False)
     _bar_users_one_series(
         axes_b[0][0],

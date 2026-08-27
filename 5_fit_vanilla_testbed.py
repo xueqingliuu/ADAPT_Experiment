@@ -9,7 +9,7 @@ or as a hierarchical Bayesian model:
 Writes ``params_env_<uid>.json`` (mediator/outcome blocks and residuals),
 ``pred_<uid>.json``, ``user_ids.txt``, and ``population_residuals.json``.
 Does not overwrite the E_w / PV / FW / PJ blocks from script 4 (including
-the lagged-J ``query_Jw_*`` suffix on PV/FW/PJ).
+the ``J_w`` ``query_Jw_*`` suffix on PV/FW/PJ).
 Next: ``6_est_Ew_weights.py``.
 """
 import json

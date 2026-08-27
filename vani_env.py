@@ -19,8 +19,8 @@ Page views are a two-part hurdle whose coefficients come from script 4
 (``theta_penalized_PV``): logistic ``P(count>0)`` and, given a positive
 count, a Gaussian on ``log(x)`` then z-scored among positives. Count 0
 sits at ``log(0.5)`` on that axis. Both parts include ``E_w``,
-weekend, slot, burden, lag1, ``A``, ``A×E_w``, and the lagged-J query on
-the linear predictor. ``I_w`` is not in this model. STE-tuned folders
+weekend, slot, burden, lag1, ``A``, ``A×E_w``, and the opening ``J_w``
+query (``week_present_lastweek``) on the linear predictor. ``I_w`` is not in this model. STE-tuned folders
 carry edited action slopes in JSON, so they enter both parts directly.
 FW/PJ stay on their original logits.
 """

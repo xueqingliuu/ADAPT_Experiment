@@ -849,7 +849,7 @@ def loop_gain_Ew(
     theta1 = pick("theta_penalized_PJ", "theta1_Ew")
     theta4 = pick("theta_penalized_PJ", "theta4_A0_morning_by_Ew")
     theta6 = pick("theta_penalized_PJ", "theta6_A1_afternoon_by_Ew")
-    # Lagged-J query block adds qE·J to each mediator's E-slope in J=1 weeks.
+    # J_w query block adds qE·J to each mediator's E-slope in J=1 weeks.
     alpha_qE = pick_opt("theta_penalized_PV", "query_Jw_Ew")
     gamma_qE = pick_opt("theta_penalized_PV", "intensity_query_Jw_Ew")
     beta_qE = pick_opt("theta_penalized_FW", "query_Jw_Ew")

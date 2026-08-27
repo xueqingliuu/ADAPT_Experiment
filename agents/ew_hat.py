@@ -140,8 +140,9 @@ def compute_Ew_hat_from_week(
       Script-6 bundle: same calendar week's page views / wear / daily
       check-in with that week's Sunday survey.
 
-    ``wp_all[sim_w]`` is last Sunday's ``J`` (used during the week as the
-    PV/FW/PJ ``J_w`` term). Do not use it here.
+    ``wp_all[sim_w]`` is opening ``J_w`` (``week_present_lastweek``), used
+    during the week as the PV/FW/PJ query. Do not use it here; this bundle
+    wants this Sunday's survey (``J_{w+1}``) with this week's mediators.
     """
     survey_idx = int(sim_w) + int(baseline_offset)
     J_w = _finite_or(wp_all, survey_idx, 0.0)

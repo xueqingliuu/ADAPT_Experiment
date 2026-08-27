@@ -326,11 +326,12 @@ class OnlineEnv:
         # cross-algorithm comparison (removes per-draw measurement noise).
         self.CAE_mean_all = np.full(self.nweek+1, np.nan)
         self.pu_all = np.full(self.nweek+1, np.nan)        # latent E_w (env truth)
-        # ``wp_all[k] = J_k`` is drawn at the end of week ``k-1`` from
-        # ``E_{k-1}`` (Script 4: Sunday ``J_w, U_w ~ E_w``). That Sunday
-        # also writes CAE of week ``k-1`` at ``CAE_all[k]``, so ``J_k``
-        # gates whether that CAE is observed. ``wp_all[0] = 1`` bootstraps
-        # week 0 (no prior Sunday).
+        # ``wp_all[k] = J_k`` is drawn at the end of week ``k-1`` from the
+        # newly created ``E_k`` (``J_k | E_k``). That is the opening
+        # check-in for week k (MRT ``week_present_lastweek``). The same
+        # value gates whether CAE of week ``k-1`` (at ``CAE_all[k]``) is
+        # observed. Week-k mediators read ``wp_all[k]``. ``wp_all[0] = 1``
+        # bootstraps week 0 (no prior Sunday).
         self.wp_all = np.full(self.nweek+1, np.nan)
         self.wp_all[0] = 1.0
         self.CAE_short_all = np.full(self.nweek+1, np.nan)
@@ -552,7 +553,7 @@ class OnlineEnv:
         return float(norm), day_of_week
 
     def _jw_week(self, sim_w) -> int:
-        """Simulated ``J_w`` (``wp_all``), 0/1. Not gated on ``I_w``."""
+        """Opening ``J_w`` (``wp_all[sim_w]``), 0/1. Not gated on ``I_w``."""
         if not (0 <= sim_w < self.wp_all.size):
             return 0
         v = float(self.wp_all[sim_w])
@@ -562,11 +563,11 @@ class OnlineEnv:
         self._Iw_per_week[k] = I_w
         # ``E_known_all[k]`` is set in ``__init__`` (k=0) or by
         # ``_finalize_week(k-1)`` (k >= 1); see ``agents.ew_hat.compute_Ew_hat_from_week``.
-        # ``wp_all[k] = J_k`` is already populated: bootstrapped to 1.0 for
-        # k == 0, and drawn at the end of week k-1 from ``E_{k-1}`` for
-        # k >= 1. Daily mediators read ``J_k`` (not ``I_w``): the query
-        # suffix is added when ``J_k = 1``. The same ``J_k`` still gates
-        # observation of CAE of week ``k-1`` (stored at ``CAE_all[k]``).
+        # ``wp_all[k]`` is already populated: bootstrapped to 1.0 for k == 0,
+        # and drawn at the end of week k-1 from the new ``E_k`` (``J_k | E_k``)
+        # for k >= 1. Daily mediators read that opening ``J_k`` (MRT
+        # ``week_present_lastweek``), not ``I_w``. The same value still
+        # gates observation of CAE of week ``k-1`` (stored at ``CAE_all[k]``).
 
         self._foursc_wk[:] = 0.0 
         self._antic_wk[:] = 0.0
@@ -1037,18 +1038,17 @@ class OnlineEnv:
         cs = self.env.gen_CAE_short(cae, sim_w)
 
         weekly_idx = self._weekly_idx(sim_w)
-        # Sunday J/U are Script-4 emissions of this week's ``E_w``, drawn
-        # before the E_w → E_{w+1} transition. ``wp_all[sim_w]`` was set at
-        # the end of week ``sim_w - 1`` (or in ``__init__`` for week 0) and
-        # is not overwritten. Same storage index as CAE of week ``sim_w``.
-        u1 = self.env.gen_tool_U1(e_w, sim_w)
-        u2 = self.env.gen_tool_U2(e_w, sim_w)
-        j_w = self.env.gen_week_present(e_w, weekly_idx)
-
+        # End-of-week boundary: first E_{w+1} from this week's mediators,
+        # then J_{w+1}, U_{w+1} | E_{w+1}. Stored at weekly_idx so next
+        # week's mediators read them as opening J_w. ``wp_all[sim_w]`` was
+        # set at the previous Sunday and is not overwritten.
         pu = self.env.gen_perceivedUtility(
             e_w, week_norm,
             self._pw_wk, self._dw_wk, self._dp_wk, sim_w,
         )
+        u1 = self.env.gen_tool_U1(pu, sim_w)
+        u2 = self.env.gen_tool_U2(pu, sim_w)
+        j_w = self.env.gen_week_present(pu, weekly_idx)
 
         self.CAE_all[weekly_idx] = cae
         self.CAE_mean_all[weekly_idx] = cae_mean

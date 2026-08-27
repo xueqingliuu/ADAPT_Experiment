@@ -39,7 +39,7 @@ EW_POOLED_COEF_JSON = WORK_DIR / "Ew_pooled_linear_coefs.json"
 COEF_DECIMALS = 3
 FEATURE_COLS = ["half_J_tool8", "PV_sum", "FW_sum", "PJ_sum"]
 OUTCOME_COL = "pred_penalized_filtered_Ew"
-DEFAULT_RIDGE_ALPHA = 10.0
+DEFAULT_RIDGE_ALPHA = 0.0
 DEFAULT_NONNEGATIVE_SLOPES = True
 
 
