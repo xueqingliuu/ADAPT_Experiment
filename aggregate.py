@@ -141,7 +141,7 @@ def _run_seed(run_dir: Path) -> int | None:
 
 
 def _configured_n_experiments(run_dirs: list[Path]) -> int:
-    n = 100
+    n = 200
     for run_dir in run_dirs:
         cfg_n = _load_config(run_dir).get("n_experiments_configured")
         if isinstance(cfg_n, int) and cfg_n > 0:

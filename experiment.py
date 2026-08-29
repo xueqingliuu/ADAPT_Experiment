@@ -172,6 +172,125 @@ def resolve_params_dir(params_dir=None):
     return Path(raw).expanduser().resolve()
 
 
+# Study-entry CAE ceiling on the raw 1--7 scale. Script 5 drops original
+# week 1 and fits weeks 2--12; this filter uses week 1 of that full
+# 12-week panel (``df_fit.csv``), not week 1 of ``df_fit_11week.csv``.
+DEFAULT_COMBINED_DIR = Path(
+    "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing"
+)
+FIRST_WEEK_CAE_CEILING = 7.0
+
+
+def _env_flag_true(name):
+    raw = os.getenv(name)
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def resolve_df_fit_12week(df_fit=None):
+    """Path to the full 12-week ``df_fit.csv`` (weeks 1--12)."""
+    candidates = []
+    if df_fit is not None:
+        candidates.append(Path(df_fit))
+    env_df = os.getenv("ADAPR_DF_FIT")
+    if env_df:
+        candidates.append(Path(env_df))
+    combined = Path(os.getenv("ADAPR_COMBINED_DIR", str(DEFAULT_COMBINED_DIR)))
+    candidates.append(combined / "df_fit.csv")
+    for raw in candidates:
+        path = Path(raw).expanduser()
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
+def _first_week_cae_by_uid(df, value_col, week=1):
+    """One CAE value per participant from study ``week`` (constant within week)."""
+    need = {"ParticipantIdentifier", "week", value_col}
+    missing = need.difference(df.columns)
+    if missing:
+        raise ValueError(f"{sorted(missing)} missing from CAE panel")
+    w = df.loc[df["week"].astype(int) == int(week), ["ParticipantIdentifier", value_col]]
+    series = w.groupby("ParticipantIdentifier", sort=False)[value_col].first()
+    series.index = series.index.astype(int)
+    return series
+
+
+def first_week_cae_12week(df_fit_path):
+    """Per-user ``CAE_avg`` at week 1 of the full 12-week panel."""
+    df = pd.read_csv(
+        df_fit_path, usecols=["ParticipantIdentifier", "week", "CAE_avg"]
+    )
+    return _first_week_cae_by_uid(df, "CAE_avg", week=1)
+
+
+def first_week_cae_from_11week_lag(df_11week_path):
+    """Original week-1 CAE via ``CAE_avg_lastweek`` on the 11-week first row.
+
+    Script 5 drops study week 1 and relabels 2--12 → 1--11, so the lag at
+    11-week ``week==1`` is the 12-week week-1 CAE. Used only if
+    ``df_fit.csv`` is unavailable.
+    """
+    df = pd.read_csv(
+        df_11week_path,
+        usecols=["ParticipantIdentifier", "week", "CAE_avg_lastweek"],
+    )
+    return _first_week_cae_by_uid(df, "CAE_avg_lastweek", week=1)
+
+
+def load_first_week_cae_12week(df_fit=None, params_dir=None):
+    """Load week-1 CAE from the 12-week panel, else the 11-week lag fallback."""
+    path = resolve_df_fit_12week(df_fit)
+    if path is not None:
+        return first_week_cae_12week(path), path, "df_fit_week1"
+    if params_dir is not None:
+        lag_path = Path(params_dir) / "df_fit_11week.csv"
+        if lag_path.is_file():
+            return (
+                first_week_cae_from_11week_lag(lag_path),
+                lag_path.resolve(),
+                "df_fit_11week_CAE_avg_lastweek",
+            )
+    raise FileNotFoundError(
+        "Need the 12-week df_fit.csv (ADAPR_COMBINED_DIR / ADAPR_DF_FIT / "
+        "--df-fit) or params_dir/df_fit_11week.csv to filter first-week CAE."
+    )
+
+
+def uids_with_first_week_cae_ceiling(user_ids, cae_by_uid, ceiling=FIRST_WEEK_CAE_CEILING):
+    """User ids whose week-1 ``CAE_avg`` equals the 1--7 ceiling (missing kept)."""
+    excluded = []
+    for uid in np.asarray(user_ids, dtype=int).ravel():
+        uid = int(uid)
+        if uid not in cae_by_uid.index:
+            continue
+        val = cae_by_uid.loc[uid]
+        if np.isfinite(val) and np.isclose(float(val), float(ceiling)):
+            excluded.append(uid)
+    return excluded
+
+
+def filter_user_ids_exclude_first_week_cae7(
+    user_ids, df_fit=None, params_dir=None, ceiling=FIRST_WEEK_CAE_CEILING
+):
+    """Drop users with 12-week week-1 CAE equal to ``ceiling`` (default 7)."""
+    cae_by_uid, source_path, source_kind = load_first_week_cae_12week(
+        df_fit=df_fit, params_dir=params_dir
+    )
+    excluded = uids_with_first_week_cae_ceiling(user_ids, cae_by_uid, ceiling)
+    kept = [
+        int(u)
+        for u in np.asarray(user_ids, dtype=int).ravel()
+        if int(u) not in set(excluded)
+    ]
+    if not kept:
+        raise ValueError(
+            "All users were excluded by the first-week CAE ceiling filter."
+        )
+    return np.asarray(kept, dtype=int), excluded, source_path, source_kind
+
+
 # %%
 # ──────────────────────────────────────────────────────────────────
 # Episode dataset (RL history lives outside MicroQueryAgent)
@@ -2169,6 +2288,24 @@ if __name__ == "__main__":
             "EnvConfig so the env horizon matches config.json."
         ),
     )
+    parser.add_argument(
+        "--exclude-first-week-cae7",
+        action="store_true",
+        help=(
+            "Drop users whose week-1 CAE_avg on the full 12-week panel "
+            "equals 7 (the 1--7 ceiling). Also set by EXCLUDE_FIRST_WEEK_CAE7=1. "
+            "Does not use week 1 of the 11-week script-5 panel."
+        ),
+    )
+    parser.add_argument(
+        "--df-fit",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the 12-week df_fit.csv used by --exclude-first-week-cae7. "
+            "Defaults to ADAPR_DF_FIT, then ADAPR_COMBINED_DIR/df_fit.csv."
+        ),
+    )
     args = parser.parse_args()
     NWEEK = _resolve_nweek(args.nweek)
 
@@ -2208,7 +2345,31 @@ if __name__ == "__main__":
     )
 
     user_ids = np.loadtxt(params_dir / "user_ids.txt", dtype=int)
-    N_EXPERIMENTS = 100
+    exclude_first_week_cae7 = (
+        bool(args.exclude_first_week_cae7)
+        or _env_flag_true("EXCLUDE_FIRST_WEEK_CAE7")
+    )
+    excluded_first_week_cae7 = []
+    first_week_cae_source = None
+    first_week_cae_source_kind = None
+    if exclude_first_week_cae7:
+        (
+            user_ids,
+            excluded_first_week_cae7,
+            first_week_cae_source,
+            first_week_cae_source_kind,
+        ) = filter_user_ids_exclude_first_week_cae7(
+            user_ids, df_fit=args.df_fit, params_dir=params_dir
+        )
+        src = first_week_cae_source
+        print(
+            f"Excluding {len(excluded_first_week_cae7)} users with first-week "
+            f"CAE_avg={FIRST_WEEK_CAE_CEILING:g} "
+            f"({first_week_cae_source_kind}: {src}): "
+            + ", ".join(str(u) for u in excluded_first_week_cae7)
+        )
+        print(f"Eligible user pool: {len(user_ids)}")
+    N_EXPERIMENTS = 200
     all_seeds = list(range(N_EXPERIMENTS))
     seed_idx = args.seed_idx
     if seed_idx is None:
@@ -2369,6 +2530,13 @@ if __name__ == "__main__":
             "loo_prior_cache_size": len(_LOO_PRIOR_CACHE) if args.prior_mode == "loo" else 0,
             "action_block_include_c": include_action_c,
             "p_rl_micro":      P_RL_MICRO,
+            "exclude_first_week_cae7": exclude_first_week_cae7,
+            "excluded_first_week_cae7": [int(u) for u in excluded_first_week_cae7],
+            "n_eligible_users": int(len(user_ids)),
+            "first_week_cae_source": (
+                str(first_week_cae_source) if first_week_cae_source else None
+            ),
+            "first_week_cae_source_kind": first_week_cae_source_kind,
             "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID"),
             "slurm_job_id":       os.getenv("SLURM_JOB_ID"),
         }, f, indent=2)
