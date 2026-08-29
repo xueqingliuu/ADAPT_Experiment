@@ -16,8 +16,11 @@ Variants (``protocol`` runs 2 and 3 in one job):
    engagement cost of sending sign-definite by *shifting* the main A→ME
    coefficients down by ``κ`` (A×E_w interactions untouched, so the addend is
    ``−κA``, not ``−κA(1+E_w)`` which would flip sign for ``E_w < −1``), and
-   *shifting* E_w→MY up so the fatigue chain can reach Y. ME→E_{w+1} and the
-   E→Y leg stay positive; only ``κ`` is root-found against the proxy STE.
+   *shifting* E_w→MY up by a **fixed** ``κ_e`` (default
+   ``FATIGUE_E_SHIFT_DEFAULT``, override ``ADAPR_FATIGUE_E_SHIFT``) so the
+   fatigue chain can reach Y. ME→E_{w+1} and the E→Y leg stay positive;
+   only the A→ME ``κ`` is root-found against the proxy STE. The control
+   arm is perturbed once, identically across the κ ladder.
 3. **STE 0.5 / 0.8 on top of 2** — knob ``benefit_foursc``: *scale* A→MY by
    ``κ`` (preserves each user's fitted CATE structure — the A×wear /
    A×interact / A×steps ratios the RL algorithm personalizes on) and *shift*
@@ -71,7 +74,8 @@ Knob reference (``--knob``)
 ---------------------------
     fatigue (canonical; alias burden_shift)
               A→ME mains −κ (shift); E_w→fourSC / E_w→antic +κ_e (shift,
-              κ_e = ADAPR_FATIGUE_E_SHIFT or κ). Moves the control arm.
+              κ_e = ADAPR_FATIGUE_E_SHIFT, default 0.15, not tied to κ).
+              Control arm moves vs vanilla, not across the κ ladder.
     benefit_foursc
               A→MY ×κ (scale) and fourSC_ewma→Y += c(κ−1), c =
               ADAPR_BENEFIT_FOURSC_SHIFT (0.05) capped at _CAP (0.20).
@@ -146,6 +150,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # was ~0.29, so a foursc_to_y_shift ladder on top should target 0.5 / 0.8,
 # not 0.2.
 BURDEN_SHIFT_LARGE_KAPPA = 0.4
+
+# Fixed E_w→MY transmission addend for the fatigue knob. Fitted E→fourSC /
+# E→antic are ≈0.003 (compound E→Y ≈0.001), so the conduit to Y is created
+# here, once. Do not tie this to the A→ME search variable: that would make
+# never-send σ_i and Y's E-driven serial correlation grow with κ, and part
+# of the STE drop would come through the denominator. Override with
+# ADAPR_FATIGUE_E_SHIFT (a float, or "kappa" to restore the old coupling).
+FATIGUE_E_SHIFT_DEFAULT = 0.15
 
 # Copied verbatim into every tuned parameter directory so it can be handed to
 # ``ste_vanilla.py`` / ``experiment.py`` as a drop-in replacement.
@@ -242,19 +254,26 @@ _NAME_CONSTANTS = {
 Knob = Callable[[float], dict[str, float]]
 
 
+def _fatigue_e_tied_to_kappa() -> bool:
+    """True only if ``ADAPR_FATIGUE_E_SHIFT=kappa`` restores the old coupling."""
+    return os.getenv("ADAPR_FATIGUE_E_SHIFT", "").strip().lower() in {"kappa", "k"}
+
+
 def _fatigue_e_shift(k: float) -> float:
     """E_w→MY transmission shift paired with the A→ME fatigue shift ``k``.
 
-    Default: tied to ``k`` (one dial, as in the original ``burden_shift``).
-    Set ``ADAPR_FATIGUE_E_SHIFT`` to decouple — e.g. fix the transmission at
-    0.4 while calibrating only the fatigue depth. Applied as a *shift*
-    because the fitted E→fourSC is mixed-sign (positive for 10/31 users):
-    a scale would leave the chain reversed for most participants.
+    Default: ``FATIGUE_E_SHIFT_DEFAULT`` (0.15), independent of ``k``, so the
+    never-send arm is the same at every point on the A→ME ladder. Applied as
+    a *shift* because fitted E→fourSC is near zero (mean ≈0.003): a scale
+    cannot create the conduit. Override with ``ADAPR_FATIGUE_E_SHIFT`` (a
+    float, or ``kappa`` to set ``κ_e = k`` as in the original coupling).
     """
     raw = os.getenv("ADAPR_FATIGUE_E_SHIFT", "").strip()
+    if raw.lower() in {"kappa", "k"}:
+        return float(k)
     if raw:
         return float(raw)
-    return float(k)
+    return float(FATIGUE_E_SHIFT_DEFAULT)
 
 
 def _fatigue_multipliers(k: float) -> dict[str, float]:
@@ -331,17 +350,22 @@ KNOBS: dict[str, KnobSpec] = {
         "fatigue",
         _fatigue_multipliers,
         zero_is_null=False,
-        sigma_invariant=False,
+        # Control arm vs vanilla moves (fixed E→MY addend) but not with κ,
+        # so σ_i can be cached across the A→ME search. False only if
+        # ADAPR_FATIGUE_E_SHIFT=kappa (see knob_sigma_invariant).
+        sigma_invariant=True,
         apply="subtract",
         doc=(
             "Coherent fatigue (variant 2): subtract kappa from the main A→ME "
-            "action coefficients (not A×E_w) and add κ_e to E_w → fourSC and "
-            "E_w → anticipated affect (κ_e = ADAPR_FATIGUE_E_SHIFT, default "
-            "κ; raw units; typical |A→ME| ≈ 0.3, fitted E→MY ≈ 0.02). The "
-            "fatigue addend is −κ A, independent of E_w. Sending lowers "
-            "engagement, a lower E_w then lowers steps and affect, so the "
-            "path reaches CAE. Moves the control arm (E→MY). Alias: "
-            "burden_shift."
+            "action coefficients (not A×E_w) and add a fixed κ_e to E_w → "
+            "fourSC and E_w → anticipated affect (κ_e = "
+            "ADAPR_FATIGUE_E_SHIFT, default 0.15; raw units; typical "
+            "|A→ME| ≈ 0.3, fitted E→MY ≈ 0.003). The fatigue addend is "
+            "−κ A, independent of E_w. Sending lowers engagement, a lower "
+            "E_w then lowers steps and affect, so the path reaches CAE. "
+            "The E→MY addend is identical across the κ ladder (set "
+            "ADAPR_FATIGUE_E_SHIFT=kappa to restore the old coupling). "
+            "Alias: burden_shift."
         ),
     ),
     "my_to_y": KnobSpec(
@@ -411,13 +435,45 @@ KNOBS: dict[str, KnobSpec] = {
 }
 
 # Backward-compatible alias: ``burden_shift`` was the original name of the
-# fatigue knob (same semantics when ADAPR_FATIGUE_E_SHIFT is unset). Reports
-# and ste_tuning.json now record ``knob: fatigue``; overwriting a folder whose
-# report says ``burden_shift`` therefore requires --overwrite, which is
-# intentional — pre-2026-08-25 burden_shift folders also shifted the A×E_w
-# interactions and must be regenerated, and the PV-hurdle action translation
-# changed from ratio to additive on the same date.
+# fatigue knob. Reports and ste_tuning.json now record ``knob: fatigue``;
+# overwriting a folder whose report says ``burden_shift`` therefore requires
+# --overwrite, which is intentional — pre-2026-08-25 burden_shift folders
+# also shifted the A×E_w interactions and must be regenerated, and the
+# PV-hurdle action translation changed from ratio to additive on the same
+# date. Default E→MY addend is FATIGUE_E_SHIFT_DEFAULT, not κ.
 KNOBS["burden_shift"] = KNOBS["fatigue"]
+
+
+def knob_sigma_invariant(knob: KnobSpec) -> bool:
+    """True when the never-send arm (hence σ_i) does not depend on kappa."""
+    if knob.name == "fatigue" and _fatigue_e_tied_to_kappa():
+        return False
+    return bool(knob.sigma_invariant)
+
+
+def _log_fatigue_e_shift(knob: KnobSpec, *, log=print) -> None:
+    if knob.name != "fatigue":
+        return
+    if _fatigue_e_tied_to_kappa():
+        log("  E→MY shift κ_e = κ  (tied; control arm moves with the search)")
+    else:
+        log(
+            f"  E→MY shift κ_e = {_fatigue_e_shift(0.0):g}  "
+            "(fixed across the κ ladder)"
+        )
+
+
+def _fatigue_report_fields(knob: KnobSpec, kappa: float | None = None) -> dict:
+    if knob.name != "fatigue":
+        return {}
+    tied = _fatigue_e_tied_to_kappa()
+    shift = float(kappa) if tied and kappa is not None else (
+        None if tied else _fatigue_e_shift(0.0)
+    )
+    return {
+        "fatigue_e_shift": shift,
+        "fatigue_e_shift_tied_to_kappa": tied,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1359,6 +1415,7 @@ def cmd_scan(args) -> None:
     scratch = Path(args.scratch).expanduser().resolve()
 
     print(f"knob '{knob.name}': {knob.doc}")
+    _log_fatigue_e_shift(knob)
     zero_cache = None
     rows = []
     for kappa in args.kappas:
@@ -1372,8 +1429,9 @@ def cmd_scan(args) -> None:
             n_jobs=args.jobs,
             proxy_to_true=args.proxy_to_true,
         )
-        if zero_cache is None and knob.sigma_invariant:
-            # Action-gated scaling leaves the control arm untouched: measure once.
+        if zero_cache is None and knob_sigma_invariant(knob):
+            # Action-gated A→ME (and a κ-invariant E→MY addend) leave the
+            # control arm untouched across the ladder: measure once.
             zero_cache = zero_cache_from(result)
         rows.append((float(kappa), result))
         print(
@@ -1388,6 +1446,7 @@ def cmd_scan(args) -> None:
             {
                 "knob": knob.name,
                 "spec": asdict(spec),
+                **_fatigue_report_fields(knob),
                 "scan": [
                     {"kappa": k, **{m: r[m] for m in ("mean_ste", "median_ste", "min_ste", "max_ste")}}
                     for k, r in rows
@@ -1474,6 +1533,7 @@ def cmd_calibrate(args) -> None:
     print(f"scratch: {scratch}", flush=True)
 
     print(f"knob '{knob.name}': {knob.doc}")
+    _log_fatigue_e_shift(knob)
     arms = [f"Bernoulli p in {spec.policy_grid}"]
     if spec.dqn_model_dir:
         arms.append(f"DiscreteCQL from {Path(spec.dqn_model_dir).name}")
@@ -1524,7 +1584,7 @@ def cmd_calibrate(args) -> None:
             n_jobs=args.jobs,
             proxy_to_true=args.proxy_to_true,
         )
-        if zero_cache is None and knob.sigma_invariant:
+        if zero_cache is None and knob_sigma_invariant(knob):
             zero_cache = zero_cache_from(result)
         last[float(kappa)] = result
         return result["mean_ste"]
@@ -1620,6 +1680,7 @@ def cmd_calibrate(args) -> None:
             "n_coefficients_scaled": len(audit),
             "stack": _knob_stack(base_dir, knob, kappa),
             "sign_violations": {k: sorted(v) for k, v in sign_violations.items()},
+            **_fatigue_report_fields(knob, kappa),
             **result,
         }
         report["params_dir"] = str(out_dir)
@@ -1661,6 +1722,7 @@ def cmd_apply(args) -> None:
     require_stable = bool(args.require_stable)
 
     print(f"knob '{knob.name}': {knob.doc}")
+    _log_fatigue_e_shift(knob)
     print(f"apply kappa={kappa:g}  {base_dir.name} -> {out_dir.name}")
 
     gains = loop_gains_for(
@@ -1701,6 +1763,7 @@ def cmd_apply(args) -> None:
         "stack": _knob_stack(base_dir, knob, kappa),
         "sign_violations": {k: sorted(v) for k, v in sign_violations.items()},
         "params_dir": str(out_dir),
+        **_fatigue_report_fields(knob, kappa),
     }
 
     if args.eval:
