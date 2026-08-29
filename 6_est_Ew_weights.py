@@ -57,10 +57,21 @@ def _r2_score(y: np.ndarray, yhat: np.ndarray) -> float:
     return 1.0 - ss_res / ss_tot
 
 
-def load_df_fit(path: Path | None = None) -> pd.DataFrame:
+def load_user_ids(work_dir: Path = WORK_DIR) -> set[int] | None:
+    path = Path(work_dir) / "user_ids.txt"
+    if not path.is_file():
+        return None
+    return {int(u) for u in np.loadtxt(path, dtype=int).ravel()}
+
+
+def load_df_fit(path: Path | None = None, work_dir: Path = WORK_DIR) -> pd.DataFrame:
     p = path or (COMBINED_DIR / "df_fit.csv")
     df = pd.read_csv(p)
-    return df.loc[df["week"].between(1, 12)].copy()
+    df = df.loc[df["week"].between(1, 12)].copy()
+    keep = load_user_ids(work_dir)
+    if keep:
+        df = df.loc[df["ParticipantIdentifier"].astype(int).isin(keep)].copy()
+    return df
 
 
 def _first_nonmissing(series: pd.Series) -> float:
@@ -298,7 +309,7 @@ def fit_pooled_linear_Ew(
         Ignored for pooled OLS.
     """
     if df_fit is None:
-        df_fit = load_df_fit()
+        df_fit = load_df_fit(work_dir=work_dir)
     response_means = weekly_response_imputation_means(df_fit)
     frame = build_pooled_regression_frame(
         df_fit,
