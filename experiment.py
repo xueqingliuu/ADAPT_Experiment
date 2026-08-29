@@ -1364,8 +1364,8 @@ TARGET_C     = 1
 # EPSILON_0 is defined in algorithm_helpers: RLSVI clips π to [ε, 1-ε].
 # The always/never baselines are hard 1 / 0 (not the clip bounds), so they
 # are outside the ε-greedy policy class the learning agents live in.
-# Default action probability is an average of ensemble softmaxes
-# (ADAPR_ENSEMBLE_ACTION=softmax, temperature ADAPR_SOFTMAX_TAU).
+# Default action probability is the ensemble fraction
+# (ADAPR_ENSEMBLE_ACTION=fraction). Softmax is ADAPR_ENSEMBLE_ACTION=softmax.
 J_PARTICLES  = 50
 B_ENSEMBLES  = 50
 DEFAULT_NWEEK = 36

@@ -611,13 +611,11 @@ def require_finite_belief(value, *, week, name="b_hat"):
 # EPSILON_0. Changing this constant does not change those baselines.
 EPSILON_0 = 0.1
 
-# Boltzmann temperature for the ensemble softmax. Q is on the weekly ``b_hat``
-# / discounted-CAE scale, so advantages are often 0.01–0.1; τ=0.1 lets a
-# 0.05 advantage map to π≈0.62 instead of collapsing to 0.5. Override with
-# ``ADAPR_SOFTMAX_TAU``. ``ADAPR_ENSEMBLE_ACTION=vote`` restores the old
-# hard majority vote.
+# Default action probability is the ensemble fraction (share of draws with
+# Q(s,1) > Q(s,0)). Softmax is available via ADAPR_ENSEMBLE_ACTION=softmax;
+# ADAPR_SOFTMAX_TAU then sets the Boltzmann temperature.
 SOFTMAX_TAU = float(os.getenv("ADAPR_SOFTMAX_TAU", "0.1"))
-ENSEMBLE_ACTION_MODE = str(os.getenv("ADAPR_ENSEMBLE_ACTION", "softmax")).strip().lower()
+ENSEMBLE_ACTION_MODE = str(os.getenv("ADAPR_ENSEMBLE_ACTION", "fraction")).strip().lower()
 
 
 def _stable_sigmoid(z):
@@ -628,15 +626,14 @@ def _stable_sigmoid(z):
 def ensemble_action_prob(phi_1, phi_0, betas, tau=None):
     """Randomisation probability from an RLSVI ensemble.
 
-    Default (softmax) averages a Bernoulli probability over posterior draws::
-
-        pi_hat = (1/M) sum_m  σ( (Q_m(s,1) - Q_m(s,0)) / τ )
-
-    with ``Q_m(s,a) = phi_a^T beta_m``. Magnitude of the advantage matters, so
-    a weakly preferred action no longer maps to π≈0.5. Set
-    ``ADAPR_ENSEMBLE_ACTION=vote`` for the old hard majority::
+    Default (fraction) is the share of posterior draws that prefer send::
 
         pi_hat = (1/M) sum_m  I( Q_m(s,1) > Q_m(s,0) )
+
+    with ``Q_m(s,a) = phi_a^T beta_m``. Set ``ADAPR_ENSEMBLE_ACTION=softmax``
+    to average Boltzmann probabilities instead::
+
+        pi_hat = (1/M) sum_m  σ( (Q_m(s,1) - Q_m(s,0)) / τ )
 
     Parameters
     ----------
@@ -654,11 +651,11 @@ def ensemble_action_prob(phi_1, phi_0, betas, tau=None):
     B = np.stack([np.asarray(beta, dtype=float) for beta in betas], axis=0)
     adv = B @ (np.asarray(phi_1, dtype=float) - np.asarray(phi_0, dtype=float))
     mode = ENSEMBLE_ACTION_MODE
-    if mode in {"vote", "majority", "hard"}:
+    if mode in {"fraction", "vote", "majority", "hard"}:
         return float(np.mean(adv > 0.0))
     if mode not in {"softmax", "boltzmann", "sigmoid"}:
         raise ValueError(
-            f"unknown ADAPR_ENSEMBLE_ACTION={mode!r}; use 'softmax' or 'vote'"
+            f"unknown ADAPR_ENSEMBLE_ACTION={mode!r}; use 'fraction' or 'softmax'"
         )
     tau = float(SOFTMAX_TAU if tau is None else tau)
     if not np.isfinite(tau) or tau <= 0.0:
