@@ -1245,7 +1245,7 @@ def sign_story_report(
     n = len(list(user_ids))
     log(f"  sign story ({params_dir.name}, n={n} participants):")
     seen = set()
-    for label, _key, _coef, _sign in _SIGN_CHECKS:
+    for label, _key, _cname, _sign in _SIGN_CHECKS:
         if label in seen:
             continue
         seen.add(label)
