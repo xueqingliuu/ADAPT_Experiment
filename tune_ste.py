@@ -15,12 +15,18 @@ Variants (``protocol`` runs 2 and 3 in one job):
 2. **low STE ≈ 0.2** — knob ``fatigue`` (alias ``burden_shift``): make the
    engagement cost of sending sign-definite by *shifting* the main A→ME
    coefficients down by ``κ`` (A×E_w interactions untouched, so the addend is
-   ``−κA``, not ``−κA(1+E_w)`` which would flip sign for ``E_w < −1``), and
-   *shifting* E_w→MY up by a **fixed** ``κ_e`` (default
+   ``−κA``, not ``−κA(1+E_w)`` which would flip sign for ``E_w < −1``),
+   **per user × mediator and only when that user's ME→E loading exceeds**
+   ``FATIGUE_ME_TO_E_MIN`` (default 0.05; ``ADAPR_FATIGUE_ME_TO_E_MIN``).
+   Crushing a mediator that *lowers* E (user 248's FW/PJ) would invert the
+   chain. E_w→MY is *shifted* up by a **fixed** ``κ_e`` (default
    ``FATIGUE_E_SHIFT_DEFAULT``, override ``ADAPR_FATIGUE_E_SHIFT``) so the
-   fatigue chain can reach Y. ME→E_{w+1} and the E→Y leg stay positive;
-   only the A→ME ``κ`` is root-found against the proxy STE. The control
-   arm is perturbed once, identically across the κ ladder.
+   fatigue chain can reach Y. Search ``κ`` is capped at
+   ``FATIGUE_KAPPA_MAX`` (default 2; ``ADAPR_FATIGUE_KAPPA_MAX``) — the
+   A→ME mains do not change loop gains, so the old 256 stability cap was
+   not a real bound. Only the gated A→ME ``κ`` is root-found against the
+   proxy STE. The control arm is perturbed once, identically across the
+   κ ladder.
 3. **STE 0.5 / 0.8 on top of 2** — knob ``benefit_foursc``: *scale* A→MY by
    ``κ`` (preserves each user's fitted CATE structure — the A×wear /
    A×interact / A×steps ratios the RL algorithm personalizes on) and *shift*
@@ -73,9 +79,12 @@ TUNE_TARGETS="0.5 0.8" run_tune_ste.sh
 Knob reference (``--knob``)
 ---------------------------
     fatigue (canonical; alias burden_shift)
-              A→ME mains −κ (shift); E_w→fourSC / E_w→antic +κ_e (shift,
-              κ_e = ADAPR_FATIGUE_E_SHIFT, default 0.15, not tied to κ).
-              Control arm moves vs vanilla, not across the κ ladder.
+              A→ME mains −κ (shift), per mediator only if that user's
+              ME→E > ADAPR_FATIGUE_ME_TO_E_MIN (default 0.05); E_w→fourSC
+              / E_w→antic +κ_e (shift, κ_e = ADAPR_FATIGUE_E_SHIFT,
+              default 0.15, not tied to κ). Search κ ≤
+              ADAPR_FATIGUE_KAPPA_MAX (default 2). Control arm moves vs
+              vanilla, not across the κ ladder.
     benefit_foursc
               A→MY ×κ (scale) and fourSC_ewma→Y += c(κ−1), c =
               ADAPR_BENEFIT_FOURSC_SHIFT (0.05) capped at _CAP (0.20).
@@ -159,6 +168,19 @@ BURDEN_SHIFT_LARGE_KAPPA = 0.4
 # ADAPR_FATIGUE_E_SHIFT (a float, or "kappa" to restore the old coupling).
 FATIGUE_E_SHIFT_DEFAULT = 0.15
 
+# Subtract κ from A→ME(m) only if that user's ME→E loading for m exceeds
+# this threshold. ``> 0`` is too tight (near-zero loadings still invert
+# under a large κ); 0.05 is a small but definite positive conduit.
+# Override with ADAPR_FATIGUE_ME_TO_E_MIN.
+FATIGUE_ME_TO_E_MIN = 0.05
+
+# Hard search cap for the fatigue κ. A→ME mains do not enter the E_w /
+# CAE loop-gain formulas, so ``largest_stable_kappa`` returns 256 and is
+# not a real bound. 2 is large vs typical |A→ME| (mean 0.29, max 1.48)
+# without inventing an order-of-magnitude engagement cost. Override with
+# ADAPR_FATIGUE_KAPPA_MAX.
+FATIGUE_KAPPA_MAX = 2.0
+
 # Copied verbatim into every tuned parameter directory so it can be handed to
 # ``ste_vanilla.py`` / ``experiment.py`` as a drop-in replacement.
 # ``rl_priors.json`` is the RCT/vanilla prior (not re-fit on the κ-scaled
@@ -225,9 +247,19 @@ PATHWAYS: dict[str, dict[str, tuple[str, ...]]] = {
     # Main action effects only: a constant (in E_w) shift of the A→ME
     # intercept. Subtracting κ from the A×E_w terms as well would change
     # the action effect by −κ(1+E_w) and flip sign for E_w < −1.
+    # Split per mediator so fatigue can sign-gate PV / FW / PJ separately.
     "A_to_ME_main": {
         "theta_penalized_PV": ("alpha3_action", "gamma3_action"),
         "theta_penalized_FW": ("beta3_A0_morning", "beta5_A1_afternoon"),
+        "theta_penalized_PJ": ("theta3_A0_morning", "theta5_A1_afternoon"),
+    },
+    "A_to_ME_PV_main": {
+        "theta_penalized_PV": ("alpha3_action", "gamma3_action"),
+    },
+    "A_to_ME_FW_main": {
+        "theta_penalized_FW": ("beta3_A0_morning", "beta5_A1_afternoon"),
+    },
+    "A_to_ME_PJ_main": {
         "theta_penalized_PJ": ("theta3_A0_morning", "theta5_A1_afternoon"),
     },
     "ME_to_E": {
@@ -240,7 +272,27 @@ PATHWAYS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 # Pathways that are gated by an action indicator, hence invisible to pi_0.
-ACTION_GATED = frozenset({"A_to_MY", "A_to_ME", "A_to_ME_main"})
+ACTION_GATED = frozenset({
+    "A_to_MY",
+    "A_to_ME",
+    "A_to_ME_main",
+    "A_to_ME_PV_main",
+    "A_to_ME_FW_main",
+    "A_to_ME_PJ_main",
+})
+
+_ME_TO_E = {
+    "PV": ("theta_penalized_Ew", "a2_PV_lag_week"),
+    "FW": ("theta_penalized_Ew", "a3_FW_lag_week"),
+    "PJ": ("theta_penalized_Ew", "a4_PJ_lag_week"),
+}
+
+_A_ME_SIGN_TO_MEDIATOR = {
+    "A->PV main <= 0": "PV",
+    "A->PV intensity main <= 0": "PV",
+    "A->FW main <= 0": "FW",
+    "A->PJ main <= 0": "PJ",
+}
 
 # Fallback coefficient names for blocks that carry no ``*_names`` key in JSON.
 _NAME_CONSTANTS = {
@@ -276,8 +328,25 @@ def _fatigue_e_shift(k: float) -> float:
     return float(FATIGUE_E_SHIFT_DEFAULT)
 
 
+def _fatigue_me_to_e_min() -> float:
+    raw = os.getenv("ADAPR_FATIGUE_ME_TO_E_MIN", "").strip()
+    return float(raw) if raw else float(FATIGUE_ME_TO_E_MIN)
+
+
+def _fatigue_kappa_max() -> float:
+    raw = os.getenv("ADAPR_FATIGUE_KAPPA_MAX", "").strip()
+    return float(raw) if raw else float(FATIGUE_KAPPA_MAX)
+
+
 def _fatigue_multipliers(k: float) -> dict[str, float]:
-    return {"A_to_ME_main": float(k), "E_to_MY": -_fatigue_e_shift(k)}
+    """Population-level fatigue map (all three A→ME mains). Writes use the
+    per-user gated version in ``_fatigue_multipliers_for_user``."""
+    return {
+        "A_to_ME_PV_main": float(k),
+        "A_to_ME_FW_main": float(k),
+        "A_to_ME_PJ_main": float(k),
+        "E_to_MY": -_fatigue_e_shift(k),
+    }
 
 
 def _benefit_foursc_shift(k: float) -> float:
@@ -308,6 +377,7 @@ class KnobSpec:
     sigma_invariant: bool  # control arm untouched, so sigma_i can be cached
     doc: str
     apply: str | dict[str, str] = "multiply"  # or per-pathway map
+    kappa_cap: float | None = None  # search hi; fatigue uses FATIGUE_KAPPA_MAX
 
 
 KNOBS: dict[str, KnobSpec] = {
@@ -355,17 +425,20 @@ KNOBS: dict[str, KnobSpec] = {
         # ADAPR_FATIGUE_E_SHIFT=kappa (see knob_sigma_invariant).
         sigma_invariant=True,
         apply="subtract",
+        kappa_cap=FATIGUE_KAPPA_MAX,
         doc=(
             "Coherent fatigue (variant 2): subtract kappa from the main A→ME "
-            "action coefficients (not A×E_w) and add a fixed κ_e to E_w → "
-            "fourSC and E_w → anticipated affect (κ_e = "
-            "ADAPR_FATIGUE_E_SHIFT, default 0.15; raw units; typical "
-            "|A→ME| ≈ 0.3, fitted E→MY ≈ 0.003). The fatigue addend is "
-            "−κ A, independent of E_w. Sending lowers engagement, a lower "
-            "E_w then lowers steps and affect, so the path reaches CAE. "
-            "The E→MY addend is identical across the κ ladder (set "
-            "ADAPR_FATIGUE_E_SHIFT=kappa to restore the old coupling). "
-            "Alias: burden_shift."
+            "action coefficients (not A×E_w), per mediator only when that "
+            "user's ME→E loading exceeds ADAPR_FATIGUE_ME_TO_E_MIN (default "
+            "0.05), and add a fixed κ_e to E_w → fourSC and E_w → "
+            "anticipated affect (κ_e = ADAPR_FATIGUE_E_SHIFT, default 0.15; "
+            "raw units; typical |A→ME| ≈ 0.3, fitted E→MY ≈ 0.003). The "
+            "fatigue addend is −κ A, independent of E_w. Sending lowers "
+            "engagement, a lower E_w then lowers steps and affect, so the "
+            "path reaches CAE. Search κ is capped at "
+            "ADAPR_FATIGUE_KAPPA_MAX (default 2). The E→MY addend is "
+            "identical across the κ ladder (set ADAPR_FATIGUE_E_SHIFT=kappa "
+            "to restore the old coupling). Alias: burden_shift."
         ),
     ),
     "my_to_y": KnobSpec(
@@ -451,6 +524,15 @@ def knob_sigma_invariant(knob: KnobSpec) -> bool:
     return bool(knob.sigma_invariant)
 
 
+def knob_kappa_cap(knob: KnobSpec) -> float | None:
+    """Search-hi cap for this knob, honouring env overrides."""
+    if knob.name == "fatigue":
+        return _fatigue_kappa_max()
+    if knob.kappa_cap is None:
+        return None
+    return float(knob.kappa_cap)
+
+
 def _log_fatigue_e_shift(knob: KnobSpec, *, log=print) -> None:
     if knob.name != "fatigue":
         return
@@ -461,6 +543,14 @@ def _log_fatigue_e_shift(knob: KnobSpec, *, log=print) -> None:
             f"  E→MY shift κ_e = {_fatigue_e_shift(0.0):g}  "
             "(fixed across the κ ladder)"
         )
+    log(
+        f"  A→ME sign-gate: ME→E > {_fatigue_me_to_e_min():g}  "
+        "(ADAPR_FATIGUE_ME_TO_E_MIN; ungated mediators keep fitted A→ME)"
+    )
+    log(
+        f"  fatigue κ cap: {_fatigue_kappa_max():g}  "
+        "(ADAPR_FATIGUE_KAPPA_MAX)"
+    )
 
 
 def _fatigue_report_fields(knob: KnobSpec, kappa: float | None = None) -> dict:
@@ -473,6 +563,8 @@ def _fatigue_report_fields(knob: KnobSpec, kappa: float | None = None) -> dict:
     return {
         "fatigue_e_shift": shift,
         "fatigue_e_shift_tied_to_kappa": tied,
+        "fatigue_me_to_e_min": _fatigue_me_to_e_min(),
+        "fatigue_kappa_max": _fatigue_kappa_max(),
     }
 
 
@@ -486,6 +578,56 @@ def _names_for(key: str, params: dict) -> list[str]:
     if key in _NAME_CONSTANTS:
         return list(_NAME_CONSTANTS[key])
     raise KeyError(f"No coefficient names available for {key!r}")
+
+
+def _coef(params: dict, key: str, coef: str) -> float:
+    names = _names_for(key, params)
+    return float(np.asarray(params[key], dtype=float).ravel()[names.index(coef)])
+
+
+def _fatigue_gated_mediators(params: dict) -> list[str]:
+    """Mediators whose ME→E loading is a definite positive conduit to E."""
+    thresh = _fatigue_me_to_e_min()
+    return [
+        m for m, (key, coef) in _ME_TO_E.items()
+        if _coef(params, key, coef) > thresh
+    ]
+
+
+def _fatigue_multipliers_for_user(k: float, params: dict) -> dict[str, float]:
+    """Fatigue map for one user: E→MY always; A→ME(m) only if gated."""
+    mult: dict[str, float] = {"E_to_MY": -_fatigue_e_shift(k)}
+    for m in _fatigue_gated_mediators(params):
+        mult[f"A_to_ME_{m}_main"] = float(k)
+    return mult
+
+
+def _knob_multipliers_fn(
+    knob: KnobSpec, kappa: float
+) -> Callable[[dict], dict[str, float]]:
+    k = float(kappa)
+    if knob.name == "fatigue":
+        return lambda params: _fatigue_multipliers_for_user(k, params)
+    return lambda params: knob.build(k)
+
+
+def _log_fatigue_gates(
+    src_dir: Path, user_ids: Sequence[int], *, log=print
+) -> dict[str, list[str]]:
+    """Print and return per-user gated A→ME mediators."""
+    gates: dict[int, list[str]] = {}
+    for uid in user_ids:
+        with open(Path(src_dir) / f"params_env_{uid}.json", encoding="utf-8") as f:
+            params = json.load(f)
+        gates[int(uid)] = _fatigue_gated_mediators(params)
+    n = len(gates)
+    for m in ("PV", "FW", "PJ"):
+        n_m = sum(1 for g in gates.values() if m in g)
+        log(f"  A→ME {m} gated for {n_m}/{n} users")
+    ungated = [u for u, g in gates.items() if not g]
+    if ungated:
+        log(f"  no A→ME shift: {ungated}")
+    return {str(u): g for u, g in gates.items()}
 
 
 def _pathway_apply(apply: str | dict[str, str], pathway: str) -> str:
@@ -593,11 +735,18 @@ def write_scaled_params(
     src_dir: Path,
     dst_dir: Path,
     user_ids: Sequence[int],
-    multipliers: dict[str, float],
+    multipliers: dict[str, float] | None = None,
     *,
     apply: str | dict[str, str] = "multiply",
+    multipliers_for: Callable[[dict], dict[str, float]] | None = None,
 ) -> list[dict]:
-    """Materialise a tuned copy of ``src_dir`` at ``dst_dir``."""
+    """Materialise a tuned copy of ``src_dir`` at ``dst_dir``.
+
+    ``multipliers_for(params)`` supplies a per-user map (fatigue sign-gate).
+    When set it takes precedence over the shared ``multipliers`` dict.
+    """
+    if multipliers is None and multipliers_for is None:
+        raise ValueError("write_scaled_params needs multipliers or multipliers_for")
     dst_dir.mkdir(parents=True, exist_ok=True)
     for fname in SUPPORTING_FILES:
         src = src_dir / fname
@@ -610,12 +759,31 @@ def write_scaled_params(
         src = src_dir / f"params_env_{uid}.json"
         with open(src, encoding="utf-8") as f:
             params = json.load(f)
-        scaled, rows = scale_params(params, multipliers, apply=apply)
+        mult = multipliers_for(params) if multipliers_for is not None else multipliers
+        scaled, rows = scale_params(params, mult, apply=apply)
         for r in rows:
             r["userid"] = int(uid)
         audit.extend(rows)
         _write_json_atomic(dst_dir / f"params_env_{uid}.json", scaled)
     return audit
+
+
+def write_knob_params(
+    src_dir: Path,
+    dst_dir: Path,
+    user_ids: Sequence[int],
+    knob: KnobSpec,
+    kappa: float,
+) -> list[dict]:
+    """Write ``src_dir`` scaled by ``knob`` at ``kappa`` (per-user if fatigue)."""
+    return write_scaled_params(
+        src_dir,
+        dst_dir,
+        user_ids,
+        knob.build(float(kappa)),
+        apply=knob.apply,
+        multipliers_for=_knob_multipliers_fn(knob, kappa),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1234,10 @@ def sign_story_report(
             names = _names_for(key, params)
             if coef not in names:
                 continue
+            if knob_name == "fatigue" and label in _A_ME_SIGN_TO_MEDIATOR:
+                med = _A_ME_SIGN_TO_MEDIATOR[label]
+                if _coef(params, *_ME_TO_E[med]) <= _fatigue_me_to_e_min():
+                    continue
             val = float(np.asarray(params[key], dtype=float).ravel()[names.index(coef)])
             if (sign < 0 and val > 0.0) or (sign > 0 and val < 0.0):
                 violators.setdefault(label, []).append(int(uid))
@@ -1086,9 +1258,10 @@ def sign_story_report(
 def loop_gains_for(
     src_dir: Path,
     user_ids: Sequence[int],
-    multipliers: dict[str, float],
+    multipliers: dict[str, float] | None,
     *,
     apply: str | dict[str, str] = "multiply",
+    multipliers_for: Callable[[dict], dict[str, float]] | None = None,
 ) -> list[dict]:
     """E_w and CAE loop gains after applying ``multipliers``, without writing."""
     with open(src_dir / "std_params.json", encoding="utf-8") as f:
@@ -1097,8 +1270,9 @@ def loop_gains_for(
     for uid in user_ids:
         with open(src_dir / f"params_env_{uid}.json", encoding="utf-8") as f:
             params = json.load(f)
+        mult = multipliers_for(params) if multipliers_for is not None else multipliers
         scaled, _ = (
-            scale_params(params, multipliers, apply=apply) if multipliers else (params, [])
+            scale_params(params, mult, apply=apply) if mult else (params, [])
         )
         rows.append(
             {
@@ -1108,6 +1282,21 @@ def loop_gains_for(
             }
         )
     return rows
+
+
+def loop_gains_for_knob(
+    src_dir: Path,
+    user_ids: Sequence[int],
+    knob: KnobSpec,
+    kappa: float,
+) -> list[dict]:
+    return loop_gains_for(
+        src_dir,
+        user_ids,
+        knob.build(float(kappa)),
+        apply=knob.apply,
+        multipliers_for=_knob_multipliers_fn(knob, kappa),
+    )
 
 
 def largest_stable_kappa(
@@ -1122,9 +1311,8 @@ def largest_stable_kappa(
 
     def ok(k: float) -> bool:
         return not unstable_users(
-            loop_gains_for(
-                src_dir, user_ids, knob.build(float(k)), apply=knob.apply
-            ), limit=limit
+            loop_gains_for_knob(src_dir, user_ids, knob, float(k)),
+            limit=limit,
         )
 
     if not ok(0.0):
@@ -1416,11 +1604,13 @@ def cmd_scan(args) -> None:
 
     print(f"knob '{knob.name}': {knob.doc}")
     _log_fatigue_e_shift(knob)
+    fatigue_gates = (
+        _log_fatigue_gates(base_dir, user_ids) if knob.name == "fatigue" else None
+    )
     zero_cache = None
     rows = []
     for kappa in args.kappas:
-        mult = knob.build(float(kappa))
-        write_scaled_params(base_dir, scratch, user_ids, mult, apply=knob.apply)
+        write_knob_params(base_dir, scratch, user_ids, knob, float(kappa))
         result = evaluate(
             scratch,
             user_ids,
@@ -1447,6 +1637,7 @@ def cmd_scan(args) -> None:
                 "knob": knob.name,
                 "spec": asdict(spec),
                 **_fatigue_report_fields(knob),
+                **({"fatigue_gates": fatigue_gates} if fatigue_gates is not None else {}),
                 "scan": [
                     {"kappa": k, **{m: r[m] for m in ("mean_ste", "median_ste", "min_ste", "max_ste")}}
                     for k, r in rows
@@ -1534,6 +1725,9 @@ def cmd_calibrate(args) -> None:
 
     print(f"knob '{knob.name}': {knob.doc}")
     _log_fatigue_e_shift(knob)
+    fatigue_gates = (
+        _log_fatigue_gates(base_dir, user_ids) if knob.name == "fatigue" else None
+    )
     arms = [f"Bernoulli p in {spec.policy_grid}"]
     if spec.dqn_model_dir:
         arms.append(f"DiscreteCQL from {Path(spec.dqn_model_dir).name}")
@@ -1557,13 +1751,20 @@ def cmd_calibrate(args) -> None:
 
     kappa_hi = 256.0
     if require_stable:
-        kappa_hi = largest_stable_kappa(base_dir, user_ids, knob, x_hi=256.0)
+        stab = largest_stable_kappa(base_dir, user_ids, knob, x_hi=256.0)
         print(
-            f"joint E_w/CAE stability cap: kappa <= {kappa_hi:.5f}  "
+            f"joint E_w/CAE stability cap: kappa <= {stab:.5f}  "
             f"(|g_zero|, |g_always| < {GAIN_LIMIT:g})"
         )
-        if kappa_hi <= 0.0:
+        if stab <= 0.0:
             raise SystemExit("no non-negative kappa is loop-stable; aborting.")
+        kappa_hi = stab
+    cap = knob_kappa_cap(knob)
+    if cap is not None:
+        print(f"knob kappa cap ({knob.name}): kappa <= {cap:g}")
+        kappa_hi = min(kappa_hi, float(cap))
+        if kappa_hi <= 0.0:
+            raise SystemExit("no non-negative kappa is feasible; aborting.")
 
     zero_cache: dict[int, list[float]] | None = None
     last: dict[float, dict] = {}
@@ -1573,9 +1774,7 @@ def cmd_calibrate(args) -> None:
         if float(kappa) in last:  # the response curve is shared across targets
             return last[float(kappa)]["mean_ste"]
         kappa_dir = scratch / f"k{float(kappa):.8g}"
-        write_scaled_params(
-            base_dir, kappa_dir, user_ids, knob.build(float(kappa)), apply=knob.apply
-        )
+        write_knob_params(base_dir, kappa_dir, user_ids, knob, float(kappa))
         result = evaluate(
             kappa_dir,
             user_ids,
@@ -1590,13 +1789,12 @@ def cmd_calibrate(args) -> None:
         return result["mean_ste"]
 
     x0 = float(args.kappa0)
-    if require_stable:
-        x0 = min(max(x0, 0.0), kappa_hi)
-        if x0 == 0.0 and kappa_hi > 0.0:
-            x0 = min(1.0, kappa_hi)
-        # One evaluation at the cap so the solver knows the feasible STE range.
-        if kappa_hi < 256.0:
-            print(f"  max-stable kappa={kappa_hi:.5f}  ->  mean STE={f(kappa_hi):.4f}")
+    x0 = min(max(x0, 0.0), kappa_hi)
+    if x0 == 0.0 and kappa_hi > 0.0:
+        x0 = min(1.0, kappa_hi)
+    # One evaluation at the search hi so the solver knows the feasible STE range.
+    if kappa_hi < 256.0:
+        print(f"  search hi kappa={kappa_hi:.5f}  ->  mean STE={f(kappa_hi):.4f}")
 
     solutions: list[tuple[float, float, float, Path]] = []
     failures: list[str] = []
@@ -1616,9 +1814,7 @@ def cmd_calibrate(args) -> None:
         if kappa not in last:  # e.g. the free f(0) endpoint won the search
             f(kappa)
         result = last[kappa]
-        gains = loop_gains_for(
-            base_dir, user_ids, knob.build(kappa), apply=knob.apply
-        )
+        gains = loop_gains_for_knob(base_dir, user_ids, knob, kappa)
         bad = unstable_users(gains)
         worst = max(gains, key=max_abs_gain)
         on_target = abs(achieved - float(target)) <= args.tol
@@ -1653,9 +1849,7 @@ def cmd_calibrate(args) -> None:
 
         out_dir = calibrated_out_dir(args.out_prefix, target, args.out_suffix)
         refuse_knob_overwrite(out_dir, knob.name, overwrite=args.overwrite)
-        audit = write_scaled_params(
-            base_dir, out_dir, user_ids, knob.build(kappa), apply=knob.apply
-        )
+        audit = write_knob_params(base_dir, out_dir, user_ids, knob, kappa)
         written = diagnose(out_dir, user_ids)
         if require_stable and unstable_users(written):
             raise SystemExit(
@@ -1681,6 +1875,7 @@ def cmd_calibrate(args) -> None:
             "stack": _knob_stack(base_dir, knob, kappa),
             "sign_violations": {k: sorted(v) for k, v in sign_violations.items()},
             **_fatigue_report_fields(knob, kappa),
+            **({"fatigue_gates": fatigue_gates} if fatigue_gates is not None else {}),
             **result,
         }
         report["params_dir"] = str(out_dir)
@@ -1723,11 +1918,15 @@ def cmd_apply(args) -> None:
 
     print(f"knob '{knob.name}': {knob.doc}")
     _log_fatigue_e_shift(knob)
+    fatigue_gates = (
+        _log_fatigue_gates(base_dir, user_ids) if knob.name == "fatigue" else None
+    )
+    cap = knob_kappa_cap(knob)
+    if cap is not None and kappa > cap:
+        print(f"WARNING: kappa={kappa:g} exceeds {knob.name} cap {cap:g}")
     print(f"apply kappa={kappa:g}  {base_dir.name} -> {out_dir.name}")
 
-    gains = loop_gains_for(
-        base_dir, user_ids, knob.build(kappa), apply=knob.apply
-    )
+    gains = loop_gains_for_knob(base_dir, user_ids, knob, kappa)
     bad = unstable_users(gains)
     if require_stable and bad:
         uids = [int(r["userid"]) for r in bad]
@@ -1737,9 +1936,7 @@ def cmd_apply(args) -> None:
         )
 
     refuse_knob_overwrite(out_dir, knob.name, overwrite=args.overwrite)
-    audit = write_scaled_params(
-        base_dir, out_dir, user_ids, knob.build(kappa), apply=knob.apply
-    )
+    audit = write_knob_params(base_dir, out_dir, user_ids, knob, kappa)
     written = diagnose(out_dir, user_ids)
     if require_stable and unstable_users(written):
         raise SystemExit(
@@ -1764,6 +1961,7 @@ def cmd_apply(args) -> None:
         "sign_violations": {k: sorted(v) for k, v in sign_violations.items()},
         "params_dir": str(out_dir),
         **_fatigue_report_fields(knob, kappa),
+        **({"fatigue_gates": fatigue_gates} if fatigue_gates is not None else {}),
     }
 
     if args.eval:
