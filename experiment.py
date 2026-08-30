@@ -2208,7 +2208,7 @@ if __name__ == "__main__":
     )
 
     user_ids = np.loadtxt(params_dir / "user_ids.txt", dtype=int)
-    N_EXPERIMENTS = 200
+    N_EXPERIMENTS = 500
     all_seeds = list(range(N_EXPERIMENTS))
     seed_idx = args.seed_idx
     if seed_idx is None:
