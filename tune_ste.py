@@ -82,7 +82,7 @@ Knob reference (``--knob``)
               A→ME mains −κ (shift), per mediator only if that user's
               ME→E > ADAPR_FATIGUE_ME_TO_E_MIN (default 0.05); E_w→fourSC
               / E_w→antic +κ_e (shift, κ_e = ADAPR_FATIGUE_E_SHIFT,
-              default 0.15, not tied to κ). Search κ ≤
+              default 0.3, not tied to κ). Search κ ≤
               ADAPR_FATIGUE_KAPPA_MAX (default 2). Control arm moves vs
               vanilla, not across the κ ladder.
     benefit_foursc
@@ -166,7 +166,7 @@ BURDEN_SHIFT_LARGE_KAPPA = 0.4
 # never-send σ_i and Y's E-driven serial correlation grow with κ, and part
 # of the STE drop would come through the denominator. Override with
 # ADAPR_FATIGUE_E_SHIFT (a float, or "kappa" to restore the old coupling).
-FATIGUE_E_SHIFT_DEFAULT = 0.15
+FATIGUE_E_SHIFT_DEFAULT = 0.3
 
 # Subtract κ from A→ME(m) only if that user's ME→E loading for m exceeds
 # this threshold. ``> 0`` is too tight (near-zero loadings still invert
@@ -314,7 +314,7 @@ def _fatigue_e_tied_to_kappa() -> bool:
 def _fatigue_e_shift(k: float) -> float:
     """E_w→MY transmission shift paired with the A→ME fatigue shift ``k``.
 
-    Default: ``FATIGUE_E_SHIFT_DEFAULT`` (0.15), independent of ``k``, so the
+    Default: ``FATIGUE_E_SHIFT_DEFAULT`` (0.3), independent of ``k``, so the
     never-send arm is the same at every point on the A→ME ladder. Applied as
     a *shift* because fitted E→fourSC is near zero (mean ≈0.003): a scale
     cannot create the conduit. Override with ``ADAPR_FATIGUE_E_SHIFT`` (a
@@ -431,7 +431,7 @@ KNOBS: dict[str, KnobSpec] = {
             "action coefficients (not A×E_w), per mediator only when that "
             "user's ME→E loading exceeds ADAPR_FATIGUE_ME_TO_E_MIN (default "
             "0.05), and add a fixed κ_e to E_w → fourSC and E_w → "
-            "anticipated affect (κ_e = ADAPR_FATIGUE_E_SHIFT, default 0.15; "
+            "anticipated affect (κ_e = ADAPR_FATIGUE_E_SHIFT, default 0.3; "
             "raw units; typical |A→ME| ≈ 0.3, fitted E→MY ≈ 0.003). The "
             "fatigue addend is −κ A, independent of E_w. Sending lowers "
             "engagement, a lower E_w then lowers steps and affect, so the "
