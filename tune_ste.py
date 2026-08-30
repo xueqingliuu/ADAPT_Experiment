@@ -9,29 +9,28 @@ fitted from the ADAPT MRT)::
     A ──(−)──> ME (PV, FW, PJ)      ──(+)──> E_{w+1} ──(+)──> MY_{w+1} ──> Y_{w+2}
                                      (ME→E)             (E→MY)
 
-Variants (``protocol`` runs 2 and 3 in one job):
+Variants (``protocol`` writes four folders plus untouched vanilla):
 
 1. **vanilla** — the fitted environment, untouched.
-2. **low STE ≈ 0.2** — knob ``fatigue`` (alias ``burden_shift``): make the
-   engagement cost of sending sign-definite by *shifting* the main A→ME
-   coefficients down by ``κ`` (A×E_w interactions untouched, so the addend is
-   ``−κA``, not ``−κA(1+E_w)`` which would flip sign for ``E_w < −1``),
-   **per user × mediator and only when that user's ME→E loading exceeds**
+2. **fatigue at κ = 2** — knob ``fatigue`` (alias ``burden_shift``), *applied*
+   at ``FATIGUE_KAPPA_MAX`` (default 2), not root-found. Make the engagement
+   cost of sending sign-definite by *shifting* the main A→ME coefficients
+   down by ``κ`` (A×E_w interactions untouched, so the addend is ``−κA``,
+   not ``−κA(1+E_w)`` which would flip sign for ``E_w < −1``), **per user
+   × mediator and only when that user's ME→E loading exceeds**
    ``FATIGUE_ME_TO_E_MIN`` (default 0.05; ``ADAPR_FATIGUE_ME_TO_E_MIN``).
    Crushing a mediator that *lowers* E (user 248's FW/PJ) would invert the
    chain. E_w→MY is *shifted* up by a **fixed** ``κ_e`` (default
    ``FATIGUE_E_SHIFT_DEFAULT``, override ``ADAPR_FATIGUE_E_SHIFT``) so the
-   fatigue chain can reach Y. Search ``κ`` is capped at
-   ``FATIGUE_KAPPA_MAX`` (default 2; ``ADAPR_FATIGUE_KAPPA_MAX``) — the
-   A→ME mains do not change loop gains, so the old 256 stability cap was
-   not a real bound. Only the gated A→ME ``κ`` is root-found against the
-   proxy STE. The control arm is perturbed once, identically across the
-   κ ladder.
-3. **STE 0.5 / 0.8 on top of 2** — knob ``benefit_foursc``: *scale* A→MY by
-   ``κ`` (preserves each user's fitted CATE structure — the A×wear /
-   A×interact / A×steps ratios the RL algorithm personalizes on) and *shift*
-   the fourSC→Y loading up by ``c(κ−1)`` (capped) so the amplified step
-   effect carries into CAE.
+   fatigue chain can reach Y. A→ME mains do not change loop gains, so the
+   old 256 stability cap was not a real bound. Proxy STE at this folder
+   is ~0.37 (job 42904804, κ_e = 0.3) — below vanilla (~0.45) but not 0.2.
+   Writes ``env_para_ste_fatigue``.
+3. **STE 0.2 / 0.5 / 0.8 on top of 2** — knob ``benefit_foursc`` on the
+   fatigue folder: *scale* A→MY by ``κ`` (preserves each user's fitted
+   CATE structure — the A×wear / A×interact / A×steps ratios the RL
+   algorithm personalizes on) and *shift* fourSC→Y by ``c(κ−1)`` (capped).
+   ``κ < 1`` lowers STE to 0.2; ``κ > 1`` raises it to 0.5 / 0.8.
 
 Shift vs scale — the rule used throughout
 -----------------------------------------
@@ -58,8 +57,8 @@ guarantee confirmation STE 0.5. Report the confirmation number.
 
 Commands
 --------
-    protocol    the whole design: fatigue → 0.2, then benefit_foursc →
-                0.5/0.8 stacked on the 0.2 folder
+    protocol    the whole design: apply fatigue at κ=2, then
+                benefit_foursc → 0.2/0.5/0.8 stacked on that folder
     diagnose    E_w and CAE loop gains (no simulation)
     eval        measure proxy STE of one parameter folder
     scan        proxy STE vs a grid of ``kappa``
@@ -72,9 +71,10 @@ Cluster::
 
 or stage by stage::
 
-    sbatch --export=ALL,TUNE_KNOB=fatigue,TUNE_TARGETS=0.2 run_tune_ste.sh
-    sbatch --export=ALL,TUNE_PARAMS_DIR=env_para_ste0.2,TUNE_KNOB=benefit_foursc,\\
-TUNE_TARGETS="0.5 0.8" run_tune_ste.sh
+    sbatch --export=ALL,TUNE_PHASE=apply,TUNE_KNOB=fatigue,TUNE_KAPPA=2,\\
+TUNE_OUT_DIR=env_para_ste_fatigue,TUNE_APPLY_EVAL=1 run_tune_ste.sh
+    sbatch --export=ALL,TUNE_PARAMS_DIR=env_para_ste_fatigue,TUNE_KNOB=benefit_foursc,\\
+TUNE_TARGETS="0.2 0.5 0.8" run_tune_ste.sh
 
 Knob reference (``--knob``)
 ---------------------------
@@ -88,6 +88,7 @@ Knob reference (``--knob``)
     benefit_foursc
               A→MY ×κ (scale) and fourSC_ewma→Y += c(κ−1), c =
               ADAPR_BENEFIT_FOURSC_SHIFT (0.05) capped at _CAP (0.20).
+              κ=1 is a no-op; κ<1 lowers STE, κ>1 raises it.
     action / benefit / burden
               pure multiplicative dials on A→{MY,ME} — cannot create a
               sign-definite effect from mixed-sign fits; kept for scans.
@@ -1986,7 +1987,7 @@ def cmd_apply(args) -> None:
 
 
 def _stage_args(args, **overrides) -> argparse.Namespace:
-    """Clone the parsed protocol args into a calibrate-shaped namespace."""
+    """Clone the parsed protocol args into a calibrate/apply-shaped namespace."""
     base = dict(
         params_dir=args.params_dir,
         episodes=args.episodes,
@@ -2006,40 +2007,55 @@ def _stage_args(args, **overrides) -> argparse.Namespace:
         max_iter=args.max_iter,
         require_stable=args.require_stable,
         keep_scratch=getattr(args, "keep_scratch", False),
+        eval=False,
+        kappa=None,
+        out_dir=None,
+        knob=None,
+        targets=None,
+        kappa0=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
 
 
-def cmd_protocol(args) -> None:
-    """The three-variant design in one run.
+def _protocol_fatigue_dir(args) -> Path:
+    raw = getattr(args, "fatigue_out_dir", None)
+    if raw:
+        p = Path(raw).expanduser()
+        return p if p.is_absolute() else PROJECT_ROOT / p
+    return PROJECT_ROOT / f"{args.out_prefix}_fatigue{args.out_suffix}"
 
-    Stage 1 (variant 2): calibrate ``fatigue`` on ``--params-dir`` (vanilla)
-    to ``--fatigue-target`` → ``<prefix><target><suffix>``.
-    Stage 2 (variant 3): calibrate ``benefit_foursc`` **on the stage-1
-    folder** to each of ``--benefit-targets`` → ``<prefix><t><suffix>``.
+
+def cmd_protocol(args) -> None:
+    """Apply large fatigue, then root-find benefit_foursc on that folder.
+
+    Stage 1: apply ``fatigue`` at ``--fatigue-kappa`` (default 2) on
+    ``--params-dir`` (vanilla) → ``--fatigue-out-dir`` (default
+    ``env_para_ste_fatigue``), and measure its proxy STE.
+    Stage 2: calibrate ``benefit_foursc`` on the stage-1 folder to each of
+    ``--benefit-targets`` (default 0.2 / 0.5 / 0.8) → ``<prefix><t><suffix>``.
     Variant 1 is the untouched vanilla folder. Each written folder carries
     its full knob stack and sign-story report in ``ste_tuning.json``.
     """
-    fatigue_dir = calibrated_out_dir(
-        args.out_prefix, args.fatigue_target, args.out_suffix
-    )
+    fatigue_dir = _protocol_fatigue_dir(args)
+    fatigue_kappa = float(args.fatigue_kappa)
     scratch = Path(args.scratch)
 
     print("=" * 70)
-    print(f"PROTOCOL stage 1/2: fatigue -> proxy STE {args.fatigue_target:g}")
+    print(f"PROTOCOL stage 1/2: apply fatigue kappa={fatigue_kappa:g} -> {fatigue_dir.name}")
     print("=" * 70)
     try:
-        cmd_calibrate(_stage_args(
+        cmd_apply(_stage_args(
             args,
             knob="fatigue",
-            targets=[float(args.fatigue_target)],
-            kappa0=float(args.fatigue_kappa0),
+            kappa=fatigue_kappa,
+            out_dir=str(fatigue_dir),
+            eval=True,
             scratch=str(scratch) + "_fatigue",
         ))
     except SystemExit as exc:
         raise SystemExit(
-            f"protocol aborted: fatigue stage did not write "
+            f"protocol aborted: fatigue apply did not write "
             f"{fatigue_dir.name} (exit {exc.code}). The benefit stage needs "
             "that folder as its base."
         ) from exc
@@ -2050,14 +2066,27 @@ def cmd_protocol(args) -> None:
         f"proxy STE {' '.join(f'{t:g}' for t in args.benefit_targets)}"
     )
     print("=" * 70)
-    cmd_calibrate(_stage_args(
-        args,
-        params_dir=str(fatigue_dir),
-        knob="benefit_foursc",
-        targets=[float(t) for t in args.benefit_targets],
-        kappa0=float(args.benefit_kappa0),
-        scratch=str(scratch) + "_benefit",
-    ))
+    try:
+        cmd_calibrate(_stage_args(
+            args,
+            params_dir=str(fatigue_dir),
+            knob="benefit_foursc",
+            targets=[float(t) for t in args.benefit_targets],
+            kappa0=float(args.benefit_kappa0),
+            scratch=str(scratch) + "_benefit",
+        ))
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        print(
+            f"\nprotocol: {fatigue_dir.name} is on disk; benefit stage "
+            f"exit {code}. Confirmation CQL will pick up whatever folders "
+            "have stable=true."
+        )
+        if code == 0:
+            raise
+        # Fatigue apply succeeded. Exit 2 so the shell still submits CQL
+        # for that folder (and any benefit folders that were written).
+        raise SystemExit(2) from exc
     print(
         "\nprotocol complete: vanilla + "
         f"{fatigue_dir.name} + "
@@ -2193,14 +2222,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser(
         "protocol",
         help=(
-            "Three-variant design: calibrate fatigue to --fatigue-target, "
-            "then benefit_foursc to --benefit-targets on the fatigue folder"
+            "Apply fatigue at --fatigue-kappa, then benefit_foursc to "
+            "--benefit-targets on that folder"
         ),
     )
     common(sp, needs_knob=True)  # --knob is accepted but ignored (fixed per stage)
-    sp.add_argument("--fatigue-target", type=float, default=0.2)
-    sp.add_argument("--benefit-targets", type=float, nargs="+", default=[0.5, 0.8])
-    sp.add_argument("--fatigue-kappa0", type=float, default=0.2)
+    sp.add_argument(
+        "--fatigue-kappa",
+        type=float,
+        default=FATIGUE_KAPPA_MAX,
+        help="Fixed fatigue κ for stage 1 (default: FATIGUE_KAPPA_MAX=2)",
+    )
+    sp.add_argument(
+        "--fatigue-out-dir",
+        default="",
+        help="Stage-1 folder (default: <out-prefix>_fatigue<out-suffix>)",
+    )
+    sp.add_argument(
+        "--benefit-targets",
+        type=float,
+        nargs="+",
+        default=[0.2, 0.5, 0.8],
+    )
     sp.add_argument("--benefit-kappa0", type=float, default=2.0)
     sp.add_argument("--out-prefix", default="env_para_ste")
     sp.add_argument("--out-suffix", default="")
