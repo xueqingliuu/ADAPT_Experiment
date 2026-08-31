@@ -4,6 +4,11 @@ E_w is not observed. This script treats it as a 1-D state, approximates the
 likelihood by quadrature, and jointly models the weekly check-in (J, U1, U2)
 and the within-week mediators (page views, Fitbit wear, daily check-in).
 Each participant is fit separately after a pooled initialization.
+Sparse-engagement users listed in ``ADAPR_STRONG_POOL_UIDS`` (default 248)
+get a larger ridge, *centered at the pooled MLE* (not the 0.05 sign nudge),
+and ``a0`` / ``log σ_E`` are included so the E_w AR cannot sit on the clip
+wall with process noise at the 0.03 floor. Emission intercepts stay free so
+rare wear/check-in is not forced to the population prevalence.
 
 Weekly PV/FW/PJ summaries that enter the E_w transition use a **fixed
 denominator** (14 slots / 7 days) with NaNs contributing 0. That is the
@@ -78,10 +83,15 @@ QUERY_JW_INTENSITY_NAMES = (
 _THETA_DIM_BASE = 61
 # Packed log-σ indices (unpack_theta exponentiates these). σ_E, σ_U1, σ_U2, σ_PV.
 _LOG_SIGMA_INDICES = (5, 10, 13, 32)
-# Baseline levels / prevalences. Ridge does not shrink these (or log-σ).
+# Baseline levels / prevalences. Ridge does not shrink these (or log-σ)
+# except for strong-pool users, who also penalize a0 and log σ_E toward
+# the pooled MLE (see ``strong_pool_uids``).
 _RIDGE_FREE_INTERCEPTS = (
     "a0", "b0", "c0", "d0", "alpha0", "gamma0", "beta0", "theta0",
 )
+# Default λ=0.5 → 5.0. Override with ADAPR_STRONG_POOL_LAM_MULT.
+_STRONG_POOL_LAM_MULT_DEFAULT = 10.0
+_STRONG_POOL_UIDS_DEFAULT = "248"
 # Quadrature support for E_w. Interval is ``vani_env.E_QUAD_LO`` / ``E_QUAD_HI``
 # (same as ``EnvConfig.limits_perceivedUtility``). Spacing matches the old
 # [-3, 3] grids (0.05 pooled / 0.025 per-user).
@@ -485,12 +495,37 @@ def build_penalized_prior_center(*, e1_known: bool) -> np.ndarray:
     return center
 
 
-def ridge_penalty_weights(*, e1_known: bool) -> np.ndarray:
+def strong_pool_uids() -> frozenset[int]:
+    """Users who shrink toward the pooled MLE with a larger λ.
+
+    Default is 248 (sparse PV/PJ, E_w AR on the σ_E floor and a0 wall).
+    Set ``ADAPR_STRONG_POOL_UIDS`` to a comma list, or empty to disable.
+    """
+    raw = os.getenv("ADAPR_STRONG_POOL_UIDS", _STRONG_POOL_UIDS_DEFAULT)
+    if not str(raw).strip():
+        return frozenset()
+    return frozenset(int(x) for x in str(raw).split(",") if x.strip())
+
+
+def strong_pool_lam_mult() -> float:
+    raw = os.getenv("ADAPR_STRONG_POOL_LAM_MULT", "").strip()
+    return float(raw) if raw else float(_STRONG_POOL_LAM_MULT_DEFAULT)
+
+
+def ridge_penalty_weights(
+    *,
+    e1_known: bool,
+    penalize_a0_sigma_e: bool = False,
+) -> np.ndarray:
     """Per-coordinate ridge weights: 1 = penalized, 0 = free.
 
     Intercepts (baseline prevalence / level) and packed log-σ stay at the
     likelihood MLE. Query-block intercepts (``*_q0``) are slopes on opening
     ``J_w`` and remain penalized.
+
+    ``penalize_a0_sigma_e`` turns on a0 and log σ_E for strong-pool users so
+    those two coordinates shrink toward the pooled MLE instead of sitting
+    on the clip / bound. Other emission intercepts stay free.
     """
     n = theta_dim(e1_known=e1_known)
     w = np.ones(n, dtype=float)
@@ -502,12 +537,24 @@ def ridge_penalty_weights(*, e1_known: bool) -> np.ndarray:
     if not e1_known:
         w[int(round(idx["m0"]))] = 0.0
         w[-1] = 0.0  # log σ0
+    if penalize_a0_sigma_e:
+        w[int(round(idx["a0"]))] = 1.0
+        w[_LOG_SIGMA_INDICES[0]] = 1.0
     return w
 
 
-def _ridge_penalty(theta: np.ndarray, lam: float, e1_known: bool, prior_center=None) -> float:
+def _ridge_penalty(
+    theta: np.ndarray,
+    lam: float,
+    e1_known: bool,
+    prior_center=None,
+    ridge_weights=None,
+) -> float:
     theta = np.asarray(theta, dtype=float)
-    w = ridge_penalty_weights(e1_known=e1_known)
+    if ridge_weights is None:
+        w = ridge_penalty_weights(e1_known=e1_known)
+    else:
+        w = np.asarray(ridge_weights, dtype=float)
     if prior_center is None:
         center = np.zeros_like(theta)
     else:
@@ -1230,6 +1277,8 @@ def penalized_json_export(
     env_penalized: dict = {
         "estimation_method": "ridge_penalized_likelihood",
         "ridge_lambda": r3(filt.get("ridge_lambda")),
+        "ridge_center": filt.get("ridge_center"),
+        "ridge_penalize_a0_sigma_e": bool(filt.get("ridge_penalize_a0_sigma_e")),
         "theta_penalized_Ew": [
             r3(par["a0"]),
             r3(par["a1"]),
@@ -2246,17 +2295,19 @@ def _loop_gain_penalty(theta: np.ndarray, e1_known: bool) -> float:
     )
 
 
-def neg_loglik_blocks(theta, blocks, grid, weights, e1_known, lam=0.5, prior_center=None):
+def neg_loglik_blocks(
+    theta, blocks, grid, weights, e1_known, lam=0.5, prior_center=None,
+    ridge_weights=None,
+):
     """Per-participant penalized negative log-likelihood.
 
     ``prior_center`` (default all-zero, i.e. the original behavior) lets the
     L2 penalty shrink toward a non-zero target for specific coefficients
-    instead of toward 0. This is used to assert theory-driven monotonicity
-    assumptions (e.g. "an intervention should not increase burden-adjusted
-    engagement") as a *population-level nudge* baked into every participant's
-    own ridge penalty, rather than fitting freely and sign-flipping the
-    result post-hoc. See ``build_penalized_prior_center``. Intercepts and
-    log-σ are omitted from the ridge (``ridge_penalty_weights``).
+    instead of toward 0. Ordinary users use ``build_penalized_prior_center``
+    (0.05 sign nudges). Strong-pool users (``strong_pool_uids``) pass the
+    pooled MLE as ``prior_center`` and a larger ``lam``. Intercepts and
+    log-σ are omitted from the ridge unless ``ridge_weights`` turns them
+    back on (a0 and log σ_E for strong-pool users).
 
     In addition to that per-coefficient ridge, the *compound* loop gain
     through E_w's own persistence (a1) and its indirect PV/FW/PJ feedback
@@ -2270,7 +2321,10 @@ def neg_loglik_blocks(theta, blocks, grid, weights, e1_known, lam=0.5, prior_cen
         if not np.isfinite(out["loglik"]):
             return 1e100
         penalty = (
-            _ridge_penalty(theta, lam, bool(e1_known), prior_center)
+            _ridge_penalty(
+                theta, lam, bool(e1_known), prior_center,
+                ridge_weights=ridge_weights,
+            )
             + _loop_gain_penalty(theta, e1_known)
         )
         return -out["loglik"] + penalty
@@ -2682,6 +2736,8 @@ def fit_one_user(
     x0: Optional[np.ndarray] = None,
     lam: float = 0.5,
     prior_center: Optional[np.ndarray] = None,
+    ridge_weights: Optional[np.ndarray] = None,
+    ridge_center_label: str = "sign_nudge",
     uid: Optional[str] = None,
 ):
     blocks = build_user_blocks(
@@ -2717,7 +2773,7 @@ def fit_one_user(
     res, restarts = _minimize_with_restarts(
         neg_loglik_blocks,
         x0,
-        args=(blocks, grid, weights, e1_known, lam, prior_center),
+        args=(blocks, grid, weights, e1_known, lam, prior_center, ridge_weights),
         bounds=make_bounds(e1_known=e1_fixed),
         maxiter=maxiter,
         maxfun=300000,
@@ -2731,6 +2787,11 @@ def fit_one_user(
     res.warm_restarts = restarts
     filt = quadrature_loglik(blocks, res.x, grid, weights, e1_known=e1_known)
     filt["ridge_lambda"] = float(lam)
+    filt["ridge_center"] = str(ridge_center_label)
+    filt["ridge_penalize_a0_sigma_e"] = bool(
+        ridge_weights is not None
+        and np.asarray(ridge_weights, dtype=float)[0] > 0
+    )
 
     retained = np.asarray(filt.get("predictive_grid_mass", []), dtype=float)
     retained = retained[np.isfinite(retained)]
@@ -2833,7 +2894,41 @@ def fit_all_users(
         "x0": pooled_x0,
         "lam": lam,
         "prior_center": prior_center,
+        "ridge_center_label": "sign_nudge",
     }
+    e1_fixed = e1_known is not None
+    strong_uids = strong_pool_uids()
+    strong_mult = strong_pool_lam_mult()
+    present_strong = sorted(
+        int(uid) for uid, _ in user_data if int(uid) in strong_uids
+    )
+    if present_strong:
+        if pooled_x0 is None:
+            print(
+                "WARNING: strong-pool uids "
+                f"{present_strong} requested but pooled_x0 is missing; "
+                "falling back to the sign-nudge ridge."
+            )
+            present_strong = []
+        else:
+            print(
+                f"Strong pooling toward pooled MLE for {present_strong} "
+                f"(lam={float(lam) * strong_mult:g} = {lam:g}×{strong_mult:g}; "
+                "also penalize a0 and log σ_E). Other users keep the "
+                f"sign-nudge center at lam={lam:g}."
+            )
+
+    def kwargs_for(uid) -> dict:
+        kw = dict(fit_kwargs)
+        if int(uid) not in present_strong:
+            return kw
+        kw["lam"] = float(lam) * strong_mult
+        kw["prior_center"] = np.asarray(pooled_x0, dtype=float)
+        kw["ridge_weights"] = ridge_penalty_weights(
+            e1_known=e1_fixed, penalize_a0_sigma_e=True,
+        )
+        kw["ridge_center_label"] = "pooled_mle"
+        return kw
     results = {}
     filtered_states = {}
     blocks_by_user = {}
@@ -2844,7 +2939,9 @@ def fit_all_users(
         blocks_by_user[uid] = blocks
         print(
             f"Participant {uid}: success={res.success}, "
-            f"nll={res.fun:.4f}, nit={res.nit}, message={res.message}, "
+            f"nll={res.fun:.4f}, nit={res.nit}, "
+            f"ridge={filt.get('ridge_center')} lam={filt.get('ridge_lambda')}, "
+            f"message={res.message}, "
             f"warm_restarts={getattr(res, 'warm_restarts', 0)}"
         )
 
@@ -2867,12 +2964,12 @@ def fit_all_users(
     print(f"Fitting {len(user_data)} participants with {n_jobs} worker process(es).")
     if n_jobs == 1:
         for uid, g in user_data:
-            record_fit(*_fit_one_user_task(uid, g, grid, fit_kwargs))
+            record_fit(*_fit_one_user_task(uid, g, grid, kwargs_for(uid)))
     else:
         with ProcessPoolExecutor(max_workers=n_jobs) as executor:
             futures = {
                 executor.submit(
-                    _fit_one_user_task, uid, g, grid, fit_kwargs
+                    _fit_one_user_task, uid, g, grid, kwargs_for(uid)
                 ): uid
                 for uid, g in user_data
             }
@@ -3270,10 +3367,9 @@ if __name__ == "__main__":
     else:
         print("Pooled fit did not converge; consider adjusting bounds / maxfun / ftol.")
 
-    # Stage 2: user-specific fits initialized at pooled estimate. prior_center
-    # bakes the "should help on average" monotonicity assumptions into
-    # each participant's own ridge penalty, instead of shrinking every
-    # coefficient toward 0 and reflecting negative outcomes afterwards.
+    # Stage 2: user-specific fits initialized at pooled estimate. Ordinary
+    # users keep the 0.05 sign-nudge ridge. Strong-pool users (default 248)
+    # shrink toward this pooled MLE with a larger λ, including a0 and log σ_E.
     _e1_known = 2.0
     results, filtered_states, blocks_by_user = fit_all_users(
         df_fit,
@@ -3303,6 +3399,6 @@ if __name__ == "__main__":
         results,
         filtered_states,
         plot_dir=_diag_dir,
-        show=True,
+        show=False,
     )
     print(f"Diagnostic figures saved under {_diag_dir}")

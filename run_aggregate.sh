@@ -25,11 +25,13 @@ if [ -z "${RESULTS_ROOT:-}" ]; then
   fi
 fi
 export RESULTS_ROOT
-# Optional: restrict to one SLURM array batch (recommended).
-# export SLURM_ARRAY_JOB_ID=<array_job_id>
-# Or pass explicitly: python aggregate.py --array-job-id <id>
-# To combine every run folder ever written under RESULTS_ROOT:
-# python aggregate.py --all-runs
+# Default: newest folder per seed 0..N-1 (N from config, 500 if any
+# run recorded n_experiments_configured=500). That merges a 1-200
+# array with a 201-500 top-up. Restrict to one array with:
+#   export SLURM_ARRAY_JOB_ID=<array_job_id>
+#   python aggregate.py --array-job-id <id>
+# Every folder under RESULTS_ROOT (including stale duplicates):
+#   python aggregate.py --all-runs
 
 echo "Running aggregate.py on $(hostname)"
 echo "ENV_VARIANT=${ENV_VARIANT}"

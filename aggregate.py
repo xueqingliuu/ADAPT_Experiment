@@ -21,13 +21,16 @@ DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla_loo"))
 # (raw = shift + scale*norm):
 #   • mean cumulative noisy CAE minus never_send (running sum of weekly
 #     CAE, paired), once with always-send and once without (ylim zoomed).
-#     SE bands average over users within each replicate, then use
-#     sd / sqrt(n_exp) across the experiment seeds.
+#     95% bands are mean ± 1.96 SE; SE averages over users within each
+#     replicate, then uses sd / sqrt(n_exp) across the experiment seeds.
 #   • mean (cumulative CAE − never_send) / week (running average of the
 #     paired weekly difference), with and without always-send.
 #   • mean cumulative CAE / week (absolute running average; never-send is
 #     a line, not a subtractor), with and without always-send.
 #   • mean walking-suggestion probability, averaged over users × replicates
+#   • 25th-percentile CAE on the same scales (cumulative vs never-send,
+#     running-mean vs never-send, absolute running mean). Pooled over all
+#     slots × seeds at that week.
 # Latent (``cae_mean_runs``) is still written to the summary table when present.
 LATENT_FIELD = "cae_mean_runs"   # latent (noise-free)
 NOISY_FIELD = "cae_runs"         # realized (with noise)
@@ -45,6 +48,9 @@ markers = {
     "always_send": "*-",
     "random_send": "+-",
 }
+
+# Normal 95% interval half-width on the replication-clustered SE.
+Z95 = 1.96
 
 NEVER_SEND_BASELINE = "never_send"
 ALWAYS_SEND_BASELINE = "always_send"
@@ -195,6 +201,7 @@ def select_run_dirs(
     all_runs: bool = False,
     array_job_id: str | None = None,
     run_glob: str | None = None,
+    n_seeds: int | None = None,
 ) -> tuple[list[Path], str]:
     """Return (filtered run dirs, human-readable selection reason)."""
     if all_runs:
@@ -212,7 +219,18 @@ def select_run_dirs(
             p for p in run_dirs
             if str(_load_config(p).get("slurm_array_job_id")) == str(array_job_id)
         ]
+        if n_seeds is not None:
+            filtered, reason = _latest_seed_batch_run_dirs(
+                filtered, n_seeds=n_seeds,
+            )
+            return filtered, f"SLURM array job {array_job_id}; {reason}"
         return filtered, f"SLURM array job {array_job_id}"
+
+    # Default: newest folder per seed 0..N-1, so a 1-200 array plus a
+    # 201-500 top-up are merged. One array job is --array-job-id / env.
+    filtered, reason = _latest_seed_batch_run_dirs(run_dirs, n_seeds=n_seeds)
+    if filtered:
+        return filtered, reason
 
     latest_array_job_id = _latest_array_job_id(run_dirs)
     if latest_array_job_id:
@@ -220,11 +238,7 @@ def select_run_dirs(
             p for p in run_dirs
             if str(_load_config(p).get("slurm_array_job_id")) == latest_array_job_id
         ]
-        return filtered, f"latest SLURM array job {latest_array_job_id} (default)"
-
-    filtered, reason = _latest_seed_batch_run_dirs(run_dirs)
-    if filtered:
-        return filtered, reason
+        return filtered, f"latest SLURM array job {latest_array_job_id} (fallback)"
 
     return run_dirs, "all runs (no batch metadata found; fallback)"
 
@@ -249,7 +263,16 @@ def parse_args() -> argparse.Namespace:
         "--array-job-id",
         default=None,
         help="Only aggregate runs from this SLURM array job id "
-             "(default: SLURM_ARRAY_JOB_ID env, else latest batch).",
+             "(or SLURM_ARRAY_JOB_ID). Default is newest folder per "
+             "seed 0..N-1 across array jobs.",
+    )
+    parser.add_argument(
+        "--n-seeds",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Only seeds 0..N-1 (newest folder per seed). "
+             "Example: --n-seeds 100 for the first 100 experiments.",
     )
     parser.add_argument(
         "--run-glob",
@@ -294,6 +317,11 @@ def _se_across_replications(arr):
     if n <= 1:
         return np.full(arr.shape[-1], np.nan)
     return np.nanstd(per_exp, axis=0, ddof=1) / np.sqrt(n)
+
+
+def _ci95(se):
+    """Half-width of a normal 95% band: 1.96 × SE."""
+    return Z95 * np.asarray(se, dtype=float)
 
 
 def _cumsum_vs_reference(all_cae, uids=None, reference=NEVER_SEND_BASELINE):
@@ -356,12 +384,52 @@ def _running_mean_cae(all_cae):
     return mean, se
 
 
+def _p25_pooled(arr):
+    """25th percentile of every slot × seed at each week.
+
+    ``arr`` is ``(n_exp, n_slot, n_week)``. Lower quartile of the pooled
+    person-week distribution.
+    """
+    a = np.asarray(arr, dtype=float)
+    return np.nanpercentile(a.reshape(-1, a.shape[-1]), 25, axis=0)
+
+
+def _paired_series(all_cae, *, reference=NEVER_SEND_BASELINE, scale="cumsum"):
+    """Per-(experiment, slot) series used by mean and p25 plots.
+
+    ``scale`` is ``"cumsum"`` (running sum), ``"runmean_diff"`` (running
+    mean of the paired difference), or ``"runmean"`` (absolute running
+    mean; ``reference`` is ignored).
+    """
+    series = {}
+    for name, a in all_cae.items():
+        a = np.asarray(a, dtype=float)
+        n_week = int(a.shape[-1])
+        weeks = np.arange(1, n_week + 1, dtype=float)
+        if scale == "runmean":
+            series[name] = np.nancumsum(a, axis=-1) / weeks
+            continue
+        cum = np.nancumsum(a, axis=-1)
+        ref = all_cae.get(reference)
+        if ref is not None and np.asarray(ref).shape == a.shape:
+            x = cum - np.nancumsum(np.asarray(ref, dtype=float), axis=-1)
+        else:
+            x = cum
+        series[name] = x if scale == "cumsum" else x / weeks
+    return series
+
+
+def _p25_of_series(series):
+    """Pooled 25th percentile for each algorithm."""
+    return {n: _p25_pooled(a) for n, a in series.items()}
+
+
 def _cae_ylim(mean, se, *, on="bands"):
     """Y-limits for CAE figures.
 
-    ``on="bands"`` (default) covers mean ± SE. ``on="means"`` uses only the
-    mean paths so nearby policies occupy more of the panel; SE ribbons may
-    clip.
+    ``on="bands"`` (default) covers mean ± 1.96 SE. ``on="means"`` uses only
+    the mean paths so nearby policies occupy more of the panel; 95% ribbons
+    may clip.
     """
     lows, highs = [], []
     for name in mean:
@@ -370,9 +438,9 @@ def _cae_ylim(mean, se, *, on="bands"):
             lows.append(np.nanmin(m))
             highs.append(np.nanmax(m))
         else:
-            s = np.asarray(se[name], dtype=float)
-            lows.append(np.nanmin(m - s))
-            highs.append(np.nanmax(m + s))
+            hw = _ci95(se[name])
+            lows.append(np.nanmin(m - hw))
+            highs.append(np.nanmax(m + hw))
     lo = float(np.nanmin(lows))
     hi = float(np.nanmax(highs))
     span = max(hi - lo, 0.02)
@@ -388,22 +456,17 @@ def _save_fig(fig, out, stem):
 
 
 def _plot_cae_vs_reference(ax, names, *, cum_mean, cum_se, labels, weeks,
-                           vs_never, kind, always_note, ylim_on="bands"):
+                           vs_never, ylim_on="bands"):
     for name in names:
         m = cum_mean[name]
         s = cum_se[name]
         ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
-        ax.fill_between(weeks, m - s, m + s, alpha=0.25)
+        ax.fill_between(weeks, m - _ci95(s), m + _ci95(s), alpha=0.25)
     if vs_never:
         ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
         ax.set_ylabel("Cumulative CAE(policy) − cumulative CAE(never-send)")
-        ax.set_title(
-            f"Cumulative CAE minus never-send (± SE across replications)\n"
-            f"running sum of weekly CAE, paired by user — {kind}{always_note}"
-        )
     else:
         ax.set_ylabel("Cumulative CAE − mean across policies")
-        ax.set_title(f"Mean cumulative CAE, centered (± SE) — {kind}{always_note}")
     ax.set_xlabel("Week")
     ax.set_ylim(*_cae_ylim(
         {n: cum_mean[n] for n in names},
@@ -414,7 +477,45 @@ def _plot_cae_vs_reference(ax, names, *, cum_mean, cum_se, labels, weeks,
     ax.grid(True, alpha=0.3)
 
 
-def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
+def _plot_p25(ax, names, *, pooled, labels, weeks, ylabel, hline=None):
+    """Pooled 25th percentile of slot-level values at each week."""
+    for name in names:
+        ax.plot(
+            weeks, pooled[name], markers.get(name, "o-"),
+            label=labels.get(name, name),
+        )
+    if hline is not None:
+        ax.axhline(hline, color="0.4", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("Week")
+    ax.set_ylabel(ylabel)
+    ax.set_ylim(*_cae_ylim(
+        {n: pooled[n] for n in names},
+        {n: np.zeros_like(pooled[n]) for n in names},
+        on="means",
+    ))
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+
+def _save_p25_family(out, stem, names, *, pooled, labels, weeks,
+                     ylabel, hline=None):
+    no_always = [n for n in names if n != ALWAYS_SEND_BASELINE]
+    for plot_names, extra in (
+        (names, ""),
+        (no_always if no_always != names else [], "_no_always"),
+    ):
+        if not plot_names:
+            continue
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        _plot_p25(
+            ax, plot_names,
+            pooled=pooled, labels=labels, weeks=weeks,
+            ylabel=ylabel, hline=hline,
+        )
+        _save_fig(fig, out, f"{stem}{extra}")
+
+
+def make_overview(stats, _kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
                   uids=None):
     """Write CAE (with and without always-send) and action-probability figures."""
     names = [n for n in stats["all_cae"] if n not in OMIT_FROM_PLOTS]
@@ -431,7 +532,7 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
     _plot_cae_vs_reference(
         ax, plotted,
         cum_mean=cum_mean, cum_se=cum_se, labels=labels, weeks=weeks,
-        vs_never=vs_never, kind=kind, always_note="",
+        vs_never=vs_never,
     )
     _save_fig(fig, out, f"cae_{suffix}")
 
@@ -440,8 +541,7 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
         _plot_cae_vs_reference(
             ax, no_always,
             cum_mean=cum_mean, cum_se=cum_se, labels=labels, weeks=weeks,
-            vs_never=vs_never, kind=kind,
-            always_note="; always-send omitted",
+            vs_never=vs_never,
             ylim_on="means",
         )
         _save_fig(fig, out, f"cae_{suffix}_no_always")
@@ -451,10 +551,9 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
         [n for n in names if n != NEVER_SEND_BASELINE] if avg_vs_never else names
     )
     avg_no_always = [n for n in avg_plotted if n != ALWAYS_SEND_BASELINE]
-    for plot_names, stem_extra, note in (
-        (avg_plotted, "", ""),
-        (avg_no_always if avg_no_always != avg_plotted else [], "_no_always",
-         "; always-send omitted"),
+    for plot_names, stem_extra in (
+        (avg_plotted, ""),
+        (avg_no_always if avg_no_always != avg_plotted else [], "_no_always"),
     ):
         if not plot_names:
             continue
@@ -463,20 +562,13 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
             m = avg_mean[name]
             s = avg_se[name]
             ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
-            ax.fill_between(weeks, m - s, m + s, alpha=0.25)
+            ax.fill_between(weeks, m - _ci95(s), m + _ci95(s), alpha=0.25)
         ax.set_xlabel("Week")
         if avg_vs_never:
             ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
             ax.set_ylabel("Running-mean CAE(policy) − running-mean CAE(never-send)")
-            ax.set_title(
-                f"Running-mean CAE minus never-send (± SE across replications)\n"
-                f"(cumulative difference) ÷ week, paired by user — {kind}{note}"
-            )
         else:
             ax.set_ylabel("Running-mean CAE − mean across policies")
-            ax.set_title(
-                f"Mean CAE per week, centered (± SE) — {kind}{note}"
-            )
         ax.set_ylim(*_cae_ylim(
             {n: avg_mean[n] for n in plot_names},
             {n: avg_se[n] for n in plot_names},
@@ -487,10 +579,9 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
 
     level_mean, level_se = _running_mean_cae(stats["all_cae"])
     level_no_always = [n for n in names if n != ALWAYS_SEND_BASELINE]
-    for plot_names, stem_extra, note in (
-        (names, "", ""),
-        (level_no_always if level_no_always != names else [], "_no_always",
-         "; always-send omitted"),
+    for plot_names, stem_extra in (
+        (names, ""),
+        (level_no_always if level_no_always != names else [], "_no_always"),
     ):
         if not plot_names:
             continue
@@ -499,13 +590,9 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
             m = level_mean[name]
             s = level_se[name]
             ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
-            ax.fill_between(weeks, m - s, m + s, alpha=0.25)
+            ax.fill_between(weeks, m - _ci95(s), m + _ci95(s), alpha=0.25)
         ax.set_xlabel("Week")
         ax.set_ylabel("Cumulative CAE / week")
-        ax.set_title(
-            f"Running-mean CAE (± SE across replications)\n"
-            f"cumulative CAE ÷ week; never-send is a line — {kind}{note}"
-        )
         ax.set_ylim(*_cae_ylim(
             {n: level_mean[n] for n in plot_names},
             {n: level_se[n] for n in plot_names},
@@ -514,6 +601,41 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
         ax.grid(True, alpha=0.3)
         _save_fig(fig, out, f"cae_avg_level_{suffix}{stem_extra}")
 
+    p25_cum = _p25_of_series(_paired_series(stats["all_cae"], scale="cumsum"))
+    p25_avg = _p25_of_series(
+        _paired_series(stats["all_cae"], scale="runmean_diff")
+    )
+    p25_lvl = _p25_of_series(_paired_series(stats["all_cae"], scale="runmean"))
+    p25_vs = NEVER_SEND_BASELINE in stats["all_cae"]
+    p25_plotted = (
+        [n for n in names if n != NEVER_SEND_BASELINE] if p25_vs else names
+    )
+    if p25_vs:
+        cum_ylabel = "25th pct cumulative CAE(policy) − CAE(never-send)"
+        avg_ylabel = "25th pct running-mean CAE(policy) − CAE(never-send)"
+        cum_hline = 0.0
+        avg_hline = 0.0
+    else:
+        cum_ylabel = "25th pct cumulative CAE"
+        avg_ylabel = "25th pct running-mean CAE"
+        cum_hline = None
+        avg_hline = None
+    _save_p25_family(
+        out, f"cae_p25_{suffix}", p25_plotted,
+        pooled=p25_cum, labels=labels, weeks=weeks,
+        ylabel=cum_ylabel, hline=cum_hline,
+    )
+    _save_p25_family(
+        out, f"cae_avg_p25_{suffix}", p25_plotted,
+        pooled=p25_avg, labels=labels, weeks=weeks,
+        ylabel=avg_ylabel, hline=avg_hline,
+    )
+    _save_p25_family(
+        out, f"cae_avg_level_p25_{suffix}", names,
+        pooled=p25_lvl, labels=labels, weeks=weeks,
+        ylabel="25th pct cumulative CAE / week",
+    )
+
     fig, ax = plt.subplots(figsize=(7.5, 5))
     for name in names:
         piA_all = all_piA[name]
@@ -521,7 +643,6 @@ def make_overview(stats, kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
         ax.plot(rl_weeks, piA_mean, markers.get(name, "o-"), label=labels.get(name, name))
     ax.set_xlabel("Week")
     ax.set_ylabel("Mean P(walking suggestion = 1)")
-    ax.set_title("Action probability over time, aggregated")
     ax.set_ylim(0.0, 1.0)
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
@@ -551,6 +672,13 @@ def _load_run_uids(run_dir: Path) -> np.ndarray | None:
     if u.ndim == 1:
         u = u.reshape(1, -1)
     return u
+
+
+def _p25_trial_scalar(arr):
+    """Mean across seeds of the within-trial 25th percentile of all slot-weeks."""
+    a = np.asarray(arr, dtype=float)
+    flat = a.reshape(a.shape[0], -1)
+    return float(np.nanmean(np.nanpercentile(flat, 25, axis=1)))
 
 
 def _se_across_replications_scalar(arr):
@@ -589,9 +717,11 @@ def write_summary(stats, kind, suffix, *, out):
                  [f"{np.nanmean(all_cae[n][..., 2:]):>{col_w}.4f}" for n in names]))
     lines.append("".join([f"{'Median CAE (all wks)':>{col_w}}"] +
                  [f"{np.nanmedian(all_cae[n]):>{col_w}.4f}" for n in names]))
-    lines.append("".join([f"{'25th pct CAE':>{col_w}}"] +
+    lines.append("".join([f"{'25th pct CAE (pooled)':>{col_w}}"] +
                  [f"{np.nanpercentile(all_cae[n], 25):>{col_w}.4f}" for n in names]))
-    lines.append("".join([f"{'75th pct CAE':>{col_w}}"] +
+    lines.append("".join([f"{'25th pct CAE (trial mean)':>{col_w}}"] +
+                 [f"{_p25_trial_scalar(all_cae[n]):>{col_w}.4f}" for n in names]))
+    lines.append("".join([f"{'75th pct CAE (pooled)':>{col_w}}"] +
                  [f"{np.nanpercentile(all_cae[n], 75):>{col_w}.4f}" for n in names]))
     lines.append("".join([f"{'Final cum-avg CAE':>{col_w}}"] +
                  [f"{stats['cumavg'][n][-1]:>{col_w}.4f}" for n in names]))
@@ -621,6 +751,7 @@ def main() -> None:
         all_runs=args.all_runs,
         array_job_id=args.array_job_id,
         run_glob=args.run_glob,
+        n_seeds=args.n_seeds,
     )
     print(f"Aggregating {len(run_dirs)} / {len(all_run_dirs)} runs ({selection_reason})")
     if not run_dirs:
