@@ -3,8 +3,9 @@
 #
 # Reads the ADAPTS MRT source tables under `DATA_FOLDER` and writes one CSV per
 # stream (surveys, schedule, page views, walking suggestions, wearables, steps).
-# Cohort rules (completers, wear/FourSC, weekly/daily response, ≥1 CAE week)
-# are the constants in the setup cell below — not a hand-picked ID list.
+# Cohort rules (completers, wear/FourSC, weekly/daily response, ≥1 CAE week,
+# high-CAE ceiling) are the constants in the setup cell below — not a
+# hand-picked ID list.
 # Next: `2_combine_data_frame.py`.
 
 # %% [markdown]
@@ -87,6 +88,14 @@ MIN_DAILY_SURVEYS_PRESENT = 1
 MIN_CAE_WEEKS_PRESENT = 1
 _CAE_ITEM_COLS = tuple(f"CAE-{i}" for i in range(1, 13))
 
+# High-CAE ceiling on the raw 1–7 scale (12 filled weekly slots). Users who
+# never leave the top of the scale do not inform the hierarchical E_w / CAE /
+# mediator pools in scripts 4–5. Drop if the 12-week minimum weekly CAE_avg
+# is ≥ 6, or week-1 CAE_avg equals 7. User 18 stays (week 1 = 5.75, min = 5.75).
+EXCLUDE_IF_HIGH_CAE = True
+MIN_WEEKLY_CAE_THRESHOLD = 6.0
+WEEK1_CAE_CEILING = 7.0
+
 # Rare protocol overrides only (empty by default).
 MANUAL_EXCLUSION_OVERRIDE_IDS = ()
 
@@ -94,12 +103,15 @@ MANUAL_EXCLUSION_OVERRIDE_IDS = ()
 # Do not hand-edit participant IDs here.
 EXCLUDED_PARTICIPANT_IDS: tuple[str, ...] = ()
 
-# Analysis sample as of 2026-08-25 (Eastern default for missing device TZ):
-# 43 span-eligible (≥83-day EOD-task span) → 8 excluded → 35 fitted.
+# Analysis sample as of 2026-09-01 (Eastern default for missing device TZ):
+# 43 span-eligible (≥83-day EOD-task span) → 15 excluded → 28 fitted.
 # Wear/FourSC < 20: 112, 117, 138, 219.
 # No weekly and/or no daily (and/or no CAE week): 82, 112, 251, 257, 259.
-# Both: 112. July 26 extract had 31 after also dropping 248, 259, 291, 327,
-# 339 for FourSC < 20 under UTC wall-clock conversion; 259 still fails daily.
+# Both: 112.
+# High-CAE ceiling (min weekly CAE_avg ≥ 6 or week-1 CAE_avg = 7):
+# 37, 141, 151, 160, 188, 225, 285.
+# July 26 extract had 31 after also dropping 248, 259, 291, 327, 339 for
+# FourSC < 20 under UTC wall-clock conversion; 259 still fails daily.
 
 # %%
 # Device metadata (timezone lookup source)
@@ -997,6 +1009,43 @@ df_daily_filled = fill_daily_84(
 )
 
 
+def _weekly_cae_ceiling_stats(df_weekly_filled):
+    """Per-user min and week-1 ``CAE_avg`` on the 12 filled weekly slots.
+
+    ``CAE_avg`` is the row mean of CAE-1..12, after recoding invalid 0s to 1
+    (same as ``2_combine_data_frame._correct_one_to_seven_zeros``). NaN weeks
+    are ignored, so a missing week 1 still flags the user if every observed
+    week is ≥ ``MIN_WEEKLY_CAE_THRESHOLD``.
+    """
+    empty = pd.Series(dtype=float), pd.Series(dtype=float)
+    if (
+        df_weekly_filled is None
+        or len(df_weekly_filled) == 0
+        or "week" not in df_weekly_filled.columns
+    ):
+        return empty
+    cae_cols = [c for c in _CAE_ITEM_COLS if c in df_weekly_filled.columns]
+    if not cae_cols:
+        return empty
+    items = df_weekly_filled[cae_cols].apply(pd.to_numeric, errors="coerce")
+    items = items.mask(items.eq(0), 1.0)
+    panel = pd.DataFrame(
+        {
+            "pid": df_weekly_filled["ParticipantIdentifier"].astype(str),
+            "week": df_weekly_filled["week"].astype(int),
+            "cae_avg": items.mean(axis=1),
+        }
+    )
+    panel = panel.loc[panel["week"].between(1, 12)]
+    weekly = panel.groupby(["pid", "week"], sort=False)["cae_avg"].first()
+    mins = weekly.groupby(level="pid").min()
+    try:
+        w1 = weekly.xs(1, level="week")
+    except KeyError:
+        w1 = pd.Series(dtype=float)
+    return mins, w1
+
+
 def audit_analysis_sample_exclusions(
     participant_ids,
     df_prior_2hours,
@@ -1017,6 +1066,8 @@ def audit_analysis_sample_exclusions(
       3) Weekly surveys: sum(week_present) < MIN_WEEKLY_SURVEYS_PRESENT
       4) Daily surveys: sum(daily_present) < MIN_DAILY_SURVEYS_PRESENT
       5) CAE: weeks with any non-missing CAE-1..12 < MIN_CAE_WEEKS_PRESENT
+      6) High-CAE ceiling: 12-week min CAE_avg ≥ MIN_WEEKLY_CAE_THRESHOLD
+         or week-1 CAE_avg = WEEK1_CAE_CEILING
     """
     override = {str(pid) for pid in MANUAL_EXCLUSION_OVERRIDE_IDS}
 
@@ -1055,6 +1106,7 @@ def audit_analysis_sample_exclusions(
                 .sum()
                 .astype(int)
             )
+    min_weekly_cae, week1_cae = _weekly_cae_ceiling_stats(df_weekly_filled)
 
     if df_missing_hours is None or len(df_missing_hours) == 0:
         raise ValueError(
@@ -1084,6 +1136,8 @@ def audit_analysis_sample_exclusions(
         n_weekly = int(weekly_present.get(pid_key, 0))
         n_daily = int(daily_present.get(pid_key, 0))
         n_cae = int(cae_weeks.get(pid_key, 0))
+        min_cae = min_weekly_cae.get(pid_key, np.nan)
+        w1_cae = week1_cae.get(pid_key, np.nan)
 
         reasons = []
         if n_wear < MIN_DECISION_WINDOW_WEAR_SUM:
@@ -1102,6 +1156,15 @@ def audit_analysis_sample_exclusions(
             reasons.append("all_daily_surveys_missing")
         if EXCLUDE_IF_ALL_CAE_MISSING and n_cae < MIN_CAE_WEEKS_PRESENT:
             reasons.append("all_cae_missing")
+        if EXCLUDE_IF_HIGH_CAE:
+            if np.isfinite(min_cae) and float(min_cae) >= float(
+                MIN_WEEKLY_CAE_THRESHOLD
+            ):
+                reasons.append("min_weekly_cae_ge_6")
+            if np.isfinite(w1_cae) and np.isclose(
+                float(w1_cae), float(WEEK1_CAE_CEILING)
+            ):
+                reasons.append("week1_cae_eq_7")
         if pid_key in override and not reasons:
             reasons.append("manual_override")
 
@@ -1114,6 +1177,8 @@ def audit_analysis_sample_exclusions(
                 "weekly_present_sum": n_weekly,
                 "daily_present_sum": n_daily,
                 "cae_weeks_present": n_cae,
+                "min_weekly_cae": min_cae,
+                "week1_cae": w1_cae,
                 "prior2hour_non_nan": int(prior_ok.get(pid_key, 0)),
                 "hourly_non_nan": n_foursc,
                 "today_non_nan": int(today_ok.get(pid_key, 0)),
@@ -3180,7 +3245,9 @@ else:
         f"FourSC≥{MIN_FOURSC_NON_NAN}; "
         f"weekly≥{MIN_WEEKLY_SURVEYS_PRESENT}; "
         f"daily≥{MIN_DAILY_SURVEYS_PRESENT}; "
-        f"CAE≥{MIN_CAE_WEEKS_PRESENT}):"
+        f"CAE≥{MIN_CAE_WEEKS_PRESENT}; "
+        f"drop min CAE≥{MIN_WEEKLY_CAE_THRESHOLD:g} or "
+        f"week-1 CAE={WEEK1_CAE_CEILING:g}):"
     )
     for _, row in _analysis_exclude_df.iterrows():
         print(
@@ -3190,6 +3257,8 @@ else:
             f"weekly={row['weekly_present_sum']}, "
             f"daily={row['daily_present_sum']}, "
             f"cae={row['cae_weeks_present']}, "
+            f"min_cae={row['min_weekly_cae']}, "
+            f"week1_cae={row['week1_cae']}, "
             f"reason={row['exclude_reason']}"
         )
     print(f"Wrote exclusion table to {_exclusion_path}")
