@@ -25,23 +25,27 @@
 #TUNE_KNOB=benefit_foursc,TUNE_TARGETS="0.5 0.8",TUNE_OUT_SUFFIX=_bs_large_bf \
 #          run_tune_ste.sh                                   # A→MY + fourSC→Y on κ_b=0.4
 #   # foursc_to_y_shift alone cannot hit 0.5/0.8 (job 41048118).
-#   # Do NOT TUNE_KNOB=burden_shift TUNE_TARGETS=0.2: floor STE≈0.27 (40926808).
+#   # A→ME-only (fatigue / burden_shift) cannot hit 0.2 (floor ≈0.27, 40926808).
 #   sbatch --export=ALL,TUNE_PHASE=diagnose run_tune_ste.sh  # E_w + CAE loop gains, ~seconds
 #   sbatch --export=ALL,TUNE_PHASE=eval run_tune_ste.sh      # proxy STE of the untouched fit
 #   sbatch --export=ALL,TUNE_PHASE=scan run_tune_ste.sh      # STE vs knob value
 #   TUNE_PHASE=validate bash run_tune_ste.sh                 # login node: re-submit the
 #                                                            # confirmation runs by hand
 #
-# Four-folder protocol in one job (fatigue κ=2, then benefit → 0.2/0.5/0.8):
-#   sbatch --export=ALL,TUNE_PHASE=protocol run_tune_ste.sh
+# Three-folder protocol from vanilla (no κ=2 fatigue folder):
+#   STE 0.2 = burden_path (A→ME+ME→E+E→MY), else benefit_foursc;
+#   STE 0.5 / 0.8 = benefit_foursc. Needs --overwrite if old stacked
+#   folders are still on disk.
+#   sbatch --export=ALL,TUNE_PHASE=protocol,TUNE_OVERWRITE=1 run_tune_ste.sh
 #
 # Overrides (sbatch --export=ALL,VAR=value,...):
 #   TUNE_PHASE        diagnose|eval|scan|apply|calibrate|protocol|validate  default calibrate
 #   TUNE_PARAMS_DIR   source fit to rescale                    default env_para_vanilla
-#   TUNE_KNOB         fatigue|action|benefit|benefit_foursc|... (burden_shift = fatigue alias)
-#   TUNE_FATIGUE_KAPPA    protocol stage-1 fixed fatigue κ     default 2
-#   TUNE_FATIGUE_DIR      protocol stage-1 folder              default env_para_ste_fatigue
-#   TUNE_BENEFIT_TARGETS  protocol stage-2 targets             default "0.2 0.5 0.8"
+#   TUNE_KNOB         burden_path|benefit_foursc|fatigue|... (burden_shift = fatigue)
+#   TUNE_STE02_TARGET     protocol low-STE target              default 0.2
+#   TUNE_BURDEN_KAPPA0    burden_path search start             default 0.3
+#   TUNE_STE02_BENEFIT_KAPPA0  benefit fallback start if 0.2 misses  default 1
+#   TUNE_BENEFIT_TARGETS  protocol high-STE targets            default "0.5 0.8"
 #   TUNE_OVERWRITE    1 to pass --overwrite (needed when replacing folders
 #                     written under an older knob name/semantics)  default 0
 #   TUNE_TARGETS      target mean STE values                   default "0.2 0.5 0.8"
@@ -70,14 +74,14 @@
 #   TUNE_SCRATCH      working dir for candidate params     default
 #                     .ste_tune_scratch_<knob>_<jobid>
 #
-# Protocol writes env_para_ste_fatigue/ (fixed κ=2) plus env_para_ste0.2/,
-# env_para_ste0.5/, env_para_ste0.8/ when those targets are hit and every
-# participant's E_w and CAE loops are stable. The *proxy* STE (Bernoulli
-# grid ± transferred CQL, same-sample max, truncated at 0) is what the
-# search matches; that is not ste_vanilla.aggregate_ste.
+# Protocol writes env_para_ste0.2/, env_para_ste0.5/, env_para_ste0.8/
+# when those targets are hit and every participant's E_w and CAE loops
+# are stable. There is no env_para_ste_fatigue folder. The *proxy* STE
+# (Bernoulli grid ± transferred CQL, same-sample max, truncated at 0)
+# is what the search matches; that is not ste_vanilla.aggregate_ste.
 # Each folder is a drop-in parameter set plus ste_tuning.json.
 # On success the script then submits one run_ste.sh array per folder
-# (STE_EXP=ste_fatigue, ste0.2, ...) so DiscreteCQL can measure confirmation STE.
+# (STE_EXP=ste0.2, ...) so DiscreteCQL can measure confirmation STE.
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")}"
@@ -103,11 +107,15 @@ TUNE_PHASE="${TUNE_PHASE:-calibrate}"
 TUNE_PARAMS_DIR="${TUNE_PARAMS_DIR:-env_para_vanilla}"
 TUNE_KNOB="${TUNE_KNOB:-action}"
 TUNE_TARGETS="${TUNE_TARGETS:-0.2 0.5 0.8}"
-TUNE_FATIGUE_KAPPA="${TUNE_FATIGUE_KAPPA:-2}"
-TUNE_BENEFIT_TARGETS="${TUNE_BENEFIT_TARGETS:-0.2 0.5 0.8}"
+TUNE_STE02_TARGET="${TUNE_STE02_TARGET:-0.2}"
+TUNE_BURDEN_KAPPA0="${TUNE_BURDEN_KAPPA0:-0.3}"
+TUNE_STE02_BENEFIT_KAPPA0="${TUNE_STE02_BENEFIT_KAPPA0:-1.0}"
+TUNE_BENEFIT_TARGETS="${TUNE_BENEFIT_TARGETS:-0.5 0.8}"
 TUNE_OVERWRITE="${TUNE_OVERWRITE:-0}"
 if [[ "${TUNE_KNOB}" == "burden_shift" || "${TUNE_KNOB}" == "fatigue" ]]; then
   TUNE_KAPPA0="${TUNE_KAPPA0:-0.2}"
+elif [[ "${TUNE_KNOB}" == "burden_path" ]]; then
+  TUNE_KAPPA0="${TUNE_KAPPA0:-0.3}"
 elif [[ "${TUNE_KNOB}" == "foursc_to_y_shift" ]]; then
   TUNE_KAPPA0="${TUNE_KAPPA0:-0.05}"
 elif [[ "${TUNE_KNOB}" == "benefit_foursc" ]]; then
@@ -129,7 +137,6 @@ TUNE_DQN_EXP="${TUNE_DQN_EXP:-5}"
 TUNE_NOISE="${TUNE_NOISE:-ar1}"
 TUNE_OUT_PREFIX="${TUNE_OUT_PREFIX:-env_para_ste}"
 TUNE_OUT_SUFFIX="${TUNE_OUT_SUFFIX:-}"
-TUNE_FATIGUE_DIR="${TUNE_FATIGUE_DIR:-${TUNE_OUT_PREFIX}_fatigue${TUNE_OUT_SUFFIX}}"
 TUNE_TOL="${TUNE_TOL:-0.02}"
 TUNE_MAX_ITER="${TUNE_MAX_ITER:-10}"
 TUNE_SEED="${TUNE_SEED:-20260814}"
@@ -325,9 +332,11 @@ case "${TUNE_PHASE}" in
     fi
     set +e
     "${PY}" tune_ste.py protocol "${COMMON_ARGS[@]}" \
-      --fatigue-kappa "${TUNE_FATIGUE_KAPPA}" \
-      --fatigue-out-dir "${TUNE_FATIGUE_DIR}" \
+      --ste02-target "${TUNE_STE02_TARGET}" \
+      --burden-kappa0 "${TUNE_BURDEN_KAPPA0}" \
+      --ste02-benefit-kappa0 "${TUNE_STE02_BENEFIT_KAPPA0}" \
       --benefit-targets ${TUNE_BENEFIT_TARGETS} \
+      --benefit-kappa0 "${TUNE_BENEFIT_KAPPA0:-2}" \
       --out-prefix "${TUNE_OUT_PREFIX}" \
       "${SUFFIX_ARGS[@]+"${SUFFIX_ARGS[@]}"}" \
       --scratch "${TUNE_SCRATCH}" \
@@ -346,14 +355,21 @@ case "${TUNE_PHASE}" in
       exit "${proto_status}"
     fi
     if [[ "${proto_status}" -eq 0 || "${proto_status}" -eq 2 ]]; then
-      PROTO_DIRS=("${TUNE_FATIGUE_DIR}")
-      for target in ${TUNE_BENEFIT_TARGETS}; do
-        PROTO_DIRS+=("${TUNE_OUT_PREFIX}${target}${TUNE_OUT_SUFFIX}")
-      done
-      echo "Submitting confirmation DiscreteCQL jobs for protocol folders."
-      submit_validation_jobs "${PROTO_DIRS[@]}" || {
-        [[ "${proto_status}" -eq 0 ]] && exit 1
-      }
+      WRITTEN_LIST="${TUNE_SCRATCH}_written"
+      PROTO_DIRS=()
+      if [[ -f "${WRITTEN_LIST}" ]]; then
+        while IFS= read -r line; do
+          [[ -n "${line}" ]] && PROTO_DIRS+=("${line}")
+        done < "${WRITTEN_LIST}"
+      fi
+      if [[ "${#PROTO_DIRS[@]}" -eq 0 ]]; then
+        echo "No folders rewritten this run; not submitting confirmation jobs."
+      else
+        echo "Submitting confirmation DiscreteCQL jobs for protocol folders rewritten this run."
+        submit_validation_jobs "${PROTO_DIRS[@]}" || {
+          [[ "${proto_status}" -eq 0 ]] && exit 1
+        }
+      fi
     else
       echo "Protocol failed (exit ${proto_status}); not submitting confirmation jobs." >&2
     fi

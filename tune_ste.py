@@ -9,28 +9,19 @@ fitted from the ADAPT MRT)::
     A ──(−)──> ME (PV, FW, PJ)      ──(+)──> E_{w+1} ──(+)──> MY_{w+1} ──> Y_{w+2}
                                      (ME→E)             (E→MY)
 
-Variants (``protocol`` writes four folders plus untouched vanilla):
+Variants (``protocol`` writes three folders plus untouched vanilla; all
+searches start from vanilla, not from a stacked fatigue folder):
 
 1. **vanilla** — the fitted environment, untouched.
-2. **fatigue at κ = 2** — knob ``fatigue`` (alias ``burden_shift``), *applied*
-   at ``FATIGUE_KAPPA_MAX`` (default 2), not root-found. Make the engagement
-   cost of sending sign-definite by *shifting* the main A→ME coefficients
-   down by ``κ`` (A×E_w interactions untouched, so the addend is ``−κA``,
-   not ``−κA(1+E_w)`` which would flip sign for ``E_w < −1``), **per user
-   × mediator and only when that user's ME→E loading exceeds**
-   ``FATIGUE_ME_TO_E_MIN`` (default 0.05; ``ADAPR_FATIGUE_ME_TO_E_MIN``).
-   Crushing a mediator that *lowers* E (user 248's FW/PJ) would invert the
-   chain. E_w→MY is *shifted* up by a **fixed** ``κ_e`` (default
-   ``FATIGUE_E_SHIFT_DEFAULT``, override ``ADAPR_FATIGUE_E_SHIFT``) so the
-   fatigue chain can reach Y. A→ME mains do not change loop gains, so the
-   old 256 stability cap was not a real bound. Proxy STE at this folder
-   is ~0.37 (job 42904804, κ_e = 0.3) — below vanilla (~0.45) but not 0.2.
-   Writes ``env_para_ste_fatigue``.
-3. **STE 0.2 / 0.5 / 0.8 on top of 2** — knob ``benefit_foursc`` on the
-   fatigue folder: *scale* A→MY by ``κ`` (preserves each user's fitted
-   CATE structure — the A×wear / A×interact / A×steps ratios the RL
-   algorithm personalizes on) and *shift* fourSC→Y by ``c(κ−1)`` (capped).
-   ``κ < 1`` lowers STE to 0.2; ``κ > 1`` raises it to 0.5 / 0.8.
+2. **STE 0.2** — first try knob ``burden_path``: fix the transmissions
+   (E→MY ``+κ_e``, default 0.3; ME→E floored at 0.05) and *search only*
+   A→ME mains ``−κ``. One raw ``κ`` must not be added to A→ME (≈0.3),
+   ME→E (≈1), and E→MY (≈0.003) together — that reintroduces the
+   never-send σ-inflation that ``fatigue`` decoupled. If the search
+   cannot hit 0.2, fall back to ``benefit_foursc`` on vanilla.
+3. **STE 0.5 / 0.8** — ``benefit_foursc`` on vanilla: *scale* A→MY by
+   ``κ`` (keeps each user's A×wear / A×interact / A×steps CATE ratios)
+   and *shift* fourSC→Y by ``c(κ−1)`` (capped). ``κ > 1`` raises STE.
 
 Shift vs scale — the rule used throughout
 -----------------------------------------
@@ -57,8 +48,8 @@ guarantee confirmation STE 0.5. Report the confirmation number.
 
 Commands
 --------
-    protocol    the whole design: apply fatigue at κ=2, then
-                benefit_foursc → 0.2/0.5/0.8 stacked on that folder
+    protocol    STE 0.2 via burden_path (then benefit_foursc fallback),
+                then benefit_foursc → 0.5/0.8; all from vanilla
     diagnose    E_w and CAE loop gains (no simulation)
     eval        measure proxy STE of one parameter folder
     scan        proxy STE vs a grid of ``kappa``
@@ -71,20 +62,23 @@ Cluster::
 
 or stage by stage::
 
-    sbatch --export=ALL,TUNE_PHASE=apply,TUNE_KNOB=fatigue,TUNE_KAPPA=2,\\
-TUNE_OUT_DIR=env_para_ste_fatigue,TUNE_APPLY_EVAL=1 run_tune_ste.sh
-    sbatch --export=ALL,TUNE_PARAMS_DIR=env_para_ste_fatigue,TUNE_KNOB=benefit_foursc,\\
-TUNE_TARGETS="0.2 0.5 0.8" run_tune_ste.sh
+    sbatch --export=ALL,TUNE_KNOB=burden_path,TUNE_TARGETS=0.2 run_tune_ste.sh
+    sbatch --export=ALL,TUNE_KNOB=benefit_foursc,TUNE_TARGETS="0.5 0.8" run_tune_ste.sh
 
 Knob reference (``--knob``)
 ---------------------------
-    fatigue (canonical; alias burden_shift)
+    burden_path
+              Whole burden chain vs vanilla, but only A→ME is searched:
+              A→ME mains −κ (all mediators, after ME→E is floored);
+              ME→E ← max(ME→E, 0.05); E→MY +κ_e (default 0.3, fixed).
+              Never-send σ_i does not move with the search κ.
+    fatigue (alias burden_shift)
               A→ME mains −κ (shift), per mediator only if that user's
-              ME→E > ADAPR_FATIGUE_ME_TO_E_MIN (default 0.05); E_w→fourSC
-              / E_w→antic +κ_e (shift, κ_e = ADAPR_FATIGUE_E_SHIFT,
-              default 0.3, not tied to κ). Search κ ≤
-              ADAPR_FATIGUE_KAPPA_MAX (default 2). Control arm moves vs
-              vanilla, not across the κ ladder.
+              fitted ME→E > ADAPR_FATIGUE_ME_TO_E_MIN (default 0.05);
+              E_w→fourSC / E_w→antic +κ_e (shift, κ_e =
+              ADAPR_FATIGUE_E_SHIFT, default 0.3, not tied to κ). Search
+              κ ≤ ADAPR_FATIGUE_KAPPA_MAX (default 2). Kept for scans /
+              apply; protocol no longer writes a κ=2 fatigue folder.
     benefit_foursc
               A→MY ×κ (scale) and fourSC_ewma→Y += c(κ−1), c =
               ADAPR_BENEFIT_FOURSC_SHIFT (0.05) capped at _CAP (0.20).
@@ -111,8 +105,12 @@ Guarantees and guards
   per participant (fatigue: A→ME ≤ 0; transmission: ME→E, E→MY ≥ 0;
   benefit: fourSC→Y, antic→Y ≥ 0) and violations are printed — fitted
   heterogeneity, so warn-only.
-* The PV hurdle occurrence logit is script 4's PV emission, so STE knobs
-  that edit ``alpha3``/``alpha4`` in JSON enter ``P(count>0)`` directly.
+* PV is a hurdle: ``alpha3``/``alpha4`` are the occurrence logit
+  ``P(count>0)``; ``gamma3``/``gamma4`` are the Gaussian mean given
+  count>0. Current A→ME knobs (``burden_path``, ``fatigue``) subtract
+  ``κ`` from the mains ``alpha3`` and ``gamma3`` only; the A×E_w slopes
+  ``alpha4``/``gamma4`` stay at the fitted values. Those JSON edits
+  enter the simulator with no extra translation.
 * ``rl_priors.json`` is copied verbatim (RCT/vanilla priors by design);
   ``loo_priors`` is a relative symlink to vanilla.
 
@@ -266,6 +264,9 @@ PATHWAYS: dict[str, dict[str, tuple[str, ...]]] = {
     "ME_to_E": {
         "theta_penalized_Ew": ("a2_PV_lag_week", "a3_FW_lag_week", "a4_PJ_lag_week"),
     },
+    "ME_to_E_PV": {"theta_penalized_Ew": ("a2_PV_lag_week",)},
+    "ME_to_E_FW": {"theta_penalized_Ew": ("a3_FW_lag_week",)},
+    "ME_to_E_PJ": {"theta_penalized_Ew": ("a4_PJ_lag_week",)},
     "E_to_MY": {
         "theta_fourSC": ("perceived_utility_lastweek",),
         "theta_antic": ("perceived_utility_lastweek",),
@@ -350,6 +351,27 @@ def _fatigue_multipliers(k: float) -> dict[str, float]:
     }
 
 
+def _burden_path_multipliers(k: float) -> dict[str, float]:
+    """Population-level map. ME→E floors are per-user (see multipliers_for)."""
+    return {
+        "A_to_ME_PV_main": float(k),
+        "A_to_ME_FW_main": float(k),
+        "A_to_ME_PJ_main": float(k),
+        "E_to_MY": -_fatigue_e_shift(0.0),
+    }
+
+
+_BURDEN_PATH_APPLY = {
+    "A_to_ME_PV_main": "subtract",
+    "A_to_ME_FW_main": "subtract",
+    "A_to_ME_PJ_main": "subtract",
+    "ME_to_E_PV": "subtract",
+    "ME_to_E_FW": "subtract",
+    "ME_to_E_PJ": "subtract",
+    "E_to_MY": "subtract",
+}
+
+
 def _benefit_foursc_shift(k: float) -> float:
     """fourSC_ewma → CAE addend paired with an A→MY multiplier ``k``.
 
@@ -415,6 +437,21 @@ KNOBS: dict[str, KnobSpec] = {
             "Multiply action -> engagement coefficients by kappa. Does not "
             "flip sign: fitted A→ME is often positive, so kappa>1 makes "
             "sending raise PV/FW/PJ more, not less."
+        ),
+    ),
+    "burden_path": KnobSpec(
+        "burden_path",
+        _burden_path_multipliers,
+        zero_is_null=False,
+        sigma_invariant=True,
+        apply=_BURDEN_PATH_APPLY,
+        doc=(
+            "Burden chain vs vanilla with a single search on A→ME: subtract "
+            "κ from all A→ME mains (not A×E_w), floor each ME→E loading at "
+            "ADAPR_FATIGUE_ME_TO_E_MIN (default 0.05), and add a fixed κ_e "
+            "to E→MY (ADAPR_FATIGUE_E_SHIFT, default 0.3). Transmissions "
+            "do not grow with the search variable, so never-send σ_i is "
+            "constant on the κ ladder. First attempt for STE 0.2."
         ),
     ),
     "fatigue": KnobSpec(
@@ -486,10 +523,10 @@ KNOBS: dict[str, KnobSpec] = {
         doc=(
             "Joint personalization + STE dial: multiply A→MY (steps/affect "
             "CATE, including A×wear/interact) by kappa and add "
-            "c(kappa-1) to fourSC_ewma → CAE (c=0.05, cap 0.20). Fatigue "
-            "(A→ME) is left alone. Use on env_para_burden_shift_large to "
-            "raise STE to 0.5/0.8 while making CAE more fourSC-dependent. "
-            "kappa=1 is a no-op. Start a search at 1.5–2."
+            "c(kappa-1) to fourSC_ewma → CAE (c=0.05, cap 0.20). The "
+            "burden chain is left alone. On vanilla this raises STE to "
+            "0.5/0.8 (κ>1) and is the fallback if burden_path misses "
+            "0.2. kappa=1 is a no-op. Start a raise search at 1.5–2."
         ),
     ),
     "me_to_e": KnobSpec(
@@ -534,6 +571,19 @@ def knob_kappa_cap(knob: KnobSpec) -> float | None:
     return float(knob.kappa_cap)
 
 
+def _log_burden_path(knob: KnobSpec, *, log=print) -> None:
+    if knob.name != "burden_path":
+        return
+    log(
+        f"  burden_path search: A→ME −κ only  "
+        f"(all mediators; ME→E floored at {_fatigue_me_to_e_min():g})"
+    )
+    log(
+        f"  E→MY shift κ_e = {_fatigue_e_shift(0.0):g}  "
+        "(fixed; not tied to the A→ME search)"
+    )
+
+
 def _log_fatigue_e_shift(knob: KnobSpec, *, log=print) -> None:
     if knob.name != "fatigue":
         return
@@ -555,6 +605,17 @@ def _log_fatigue_e_shift(knob: KnobSpec, *, log=print) -> None:
 
 
 def _fatigue_report_fields(knob: KnobSpec, kappa: float | None = None) -> dict:
+    if knob.name == "burden_path":
+        return {
+            "burden_path_a_me_kappa": None if kappa is None else float(kappa),
+            "fatigue_e_shift": _fatigue_e_shift(0.0),
+            "fatigue_me_to_e_min": _fatigue_me_to_e_min(),
+            "pathways": [
+                "A_to_ME_main (search)",
+                "ME_to_E (floor at fatigue_me_to_e_min)",
+                "E_to_MY (fixed κ_e)",
+            ],
+        }
     if knob.name != "fatigue":
         return {}
     tied = _fatigue_e_tied_to_kappa()
@@ -586,13 +647,20 @@ def _coef(params: dict, key: str, coef: str) -> float:
     return float(np.asarray(params[key], dtype=float).ravel()[names.index(coef)])
 
 
-def _fatigue_gated_mediators(params: dict) -> list[str]:
+def _fatigue_gated_mediators(params: dict, extra: float = 0.0) -> list[str]:
     """Mediators whose ME→E loading is a definite positive conduit to E."""
     thresh = _fatigue_me_to_e_min()
     return [
         m for m, (key, coef) in _ME_TO_E.items()
-        if _coef(params, key, coef) > thresh
+        if _coef(params, key, coef) + float(extra) > thresh
     ]
+
+
+def _me_to_e_floor_subtract(params: dict, mediator: str) -> float:
+    """Amount to subtract so ME→E(m) becomes ``max(fitted, floor)``."""
+    key, coef = _ME_TO_E[mediator]
+    a = _coef(params, key, coef)
+    return float(a - max(a, _fatigue_me_to_e_min()))
 
 
 def _fatigue_multipliers_for_user(k: float, params: dict) -> dict[str, float]:
@@ -603,12 +671,30 @@ def _fatigue_multipliers_for_user(k: float, params: dict) -> dict[str, float]:
     return mult
 
 
+def _burden_path_multipliers_for_user(k: float, params: dict) -> dict[str, float]:
+    """A→ME −κ for every mediator; ME→E floored; E→MY +κ_e (fixed)."""
+    kk = float(k)
+    mult: dict[str, float] = {
+        "A_to_ME_PV_main": kk,
+        "A_to_ME_FW_main": kk,
+        "A_to_ME_PJ_main": kk,
+        "E_to_MY": -_fatigue_e_shift(0.0),
+    }
+    for m in ("PV", "FW", "PJ"):
+        floor_sub = _me_to_e_floor_subtract(params, m)
+        if floor_sub != 0.0:
+            mult[f"ME_to_E_{m}"] = floor_sub
+    return mult
+
+
 def _knob_multipliers_fn(
     knob: KnobSpec, kappa: float
 ) -> Callable[[dict], dict[str, float]]:
     k = float(kappa)
     if knob.name == "fatigue":
         return lambda params: _fatigue_multipliers_for_user(k, params)
+    if knob.name == "burden_path":
+        return lambda params: _burden_path_multipliers_for_user(k, params)
     return lambda params: knob.build(k)
 
 
@@ -620,7 +706,7 @@ def _log_fatigue_gates(
     for uid in user_ids:
         with open(Path(src_dir) / f"params_env_{uid}.json", encoding="utf-8") as f:
             params = json.load(f)
-        gates[int(uid)] = _fatigue_gated_mediators(params)
+        gates[int(uid)] = _fatigue_gated_mediators(params, extra=0.0)
     n = len(gates)
     for m in ("PV", "FW", "PJ"):
         n_m = sum(1 for g in gates.values() if m in g)
@@ -776,7 +862,7 @@ def write_knob_params(
     knob: KnobSpec,
     kappa: float,
 ) -> list[dict]:
-    """Write ``src_dir`` scaled by ``knob`` at ``kappa`` (per-user if fatigue)."""
+    """Write ``src_dir`` scaled by ``knob`` at ``kappa`` (per-user if gated)."""
     return write_scaled_params(
         src_dir,
         dst_dir,
@@ -1208,6 +1294,12 @@ _KNOB_SIGN_STORY: dict[str, tuple[str, ...]] = {
         "PV->E >= 0", "FW->E >= 0", "PJ->E >= 0",
         "E->fourSC >= 0", "E->antic >= 0",
     ),
+    "burden_path": (
+        "A->PV main <= 0", "A->PV intensity main <= 0",
+        "A->FW main <= 0", "A->PJ main <= 0",
+        "PV->E >= 0", "FW->E >= 0", "PJ->E >= 0",
+        "E->fourSC >= 0", "E->antic >= 0",
+    ),
     "benefit_foursc": ("fourSC->Y >= 0", "antic->Y >= 0"),
 }
 
@@ -1542,6 +1634,30 @@ def summarise(result: dict, label: str = "") -> None:
         print(f"  DiscreteCQL arm won for {won.count('dqn')} of {len(won)} participants")
 
 
+def _sigma_by_uid(result: dict) -> dict[int, float]:
+    return {int(r["userid"]): float(r["sigma"]) for r in result.get("users", [])}
+
+
+def _sigma_ratio_report(num: dict, den: dict, *, log=print, label: str) -> dict:
+    """Per-user and mean σ_i(num) / σ_i(den). Denominator-driven STE shows up here."""
+    nmap = _sigma_by_uid(num)
+    dmap = _sigma_by_uid(den)
+    users = []
+    for uid in sorted(set(nmap) & set(dmap)):
+        d = dmap[uid]
+        ratio = float(nmap[uid] / d) if d > 0 else float("nan")
+        users.append({
+            "userid": uid,
+            "sigma": nmap[uid],
+            "sigma_ref": d,
+            "ratio": ratio,
+        })
+    ratios = [u["ratio"] for u in users if np.isfinite(u["ratio"])]
+    mean_r = float(np.mean(ratios)) if ratios else float("nan")
+    log(f"  {label}: mean σ_i ratio = {mean_r:.3f}  (n={len(ratios)})")
+    return {"label": label, "mean": mean_r, "n_users": len(ratios), "users": users}
+
+
 def _json_safe(obj):
     """Drop bulky raw draws and turn NaN/inf into null so the report is valid JSON."""
     if isinstance(obj, dict):
@@ -1726,6 +1842,7 @@ def cmd_calibrate(args) -> None:
 
     print(f"knob '{knob.name}': {knob.doc}")
     _log_fatigue_e_shift(knob)
+    _log_burden_path(knob)
     fatigue_gates = (
         _log_fatigue_gates(base_dir, user_ids) if knob.name == "fatigue" else None
     )
@@ -1769,6 +1886,7 @@ def cmd_calibrate(args) -> None:
 
     zero_cache: dict[int, list[float]] | None = None
     last: dict[float, dict] = {}
+    source_eval: dict | None = None
 
     def f(kappa: float) -> float:
         nonlocal zero_cache
@@ -1859,6 +1977,26 @@ def cmd_calibrate(args) -> None:
         print(f"  wrote {out_dir}")
         sign_violations = sign_story_report(out_dir, user_ids, knob_name=knob.name)
 
+        if source_eval is None:
+            print("  evaluating source-folder never-send σ_i (for σ ratios)")
+            source_eval = evaluate(
+                base_dir, user_ids, spec,
+                n_jobs=args.jobs, proxy_to_true=args.proxy_to_true,
+            )
+        sigma_ratios = {
+            "vs_source": _sigma_ratio_report(
+                result, source_eval,
+                label=f"σ_i(κ={kappa:g}) / σ_i(source {base_dir.name})",
+            )
+        }
+        if 0.0 not in last:
+            f(0.0)
+        if 0.0 in last:
+            sigma_ratios["vs_knob0"] = _sigma_ratio_report(
+                result, last[0.0],
+                label=f"σ_i(κ={kappa:g}) / σ_i(κ=0)",
+            )
+
         report = {
             "target_mean_ste": float(target),
             "achieved_mean_ste": float(achieved),
@@ -1875,6 +2013,7 @@ def cmd_calibrate(args) -> None:
             "n_coefficients_scaled": len(audit),
             "stack": _knob_stack(base_dir, knob, kappa),
             "sign_violations": {k: sorted(v) for k, v in sign_violations.items()},
+            "sigma_ratios": sigma_ratios,
             **_fatigue_report_fields(knob, kappa),
             **({"fatigue_gates": fatigue_gates} if fatigue_gates is not None else {}),
             **result,
@@ -1919,6 +2058,7 @@ def cmd_apply(args) -> None:
 
     print(f"knob '{knob.name}': {knob.doc}")
     _log_fatigue_e_shift(knob)
+    _log_burden_path(knob)
     fatigue_gates = (
         _log_fatigue_gates(base_dir, user_ids) if knob.name == "fatigue" else None
     )
@@ -2018,83 +2158,138 @@ def _stage_args(args, **overrides) -> argparse.Namespace:
     return argparse.Namespace(**base)
 
 
-def _protocol_fatigue_dir(args) -> Path:
-    raw = getattr(args, "fatigue_out_dir", None)
-    if raw:
-        p = Path(raw).expanduser()
-        return p if p.is_absolute() else PROJECT_ROOT / p
-    return PROJECT_ROOT / f"{args.out_prefix}_fatigue{args.out_suffix}"
+def _tuned_folder_stable(out_dir: Path) -> bool:
+    report = out_dir / "ste_tuning.json"
+    if not report.is_file():
+        return False
+    try:
+        return json.loads(report.read_text(encoding="utf-8")).get("stable") is True
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _report_stamp(out_dir: Path) -> tuple[int, int] | None:
+    """Identity of ``ste_tuning.json`` before a calibrate stage (mtime, size)."""
+    report = out_dir / "ste_tuning.json"
+    if not report.is_file():
+        return None
+    st = report.stat()
+    return (int(st.st_mtime_ns), int(st.st_size))
+
+
+def _written_this_run(out_dir: Path, before: tuple[int, int] | None) -> bool:
+    """True only if this run wrote a stable ``ste_tuning.json`` at ``out_dir``.
+
+    A leftover folder from an older protocol / knob / cohort can have
+    ``stable: true``. Using that to skip the 0.2 fallback or to submit
+    confirmation CQL would keep the stale environment.
+    """
+    if not _tuned_folder_stable(out_dir):
+        return False
+    after = _report_stamp(out_dir)
+    return after is not None and after != before
+
+
+def _calibrate_status(stage_args) -> int:
+    """Run ``cmd_calibrate`` and return its exit code (0 / 1 / 2)."""
+    try:
+        cmd_calibrate(stage_args)
+        return 0
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        return 0 if code is None else int(code)
 
 
 def cmd_protocol(args) -> None:
-    """Apply large fatigue, then root-find benefit_foursc on that folder.
+    """Root-find STE 0.2 / 0.5 / 0.8 from vanilla (no stacked fatigue folder).
 
-    Stage 1: apply ``fatigue`` at ``--fatigue-kappa`` (default 2) on
-    ``--params-dir`` (vanilla) → ``--fatigue-out-dir`` (default
-    ``env_para_ste_fatigue``), and measure its proxy STE.
-    Stage 2: calibrate ``benefit_foursc`` on the stage-1 folder to each of
-    ``--benefit-targets`` (default 0.2 / 0.5 / 0.8) → ``<prefix><t><suffix>``.
-    Variant 1 is the untouched vanilla folder. Each written folder carries
-    its full knob stack and sign-story report in ``ste_tuning.json``.
+    STE 0.2: ``burden_path`` first (A→ME, ME→E, E→MY together). If that
+    search misses or is unstable, ``benefit_foursc`` on the same vanilla
+    source. STE 0.5 / 0.8: ``benefit_foursc`` on vanilla. Variant 1 is
+    the untouched vanilla folder.
     """
-    fatigue_dir = _protocol_fatigue_dir(args)
-    fatigue_kappa = float(args.fatigue_kappa)
     scratch = Path(args.scratch)
+    ste02 = float(args.ste02_target)
+    raise_targets = [float(t) for t in args.benefit_targets]
+    dest_02 = calibrated_out_dir(args.out_prefix, ste02, args.out_suffix)
+    dest_hi = [
+        calibrated_out_dir(args.out_prefix, t, args.out_suffix)
+        for t in raise_targets
+    ]
+    stamp_02 = _report_stamp(dest_02)
+    stamps_hi = [_report_stamp(d) for d in dest_hi]
 
     print("=" * 70)
-    print(f"PROTOCOL stage 1/2: apply fatigue kappa={fatigue_kappa:g} -> {fatigue_dir.name}")
+    print(
+        f"PROTOCOL STE {ste02:g}: burden_path on {Path(args.params_dir).name} "
+        f"-> {dest_02.name}"
+    )
     print("=" * 70)
-    try:
-        cmd_apply(_stage_args(
+    _calibrate_status(_stage_args(
+        args,
+        knob="burden_path",
+        targets=[ste02],
+        kappa0=float(args.burden_kappa0),
+        scratch=str(scratch) + "_burden_path",
+    ))
+
+    if _written_this_run(dest_02, stamp_02):
+        print(f"\nprotocol: {dest_02.name} written by burden_path; skip benefit fallback.")
+    else:
+        if _tuned_folder_stable(dest_02) and not _written_this_run(dest_02, stamp_02):
+            print(
+                f"\nprotocol: {dest_02.name} is leftover (stable=true but not "
+                "rewritten this run); trying benefit_foursc fallback."
+            )
+        print("\n" + "=" * 70)
+        print(
+            f"PROTOCOL STE {ste02:g}: burden_path missed; "
+            f"fallback benefit_foursc on {Path(args.params_dir).name} "
+            f"-> {dest_02.name}"
+        )
+        print("=" * 70)
+        _calibrate_status(_stage_args(
             args,
-            knob="fatigue",
-            kappa=fatigue_kappa,
-            out_dir=str(fatigue_dir),
-            eval=True,
-            scratch=str(scratch) + "_fatigue",
+            knob="benefit_foursc",
+            targets=[ste02],
+            kappa0=float(args.ste02_benefit_kappa0),
+            scratch=str(scratch) + "_ste02_benefit",
         ))
-    except SystemExit as exc:
-        raise SystemExit(
-            f"protocol aborted: fatigue apply did not write "
-            f"{fatigue_dir.name} (exit {exc.code}). The benefit stage needs "
-            "that folder as its base."
-        ) from exc
 
     print("\n" + "=" * 70)
     print(
-        f"PROTOCOL stage 2/2: benefit_foursc on {fatigue_dir.name} -> "
-        f"proxy STE {' '.join(f'{t:g}' for t in args.benefit_targets)}"
+        f"PROTOCOL STE {' '.join(f'{t:g}' for t in raise_targets)}: "
+        f"benefit_foursc on {Path(args.params_dir).name}"
     )
     print("=" * 70)
-    try:
-        cmd_calibrate(_stage_args(
-            args,
-            params_dir=str(fatigue_dir),
-            knob="benefit_foursc",
-            targets=[float(t) for t in args.benefit_targets],
-            kappa0=float(args.benefit_kappa0),
-            scratch=str(scratch) + "_benefit",
-        ))
-    except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else 1
-        print(
-            f"\nprotocol: {fatigue_dir.name} is on disk; benefit stage "
-            f"exit {code}. Confirmation CQL will pick up whatever folders "
-            "have stable=true."
-        )
-        if code == 0:
-            raise
-        # Fatigue apply succeeded. Exit 2 so the shell still submits CQL
-        # for that folder (and any benefit folders that were written).
-        raise SystemExit(2) from exc
+    _calibrate_status(_stage_args(
+        args,
+        knob="benefit_foursc",
+        targets=raise_targets,
+        kappa0=float(args.benefit_kappa0),
+        scratch=str(scratch) + "_benefit",
+    ))
+
+    written_dirs = []
+    if _written_this_run(dest_02, stamp_02):
+        written_dirs.append(dest_02)
+    for d, before in zip(dest_hi, stamps_hi):
+        if _written_this_run(d, before):
+            written_dirs.append(d)
+    written = [d.name for d in written_dirs]
+    wanted = [dest_02.name] + [d.name for d in dest_hi]
+    written_list = Path(str(scratch) + "_written")
+    written_list.write_text("".join(f"{d}\n" for d in written_dirs), encoding="utf-8")
+
+    print("\nprotocol written: " + (", ".join(written) if written else "(none)"))
+    if written == wanted:
+        print("protocol complete: vanilla + " + ", ".join(written))
+        return
     print(
-        "\nprotocol complete: vanilla + "
-        f"{fatigue_dir.name} + "
-        + ", ".join(
-            calibrated_out_dir(args.out_prefix, t, args.out_suffix).name
-            for t in args.benefit_targets
-        )
+        "protocol incomplete; confirmation CQL will pick up folders "
+        "rewritten this run (not leftover ste_tuning.json)."
     )
+    raise SystemExit(2 if written else 1)
 
 
 def cmd_diagnose(args) -> None:
@@ -2222,27 +2417,35 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser(
         "protocol",
         help=(
-            "Apply fatigue at --fatigue-kappa, then benefit_foursc to "
-            "--benefit-targets on that folder"
+            "STE 0.2 via burden_path (benefit_foursc fallback), then "
+            "benefit_foursc to 0.5/0.8; all from vanilla"
         ),
     )
     common(sp, needs_knob=True)  # --knob is accepted but ignored (fixed per stage)
     sp.add_argument(
-        "--fatigue-kappa",
+        "--ste02-target",
         type=float,
-        default=FATIGUE_KAPPA_MAX,
-        help="Fixed fatigue κ for stage 1 (default: FATIGUE_KAPPA_MAX=2)",
+        default=0.2,
+        help="Low STE target tried first with burden_path (default 0.2)",
     )
     sp.add_argument(
-        "--fatigue-out-dir",
-        default="",
-        help="Stage-1 folder (default: <out-prefix>_fatigue<out-suffix>)",
+        "--burden-kappa0",
+        type=float,
+        default=0.3,
+        help="Search start for burden_path on the 0.2 target (default 0.3)",
+    )
+    sp.add_argument(
+        "--ste02-benefit-kappa0",
+        type=float,
+        default=1.0,
+        help="Search start for benefit_foursc if burden_path misses 0.2",
     )
     sp.add_argument(
         "--benefit-targets",
         type=float,
         nargs="+",
-        default=[0.2, 0.5, 0.8],
+        default=[0.5, 0.8],
+        help="High STE targets via benefit_foursc on vanilla (default 0.5 0.8)",
     )
     sp.add_argument("--benefit-kappa0", type=float, default=2.0)
     sp.add_argument("--out-prefix", default="env_para_ste")
