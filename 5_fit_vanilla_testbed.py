@@ -6,9 +6,10 @@ or as a hierarchical Bayesian model:
     4-hour step counts, anticipated affect, weekly CAE / short CAE,
     prior-2h steps, active status, walking-suggestion interaction.
 
-Drops users whose week-1 ``CAE_avg`` on the full 12-week panel equals 7
-*before* the week-1 row drop and before the partial-pooling fits, so those
-ceiling trajectories do not shrink the shared CAE / mediator posteriors.
+Drops users whose minimum weekly ``CAE_avg`` on the full 12-week panel is
+≥ 6, or whose week-1 ``CAE_avg`` equals 7, *before* the week-1 row drop
+and before the partial-pooling fits, so high-ceiling trajectories do not
+shrink the shared CAE / mediator posteriors.
 Writes ``params_env_<uid>.json`` (mediator/outcome blocks and residuals),
 ``pred_<uid>.json``, ``user_ids.txt``, and ``population_residuals.json``.
 Does not overwrite the E_w / PV / FW / PJ blocks from script 4 (including
@@ -35,10 +36,12 @@ from sklearn.linear_model import (
 
 from vani_env import assert_complete_week_slots, cae_mediator_ewma_rows
 
-# Week-1 CAE ceiling on the raw 1--7 scale, identified on the full 12-week
-# panel (not week 1 of the 11-week fit panel). Default on; set
-# EXCLUDE_FIRST_WEEK_CAE7=0 to keep those users in the hierarchical pools.
-FIRST_WEEK_CAE_CEILING = 7.0
+# High CAE on the raw 1--7 scale, identified on the full 12-week panel
+# (not the later 11-week fit panel). Drop if the 12-week minimum is ≥ 6
+# or week-1 CAE equals 7. Default on; set EXCLUDE_HIGH_CAE=0 to keep
+# those users in the hierarchical pools.
+MIN_CAE_THRESHOLD = 6.0
+INITIAL_CAE_CEILING = 7.0
 
 
 def _env_flag_true(name, default=True):
@@ -48,15 +51,36 @@ def _env_flag_true(name, default=True):
     return str(raw).strip().lower() not in ("0", "false", "no", "off")
 
 
-def first_week_cae_ceiling_uids(df, ceiling=FIRST_WEEK_CAE_CEILING):
-    """User ids with study-week-1 ``CAE_avg`` equal to the 1--7 ceiling."""
+def high_cae_uids(
+    df,
+    min_threshold=MIN_CAE_THRESHOLD,
+    initial_ceiling=INITIAL_CAE_CEILING,
+):
+    """User ids with 12-week min ``CAE_avg`` ≥ 6 or week-1 ``CAE_avg`` = 7.
+
+    One ``CAE_avg`` per user-week (first slot). NaN weeks are ignored, so a
+    missing week 1 still drops the user if every observed week is ≥ 6.
+    """
     if "week" not in df.columns or "CAE_avg" not in df.columns:
         raise ValueError("df_fit must have week and CAE_avg to apply the ceiling filter")
-    w1 = df.loc[df["week"].astype(int) == 1, ["ParticipantIdentifier", "CAE_avg"]]
-    series = w1.groupby("ParticipantIdentifier", sort=False)["CAE_avg"].first()
+    panel = df.loc[
+        df["week"].astype(int).between(1, 12),
+        ["ParticipantIdentifier", "week", "CAE_avg"],
+    ].copy()
+    panel["week"] = panel["week"].astype(int)
+    weekly = panel.groupby(["ParticipantIdentifier", "week"], sort=False)["CAE_avg"].first()
+    w1 = weekly.xs(1, level="week")
+    mins = weekly.groupby(level="ParticipantIdentifier").min()
+    uids = sorted(set(w1.index) | set(mins.index), key=lambda u: int(u))
     excluded = []
-    for uid, val in series.items():
-        if np.isfinite(val) and np.isclose(float(val), float(ceiling)):
+    for uid in uids:
+        initial = w1.get(uid, np.nan)
+        minimum = mins.get(uid, np.nan)
+        if (
+            np.isfinite(minimum) and float(minimum) >= float(min_threshold)
+        ) or (
+            np.isfinite(initial) and np.isclose(float(initial), float(initial_ceiling))
+        ):
             excluded.append(int(uid))
     return excluded
 
@@ -93,16 +117,18 @@ file_params_env_prefix = str(work_folder / 'params_env_')
 file_pred_prefix = str(work_folder / 'pred_')
 file_user_ids = str(work_folder / 'user_ids.txt')
 
-# Drop ceiling users on the 12-week panel first. Script 5's CAE / FourSC /
-# anticipated-affect models are one hierarchical pool; leaving these users
-# in would shrink every remaining person's random effects. Week 1 of the
-# later 11-week panel is original week 2, so this must run before that drop.
-if _env_flag_true("EXCLUDE_FIRST_WEEK_CAE7", default=True):
-    _ceiling_uids = first_week_cae_ceiling_uids(df_fit)
+# Drop high-CAE users on the 12-week panel first. Script 5's CAE /
+# FourSC / anticipated-affect models are one hierarchical pool; leaving
+# these users in would shrink every remaining person's random effects.
+# Week 1 of the later 11-week panel is original week 2, so this must run
+# before that drop.
+if _env_flag_true("EXCLUDE_HIGH_CAE", default=True):
+    _ceiling_uids = high_cae_uids(df_fit)
     if _ceiling_uids:
         print(
-            "Excluding users with first-week CAE_avg="
-            f"{FIRST_WEEK_CAE_CEILING:g} (12-week panel): "
+            "Excluding users with min weekly CAE_avg >= "
+            f"{MIN_CAE_THRESHOLD:g} or week-1 CAE_avg = "
+            f"{INITIAL_CAE_CEILING:g} (12-week panel): "
             + ", ".join(str(u) for u in _ceiling_uids)
         )
         df_fit = df_fit[
