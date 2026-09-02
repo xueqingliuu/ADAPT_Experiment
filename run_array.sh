@@ -5,7 +5,9 @@
 #SBATCH -c 1
 #SBATCH -t 2-10:00:00
 #SBATCH --mem=3G
-#SBATCH --array=1-500%50
+#SBATCH --array=1-300%50
+# Override for a top-up, e.g. 700 more seeds after 1-300:
+#   sbatch --array=301-1000%50 --export=ALL,PRIOR_MODE=loo,ENV_VARIANT=env_para_vanilla,RESULTS_ROOT=results_vanilla_loo run_array.sh
 #SBATCH -o logs/exp_%A_%a.out
 #SBATCH -e logs/exp_%A_%a.err
 

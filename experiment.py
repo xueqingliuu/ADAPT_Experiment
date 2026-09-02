@@ -1063,9 +1063,10 @@ class OnlineEnv:
         # The agent never sees this; it gets ``E_known_all`` instead.
         self.s["perceivedUtilityLastWeek"] = pu
 
-        # E-hat for next week: this week's PV/FW/PJ with this Sunday's J/U1/U2
-        # (index ``weekly_idx = sim_w + 1``). Stored there so ``start_week(k)``
-        # reads ``E_known_all[k]``.
+        # E-hat for next week: this week's PV/FW/PJ with last Sunday's J/U1/U2
+        # (``wp_all[sim_w]`` / opening ``J_w``). Week 0 uses 0 (no prior
+        # Sunday). Stored at ``weekly_idx`` so ``start_week(k)`` reads
+        # ``E_known_all[k]``.
 
         self.E_known_all[weekly_idx] = compute_Ew_hat_from_week(
             sim_w,
@@ -2208,7 +2209,7 @@ if __name__ == "__main__":
     )
 
     user_ids = np.loadtxt(params_dir / "user_ids.txt", dtype=int)
-    N_EXPERIMENTS = 500
+    N_EXPERIMENTS = 1000
     all_seeds = list(range(N_EXPERIMENTS))
     seed_idx = args.seed_idx
     if seed_idx is None:

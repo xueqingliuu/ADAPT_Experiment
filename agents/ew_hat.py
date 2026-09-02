@@ -74,7 +74,15 @@ def weekly_Ew_predictor_table(
             "FW_sum": fw_sum,
             "PJ_sum": pj_sum,
         })
-    return pd.DataFrame(rows)
+    tbl = pd.DataFrame(rows)
+    if not tbl.empty:
+        # Script 6 uses last Sunday's product (opening J_w, U_w); week 1 → 0.
+        tbl["half_J_tool8"] = (
+            tbl.groupby("ParticipantIdentifier", sort=False)["half_J_tool8"]
+            .shift(1)
+            .fillna(0.0)
+        )
+    return tbl
 
 
 def initial_Ew_hat_for_user(user_id, df_fit=None, coefs=None):
@@ -129,26 +137,27 @@ def compute_Ew_hat_from_week(
     dp_wk,
     baseline_offset=BASELINE_OFFSET,
 ):
-    """Approximate E_{w+1} from week ``sim_w`` mediators and this Sunday's survey.
+    """Approximate E_{w+1} from week ``sim_w`` mediators and last Sunday's survey.
 
     ``sim_w`` is RL week ``k`` (0-based). At the end of week ``w``:
 
-    * PV/FW/PJ are this week's series (emissions of ``E_w``, predictors of
-      ``E_{w+1}``).
-    * ``J``, ``U1``, ``U2`` are drawn on this Sunday from ``E_w`` (Script 4
-      emission) and stored at ``sim_w + baseline_offset``. That is the
-      Script-6 bundle: same calendar week's page views / wear / daily
-      check-in with that week's Sunday survey.
+    * PV/FW/PJ are this week's series (transition inputs for ``E_{w+1}``).
+    * ``half_J_tool8`` is last Sunday's ``J(U1+U2)/14`` — script 4's opening
+      ``J_w, U_w`` (emission of ``E_w``), standing in for the AR
+      ``E_w → E_{w+1}``. That survey lives at ``wp_all[sim_w]`` /
+      ``U1_all[sim_w]`` (``week_present_lastweek``). Week 0 has no prior
+      Sunday, so the product is 0, matching script 6.
 
-    ``wp_all[sim_w]`` is opening ``J_w`` (``week_present_lastweek``), used
-    during the week as the PV/FW/PJ query. Do not use it here; this bundle
-    wants this Sunday's survey (``J_{w+1}``) with this week's mediators.
+    This Sunday's ``J_{w+1}`` (index ``sim_w + baseline_offset``) is not
+    used: it is a weak emission of ``E_{w+1}``.
     """
-    survey_idx = int(sim_w) + int(baseline_offset)
-    J_w = _finite_or(wp_all, survey_idx, 0.0)
-    u1 = _finite_or(U1_all, survey_idx, coefs.get("U1_impute_mean", 0.0))
-    u2 = _finite_or(U2_all, survey_idx, coefs.get("U2_impute_mean", 0.0))
-    half_J_tool8 = J_w * (u1 + u2) / 14.0
+    if int(sim_w) <= 0:
+        half_J_tool8 = 0.0
+    else:
+        J_w = _finite_or(wp_all, int(sim_w), 0.0)
+        u1 = _finite_or(U1_all, int(sim_w), coefs.get("U1_impute_mean", 0.0))
+        u2 = _finite_or(U2_all, int(sim_w), coefs.get("U2_impute_mean", 0.0))
+        half_J_tool8 = J_w * (u1 + u2) / 14.0
     slot_start = int(sim_w) * FOURSC_SLOTS_PER_WEEK
     slot_stop = int(sim_w + 1) * FOURSC_SLOTS_PER_WEEK
     pv_sum = weekly_pv_sum_for_ew(pageViewNext4HourAll[slot_start:slot_stop])

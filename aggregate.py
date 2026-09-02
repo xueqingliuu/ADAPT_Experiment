@@ -15,6 +15,8 @@ from vani_env import PARAMS_DIR, PROJECT_ROOT, denormalize_CAE
 
 # Must match run_array.sh RESULTS_ROOT (env-overridable).
 DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla_loo"))
+# Default Monte Carlo batch: seeds 0..299 (run_array.sh --array=1-300).
+DEFAULT_N_SEEDS = 300
 
 # ── CAE reporting conventions ────────────────────────────────────────────
 # Figures on the *raw* (pre-normalization) scale via ``denormalize_CAE``
@@ -146,15 +148,6 @@ def _run_seed(run_dir: Path) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _configured_n_experiments(run_dirs: list[Path]) -> int:
-    n = 200
-    for run_dir in run_dirs:
-        cfg_n = _load_config(run_dir).get("n_experiments_configured")
-        if isinstance(cfg_n, int) and cfg_n > 0:
-            n = max(n, cfg_n)
-    return n
-
-
 def _latest_seed_batch_run_dirs(
     run_dirs: list[Path],
     *,
@@ -162,7 +155,7 @@ def _latest_seed_batch_run_dirs(
 ) -> tuple[list[Path], str]:
     """Newest folder per seed (0 .. n_seeds-1); batches may span calendar days."""
     if n_seeds is None:
-        n_seeds = _configured_n_experiments(run_dirs)
+        n_seeds = DEFAULT_N_SEEDS
 
     best: dict[int, Path] = {}
     best_ts: dict[int, str] = {}
@@ -226,8 +219,8 @@ def select_run_dirs(
             return filtered, f"SLURM array job {array_job_id}; {reason}"
         return filtered, f"SLURM array job {array_job_id}"
 
-    # Default: newest folder per seed 0..N-1, so a 1-200 array plus a
-    # 201-500 top-up are merged. One array job is --array-job-id / env.
+    # Default: newest folder per seed 0..299 (the 300-experiment batch).
+    # One array job is --array-job-id / env.
     filtered, reason = _latest_seed_batch_run_dirs(run_dirs, n_seeds=n_seeds)
     if filtered:
         return filtered, reason
@@ -269,10 +262,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--n-seeds",
         type=int,
-        default=None,
+        default=DEFAULT_N_SEEDS,
         metavar="N",
         help="Only seeds 0..N-1 (newest folder per seed). "
-             "Example: --n-seeds 100 for the first 100 experiments.",
+             f"Default {DEFAULT_N_SEEDS} (the 300-experiment batch).",
     )
     parser.add_argument(
         "--run-glob",
@@ -309,7 +302,7 @@ def _se_across_replications(arr):
     """Week-wise SE of the grand mean, clustered by experiment.
 
     ``arr`` is ``(n_exp, n_slot, n_week)``. Users are averaged within each
-    replicate, then ``SE = sd / sqrt(n_exp)``. The 31 testbed users are
+    replicate, then ``SE = sd / sqrt(n_exp)``. The 28 testbed users are
     treated as fixed; uncertainty is Monte Carlo error across seeds.
     """
     per_exp = np.nanmean(np.asarray(arr, dtype=float), axis=1)

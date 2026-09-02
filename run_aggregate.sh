@@ -25,9 +25,8 @@ if [ -z "${RESULTS_ROOT:-}" ]; then
   fi
 fi
 export RESULTS_ROOT
-# Default: newest folder per seed 0..N-1 (N from config, 500 if any
-# run recorded n_experiments_configured=500). That merges a 1-200
-# array with a 201-500 top-up. Restrict to one array with:
+# Default: newest folder per seed 0..299 (300 experiments). Restrict
+# to one array with:
 #   export SLURM_ARRAY_JOB_ID=<array_job_id>
 #   python aggregate.py --array-job-id <id>
 # Every folder under RESULTS_ROOT (including stale duplicates):

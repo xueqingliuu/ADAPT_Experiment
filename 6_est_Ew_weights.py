@@ -2,9 +2,16 @@
 
 Used at RCT time, when the latent E_w from script 4 is not available. The
 outcome is the filtered trajectory in ``pred_<uid>.json``. The four predictors
-are pleasantness/helpfulness, page-view average, Fitbit-wear average, and
-daily-check-in average. Week-survey presence ``J_w`` is not a standalone
-regressor; it only gates ``half_J_tool8``.
+are last week's pleasantness/helpfulness product, this week's page-view
+average, Fitbit-wear average, and daily-check-in average. Week-survey
+presence ``J_w`` is not a standalone regressor; it only gates
+``half_J_tool8``.
+
+``half_J_tool8`` is last Sunday's ``J(U_1+U_2)/14`` (script 4's opening
+``J_w, U_w``, an emission of ``E_w``). It stands in for the AR term
+``E_w → E_{w+1}``. Week 1 has no prior Sunday, so the product is 0. This
+week's Sunday (``J_{w+1}, U_{w+1}``) is not used: it is a weak emission of
+``E_{w+1}`` and gets weight 0 once ``M_w`` is in the model.
 
 PV/FW/PJ averages use the same fixed denominators as script 4 (14 slots /
 7 days) with missing values as 0. FW therefore treats a missing wear flag
@@ -107,7 +114,8 @@ def weekly_predictor_table(
     ``PV_sum`` / ``FW_sum`` / ``PJ_sum`` are ``nansum / 14`` and ``nansum / 7``
     (missing → 0), matching ``4_perceived_utility.build_user_blocks``. A
     missing Fitbit wear flag is coded as not wearing, not dropped from the
-    denominator.
+    denominator. ``half_J_tool8`` here is this Sunday's product; the
+    regression lags it via ``lag_half_J_tool8``.
     """
     if response_imputation_means is None:
         response_imputation_means = weekly_response_imputation_means(df)
@@ -185,6 +193,12 @@ def align_ew_to_weeks(ew_list: list[float]) -> dict[int, float]:
     return {i + 1: ew_list[i] for i in range(len(ew_list))}
 
 
+def lag_half_J_tool8(tbl: pd.DataFrame) -> pd.Series:
+    """Last Sunday's ``J(U_1+U_2)/14``; 0 on the first study week."""
+    lagged = tbl.groupby("ParticipantIdentifier", sort=False)["half_J_tool8"].shift(1)
+    return lagged.fillna(0.0)
+
+
 def build_pooled_regression_frame(
     df_fit: pd.DataFrame,
     work_dir: Path = WORK_DIR,
@@ -194,7 +208,8 @@ def build_pooled_regression_frame(
     pred_tbl = weekly_predictor_table(
         df_fit,
         response_imputation_means=response_imputation_means,
-    )
+    ).copy()
+    pred_tbl["half_J_tool8"] = lag_half_J_tool8(pred_tbl)
     out_rows = []
     for uid, sub in pred_tbl.groupby("ParticipantIdentifier"):
         ew = load_pred_ew_series(work_dir, uid)
