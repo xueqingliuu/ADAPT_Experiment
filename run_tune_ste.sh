@@ -59,10 +59,9 @@
 #                     benefit_foursc
 #   TUNE_KAPPAS       scan grid                                default "0.25 0.5 1 2 4"
 #   TUNE_EPISODES     paired episodes per arm                  default 100
-#   TUNE_POLICY_GRID  Bernoulli suggestion rates               default "0.5 1.0"
-#   TUNE_DQN_EXP      ste_vanilla --exp whose DiscreteCQL policies join as an
-#                     extra arm, "" to skip. Vanilla CQL is exp 5 (21-d frozen
-#                     STE map; exp 1/2 are old DQN).  default 5
+#   TUNE_POLICY_GRID  Bernoulli rates to add as extra arms     default "" (CQL only)
+#   TUNE_DQN_EXP      transferred DiscreteCQL exp              default 8
+#                     (28-user vanilla). "" only if TUNE_POLICY_GRID is set.
 #   TUNE_NOISE        ar1|random|sequential                    default ar1
 #   TUNE_OUT_PREFIX   tuned dirs are <prefix><target><suffix>  default env_para_ste
 #   TUNE_OUT_SUFFIX   e.g. _burden → env_para_ste0.2_burden    default ""
@@ -77,8 +76,8 @@
 # Protocol writes env_para_ste0.2/, env_para_ste0.5/, env_para_ste0.8/
 # when those targets are hit and every participant's E_w and CAE loops
 # are stable. There is no env_para_ste_fatigue folder. The *proxy* STE
-# (Bernoulli grid ± transferred CQL, same-sample max, truncated at 0)
-# is what the search matches; that is not ste_vanilla.aggregate_ste.
+# is transferred vanilla CQL vs never-suggest, Δ clipped at 0; that is
+# a lower bound on the clipped oracle. Confirmation uses the same clip.
 # Each folder is a drop-in parameter set plus ste_tuning.json.
 # On success the script then submits one run_ste.sh array per folder
 # (STE_EXP=ste0.2, ...) so DiscreteCQL can measure confirmation STE.
@@ -132,8 +131,8 @@ else
   TUNE_OUT_DIR="${TUNE_OUT_DIR:-env_para_${TUNE_KNOB}_${TUNE_KAPPA}}"
 fi
 TUNE_EPISODES="${TUNE_EPISODES:-100}"
-TUNE_POLICY_GRID="${TUNE_POLICY_GRID:-0.5 1.0}"
-TUNE_DQN_EXP="${TUNE_DQN_EXP:-5}"
+TUNE_POLICY_GRID="${TUNE_POLICY_GRID:-}"
+TUNE_DQN_EXP="${TUNE_DQN_EXP:-8}"
 TUNE_NOISE="${TUNE_NOISE:-ar1}"
 TUNE_OUT_PREFIX="${TUNE_OUT_PREFIX:-env_para_ste}"
 TUNE_OUT_SUFFIX="${TUNE_OUT_SUFFIX:-}"
@@ -224,9 +223,9 @@ if [[ -n "${TUNE_DQN_EXP}" ]]; then
   if try_dqn_exp "${TUNE_DQN_EXP}"; then
     :
   else
-    echo "Searching vanilla CQL folders 5, 4, 3." >&2
+    echo "Searching vanilla CQL folders 8, 5, 4, 3." >&2
     used=""
-    for fallback in 5 4 3; do
+    for fallback in 8 5 4 3; do
       if [[ "${fallback}" == "${TUNE_DQN_EXP}" ]]; then
         continue
       fi
@@ -237,10 +236,19 @@ if [[ -n "${TUNE_DQN_EXP}" ]]; then
       fi
     done
     if [[ -z "${used}" ]]; then
-      echo "DiscreteCQL arm: OFF. Proxy STE uses the Bernoulli grid only." \
-           "Point TUNE_DQN_EXP at a discrete_cql folder (vanilla CQL is 5)." >&2
+      if [[ -z "${TUNE_POLICY_GRID}" ]]; then
+        echo "Transferred CQL is required (empty TUNE_POLICY_GRID) but no" \
+             "discrete_cql checkpoints were found. Train exp 8 first." >&2
+        exit 1
+      fi
+      echo "DiscreteCQL arm: OFF. Proxy STE uses the Bernoulli grid only." >&2
     fi
   fi
+fi
+
+POLICY_GRID_ARGS=()
+if [[ -n "${TUNE_POLICY_GRID}" ]]; then
+  POLICY_GRID_ARGS=(--policy-grid ${TUNE_POLICY_GRID})
 fi
 
 COMMON_ARGS=(
@@ -248,7 +256,7 @@ COMMON_ARGS=(
   --episodes "${TUNE_EPISODES}"
   --seed "${TUNE_SEED}"
   --noise "${TUNE_NOISE}"
-  --policy-grid ${TUNE_POLICY_GRID}
+  "${POLICY_GRID_ARGS[@]+"${POLICY_GRID_ARGS[@]}"}"
   --jobs "${TUNE_JOBS}"
   --proxy-to-true "${TUNE_PROXY_TO_TRUE}"
   "${DQN_ARGS[@]+"${DQN_ARGS[@]}"}"

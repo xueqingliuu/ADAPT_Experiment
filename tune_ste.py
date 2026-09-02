@@ -36,15 +36,15 @@ main effects only.
 
 The proxy STE (what "target 0.2/0.5/0.8" means here)
 ----------------------------------------------------
-For each participant the proxy is ``max(0, max_arm Δ̂_i) / σ̂_i``, averaged
-over users: Δ̂_i is the paired mean total-CAE gap vs never-suggest on the
-**same** Monte-Carlo episodes used to pick the arm (Bernoulli rates from
-``--policy-grid`` plus, optionally, a source-env DiscreteCQL via
-``--dqn-exp``). The same-sample max is upward-biased for the oracle best-arm
-Δ; clipping at 0 encodes that never-suggest is in the class. This is **not**
-``ste_vanilla.aggregate_ste`` (DiscreteCQL trained in the tuned folder, gated
-on held-out seeds, test Δ can be negative); hitting proxy 0.5 does not
-guarantee confirmation STE 0.5. Report the confirmation number.
+For each participant the proxy is ``max(0, Δ̂_i) / σ̂_i`` under the
+**transferred** vanilla DiscreteCQL (``--dqn-exp``, default 8), averaged
+over users. Never-send is in the class, so the oracle Δ cannot be
+negative; clipping both the proxy and confirmation at 0 (no SE gate)
+keeps that floor. Transferred CQL is feasible in the candidate folder,
+so the clipped proxy is a lower bound on the clipped oracle.
+``--policy-grid`` is empty by default; setting rates adds Bernoulli arms
+and a same-sample max (no longer a bound). Confirmation is
+``ste_vanilla.aggregate_ste`` (in-folder CQL, same per-user clip).
 
 Commands
 --------
@@ -884,20 +884,17 @@ class ProxySpec:
     difference has far less variance than either arm, and averaging over ~30
     participants shrinks it further, so 100 episodes already puts the standard
     error of the reported mean STE around 0.01 -- below the default tolerance.
-    A short ``policy_grid`` is deliberate: ``Delta_i`` is a max over treatment
-    arms on the same episodes used to estimate it (winner's curse). Extra arms
-    raise the reported proxy and the selection bias; they are not a tighter
-    bound on ``ste_vanilla.aggregate_ste``.
-
-    ``dqn_model_dir`` points at a directory of ``ste_vanilla.py`` checkpoints
-    (``user<uid>_model.d3``); when set, each participant's source-env
-    DiscreteCQL policy is added as one more treatment arm (not retrained).
+    Default is transferred DiscreteCQL only (empty ``policy_grid``,
+    ``dqn_model_dir`` set). Per-user Δ is clipped at 0 (never-send is in
+    the class). That is a lower bound on the clipped oracle. A nonempty
+    ``policy_grid`` adds Bernoulli arms and a same-sample max, which is
+    no longer a bound.
     """
 
     episodes: int = 100
     seed0: int = 20260814
     noise: str = "ar1"
-    policy_grid: tuple[float, ...] = (0.5, 1.0)
+    policy_grid: tuple[float, ...] = ()
     i_w_fixed: int = 1
     dqn_model_dir: str | None = None
 
@@ -949,8 +946,7 @@ def load_dqn(model_dir: Path, uid: int, *, nweek: int, noise: str):
         import d3rlpy
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise RuntimeError(
-            "d3rlpy is required for --dqn-exp / --dqn-model-dir; install it or "
-            "drop back to the Bernoulli-only arms."
+            "d3rlpy is required for --dqn-exp / --dqn-model-dir."
         ) from exc
 
     model = d3rlpy.load_learnable(str(path))
@@ -1024,18 +1020,20 @@ def _eval_user(task: tuple) -> dict:
                 Path(spec.dqn_model_dir), uid, nweek=nweek, noise=spec.noise
             ),
         )
+    if not arms:
+        raise ValueError("proxy has no treatment arm; set --dqn-exp or --policy-grid")
 
     best = max(arms, key=lambda k: arms[k]["delta"])
     sigma = float(np.std(zero_totals, ddof=1))
-    # Population best-arm Δ cannot be negative (never-suggest is in the class).
-    # Clip the same-sample estimate at 0; the unclipped winner is ``delta_raw``.
-    delta = max(0.0, arms[best]["delta"])
+    # Never-send is in the class: clip at 0 (same as confirmation aggregate).
+    delta_raw = float(arms[best]["delta"])
+    delta = max(0.0, delta_raw)
     return {
         "userid": int(uid),
         "nweek": nweek,
         "sigma": sigma,
         "delta": delta,
-        "delta_raw": float(arms[best]["delta"]),
+        "delta_raw": delta_raw,
         "ste": delta / sigma if sigma > 0 else float("nan"),
         "best_policy": best,
         "mean_total_zero": float(np.mean(zero_totals)),
@@ -1575,8 +1573,7 @@ def require_dqn_checkpoints(spec: ProxySpec, user_ids: Sequence[int]) -> None:
         import d3rlpy  # noqa: F401
     except ImportError as exc:
         raise SystemExit(
-            "d3rlpy is required for --dqn-exp / --dqn-model-dir; install it or "
-            "drop the flag to use the Bernoulli-only arms."
+            "d3rlpy is required for --dqn-exp / --dqn-model-dir."
         ) from exc
     model_dir = Path(spec.dqn_model_dir)
     missing = [
@@ -1604,16 +1601,14 @@ def require_dqn_checkpoints(spec: ProxySpec, user_ids: Sequence[int]) -> None:
         raise SystemExit(
             f"{model_dir} checkpoints are not {STE_ALGO} "
             f"(found {wrong_algo[:5]}{'...' if len(wrong_algo) > 5 else ''}). "
-            "Retrain with the current ste_vanilla.py DiscreteCQL trainer, or "
-            "drop the DiscreteCQL arm (TUNE_DQN_EXP='' / omit --dqn-exp) and "
-            "calibrate on the Bernoulli policy grid only."
+            "Retrain with the current ste_vanilla.py DiscreteCQL trainer."
         )
     if wrong_dim:
         raise SystemExit(
             f"{model_dir} observation dim is not the frozen STE map "
             f"(trained state_dim={wrong_dim[0][1]}, STE_OBS_DIM={STE_OBS_DIM}). "
             "Point TUNE_DQN_EXP at DiscreteCQL trained on this 20-d vector "
-            "(vanilla CQL is exp 5), or set TUNE_DQN_EXP=''."
+            "(vanilla CQL is exp 8)."
         )
     print(f"DiscreteCQL arm: {len(user_ids)} checkpoints from {model_dir}")
 
@@ -1685,13 +1680,20 @@ def resolve_dqn_dir(args) -> str | None:
 
 
 def make_spec(args) -> ProxySpec:
-    return ProxySpec(
+    spec = ProxySpec(
         episodes=args.episodes,
         seed0=args.seed,
         noise=args.noise,
-        policy_grid=tuple(float(p) for p in args.policy_grid),
+        policy_grid=tuple(float(p) for p in (args.policy_grid or ())),
         dqn_model_dir=resolve_dqn_dir(args),
     )
+    if not spec.policy_grid and not spec.dqn_model_dir:
+        raise SystemExit(
+            "Proxy needs a treatment arm: default is transferred DiscreteCQL "
+            "(--dqn-exp 8). Pass --dqn-exp / --dqn-model-dir, or "
+            "--policy-grid 0.5 1.0 for Bernoulli arms."
+        )
+    return spec
 
 
 def cmd_eval(args) -> None:
@@ -1846,12 +1848,16 @@ def cmd_calibrate(args) -> None:
     fatigue_gates = (
         _log_fatigue_gates(base_dir, user_ids) if knob.name == "fatigue" else None
     )
-    arms = [f"Bernoulli p in {spec.policy_grid}"]
+    arms = []
+    if spec.policy_grid:
+        arms.append(f"Bernoulli p in {spec.policy_grid}")
     if spec.dqn_model_dir:
-        arms.append(f"DiscreteCQL from {Path(spec.dqn_model_dir).name}")
-    print(f"proxy: same-sample max over [{', '.join(arms)}] vs never-suggest, "
-          f"truncated at 0; {spec.episodes} paired episodes/arm, "
-          f"{len(user_ids)} participants")
+        arms.append(f"transferred DiscreteCQL from {Path(spec.dqn_model_dir).name}")
+    how = "same-sample max over" if len(arms) > 1 else "clipped-at-0"
+    print(
+        f"proxy: {how} [{', '.join(arms)}] vs never-suggest; "
+        f"{spec.episodes} paired episodes/arm, {len(user_ids)} participants"
+    )
     if args.proxy_to_true != 1.0:
         print(f"proxy-to-true shrinkage: {args.proxy_to_true:g}")
 
@@ -2326,7 +2332,12 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--seed", type=int, default=ProxySpec.seed0)
         sp.add_argument("--noise", default="ar1", choices=["ar1", "random", "sequential"])
         sp.add_argument(
-            "--policy-grid", type=float, nargs="+", default=list(ProxySpec.policy_grid)
+            "--policy-grid",
+            type=float,
+            nargs="*",
+            default=[],
+            help="Bernoulli rates to add as extra arms (default: none; "
+                 "transferred CQL only).",
         )
         sp.add_argument("--jobs", type=int, default=None)
         sp.add_argument(
@@ -2334,20 +2345,17 @@ def build_parser() -> argparse.ArgumentParser:
             type=float,
             default=1.0,
             help=(
-                "Multiply each user's proxy STE after max/truncation "
-                "(default 1.0: report the proxy as-is). Not estimated from "
-                "DiscreteCQL; set only with an external shrinkage factor."
+                "Multiply each user's proxy STE (default 1.0). Not estimated "
+                "from DiscreteCQL; set only with an external shrinkage factor."
             ),
         )
         sp.add_argument("--report", default=None)
         sp.add_argument(
             "--dqn-exp",
-            default=None,
+            default="8",
             help=(
-                "Add each participant's trained DiscreteCQL policy as a "
-                "treatment arm, reading d3rlpy_logs/ste_exp_<EXP>/"
-                "user<uid>_model.d3 (the --exp value used with "
-                "ste_vanilla.py train)"
+                "Transferred DiscreteCQL arm from d3rlpy_logs/ste_exp_<EXP>/ "
+                "(default 8 = 28-user vanilla). Empty string to omit."
             ),
         )
         sp.add_argument(

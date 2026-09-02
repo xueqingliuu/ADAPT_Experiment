@@ -8,7 +8,13 @@ Commands (``jobid`` is a row of ``user_ids.txt``)::
 
 STE for user i is (mean total CAE under DiscreteCQL minus never-suggest)
 divided by the never-suggest SD; ``aggregate`` averages that over users.
-The policy treats only when ``Q(s,1) - Q(s,0) > ADVANTAGE_MARGIN``.
+Confirmation always evaluates the selected DiscreteCQL checkpoint: CQL
+is a stand-in for the optimal policy so the number is a DGP
+signal-to-noise diagnostic, not a deployment rule. Per-user Δ is
+clipped at 0 (never-send is in the class); that is not the old SE gate.
+A holdout ``gate_Δ - c·SE > 0`` is still recorded but never replaces
+CQL with never-send. The policy treats only when
+``Q(s,1) - Q(s,0) > ADVANTAGE_MARGIN``.
 Training data are simulated under a random walking policy. Discount is 1
 within the week and 0.9 only at Saturday afternoon. Default residual noise
 is AR(1) bootstrap (``--noise ar1``).
@@ -17,25 +23,11 @@ Seed split (do not overlap these ranges)::
 
     train env seeds              ``2024 + jobid + episode``
     checkpoint-selection seeds   ``100000 .. 100199``
-    deployment-gate seeds        ``150000 .. 150199``
+    holdout-gate seeds           ``150000 .. 150199``  (logged only)
     test / STE seeds             ``300000 ..``
 
 The saved checkpoint is the one with the largest selection-set
-``mean(G_pi - G_0)``, not the network at the final training step. After
-that, deploy CQL only if
-
-    gate_Δ - VAL_FALLBACK_C * SE(gate_Δ) > 0
-
-on the independent gate seeds. ``SE`` is the paired Monte Carlo SE of
-``D_b = G_{π,b} - G_{0,b}`` (same gate seeds for CQL and zero), not a
-two-sample SE. The gate is not scored on the seeds that chose the
-checkpoint, so it does not inherit that winner's-curse bias.
-
-``c = 1`` is a performance-oriented safety heuristic (~84% one-sided
-normal), not a 95% test; do not retune ``c`` against test STE.
-
-Test STE uses ``TEST_SEED0 = 300000`` so the fallback rule is not scored
-on the old 200000+ seeds that identified the negative users.
+``mean(G_pi - G_0)``, not the network at the final training step.
 
 Checkpoints: ``d3rlpy_logs/ste_exp_<EXP>/user<uid>_model.d3``
 Eval rows:   ``results_ste/exp<EXP>/res<EXP>_<uid>.txt``
@@ -100,8 +92,7 @@ GATE_SEED0 = 150_000
 N_GATE_EPISODES = 200
 # Fresh test range after the val-Δ fallback was introduced (old evals used 200000).
 TEST_SEED0 = 300_000
-# Deploy CQL iff paired gate_Δ - c * SE > 0. c=1 is ~84% one-sided normal,
-# a performance heuristic, not a 95% test (that would be c≈1.645).
+# Holdout diagnostic only (does not drop CQL). c=1 is ~84% one-sided.
 VAL_FALLBACK_C = 1.0
 STE_OBSERVATION_SCALER = "none"
 # Frozen DiscreteCQL observation. Independent of the RLSVI
@@ -476,7 +467,10 @@ def decide_deploy_cql(
     *,
     c: float = VAL_FALLBACK_C,
 ) -> bool:
-    """Deploy CQL iff ``Δ - c * SE(Δ) > 0`` on the independent gate seeds."""
+    """Holdout diagnostic: ``Δ - c * SE(Δ) > 0`` on the independent gate seeds.
+
+    Confirmation STE always evaluates CQL. This flag is logged only.
+    """
     if not np.isfinite(delta) or not np.isfinite(se):
         return False
     return float(delta) - float(c) * float(se) > 0.0
@@ -794,15 +788,12 @@ def eval_ste_job(
                 f"trained={metadata.get(key)!r}, evaluation={value!r}"
             )
 
-    selected_policy = str(metadata.get("selected_policy", "cql"))
     print(
-        f"eval user={userid}  selected_policy={selected_policy}  "
+        f"eval user={userid}  selected_policy=cql  "
         f"test_seed0={TEST_SEED0}  n_test={n_test}",
         flush=True,
     )
-    dqn = None
-    if selected_policy != "zero":
-        dqn = d3rlpy.load_learnable(str(model_dir))
+    dqn = d3rlpy.load_learnable(str(model_dir))
 
     out = np.zeros((n_test, 2))
     for n in range(n_test):
@@ -816,19 +807,16 @@ def eval_ste_job(
             noise=noise,
             params_dir=params_path,
         )
-        if selected_policy == "zero":
-            out[n, 1] = out[n, 0]
-        else:
-            rd.seed(test_seed)
-            out[n, 1] = rollout_total_cae(
-                userid,
-                nweek=nweek,
-                seed=test_seed,
-                policy="dqn_greedy",
-                dqn=dqn,
-                noise=noise,
-                params_dir=params_path,
-            )
+        rd.seed(test_seed)
+        out[n, 1] = rollout_total_cae(
+            userid,
+            nweek=nweek,
+            seed=test_seed,
+            policy="dqn_greedy",
+            dqn=dqn,
+            noise=noise,
+            params_dir=params_path,
+        )
 
     path = Path("results_ste") / f"exp{exp}"
     path.mkdir(parents=True, exist_ok=True)
@@ -919,12 +907,12 @@ def train_ste_job(
         prefix="gate",
         params_dir=params_path,
     )
-    deploy_cql = decide_deploy_cql(
+    would_pass_gate = decide_deploy_cql(
         gate_stats["gate_delta"],
         gate_stats["gate_se"],
         c=val_fallback_c,
     )
-    selected_policy = "cql" if deploy_cql else "zero"
+    selected_policy = "cql"
     print(
         f"gate user={userid}  sel_Δ={float(selection.get('best_val_delta', float('nan'))):.6f}  "
         f"gate_Δ={gate_stats['gate_delta']:.6f}  "
@@ -932,6 +920,7 @@ def train_ste_job(
         f"z={gate_stats['gate_z']:.3f}  "
         f"threshold={val_fallback_c}*SE  "
         f"action1_rate={gate_stats['action1_rate']:.3f}  "
+        f"would_pass_gate={int(would_pass_gate)}  "
         f"policy={selected_policy}",
         flush=True,
     )
@@ -960,6 +949,7 @@ def train_ste_job(
         "n_gate": int(n_gate),
         "test_seed0": TEST_SEED0,
         "val_fallback_c": float(val_fallback_c),
+        "would_pass_gate": bool(would_pass_gate),
         "selected_policy": selected_policy,
         "selected_step": selection.get("best_step"),
         **gate_stats,
@@ -982,8 +972,10 @@ def aggregate_ste(
 
     where, for each participant type ``i`` with ``B_eval`` Monte Carlo rows,
 
-        hat_Delta_i = mean(G_opt) - mean(G_zero)
+        hat_Delta_i = max(0, mean(G_opt) - mean(G_zero))
         hat_sigma_i^2 = sample variance of ``G_zero`` (ddof=1).
+
+    The clip is the in-class floor (never-send), not a significance gate.
 
     Expects ``results_ste/exp{exp}/res{exp}_{userid}.txt`` with two columns:
     ``sum_CAE_zero``, ``sum_CAE_opt`` per Monte Carlo row.
@@ -1017,7 +1009,7 @@ def aggregate_ste(
             raise ValueError(
                 f"Need at least 2 evaluation episodes for user {userid}, got {g_zero.size}"
             )
-        delta_hat = float(np.mean(g_opt) - np.mean(g_zero))
+        delta_hat = max(0.0, float(np.mean(g_opt) - np.mean(g_zero)))
         var_i = float(np.var(g_zero, ddof=1))
         if not np.isfinite(var_i) or var_i <= 0.0:
             raise ValueError(f"Zero variance under pi^0 for user {userid}")
@@ -1079,10 +1071,13 @@ def report_ste(
             g_zero = reward[:, 0]
             g_opt = reward[:, 1]
             d = g_opt - g_zero
-            ste = float(np.mean(d) / np.std(g_zero, ddof=1))
+            delta_raw = float(np.mean(d))
+            sig = float(np.std(g_zero, ddof=1))
+            ste_raw = delta_raw / sig
+            ste = max(0.0, delta_raw) / sig
             n_users += 1
-            n_pos += int(ste > 0)
-            if only_negative and ste >= 0:
+            n_pos += int(ste_raw > 0)
+            if only_negative and ste_raw >= 0:
                 continue
         elif want is None:
             continue
@@ -1150,7 +1145,7 @@ def main(argv: list[str] | None = None) -> None:
         "--n-gate",
         type=int,
         default=N_GATE_EPISODES,
-        help="Independent deployment-gate episodes (seeds GATE_SEED0+)",
+        help="Holdout-gate episodes, logged only (seeds GATE_SEED0+)",
     )
     pt.add_argument("--val-every", type=int, default=VAL_EVERY_STEPS)
     pt.add_argument(
@@ -1160,7 +1155,7 @@ def main(argv: list[str] | None = None) -> None:
         "--val-fallback-c",
         type=float,
         default=VAL_FALLBACK_C,
-        help="Deploy CQL only if gate_Δ - c*SE(gate_Δ) > 0 (default 1.0)",
+        help="Holdout diagnostic threshold (does not drop CQL; default 1.0)",
     )
     pt.add_argument(
         "--params-dir",
