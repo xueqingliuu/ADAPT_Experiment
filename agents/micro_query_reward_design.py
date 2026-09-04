@@ -4,7 +4,7 @@ import numpy as np
 from algorithm_helpers import (
     N_RL_DAYS, N_RL_SLOTS, QUERY_D, QUERY_T, _stack_param_store, build_phi_action,
     build_redistribution_phi, build_rl_training_data, _next_slot,
-    TERMINAL_D, TERMINAL_T, clip_prob,
+    clip_prob,
     compute_reward_shaping_eta, compute_rlsvi_betas,
     daily_mediator_shares, empirical_bayes_sigma2_ensemble,
     ensemble_action_prob, fit_daily_mediator_decomposition,
@@ -21,9 +21,10 @@ class MicroQueryRewardDesignAgent:
     (override with a fixed ``engagement_bonus``).  V3/V4 keep the
     discounted-CAE objective and add the week-boundary potential
     ``F = γ̄ ê_{w+1} - ê_w``.  V2/V4 fit Stage 1 daily-mediator
-    decompositions and the Stage 2 within-week redistribution.  Both then
-    add the exact terminal residual so the shaped week sums to the weekly
-    target (V2: ``b̂_{w+1} + λ ê_{w+1}``; V4: ``b̂_{w+1} + F``).
+    decompositions and the Stage 2 within-week redistribution.  Slot
+    TD rewards are ``φ^⊤ η`` only — no leftover is added on the last
+    slot to force the week to sum to the target (V2 target
+    ``b̂_{w+1} + λ ê_{w+1}``; V4 ``b̂_{w+1} + F``).
     ``ê_{w+1}`` enters only that weekly target, not Stage-2 slot features.
     """
     def __init__(self, *args, reward_design, engagement_bonus=None,
@@ -185,8 +186,11 @@ class MicroQueryRewardDesignAgent:
         return q
 
     def _redistributed_training_data(self, k_cur, eval_betas, select_betas, daily, eta):
-        """TD rows using Stage-2 rewards plus a terminal leftover so the
-        week sums to the weekly target (V2 and V4)."""
+        """TD rows using Stage-2 slot rewards ``φ^⊤ η`` (V2 and V4).
+
+        Approximation error vs the weekly target stays in ``η``; it is not
+        dumped onto Saturday afternoon.
+        """
         rows, targets = [], [[] for _ in range(self.B)]
         for kp in range(k_cur):
             full = self.get_full_mediators(kp)
@@ -194,9 +198,6 @@ class MicroQueryRewardDesignAgent:
             for d in range(N_RL_DAYS):
                 for t in range(N_RL_SLOTS):
                     rewards[d, t] = self._slot_phi(kp, d, t, full, daily) @ eta
-            rewards[TERMINAL_D, TERMINAL_T] += (
-                self._week_return_target(kp) - rewards.sum()
-            )
             for d in range(N_RL_DAYS):
                 for t in range(N_RL_SLOTS):
                     state = self.get_state(kp, d, t)

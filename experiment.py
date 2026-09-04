@@ -118,6 +118,7 @@ from agents import (
     MicroQueryAgent,
     MicroQueryAgent_ModifiedTDLoss,
     MicroQueryRewardDesignAgent,
+    MicroQueryResidualAgent,
     NeverSendAgent,
     AlwaysSendAgent,
     RandomSendAgent,
@@ -1468,7 +1469,7 @@ def _default_reward_redistribution_priors():
 def _default_variant_q_priors():
     return {
         name: {"mu_0": np.zeros(P_RL_MICRO), "Sigma_0": np.eye(P_RL_MICRO), "sigma2": 1.0}
-        for name in ("g09", "g099", "v2", "v4")
+        for name in ("g09", "g099", "v2", "v4", "residual")
     }
 
 
@@ -1568,6 +1569,13 @@ def _configure_priors(params_dir=None, *, force=False):
             variant_q_priors.update(_priors["q_redistribution"])
         else:
             _setup_log("[priors] variant-specific Q priors missing; V2/V4 and gamma=0.9 use zero/identity fallback (rerun est_prior.py).")
+        if "q_residual_g09" in _priors:
+            variant_q_priors["residual"] = _priors["q_residual_g09"]
+        else:
+            _setup_log(
+                "[priors] q_residual_g09 missing; residual arm uses zero/"
+                "identity Q (not q_no_td_modify_g09). Rerun est_prior.py."
+            )
         mu_0_reward     = _priors["mu_0_reward"]
         Sigma_0_reward  = _priors["Sigma_0_reward"]
         sigma2_reward   = _priors["sigma2_reward"]
@@ -1672,12 +1680,19 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
     mu_0_micro = np.asarray(qn["mu_0"], dtype=float)
     Sigma_0_micro = np.asarray(qn["Sigma_0"], dtype=float)
     sigma2_rl_micro = float(qn["sigma2"])
-    variant_q_priors = {
-        "g09": fitted["q_no_td_modify_g09"],
-        **fitted["q_redistribution"],
-    }
+    variant_q_priors = _default_variant_q_priors()
+    variant_q_priors["g09"] = fitted["q_no_td_modify_g09"]
+    variant_q_priors.update(fitted["q_redistribution"])
     if fitted.get("q_no_td_modify_g099"):
         variant_q_priors["g099"] = fitted["q_no_td_modify_g099"]
+    if fitted.get("q_residual_g09"):
+        variant_q_priors["residual"] = fitted["q_residual_g09"]
+    else:
+        _setup_log(
+            f"[priors] WARNING: LOO q_residual_g09 missing for held-out "
+            f"user {int(held_out_uid)}; residual arm uses zero/identity Q "
+            "(not q_no_td_modify_g09)."
+        )
     for prior in variant_q_priors.values():
         prior["mu_0"] = np.asarray(prior["mu_0"], dtype=float)
         prior["Sigma_0"] = np.asarray(prior["Sigma_0"], dtype=float)
@@ -1871,6 +1886,33 @@ def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5, params_dir=None):
     return result, oenv
 
 
+def run_micro_query_residual(uid, seed=42, gamma_bar=0.9, params_dir=None):
+    """Base RLSVI with residual weekly reward ``b̂_{w+1} − ρ̂_w b̂_w``.
+
+    Uses ``q_residual_g09`` when present; never falls back to
+    ``q_no_td_modify_g09``. No engagement term and no Stage-2 η.
+    """
+    _ensure_priors_configured(params_dir)
+    cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
+    nweek = cfg.nweek
+    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
+    dataset = EpisodeDataset(nweek)
+    q_prior = variant_q_priors["residual"]
+    agent = MicroQueryResidualAgent(
+        W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
+        mu_0_rl=q_prior["mu_0"], Sigma_0_rl=q_prior["Sigma_0"], sigma2_rl=q_prior["sigma2"],
+        gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
+        target_update_C=TARGET_C,
+        nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
+        nu_0_Y=nu_0_Y, Gamma_0_Y=Gamma_0_Y, sigma2_Y=sigma2_Y,
+        nu_0_tilde_Y=nu_0_tilde_Y, Gamma_0_tilde_Y=Gamma_0_tilde_Y,
+        sigma2_tilde_Y=sigma2_tilde_Y,
+        Y_1=float(oenv.CAE_all[0]),
+        rng=np.random.default_rng(seed),
+    )
+    return oenv.run_episode(agent, dataset, week0_actions=week0_actions, I_hist=I_hist), oenv
+
+
 def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.5,
                                    params_dir=None, engagement_bonus=None,
                                    engagement_rho=None):
@@ -1880,8 +1922,8 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
     with ``λ = ρ · sd(b̂) / sd(ê)`` unless ``engagement_bonus`` is set.
     V3/V4 keep discounted CAE and add the potential ``F = γ̄ ê_{w+1} - ê_w``.
     V2/V4 additionally redistribute with the two-stage daily-mediator
-    decomposition, then add a terminal leftover so the week sums to the
-    weekly target. ``ê_{w+1}`` is used only in that target, not in Stage-2
+    decomposition. Slot TD rewards are ``φ^⊤ η`` only (no last-slot leftover).
+    ``ê_{w+1}`` is used only in that weekly Stage-2 target, not in Stage-2
     slot features.
     """
     _ensure_priors_configured(params_dir)
@@ -2016,7 +2058,7 @@ def run_random_send(uid, seed=42, params_dir=None):
 
 
 # Algorithm registry: V1--V6 at γ̄=0.9, V7/V8 base-discount sensitivities,
-# then the three fixed-policy baselines.
+# V9 residual CAE (AR control variate), then the three fixed-policy baselines.
 ALGORITHMS = {
     "rl_v1_base_g09": (partial(run_micro_query, gamma_bar=0.9), "RL base (γ̄=0.9)"),
     "rl_v2_mtd_g09": (partial(run_micro_query_mtd, gamma_bar=0.9), "RL + bottleneck TD (γ̄=0.9)"),
@@ -2026,6 +2068,10 @@ ALGORITHMS = {
     "rl_v6_invariant_redistributed": (partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9), "RL V4: return-invariant redistributed reward (γ̄=0.9)"),
     "rl_v7_base_g05": (partial(run_micro_query, gamma_bar=0.5), "RL base (γ̄=0.5 sensitivity)"),
     "rl_v8_base_g099": (partial(run_micro_query, gamma_bar=0.99), "RL base (γ̄=0.99 sensitivity)"),
+    "rl_v9_residual_g09": (
+        partial(run_micro_query_residual, gamma_bar=0.9),
+        "RL residual CAE (γ̄=0.9)",
+    ),
     "never_send":   (run_never_send,  "Never send (π_A=0)"),
     "always_send":  (run_always_send, "Always send (π_A=1)"),
     "random_send":  (run_random_send, "Random send (π_A=0.5)"),
@@ -2369,6 +2415,7 @@ if __name__ == "__main__":
             "prior_mode":      args.prior_mode,
             "loo_prior_cache_size": len(_LOO_PRIOR_CACHE) if args.prior_mode == "loo" else 0,
             "action_block_include_c": include_action_c,
+            "residual_rho_fallback": 0.89,
             "p_rl_micro":      P_RL_MICRO,
             "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID"),
             "slurm_job_id":       os.getenv("SLURM_JOB_ID"),

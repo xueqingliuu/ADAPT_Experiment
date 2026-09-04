@@ -7,6 +7,7 @@ from agents.ew_hat import (
 from agents.micro_query import MicroQueryAgent
 from agents.micro_query_modified_td import MicroQueryAgent_ModifiedTDLoss
 from agents.micro_query_reward_design import MicroQueryRewardDesignAgent
+from agents.micro_query_residual import MicroQueryResidualAgent
 from agents.rl_query import RLQueryAgent
 from agents.never_send import NeverSendAgent
 from agents.always_send import AlwaysSendAgent
@@ -16,6 +17,7 @@ __all__ = [
     "MicroQueryAgent",
     "MicroQueryAgent_ModifiedTDLoss",
     "MicroQueryRewardDesignAgent",
+    "MicroQueryResidualAgent",
     "RLQueryAgent",
     "NeverSendAgent",
     "AlwaysSendAgent",

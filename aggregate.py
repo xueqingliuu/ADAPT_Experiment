@@ -46,6 +46,7 @@ markers = {
     "rl_v6_invariant_redistributed": "d-",
     "rl_v7_base_g05": "o-",
     "rl_v8_base_g099": "o--",
+    "rl_v9_residual_g09": "P-",
     "never_send": "x-",
     "always_send": "*-",
     "random_send": "+-",
@@ -775,6 +776,7 @@ def main() -> None:
         algorithms.append("rl_v8_base_g099")
     labels["rl_v7_base_g05"] = "RL base (\u03b3\u0304=0.5)"
     labels["rl_v8_base_g099"] = "RL base (\u03b3\u0304=0.99)"
+    labels["rl_v9_residual_g09"] = "RL residual CAE (\u03b3\u0304=0.9)"
     nweek = cfg["nweek"]
     params_dir = resolve_denorm_params_dir(
         cfg.get("params_dir"), cli_params_dir=args.params_dir

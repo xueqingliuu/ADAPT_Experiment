@@ -606,6 +606,41 @@ def require_finite_belief(value, *, week, name="b_hat"):
     return x
 
 
+# Residual-reward arm (``MicroQueryResidualAgent``): OLS AR(1) without
+# intercept on predetermined ``b̂``, else this fallback (PF CAE lag ≈ 0.89).
+RESIDUAL_RHO_FALLBACK = 0.89
+RESIDUAL_RHO_MIN_PAIRS = 2
+
+
+def estimate_ar_control_rho(b_hat_hist, week, *, fallback=RESIDUAL_RHO_FALLBACK,
+                            min_pairs=RESIDUAL_RHO_MIN_PAIRS):
+    """``ρ̂_w`` from ``b̂_{t+1} ~ ρ b̂_t`` using weeks ``0..w`` (pairs ``t<w``).
+
+    For residual reward ``R_w = b̂_{w+1} - ρ̂_w b̂_w``, both ``b̂_w`` and the
+    pairs ``(b̂_t, b̂_{t+1})`` for ``t=0..w-1`` are known before week-``w``
+    actions. Fewer than ``min_pairs`` finite pairs → ``fallback``.
+    """
+    x, y = [], []
+    hist = np.asarray(b_hat_hist, dtype=float).ravel()
+    w = int(week)
+    for t in range(max(w, 0)):
+        if t + 1 >= hist.size:
+            break
+        xt, yt = hist[t], hist[t + 1]
+        if np.isfinite(xt) and np.isfinite(yt):
+            x.append(float(xt))
+            y.append(float(yt))
+    if len(x) < int(min_pairs):
+        return float(fallback)
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    den = float(x_arr @ x_arr)
+    if den < 1e-12:
+        return float(fallback)
+    rho = float(x_arr @ y_arr) / den
+    return float(fallback) if not np.isfinite(rho) else rho
+
+
 # Default clip used by RLSVI only (π ∈ [ε, 1-ε]). The never/always baselines
 # are hard 0/1; they are not in this policy class and are not generated from
 # EPSILON_0. Changing this constant does not change those baselines.

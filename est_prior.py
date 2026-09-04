@@ -43,6 +43,8 @@ RL Q (no TD modify, beta)       -> mu_0_micro, Sigma_0_micro, sigma2_rl_micro
    (gamma_terminal=0.5; V7 base sensitivity)
    q_no_td_modify_g09              (gamma_terminal=0.9; V1/V3/V5)
    q_no_td_modify_g099             (gamma_terminal=0.99; V8)
+   q_residual_g09                  (gamma_terminal=0.9; residual CAE
+                                    R_w = Y_w − ρ̂_w Y_{w−1}; V9)
 
 RL Q joint (eta, beta) for      -> mu_0_micro_mtd_joint,
    modified-TD-loss RLSVI          Sigma_0_micro_mtd_joint (FULL cov),
@@ -96,6 +98,7 @@ from algorithm_helpers import (
     build_redistribution_phi,
     build_phi_bottleneck,
     build_rl_context_vector,
+    estimate_ar_control_rho,
 )
 from vani_env import (
     PF_THETA_CAE_NAMES,
@@ -1301,15 +1304,14 @@ def _fit_redistribution_coefficients(
 def _attach_redistributed_rewards(feats: Dict[str, Any], td: Dict[str, np.ndarray],
                                   variant: str,
                                   daily: Dict[str, np.ndarray], eta: np.ndarray,
-                                  week_targets: np.ndarray) -> Dict[str, Any]:
-    """Attach the exact per-slot V2/V4 rewards to a precomputed FQI payload."""
+                                  _week_targets: np.ndarray) -> Dict[str, Any]:
+    """Attach per-slot V2/V4 rewards ``φ^⊤ η`` (no last-slot leftover)."""
     out = dict(feats)
     rewards = np.empty((feats["n_train"], N_RL_SLOTS_WEEK), dtype=float)
     for k in range(feats["n_train"]):
         phi_slots = np.stack([_redistribution_week_phi_slot(td, k, i, daily)
                               for i in range(N_RL_SLOTS_WEEK)])
         rewards[k] = phi_slots @ eta
-        rewards[k, -1] += float(week_targets[k] - rewards[k].sum())
     out["rewards"] = rewards
     return out
 
@@ -1606,6 +1608,54 @@ def fit_q_prior(df_fit: pd.DataFrame, *, gamma_terminal: float = GAMMA_TERMINAL)
     mu, Sigma, sigma2 = _pool_user_fits(
         th_nomod_pool, th_nomod_users, s2_nomod_users,
         X_pooled=_stack_phi_obs(feats_nomod_pool))
+    _assert_named_coords_diffuse(
+        Sigma, _phi_action_names(), ("b_tilde", "A*b_tilde"))
+    return {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
+
+
+def _residualize_q_features(feats: Dict[str, Any], b_hat_start: np.ndarray) -> Dict[str, Any]:
+    """Replace level CAE targets with ``R_w − ρ̂_w b̂_w`` (online residual arm)."""
+    out = dict(feats)
+    n_train = int(feats["n_train"])
+    R = np.asarray(feats["R"], dtype=float).copy()
+    lag = np.asarray(b_hat_start, dtype=float).ravel()
+    for k in range(n_train):
+        rho = estimate_ar_control_rho(lag, k)
+        out_lag = float(lag[k]) if k < lag.size and np.isfinite(lag[k]) else 0.0
+        R[k] = float(R[k]) - rho * out_lag
+    out["R"] = R
+    return out
+
+
+def fit_q_residual_prior(df_fit: pd.DataFrame, *, gamma_terminal: float = 0.9) -> Dict[str, Any]:
+    """FQI prior for the residual-reward arm (not ``q_no_td_modify_g09``).
+
+    Same φ and weekly discount as the γ̄=0.9 base, but terminal targets use
+    ``Y_w − ρ̂_w Y_{w−1}`` with the same causal ``ρ̂_w`` as the online agent.
+    """
+    th_users: List[Optional[np.ndarray]] = []
+    s2_users: List[Optional[float]] = []
+    feats_pool: List[Dict[str, Any]] = []
+
+    for _uid, dat in df_fit.groupby("ParticipantIdentifier", sort=False):
+        dat = dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True)
+        td = _user_weekly_tensors(dat)
+        feats_u = _precompute_q_features(td, use_td_modify=False)
+        if feats_u is None:
+            th_users.append(None)
+            s2_users.append(None)
+            continue
+        feats_u = _residualize_q_features(feats_u, td["b_hat_start"])
+        th, s2_u, _ = _fqi_iterate(
+            [feats_u], None, use_td_modify=False, gamma_terminal=gamma_terminal)
+        th_users.append(th)
+        s2_users.append(s2_u)
+        feats_pool.append(feats_u)
+
+    th_pool, _, _ = _fqi_iterate(
+        feats_pool, None, use_td_modify=False, gamma_terminal=gamma_terminal)
+    mu, Sigma, sigma2 = _pool_user_fits(
+        th_pool, th_users, s2_users, X_pooled=_stack_phi_obs(feats_pool))
     _assert_named_coords_diffuse(
         Sigma, _phi_action_names(), ("b_tilde", "A*b_tilde"))
     return {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
@@ -1962,6 +2012,11 @@ def save_split_rl_prior_files(
                    "feature_names": _phi_action_names(), **prior}
             for name, prior in priors["q_redistribution"].items()
         }
+    if "q_residual_g09" in priors:
+        rl_q_payload["q_residual_g09"] = {
+            "model": "q_residual_g09", "block": "beta",
+            "feature_names": _phi_action_names(), **priors["q_residual_g09"],
+        }
 
     with open(reward_path, "w", encoding="utf-8") as f:
         json.dump(_to_jsonable(reward_payload), f, indent=2, allow_nan=False)
@@ -2087,6 +2142,13 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
         rl_rows.extend(_summary_rows(
             prior_family="RL", model=f"q_redistribution_{name}", block="beta",
             mean=prior.get("mu_0"), cov=prior.get("Sigma_0"), names=_phi_action_names(),
+        ))
+    q_resid = priors.get("q_residual_g09")
+    if q_resid is not None:
+        rl_rows.extend(_summary_rows(
+            prior_family="RL", model="q_residual_g09", block="beta",
+            mean=q_resid.get("mu_0"), cov=q_resid.get("Sigma_0"),
+            names=_phi_action_names(),
         ))
 
     joint_rows: list[dict[str, Any]] = []
@@ -2291,6 +2353,7 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
     qn_g09 = raw.get("q_no_td_modify_g09")
     qn_g099 = raw.get("q_no_td_modify_g099")
     q_redistribution = raw.get("q_redistribution")
+    q_residual = raw.get("q_residual_g09")
     qj = raw.get("q_td_modify_joint")
     redistribution = raw.get("reward_redistribution")
 
@@ -2328,6 +2391,12 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
             name: {"mu_0": arr(prior["mu_0"]),
                    "Sigma_0": arr(prior["Sigma_0"]), "sigma2": float(prior["sigma2"])}
             for name, prior in q_redistribution.items()
+        }
+    if q_residual is not None:
+        out["q_residual_g09"] = {
+            "mu_0": arr(q_residual["mu_0"]),
+            "Sigma_0": arr(q_residual["Sigma_0"]),
+            "sigma2": float(q_residual["sigma2"]),
         }
     if redistribution is not None:
         out["daily_mediator_priors"] = {
@@ -2377,6 +2446,7 @@ def fit_all_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
         variant: fit_q_redistribution_prior(df_fit, variant, gamma_terminal=0.9)
         for variant in ("v2", "v4")
     }
+    q_residual_g09 = fit_q_residual_prior(df_fit, gamma_terminal=0.9)
     q_mod_joint = fit_q_td_modify_joint_prior(df_fit, gamma_terminal=0.9)
     return {
         "pf": pf,
@@ -2386,6 +2456,7 @@ def fit_all_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
         "q_no_td_modify_g09": q_no_mod_g09,
         "q_no_td_modify_g099": q_no_mod_g099,
         "q_redistribution": q_redistribution,
+        "q_residual_g09": q_residual_g09,
         "q_td_modify_joint": q_mod_joint,
     }
 
@@ -2501,6 +2572,11 @@ def main() -> Dict[str, Any]:
     for variant, prior in q_redistribution.items():
         print(f"  Q ({variant}): p={len(prior['mu_0'])}, sigma2={prior['sigma2']:.4f}")
 
+    print("Fitting residual-reward Q prior (γ̄=0.9, not q_no_td_modify_g09) ...")
+    q_residual_g09 = fit_q_residual_prior(df_fit, gamma_terminal=0.9)
+    print(f"  Q (residual): p={len(q_residual_g09['mu_0'])}, "
+          f"sigma2={q_residual_g09['sigma2']:.4f}")
+
     print("Summarizing pooled RL Q GEE coefficients ...")
     pooled_rl_q = build_pooled_rl_q_summary(df_fit)
     if pooled_rl_q.empty:
@@ -2531,6 +2607,7 @@ def main() -> Dict[str, Any]:
         "q_no_td_modify_g09":  q_no_mod_g09,
         "q_no_td_modify_g099": q_no_mod_g099,
         "q_redistribution":    q_redistribution,
+        "q_residual_g09":      q_residual_g09,
         "q_td_modify_joint":   q_mod_joint,
     }
     path = save_priors(priors)
