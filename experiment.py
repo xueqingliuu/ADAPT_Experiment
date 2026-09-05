@@ -16,6 +16,7 @@ import json
 import pickle
 from datetime import datetime
 from pathlib import Path
+from contextlib import contextmanager, nullcontext
 from functools import partial
 
 
@@ -119,6 +120,8 @@ from agents import (
     MicroQueryAgent_ModifiedTDLoss,
     MicroQueryRewardDesignAgent,
     MicroQueryResidualAgent,
+    MicroQueryPooledAgent,
+    PooledRLSVILearner,
     NeverSendAgent,
     AlwaysSendAgent,
     RandomSendAgent,
@@ -153,6 +156,7 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     SOFTMAX_TAU,
     ENSEMBLE_ACTION_MODE,
     set_action_block_include_c,
+    action_block_include_m,
 )
 from agents.ew_hat import (
     compute_Ew_hat_from_week,
@@ -1328,6 +1332,10 @@ _DUMMY_RL_STATE = {
 P_RL_MICRO = int(
     build_phi_action(0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0).shape[0]
 )
+with action_block_include_m(True):
+    P_RL_ADV_M = int(
+        build_phi_action(0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0).shape[0]
+    )
 P_RL_REWARDSHAPING = int(
     build_phi_action_rewardshaping(0.0, 0.0, _DUMMY_RL_STATE, 0, 0).shape[0]
 )
@@ -1345,7 +1353,7 @@ P_REDISRIBUTION = int(build_redistribution_phi(
 
 def _refresh_phi_dims():
     """Recompute Q dimensions after :func:`set_action_block_include_c`."""
-    global P_RL_MICRO, P_RL_REWARDSHAPING, P_RL_BOTTLENECK
+    global P_RL_MICRO, P_RL_REWARDSHAPING, P_RL_BOTTLENECK, P_RL_ADV_M
     P_RL_MICRO = int(
         build_phi_action(0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0).shape[0]
     )
@@ -1355,6 +1363,10 @@ def _refresh_phi_dims():
     P_RL_BOTTLENECK = int(
         build_phi_bottleneck(0.0, 0.0, _DUMMY_RL_STATE).shape[0]
     )
+    with action_block_include_m(True):
+        P_RL_ADV_M = int(
+            build_phi_action(0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0).shape[0]
+        )
 
 # ── RL hyperparameters (shared) ──
 # Weekly discount used by micro-query agents. V1--V6 are registered at
@@ -1473,6 +1485,15 @@ def _default_variant_q_priors():
     }
 
 
+def _default_adv_m_q_prior():
+    """Zero/identity Q for the V11 mediator-advantage map (p = P_RL_ADV_M)."""
+    return {
+        "mu_0": np.zeros(P_RL_ADV_M),
+        "Sigma_0": np.eye(P_RL_ADV_M),
+        "sigma2": 1.0,
+    }
+
+
 def _default_rl_joint_priors(p_eta, p_beta):
     """Fallback joint prior for the modified-TD-loss RLSVI agents.
 
@@ -1511,7 +1532,7 @@ def _configure_priors(params_dir=None, *, force=False):
     global nu_0_Y, Gamma_0_Y, sigma2_Y
     global nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y
     global mu_0_micro, Sigma_0_micro, sigma2_rl_micro
-    global variant_q_priors
+    global variant_q_priors, q_adv_m_g09
     global mu_0_reward, Sigma_0_reward, sigma2_reward
     global daily_mediator_priors, redistribution_priors
     global mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint
@@ -1536,6 +1557,7 @@ def _configure_priors(params_dir=None, *, force=False):
         sigma2_tilde_Y = _pf["sigma2_tilde_Y"]
         mu_0_micro, Sigma_0_micro, sigma2_rl_micro = _default_rl_priors(P_RL_MICRO)
         variant_q_priors = _default_variant_q_priors()
+        q_adv_m_g09 = _default_adv_m_q_prior()
         mu_0_reward, Sigma_0_reward, sigma2_reward = _default_rl_priors(
             P_RL_REWARDSHAPING
         )
@@ -1575,6 +1597,21 @@ def _configure_priors(params_dir=None, *, force=False):
             _setup_log(
                 "[priors] q_residual_g09 missing; residual arm uses zero/"
                 "identity Q (not q_no_td_modify_g09). Rerun est_prior.py."
+            )
+        q_adv_m_g09 = _default_adv_m_q_prior()
+        if "q_adv_m_g09" in _priors:
+            loaded_adv = _priors["q_adv_m_g09"]
+            if np.asarray(loaded_adv["mu_0"]).shape == (P_RL_ADV_M,):
+                q_adv_m_g09 = loaded_adv
+            else:
+                _setup_log(
+                    "[priors] q_adv_m_g09 has the wrong dimension; V11 uses "
+                    "zero/identity. Rerun est_prior.py."
+                )
+        else:
+            _setup_log(
+                "[priors] q_adv_m_g09 missing; V11 uses zero/identity Q "
+                "(not q_no_td_modify_g09). Rerun est_prior.py."
             )
         mu_0_reward     = _priors["mu_0_reward"]
         Sigma_0_reward  = _priors["Sigma_0_reward"]
@@ -1624,6 +1661,10 @@ def _configure_priors(params_dir=None, *, force=False):
     for name, prior in variant_q_priors.items():
         assert prior["mu_0"].shape == (P_RL_MICRO,), f"{name} Q mean has wrong dimension"
         assert prior["Sigma_0"].shape == (P_RL_MICRO, P_RL_MICRO), f"{name} Q covariance has wrong dimension"
+    assert q_adv_m_g09["mu_0"].shape == (P_RL_ADV_M,), (
+        f"V11 Q mean dim {q_adv_m_g09['mu_0'].shape} != ({P_RL_ADV_M},)"
+    )
+    assert q_adv_m_g09["Sigma_0"].shape == (P_RL_ADV_M, P_RL_ADV_M)
     for name, p in P_DAILY_MEDIATOR.items():
         assert daily_mediator_priors[name]["mu_0"].shape == (p,)
         assert daily_mediator_priors[name]["Sigma_0"].shape == (p, p)
@@ -1656,7 +1697,7 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
     global _priors_src
     global nu_0_MY, Gamma_0_MY, sigma2_MY, nu_0_Y, Gamma_0_Y, sigma2_Y
     global nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y
-    global mu_0_micro, Sigma_0_micro, sigma2_rl_micro, variant_q_priors
+    global mu_0_micro, Sigma_0_micro, sigma2_rl_micro, variant_q_priors, q_adv_m_g09
     global mu_0_reward, Sigma_0_reward, sigma2_reward
     global daily_mediator_priors, redistribution_priors
     global mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint, sigma2_Q_mtd_joint
@@ -1692,6 +1733,27 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
             f"[priors] WARNING: LOO q_residual_g09 missing for held-out "
             f"user {int(held_out_uid)}; residual arm uses zero/identity Q "
             "(not q_no_td_modify_g09)."
+        )
+    q_adv_m_g09 = _default_adv_m_q_prior()
+    if fitted.get("q_adv_m_g09"):
+        loaded_adv = fitted["q_adv_m_g09"]
+        mu_adv = np.asarray(loaded_adv["mu_0"], dtype=float)
+        if mu_adv.shape == (P_RL_ADV_M,):
+            q_adv_m_g09 = {
+                "mu_0": mu_adv,
+                "Sigma_0": np.asarray(loaded_adv["Sigma_0"], dtype=float),
+                "sigma2": float(loaded_adv["sigma2"]),
+            }
+        else:
+            _setup_log(
+                f"[priors] WARNING: LOO q_adv_m_g09 dim {mu_adv.shape} != "
+                f"({P_RL_ADV_M},) for held-out user {int(held_out_uid)}; "
+                "V11 uses zero/identity Q."
+            )
+    else:
+        _setup_log(
+            f"[priors] WARNING: LOO q_adv_m_g09 missing for held-out "
+            f"user {int(held_out_uid)}; V11 uses zero/identity Q."
         )
     for prior in variant_q_priors.values():
         prior["mu_0"] = np.asarray(prior["mu_0"], dtype=float)
@@ -1913,6 +1975,210 @@ def run_micro_query_residual(uid, seed=42, gamma_bar=0.9, params_dir=None):
     return oenv.run_episode(agent, dataset, week0_actions=week0_actions, I_hist=I_hist), oenv
 
 
+def run_micro_query_adv_m(uid, seed=42, gamma_bar=0.9, params_dir=None):
+    """Base RLSVI with the five mediator EWMAs in the advantage (V11).
+
+    Same γ̄=0.9 and weekly CAE target as V1. ``q_adv_m_g09`` when present;
+    otherwise zero/identity of the larger φ. The action-block flag is
+    restored after the episode so V1–V10 keep the original map.
+    """
+    _ensure_priors_configured(params_dir)
+    cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
+    nweek = cfg.nweek
+    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
+    dataset = EpisodeDataset(nweek)
+    q_prior = q_adv_m_g09
+    with action_block_include_m(True):
+        agent = MicroQueryAgent(
+            W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
+            mu_0_rl=q_prior["mu_0"], Sigma_0_rl=q_prior["Sigma_0"],
+            sigma2_rl=q_prior["sigma2"],
+            gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
+            target_update_C=TARGET_C,
+            nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
+            nu_0_Y=nu_0_Y, Gamma_0_Y=Gamma_0_Y, sigma2_Y=sigma2_Y,
+            nu_0_tilde_Y=nu_0_tilde_Y, Gamma_0_tilde_Y=Gamma_0_tilde_Y,
+            sigma2_tilde_Y=sigma2_tilde_Y,
+            Y_1=float(oenv.CAE_all[0]),
+            rng=np.random.default_rng(seed),
+        )
+        return oenv.run_episode(
+            agent, dataset, week0_actions=week0_actions, I_hist=I_hist
+        ), oenv
+
+
+_POOLED_Q_SALT = 910010
+_POOLED_ADV_M_SALT = 910012
+COHORT_ALGORITHMS = frozenset({
+    "rl_v10_pooled_g09",
+    "rl_v12_pooled_adv_m_g09",
+})
+
+
+def run_micro_query_pooled(uid, seed=42, gamma_bar=0.9, params_dir=None):
+    raise RuntimeError(
+        "rl_v10_pooled_g09 is week-synchronous over the experiment cohort. "
+        "The driver calls run_micro_query_pooled_cohort; do not run this "
+        "per user."
+    )
+
+
+def run_micro_query_pooled_adv_m(uid, seed=42, gamma_bar=0.9, params_dir=None):
+    raise RuntimeError(
+        "rl_v12_pooled_adv_m_g09 is week-synchronous over the experiment "
+        "cohort. The driver calls run_micro_query_pooled_cohort("
+        "include_m=True); do not run this per user."
+    )
+
+
+def _walk_rl_days(oenv, agent, dataset, k, I_w, days):
+    for d in days:
+        for t in range(oenv.K):
+            d_global = oenv._day_idx(k, d)
+            step_idx = oenv._step_idx(k, d, t)
+            oenv._ensure_day_started(k, d, d_global)
+            oenv._generate_prior2hour_for_slot(k, d, t, d_global, step_idx)
+            state = make_state(oenv.get_context(k, d, t))
+            A_wdt, pi_A = agent.act(k, d, t, state)
+            dataset.record_walking(k, d, t, state, A_wdt, pi_A)
+            oenv.step_action(k, d, t, A_wdt, I_w)
+
+
+@contextmanager
+def _member_env_rng(rd_states, idx):
+    """Restore one member's legacy ``rd`` stream, then save it on exit.
+
+    ``vani_env`` draws from the global ``numpy.random`` state seeded in
+    ``OnlineEnv.__init__``. The sequential runner gives each (seed, draw)
+    a contiguous stream. The cohort loop must swap that saved state around
+    every env segment so members stay CRN-paired with the other arms.
+    ``learner.refit`` does not touch ``rd``.
+    """
+    rd.set_state(rd_states[idx])
+    try:
+        yield
+    finally:
+        rd_states[idx] = rd.get_state()
+
+
+def run_micro_query_pooled_cohort(
+    uids, exp_seed, params_dir=None, prior_mode="saved", gamma_bar=0.9,
+    include_m=False,
+):
+    """Week-synchronous pooled Q over the experiment cohort (V10 / V12).
+
+    ``include_m=False`` is V10 (same φ as V1, ``q_no_td_modify_g09``).
+    ``include_m=True`` is V12 (V11 φ, ``q_adv_m_g09`` or zeros).
+
+    ``prior_mode='loo'`` still gives each user their LOO *PF* prior. The
+    shared Q is the experiment-level prior above.
+
+    Each member keeps its own legacy ``rd`` state so environment noise is
+    the same contiguous stream the sequential runner would have drawn at
+    that (exp_seed, draw). Week-start, day-0, and days-1–5+finalize swap
+    that state in; ``learner.refit`` does not.
+    """
+    _ensure_priors_configured(params_dir)
+    src = q_adv_m_g09 if include_m else variant_q_priors["g09"]
+    q_prior = {
+        "mu_0": np.asarray(src["mu_0"], dtype=float).copy(),
+        "Sigma_0": np.asarray(src["Sigma_0"], dtype=float).copy(),
+        "sigma2": float(src["sigma2"]),
+    }
+    pooled_salt = _POOLED_ADV_M_SALT if include_m else _POOLED_Q_SALT
+    m_ctx = action_block_include_m(True) if include_m else nullcontext()
+    with m_ctx:
+        return _run_micro_query_pooled_cohort_body(
+            uids, exp_seed, q_prior, prior_mode=prior_mode,
+            params_dir=params_dir, gamma_bar=gamma_bar,
+            pooled_salt=pooled_salt,
+        )
+
+
+def _run_micro_query_pooled_cohort_body(
+    uids, exp_seed, q_prior, *, prior_mode, params_dir, gamma_bar, pooled_salt,
+):
+    learner = PooledRLSVILearner(
+        mu_0_rl=q_prior["mu_0"],
+        Sigma_0_rl=q_prior["Sigma_0"],
+        sigma2_rl=q_prior["sigma2"],
+        gamma_dt=_gamma_dt_micro(gamma_bar),
+        gamma_bar=gamma_bar,
+        B=B_ENSEMBLES,
+        target_update_C=TARGET_C,
+        rng=np.random.default_rng(
+            np.random.SeedSequence([int(exp_seed), int(pooled_salt)])
+        ),
+    )
+
+    members = []
+    rd_states = []
+    for draw_idx, uid in enumerate(uids):
+        uid = int(uid)
+        if prior_mode == "loo":
+            configure_leave_one_out_priors(uid, params_dir=params_dir)
+        draw_seed = _episode_seed(exp_seed, draw_idx)
+        cfg, env, oenv = _make_online_env(uid, seed=draw_seed, params_dir=params_dir)
+        nweek = cfg.nweek
+        week0_actions, I_hist = shared_episode_exogenous(draw_seed, nweek)
+        dataset = EpisodeDataset(nweek)
+        dataset.I_hist[:] = np.asarray(I_hist, dtype=int)
+        agent = MicroQueryPooledAgent(
+            learner,
+            W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
+            mu_0_rl=q_prior["mu_0"], Sigma_0_rl=q_prior["Sigma_0"],
+            sigma2_rl=q_prior["sigma2"],
+            gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
+            target_update_C=TARGET_C,
+            nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
+            nu_0_Y=nu_0_Y, Gamma_0_Y=Gamma_0_Y, sigma2_Y=sigma2_Y,
+            nu_0_tilde_Y=nu_0_tilde_Y, Gamma_0_tilde_Y=Gamma_0_tilde_Y,
+            sigma2_tilde_Y=sigma2_tilde_Y,
+            Y_1=float(oenv.CAE_all[0]),
+            rng=np.random.default_rng(draw_seed),
+        )
+        agent.reset(dataset, week0_actions=week0_actions)
+        pf = ParticleFilterRuntime(agent, dataset, agent.rng)
+        oenv._reset_episode_state()
+        rd_states.append(rd.get_state())
+        members.append((agent, dataset, oenv, pf, nweek))
+
+    nweek = members[0][4]
+    for k in range(nweek):
+        iw_by_member = []
+        for i, (agent, dataset, oenv, pf, _) in enumerate(members):
+            with _member_env_rng(rd_states, i):
+                packet = oenv.get_week_packet(k)
+                dataset.record_week_start(
+                    k, make_state(oenv.get_context(k, QUERY_D, QUERY_T))
+                )
+                I_w = agent.begin_week(k, packet)
+                pf.update_standard(k, packet, I_w)
+                oenv.start_week(k, I_w)
+                agent.prepare_week(k)
+            iw_by_member.append(I_w)
+        for i, ((agent, dataset, oenv, pf, _), I_w) in enumerate(
+            zip(members, iw_by_member)
+        ):
+            with _member_env_rng(rd_states, i):
+                _walk_rl_days(oenv, agent, dataset, k, I_w, days=(0,))
+        learner.refit(k, [m[0] for m in members])
+        for i, ((agent, dataset, oenv, pf, _), I_w) in enumerate(
+            zip(members, iw_by_member)
+        ):
+            agent.update_rlsvi(k)
+            with _member_env_rng(rd_states, i):
+                _walk_rl_days(oenv, agent, dataset, k, I_w, days=range(1, N_RL_DAYS))
+                oenv._finalize_week(k)
+                full_ctx = oenv.get_context(k, N_RL_DAYS, 0)
+                dataset.record_full_week_mediators(k, full_ctx["M_Y"], full_ctx["M_E"])
+
+    return [
+        (agent.results(dataset), oenv)
+        for agent, dataset, oenv, _pf, _nweek in members
+    ]
+
+
 def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.5,
                                    params_dir=None, engagement_bonus=None,
                                    engagement_rho=None):
@@ -2058,7 +2324,8 @@ def run_random_send(uid, seed=42, params_dir=None):
 
 
 # Algorithm registry: V1--V6 at γ̄=0.9, V7/V8 base-discount sensitivities,
-# V9 residual CAE (AR control variate), then the three fixed-policy baselines.
+# V9 residual CAE, V10 pooled Q, V11 mediator advantage, V12 = V10+V11,
+# then baselines.
 ALGORITHMS = {
     "rl_v1_base_g09": (partial(run_micro_query, gamma_bar=0.9), "RL base (γ̄=0.9)"),
     "rl_v2_mtd_g09": (partial(run_micro_query_mtd, gamma_bar=0.9), "RL + bottleneck TD (γ̄=0.9)"),
@@ -2071,6 +2338,18 @@ ALGORITHMS = {
     "rl_v9_residual_g09": (
         partial(run_micro_query_residual, gamma_bar=0.9),
         "RL residual CAE (γ̄=0.9)",
+    ),
+    "rl_v10_pooled_g09": (
+        partial(run_micro_query_pooled, gamma_bar=0.9),
+        "RL pooled cohort (γ̄=0.9)",
+    ),
+    "rl_v11_adv_m_g09": (
+        partial(run_micro_query_adv_m, gamma_bar=0.9),
+        "RL mediator advantage (γ̄=0.9)",
+    ),
+    "rl_v12_pooled_adv_m_g09": (
+        partial(run_micro_query_pooled_adv_m, gamma_bar=0.9),
+        "RL pooled + mediator advantage (γ̄=0.9)",
     ),
     "never_send":   (run_never_send,  "Never send (π_A=0)"),
     "always_send":  (run_always_send, "Always send (π_A=1)"),
@@ -2311,6 +2590,24 @@ if __name__ == "__main__":
             pf_runs[name].append([])
             oenv_runs[name].append([])
 
+        cohort_cache = {}
+        for name, include_m, label in (
+            ("rl_v10_pooled_g09", False, "pooled V10"),
+            ("rl_v12_pooled_adv_m_g09", True, "pooled V12 (adv M)"),
+        ):
+            if name not in ALGORITHMS:
+                continue
+            print(
+                f"  Experiment {exp_idx}: {label} over "
+                f"{len(sampled_uids)} cohort slots ...",
+                flush=True,
+            )
+            cohort_cache[name] = run_micro_query_pooled_cohort(
+                sampled_uids, seed, params_dir=params_dir,
+                prior_mode=args.prior_mode, gamma_bar=0.9,
+                include_m=include_m,
+            )
+
         for draw_idx, uid in enumerate(sampled_uids):
             uid = int(uid)
             if args.prior_mode == "loo":
@@ -2324,7 +2621,10 @@ if __name__ == "__main__":
 
             summary_parts = []
             for name, (runner, _label) in ALGORITHMS.items():
-                res, oenv = runner(uid, seed=draw_seed, params_dir=params_dir)
+                if name in cohort_cache:
+                    res, oenv = cohort_cache[name][draw_idx]
+                else:
+                    res, oenv = runner(uid, seed=draw_seed, params_dir=params_dir)
                 snap = _snapshot_oenv(oenv)
                 if _save_trajectories_for_algo(save_mode, name):
                     oenv_runs[name][exp_idx].append(snap)

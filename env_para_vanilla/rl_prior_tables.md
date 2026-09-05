@@ -326,6 +326,36 @@
 | RL | q_residual_g09 | beta | 22 | A*active_status_fraction_7days | 0.001345 | 0.002455 |
 | RL | q_residual_g09 | beta | 23 | A*recent_burden | -0.004642 | 0.000536 |
 | RL | q_residual_g09 | beta | 24 | A*walk_interaction_7d | -0.009297 | 0.003731 |
+| RL | q_adv_m_g09 | beta | 0 | intercept | 0.141432 | 0.147616 |
+| RL | q_adv_m_g09 | beta | 1 | weekday_vs_weekend | -0.047913 | 0.245919 |
+| RL | q_adv_m_g09 | beta | 2 | slot_pm | 0.001038 | 0.007739 |
+| RL | q_adv_m_g09 | beta | 3 | E_w | 0.037671 | 0.073417 |
+| RL | q_adv_m_g09 | beta | 4 | b_hat | 1.564204 | 0.068274 |
+| RL | q_adv_m_g09 | beta | 5 | b_tilde | 0.000000 | 1.000000 |
+| RL | q_adv_m_g09 | beta | 6 | M_Y_anticipated_affect_ewma | 0.474969 | 0.017800 |
+| RL | q_adv_m_g09 | beta | 7 | M_Y_fourSC_ewma | -0.032645 | 0.012939 |
+| RL | q_adv_m_g09 | beta | 8 | M_E_pageview_ewma | 0.006149 | 0.000918 |
+| RL | q_adv_m_g09 | beta | 9 | M_E_fitbit_wear_ewma | -0.215130 | 0.009712 |
+| RL | q_adv_m_g09 | beta | 10 | M_E_survey_complete_ewma | -0.046662 | 0.007496 |
+| RL | q_adv_m_g09 | beta | 11 | yesterday_step_count | -0.000270 | 0.002599 |
+| RL | q_adv_m_g09 | beta | 12 | prior2hour_step_count | -0.015896 | 0.000727 |
+| RL | q_adv_m_g09 | beta | 13 | active_status_fraction_7days | 0.022077 | 0.049175 |
+| RL | q_adv_m_g09 | beta | 14 | recent_burden | -0.015672 | 0.005577 |
+| RL | q_adv_m_g09 | beta | 15 | walk_interaction_7d | -0.083290 | 0.045583 |
+| RL | q_adv_m_g09 | beta | 16 | A | 0.010379 | 0.004656 |
+| RL | q_adv_m_g09 | beta | 17 | A*E_w | 0.004200 | 0.004314 |
+| RL | q_adv_m_g09 | beta | 18 | A*b_hat | -0.010706 | 0.004358 |
+| RL | q_adv_m_g09 | beta | 19 | A*b_tilde | 0.000000 | 1.000000 |
+| RL | q_adv_m_g09 | beta | 20 | A*yesterday_step_count | -0.006467 | 0.004421 |
+| RL | q_adv_m_g09 | beta | 21 | A*prior2hour_step_count | 0.009972 | 0.001332 |
+| RL | q_adv_m_g09 | beta | 22 | A*active_status_fraction_7days | -0.022009 | 0.003635 |
+| RL | q_adv_m_g09 | beta | 23 | A*recent_burden | -0.004645 | 0.001697 |
+| RL | q_adv_m_g09 | beta | 24 | A*walk_interaction_7d | 0.021339 | 0.005266 |
+| RL | q_adv_m_g09 | beta | 25 | A*M_Y_anticipated_affect_ewma | 0.048905 | 0.004105 |
+| RL | q_adv_m_g09 | beta | 26 | A*M_Y_fourSC_ewma | 0.002289 | 0.003592 |
+| RL | q_adv_m_g09 | beta | 27 | A*M_E_pageview_ewma | -0.002330 | 0.001095 |
+| RL | q_adv_m_g09 | beta | 28 | A*M_E_fitbit_wear_ewma | -0.018684 | 0.002189 |
+| RL | q_adv_m_g09 | beta | 29 | A*M_E_survey_complete_ewma | -0.038874 | 0.004956 |
 
 ## Joint Modified-TD Priors
 

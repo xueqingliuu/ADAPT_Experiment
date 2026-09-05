@@ -47,6 +47,9 @@ markers = {
     "rl_v7_base_g05": "o-",
     "rl_v8_base_g099": "o--",
     "rl_v9_residual_g09": "P-",
+    "rl_v10_pooled_g09": "X--",
+    "rl_v11_adv_m_g09": "P:",
+    "rl_v12_pooled_adv_m_g09": "X:",
     "never_send": "x-",
     "always_send": "*-",
     "random_send": "+-",
@@ -702,14 +705,14 @@ def write_summary(stats, kind, suffix, *, out):
     lines.append("=" * sep_w)
     lines.append("".join(f"{h:>{col_w}}" for h in headers))
     lines.append("-" * sep_w)
-    lines.append("".join([f"{'Mean CAE (all weeks)':>{col_w}}"] +
+    lines.append("".join([f"{'Mean CAE (weeks 1–36)':>{col_w}}"] +
                  [f"{np.nanmean(all_cae[n]):>{col_w}.4f}" for n in names]))
     lines.append("".join([f"{'SE CAE (across reps)':>{col_w}}"] +
                  [f"{_se_across_replications_scalar(all_cae[n]):>{col_w}.4f}"
                   for n in names]))
     lines.append("".join([f"{'Mean CAE (week 3+)':>{col_w}}"] +
                  [f"{np.nanmean(all_cae[n][..., 2:]):>{col_w}.4f}" for n in names]))
-    lines.append("".join([f"{'Median CAE (all wks)':>{col_w}}"] +
+    lines.append("".join([f"{'Median CAE (weeks 1–36)':>{col_w}}"] +
                  [f"{np.nanmedian(all_cae[n]):>{col_w}.4f}" for n in names]))
     lines.append("".join([f"{'25th pct CAE (pooled)':>{col_w}}"] +
                  [f"{np.nanpercentile(all_cae[n], 25):>{col_w}.4f}" for n in names]))
@@ -777,6 +780,9 @@ def main() -> None:
     labels["rl_v7_base_g05"] = "RL base (\u03b3\u0304=0.5)"
     labels["rl_v8_base_g099"] = "RL base (\u03b3\u0304=0.99)"
     labels["rl_v9_residual_g09"] = "RL residual CAE (\u03b3\u0304=0.9)"
+    labels["rl_v10_pooled_g09"] = "RL pooled cohort (\u03b3\u0304=0.9)"
+    labels["rl_v11_adv_m_g09"] = "RL mediator advantage (\u03b3\u0304=0.9)"
+    labels["rl_v12_pooled_adv_m_g09"] = "RL pooled + mediator advantage (\u03b3\u0304=0.9)"
     nweek = cfg["nweek"]
     params_dir = resolve_denorm_params_dir(
         cfg.get("params_dir"), cli_params_dir=args.params_dir
@@ -841,7 +847,12 @@ def main() -> None:
         if latent_available and latent_parts:
             all_cae_latent_full[name] = np.concatenate(latent_parts, axis=0)
 
-        print(name, "CAE shape:", all_cae_noisy_full[name].shape)
+        shape = all_cae_noisy_full[name].shape
+        print(
+            f"{name} CAE shape: {shape} "
+            "(index 0 = pre-RL baseline, excluded from averages; "
+            f"{shape[-1] - 1} simulated weeks)"
+        )
 
     sample = next(iter(all_cae_noisy_full.values()), None)
     n_exp = int(sample.shape[0]) if sample is not None else 0

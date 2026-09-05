@@ -45,6 +45,8 @@ RL Q (no TD modify, beta)       -> mu_0_micro, Sigma_0_micro, sigma2_rl_micro
    q_no_td_modify_g099             (gamma_terminal=0.99; V8)
    q_residual_g09                  (gamma_terminal=0.9; residual CAE
                                     R_w = Y_w − ρ̂_w Y_{w−1}; V9)
+   q_adv_m_g09                     (gamma_terminal=0.9; V11 / V12, five
+                                    mediator EWMAs in the advantage)
 
 RL Q joint (eta, beta) for      -> mu_0_micro_mtd_joint,
    modified-TD-loss RLSVI          Sigma_0_micro_mtd_joint (FULL cov),
@@ -1627,6 +1629,16 @@ def _residualize_q_features(feats: Dict[str, Any], b_hat_start: np.ndarray) -> D
     return out
 
 
+def fit_q_adv_m_prior(df_fit: pd.DataFrame, *, gamma_terminal: float = 0.9) -> Dict[str, Any]:
+    """FQI prior for V11 (mediator EWMAs in the advantage).
+
+    Same weekly CAE targets as ``q_no_td_modify_g09``; φ is the larger map.
+    """
+    from algorithm_helpers import action_block_include_m
+    with action_block_include_m(True):
+        return fit_q_prior(df_fit, gamma_terminal=gamma_terminal)
+
+
 def fit_q_residual_prior(df_fit: pd.DataFrame, *, gamma_terminal: float = 0.9) -> Dict[str, Any]:
     """FQI prior for the residual-reward arm (not ``q_no_td_modify_g09``).
 
@@ -1935,6 +1947,9 @@ def _phi_action_names() -> list[str]:
         "A*b_hat",
         "A*b_tilde",
     ] + [f"A*{name}" for name in _rl_context_names()]
+    from algorithm_helpers import ACTION_BLOCK_INCLUDE_M
+    if ACTION_BLOCK_INCLUDE_M:
+        action_context += [f"A*{name}" for name in _rl_my_names() + _rl_me_names()]
     return _phi_state_names() + action_context
 
 
@@ -2016,6 +2031,14 @@ def save_split_rl_prior_files(
         rl_q_payload["q_residual_g09"] = {
             "model": "q_residual_g09", "block": "beta",
             "feature_names": _phi_action_names(), **priors["q_residual_g09"],
+        }
+    if "q_adv_m_g09" in priors:
+        from algorithm_helpers import action_block_include_m
+        with action_block_include_m(True):
+            adv_names = _phi_action_names()
+        rl_q_payload["q_adv_m_g09"] = {
+            "model": "q_adv_m_g09", "block": "beta",
+            "feature_names": adv_names, **priors["q_adv_m_g09"],
         }
 
     with open(reward_path, "w", encoding="utf-8") as f:
@@ -2149,6 +2172,16 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
             prior_family="RL", model="q_residual_g09", block="beta",
             mean=q_resid.get("mu_0"), cov=q_resid.get("Sigma_0"),
             names=_phi_action_names(),
+        ))
+    q_adv = priors.get("q_adv_m_g09")
+    if q_adv is not None:
+        from algorithm_helpers import action_block_include_m
+        with action_block_include_m(True):
+            adv_names = _phi_action_names()
+        rl_rows.extend(_summary_rows(
+            prior_family="RL", model="q_adv_m_g09", block="beta",
+            mean=q_adv.get("mu_0"), cov=q_adv.get("Sigma_0"),
+            names=adv_names,
         ))
 
     joint_rows: list[dict[str, Any]] = []
@@ -2354,6 +2387,7 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
     qn_g099 = raw.get("q_no_td_modify_g099")
     q_redistribution = raw.get("q_redistribution")
     q_residual = raw.get("q_residual_g09")
+    q_adv_m = raw.get("q_adv_m_g09")
     qj = raw.get("q_td_modify_joint")
     redistribution = raw.get("reward_redistribution")
 
@@ -2397,6 +2431,12 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
             "mu_0": arr(q_residual["mu_0"]),
             "Sigma_0": arr(q_residual["Sigma_0"]),
             "sigma2": float(q_residual["sigma2"]),
+        }
+    if q_adv_m is not None:
+        out["q_adv_m_g09"] = {
+            "mu_0": arr(q_adv_m["mu_0"]),
+            "Sigma_0": arr(q_adv_m["Sigma_0"]),
+            "sigma2": float(q_adv_m["sigma2"]),
         }
     if redistribution is not None:
         out["daily_mediator_priors"] = {
@@ -2447,6 +2487,7 @@ def fit_all_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
         for variant in ("v2", "v4")
     }
     q_residual_g09 = fit_q_residual_prior(df_fit, gamma_terminal=0.9)
+    q_adv_m_g09 = fit_q_adv_m_prior(df_fit, gamma_terminal=0.9)
     q_mod_joint = fit_q_td_modify_joint_prior(df_fit, gamma_terminal=0.9)
     return {
         "pf": pf,
@@ -2457,6 +2498,7 @@ def fit_all_priors(df_fit: pd.DataFrame) -> Dict[str, Any]:
         "q_no_td_modify_g099": q_no_mod_g099,
         "q_redistribution": q_redistribution,
         "q_residual_g09": q_residual_g09,
+        "q_adv_m_g09": q_adv_m_g09,
         "q_td_modify_joint": q_mod_joint,
     }
 
@@ -2577,6 +2619,11 @@ def main() -> Dict[str, Any]:
     print(f"  Q (residual): p={len(q_residual_g09['mu_0'])}, "
           f"sigma2={q_residual_g09['sigma2']:.4f}")
 
+    print("Fitting mediator-advantage Q prior (γ̄=0.9, V11) ...")
+    q_adv_m_g09 = fit_q_adv_m_prior(df_fit, gamma_terminal=0.9)
+    print(f"  Q (adv M): p={len(q_adv_m_g09['mu_0'])}, "
+          f"sigma2={q_adv_m_g09['sigma2']:.4f}")
+
     print("Summarizing pooled RL Q GEE coefficients ...")
     pooled_rl_q = build_pooled_rl_q_summary(df_fit)
     if pooled_rl_q.empty:
@@ -2608,6 +2655,7 @@ def main() -> Dict[str, Any]:
         "q_no_td_modify_g099": q_no_mod_g099,
         "q_redistribution":    q_redistribution,
         "q_residual_g09":      q_residual_g09,
+        "q_adv_m_g09":         q_adv_m_g09,
         "q_td_modify_joint":   q_mod_joint,
     }
     path = save_priors(priors)

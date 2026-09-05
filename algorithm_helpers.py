@@ -1,5 +1,6 @@
 import numpy as np
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -29,6 +30,9 @@ def _env_flag(name, default=True):
 # state features). Call :func:`set_action_block_include_c` before building
 # phi / priors so the dimension stays consistent.
 ACTION_BLOCK_INCLUDE_C = _env_flag("ACTION_BLOCK_C", True)
+# When True, also append the five mediator EWMAs to the action block so they
+# enter Q(s,1)−Q(s,0). Default off (V1–V10). V11 enables this in-process.
+ACTION_BLOCK_INCLUDE_M = _env_flag("ACTION_BLOCK_M", False)
 
 
 def set_action_block_include_c(include_c):
@@ -36,12 +40,32 @@ def set_action_block_include_c(include_c):
     ACTION_BLOCK_INCLUDE_C = bool(include_c)
 
 
-def action_interact_vec(E_w, b_hat, b_tilde, C_dt):
-    """Action-interaction features ``[1, E_w, b_hat, b_tilde]`` (+ ``C``)."""
-    core = np.array([1.0, float(E_w), float(b_hat), float(b_tilde)], dtype=float)
+def set_action_block_include_m(include_m):
+    global ACTION_BLOCK_INCLUDE_M
+    ACTION_BLOCK_INCLUDE_M = bool(include_m)
+
+
+@contextmanager
+def action_block_include_m(enabled=True):
+    """Temporarily put mediator EWMAs in the advantage (V11)."""
+    prev = ACTION_BLOCK_INCLUDE_M
+    set_action_block_include_m(enabled)
+    try:
+        yield
+    finally:
+        set_action_block_include_m(prev)
+
+
+def action_interact_vec(E_w, b_hat, b_tilde, C_dt, M_ewma=None):
+    """Action-interaction features ``[1, E_w, b_hat, b_tilde]`` (+ ``C``, + ``M``)."""
+    parts = [np.array([1.0, float(E_w), float(b_hat), float(b_tilde)], dtype=float)]
     if ACTION_BLOCK_INCLUDE_C:
-        return np.concatenate([core, np.asarray(C_dt, dtype=float).ravel()])
-    return core
+        parts.append(np.asarray(C_dt, dtype=float).ravel())
+    if ACTION_BLOCK_INCLUDE_M:
+        if M_ewma is None:
+            raise ValueError("ACTION_BLOCK_INCLUDE_M requires M_ewma")
+        parts.append(np.asarray(M_ewma, dtype=float).ravel())
+    return np.concatenate(parts)
 
 
 def spd_inverse(A):
@@ -1956,8 +1980,9 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
 
     phi = [1, d_n, t_n, E_w, b_hat, b_tilde]
         ⌢ [M_ewma (AA, SC, PV, FW, PJ), C_{w,d,t}]
-        ⌢ A * [1, E_w, b_hat, b_tilde]            if ACTION_BLOCK_INCLUDE_C=0
-        ⌢ A * [1, E_w, b_hat, b_tilde, C_{w,d,t}]  otherwise
+        ⌢ A * [1, E_w, b_hat, b_tilde]            if no C / M in the block
+        ⌢ A * [1, E_w, b_hat, b_tilde, C]         default
+        ⌢ A * [1, E_w, b_hat, b_tilde, C, M]      if ACTION_BLOCK_INCLUDE_M
 
     ``d_n`` / ``t_n`` come from :func:`_time_features`. Raw ``d`` / ``t``
     select which past mediators enter the EWMA.
@@ -1981,8 +2006,11 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
     """
     E_w = state['E_w']
     C_dt = np.asarray(state['C']).ravel()
+    M_ewma = summarize_mediators_ewma(state['M_Y'], state['M_E'], d, t)
     state_part = build_phi_state(state, d, t, b_hat=b_hat, b_tilde=b_tilde)
-    action_block = float(action) * action_interact_vec(E_w, b_hat, b_tilde, C_dt)
+    action_block = float(action) * action_interact_vec(
+        E_w, b_hat, b_tilde, C_dt, M_ewma=M_ewma,
+    )
     return np.concatenate([state_part, action_block])
 
 def build_phi_action_rewardshaping(b_hat, b_tilde, state, d, t):
@@ -2992,7 +3020,7 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
         1.0, d_feat, t_feat, E_w, b_hat, b_tilde,
     ])
     med_ctx = np.concatenate([M_ewma, C_dt_eff])
-    interact = action_interact_vec(E_w, b_hat, b_tilde, C_dt_eff)
+    interact = action_interact_vec(E_w, b_hat, b_tilde, C_dt_eff, M_ewma=M_ewma)
     if action == 1:
         query_block = interact if is_query else np.zeros_like(interact)
         walk_block = np.zeros_like(interact) if is_query else interact
