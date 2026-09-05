@@ -1559,14 +1559,18 @@ class Env:
         """Draw interaction with a delivered activity suggestion.
 
         ``A = 0`` means no suggestion was sent, so the interaction event is 0.
+        Residual and Bernoulli draws still run so two policies that first
+        differ on A stay on the same global ``numpy.random`` stream
+        (same idea as ``gen_pageview`` intensity noise).
         """
-        if float(Ah) == 0.0:
-            return 0.0
         eta = self.gen_ws_interaction_mean(s, return_logit=True)
         base_p = self._sigmoid(eta)
         noise = self._sample_noise(self.cfg.resid_ws_interaction, step_idx, name="ws_interaction")
         p = float(np.clip(base_p + noise, *self.cfg.limits_ws_interaction))
-        return float(rd.binomial(1, p))
+        draw = float(rd.binomial(1, p))
+        if float(Ah) == 0.0:
+            return 0.0
+        return draw
 
     def gen_fourSC_mean(self, s, Ah):
         """

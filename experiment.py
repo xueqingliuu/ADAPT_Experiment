@@ -16,7 +16,6 @@ import json
 import pickle
 from datetime import datetime
 from pathlib import Path
-from contextlib import contextmanager, nullcontext
 from functools import partial
 
 
@@ -120,8 +119,6 @@ from agents import (
     MicroQueryAgent_ModifiedTDLoss,
     MicroQueryRewardDesignAgent,
     MicroQueryResidualAgent,
-    MicroQueryPooledAgent,
-    PooledRLSVILearner,
     NeverSendAgent,
     AlwaysSendAgent,
     RandomSendAgent,
@@ -157,6 +154,9 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     ENSEMBLE_ACTION_MODE,
     set_action_block_include_c,
     action_block_include_m,
+    pad_q_prior_action_time,
+    pad_joint_prior_action_time,
+    pad_prior_append,
 )
 from agents.ew_hat import (
     compute_Ew_hat_from_week,
@@ -1444,8 +1444,10 @@ def _save_trajectories_for_algo(save_mode, algo_name):
 # ──────────────────────────────────────────────────────────────────
 # Load priors estimated from df_fit (``<params_dir>/rl_priors.json``).
 # Run ``python est_prior.py`` to (re)generate vanilla priors, or copy/regenerate
-# the priors into the selected parameter folder. If the file is missing (or
-# USE_ESTIMATED_PRIORS=0 is set) we fall back to zero / identity placeholders.
+# the priors into the selected parameter folder. Zero / identity placeholders
+# are used only when USE_ESTIMATED_PRIORS=0. A requested estimated-prior load
+# (missing file, ImportError from est_prior/statsmodels, corrupt JSON) raises
+# instead of silently installing zeros for PF and Q.
 # ──────────────────────────────────────────────────────────────────
 def _default_pf_priors():
     return {
@@ -1494,6 +1496,38 @@ def _default_adv_m_q_prior():
     }
 
 
+def _coerce_q_prior(prior, expected_p, label):
+    """Pad a saved Q prior when it predates A×[weekday, slot_pm]."""
+    mu, Sig = pad_q_prior_action_time(prior["mu_0"], prior["Sigma_0"], expected_p)
+    out = {
+        "mu_0": mu,
+        "Sigma_0": Sig,
+        "sigma2": float(prior.get("sigma2", 1.0)),
+    }
+    if int(np.asarray(prior["mu_0"]).ravel().size) != int(expected_p):
+        _setup_log(
+            f"[priors] padded {label} with zero A×[weekday,slot] "
+            f"({np.asarray(prior['mu_0']).ravel().size} → {expected_p})"
+        )
+    return out
+
+
+def _coerce_daily_mediator_prior(prior, expected_p, label):
+    """Pad a saved Stage-1 prior when it predates A×slot_pm."""
+    mu, Sig = pad_prior_append(prior["mu_0"], prior["Sigma_0"], expected_p)
+    out = {
+        "mu_0": mu,
+        "Sigma_0": Sig,
+        "sigma2": float(prior.get("sigma2", 1.0)),
+    }
+    if int(np.asarray(prior["mu_0"]).ravel().size) != int(expected_p):
+        _setup_log(
+            f"[priors] padded {label} with zero A×slot_pm "
+            f"({np.asarray(prior['mu_0']).ravel().size} → {expected_p})"
+        )
+    return out
+
+
 def _default_rl_joint_priors(p_eta, p_beta):
     """Fallback joint prior for the modified-TD-loss RLSVI agents.
 
@@ -1512,17 +1546,32 @@ _LOO_PRIOR_CACHE = {}
 
 
 def _load_priors(params_dir=None):
-    """Try selected-dir ``rl_priors.json``; fall back to defaults on miss."""
+    """Load ``rl_priors.json`` when estimated priors were requested.
+
+    ``USE_ESTIMATED_PRIORS=0`` returns ``(None, reason)`` so the caller
+    installs zero / identity defaults. ``USE_ESTIMATED_PRIORS=1`` must
+    succeed; failures raise and do not fall back.
+    """
     if os.getenv("USE_ESTIMATED_PRIORS", "0") == "0":
         return None, "USE_ESTIMATED_PRIORS=0 -> defaults"
+    prior_path = resolve_params_dir(params_dir) / "rl_priors.json"
+    if not prior_path.exists():
+        raise FileNotFoundError(
+            f"USE_ESTIMATED_PRIORS=1 but {prior_path} was not found. "
+            "Refusing silent zero/identity fallback (PF and Q). "
+            "Generate or copy rl_priors.json, or set USE_ESTIMATED_PRIORS=0."
+        )
     try:
         from est_prior import load_estimated_priors
-        prior_path = resolve_params_dir(params_dir) / "rl_priors.json"
-        if not prior_path.exists():
-            return None, f"{prior_path} not found"
         return load_estimated_priors(prior_path), str(prior_path)
-    except Exception as exc:  # noqa: BLE001 - any failure -> safe fallback
-        return None, f"load_estimated_priors failed: {exc!r}"
+    except Exception as exc:
+        raise RuntimeError(
+            f"USE_ESTIMATED_PRIORS=1 but loading estimated priors from "
+            f"{prior_path} failed ({exc!r}). Refusing silent zero/identity "
+            "fallback for PF and Q. Install missing dependencies (often "
+            "statsmodels, imported by est_prior) or set "
+            "USE_ESTIMATED_PRIORS=0 if zeros were intended."
+        ) from exc
 
 
 def _configure_priors(params_dir=None, *, force=False):
@@ -1579,20 +1628,35 @@ def _configure_priors(params_dir=None, *, force=False):
         sigma2_tilde_Y = _priors["sigma2_tilde_Y"]
         # Q prior used by the base and reward-design RL variants
         # (no TD-modify variant).
-        mu_0_micro      = _priors["mu_0_micro"]
-        Sigma_0_micro   = _priors["Sigma_0_micro"]
+        mu_0_micro, Sigma_0_micro = pad_q_prior_action_time(
+            _priors["mu_0_micro"], _priors["Sigma_0_micro"], P_RL_MICRO,
+        )
         sigma2_rl_micro = _priors["sigma2_rl_micro"]
+        if int(np.asarray(_priors["mu_0_micro"]).ravel().size) != P_RL_MICRO:
+            _setup_log(
+                f"[priors] padded mu_0_micro with zero A×[weekday,slot] "
+                f"({np.asarray(_priors['mu_0_micro']).ravel().size} → {P_RL_MICRO})"
+            )
         variant_q_priors = _default_variant_q_priors()
         if "q_no_td_modify_g09" in _priors:
-            variant_q_priors["g09"] = _priors["q_no_td_modify_g09"]
+            variant_q_priors["g09"] = _coerce_q_prior(
+                _priors["q_no_td_modify_g09"], P_RL_MICRO, "q_no_td_modify_g09",
+            )
         if "q_no_td_modify_g099" in _priors:
-            variant_q_priors["g099"] = _priors["q_no_td_modify_g099"]
+            variant_q_priors["g099"] = _coerce_q_prior(
+                _priors["q_no_td_modify_g099"], P_RL_MICRO, "q_no_td_modify_g099",
+            )
         if "q_redistribution" in _priors:
-            variant_q_priors.update(_priors["q_redistribution"])
+            variant_q_priors.update({
+                name: _coerce_q_prior(prior, P_RL_MICRO, f"q_redistribution.{name}")
+                for name, prior in _priors["q_redistribution"].items()
+            })
         else:
             _setup_log("[priors] variant-specific Q priors missing; V2/V4 and gamma=0.9 use zero/identity fallback (rerun est_prior.py).")
         if "q_residual_g09" in _priors:
-            variant_q_priors["residual"] = _priors["q_residual_g09"]
+            variant_q_priors["residual"] = _coerce_q_prior(
+                _priors["q_residual_g09"], P_RL_MICRO, "q_residual_g09",
+            )
         else:
             _setup_log(
                 "[priors] q_residual_g09 missing; residual arm uses zero/"
@@ -1600,10 +1664,11 @@ def _configure_priors(params_dir=None, *, force=False):
             )
         q_adv_m_g09 = _default_adv_m_q_prior()
         if "q_adv_m_g09" in _priors:
-            loaded_adv = _priors["q_adv_m_g09"]
-            if np.asarray(loaded_adv["mu_0"]).shape == (P_RL_ADV_M,):
-                q_adv_m_g09 = loaded_adv
-            else:
+            try:
+                q_adv_m_g09 = _coerce_q_prior(
+                    _priors["q_adv_m_g09"], P_RL_ADV_M, "q_adv_m_g09",
+                )
+            except ValueError:
                 _setup_log(
                     "[priors] q_adv_m_g09 has the wrong dimension; V11 uses "
                     "zero/identity. Rerun est_prior.py."
@@ -1618,7 +1683,12 @@ def _configure_priors(params_dir=None, *, force=False):
         sigma2_reward   = _priors["sigma2_reward"]
         daily_mediator_priors, redistribution_priors = _default_reward_redistribution_priors()
         if "daily_mediator_priors" in _priors and "redistribution_priors" in _priors:
-            daily_mediator_priors = _priors["daily_mediator_priors"]
+            daily_mediator_priors = {
+                name: _coerce_daily_mediator_prior(
+                    prior, P_DAILY_MEDIATOR[name], f"daily_mediator.{name}",
+                )
+                for name, prior in _priors["daily_mediator_priors"].items()
+            }
             redistribution_priors = _priors["redistribution_priors"]
         else:
             _setup_log("[priors] V2/V4 redistribution priors missing; using zero/identity fallback (rerun est_prior.py).")
@@ -1630,9 +1700,19 @@ def _configure_priors(params_dir=None, *, force=False):
             "mu_0_micro_mtd_joint" in _priors
             and _priors["mu_0_micro_mtd_joint"] is not None
         ):
-            mu_0_mtd_joint              = _priors["mu_0_micro_mtd_joint"]
-            Sigma_0_mtd_joint           = _priors["Sigma_0_micro_mtd_joint"]
-            p_eta_mtd_joint             = int(_priors["p_eta_micro_mtd_joint"])
+            p_eta_mtd_joint = int(_priors["p_eta_micro_mtd_joint"])
+            mu_0_mtd_joint, Sigma_0_mtd_joint = pad_joint_prior_action_time(
+                _priors["mu_0_micro_mtd_joint"],
+                _priors["Sigma_0_micro_mtd_joint"],
+                p_eta_mtd_joint,
+                P_RL_MICRO,
+            )
+            if int(np.asarray(_priors["mu_0_micro_mtd_joint"]).ravel().size) != (
+                p_eta_mtd_joint + P_RL_MICRO
+            ):
+                _setup_log(
+                    "[priors] padded joint MTD prior with zero A×[weekday,slot]"
+                )
             sigma2_Q_mtd_joint          = float(_priors.get(
                 "sigma2_Q_mtd_joint",
                 _priors.get("sigma2_TD_mtd_joint", 1.0),
@@ -1718,16 +1798,26 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
     mu_0_reward = np.asarray(rw["mu_0"], dtype=float)
     Sigma_0_reward = np.asarray(rw["Sigma_0"], dtype=float)
     sigma2_reward = float(rw["sigma2"])
-    mu_0_micro = np.asarray(qn["mu_0"], dtype=float)
-    Sigma_0_micro = np.asarray(qn["Sigma_0"], dtype=float)
+    mu_0_micro, Sigma_0_micro = pad_q_prior_action_time(
+        qn["mu_0"], qn["Sigma_0"], P_RL_MICRO,
+    )
     sigma2_rl_micro = float(qn["sigma2"])
     variant_q_priors = _default_variant_q_priors()
-    variant_q_priors["g09"] = fitted["q_no_td_modify_g09"]
-    variant_q_priors.update(fitted["q_redistribution"])
+    variant_q_priors["g09"] = _coerce_q_prior(
+        fitted["q_no_td_modify_g09"], P_RL_MICRO, "LOO q_no_td_modify_g09",
+    )
+    variant_q_priors.update({
+        name: _coerce_q_prior(prior, P_RL_MICRO, f"LOO q_redistribution.{name}")
+        for name, prior in fitted["q_redistribution"].items()
+    })
     if fitted.get("q_no_td_modify_g099"):
-        variant_q_priors["g099"] = fitted["q_no_td_modify_g099"]
+        variant_q_priors["g099"] = _coerce_q_prior(
+            fitted["q_no_td_modify_g099"], P_RL_MICRO, "LOO q_no_td_modify_g099",
+        )
     if fitted.get("q_residual_g09"):
-        variant_q_priors["residual"] = fitted["q_residual_g09"]
+        variant_q_priors["residual"] = _coerce_q_prior(
+            fitted["q_residual_g09"], P_RL_MICRO, "LOO q_residual_g09",
+        )
     else:
         _setup_log(
             f"[priors] WARNING: LOO q_residual_g09 missing for held-out "
@@ -1736,17 +1826,14 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
         )
     q_adv_m_g09 = _default_adv_m_q_prior()
     if fitted.get("q_adv_m_g09"):
-        loaded_adv = fitted["q_adv_m_g09"]
-        mu_adv = np.asarray(loaded_adv["mu_0"], dtype=float)
-        if mu_adv.shape == (P_RL_ADV_M,):
-            q_adv_m_g09 = {
-                "mu_0": mu_adv,
-                "Sigma_0": np.asarray(loaded_adv["Sigma_0"], dtype=float),
-                "sigma2": float(loaded_adv["sigma2"]),
-            }
-        else:
+        try:
+            q_adv_m_g09 = _coerce_q_prior(
+                fitted["q_adv_m_g09"], P_RL_ADV_M, "LOO q_adv_m_g09",
+            )
+        except ValueError:
             _setup_log(
-                f"[priors] WARNING: LOO q_adv_m_g09 dim {mu_adv.shape} != "
+                f"[priors] WARNING: LOO q_adv_m_g09 dim "
+                f"{np.asarray(fitted['q_adv_m_g09']['mu_0']).shape} != "
                 f"({P_RL_ADV_M},) for held-out user {int(held_out_uid)}; "
                 "V11 uses zero/identity Q."
             )
@@ -1759,9 +1846,14 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
         prior["mu_0"] = np.asarray(prior["mu_0"], dtype=float)
         prior["Sigma_0"] = np.asarray(prior["Sigma_0"], dtype=float)
         prior["sigma2"] = float(prior["sigma2"])
-    daily_mediator_priors = fitted["reward_redistribution"]["daily_mediators"]
+    daily_mediator_priors = {
+        name: _coerce_daily_mediator_prior(
+            prior, P_DAILY_MEDIATOR[name], f"LOO daily_mediator.{name}",
+        )
+        for name, prior in fitted["reward_redistribution"]["daily_mediators"].items()
+    }
     redistribution_priors = fitted["reward_redistribution"]["redistribution"]
-    for prior in list(daily_mediator_priors.values()) + list(redistribution_priors.values()):
+    for prior in list(redistribution_priors.values()):
         prior["mu_0"] = np.asarray(prior["mu_0"], dtype=float)
         prior["Sigma_0"] = np.asarray(prior["Sigma_0"], dtype=float)
         prior["sigma2"] = float(prior["sigma2"])
@@ -1774,10 +1866,21 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
         and joint.get("p_eta") is not None
     )
     if joint_ok:
-        mu_0_mtd_joint = np.asarray(mu_joint, dtype=float)
-        Sigma_0_mtd_joint = np.asarray(joint["Sigma_0"], dtype=float)
         p_eta_mtd_joint = int(joint["p_eta"])
-        sigma2_Q_mtd_joint = float(joint.get("sigma2_Q", 1.0))
+        try:
+            mu_0_mtd_joint, Sigma_0_mtd_joint = pad_joint_prior_action_time(
+                mu_joint, joint["Sigma_0"], p_eta_mtd_joint, P_RL_MICRO,
+            )
+        except ValueError:
+            _setup_log(
+                f"[priors] WARNING: LOO joint MTD prior dim cannot be padded "
+                f"for held-out user {int(held_out_uid)}; using zero/identity."
+            )
+            (mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint,
+             sigma2_Q_mtd_joint) = _default_rl_joint_priors(
+                P_RL_BOTTLENECK, P_RL_MICRO)
+        else:
+            sigma2_Q_mtd_joint = float(joint.get("sigma2_Q", 1.0))
     else:
         _setup_log(
             f"[priors] WARNING: LOO joint MTD prior missing or null for "
@@ -1975,210 +2078,6 @@ def run_micro_query_residual(uid, seed=42, gamma_bar=0.9, params_dir=None):
     return oenv.run_episode(agent, dataset, week0_actions=week0_actions, I_hist=I_hist), oenv
 
 
-def run_micro_query_adv_m(uid, seed=42, gamma_bar=0.9, params_dir=None):
-    """Base RLSVI with the five mediator EWMAs in the advantage (V11).
-
-    Same γ̄=0.9 and weekly CAE target as V1. ``q_adv_m_g09`` when present;
-    otherwise zero/identity of the larger φ. The action-block flag is
-    restored after the episode so V1–V10 keep the original map.
-    """
-    _ensure_priors_configured(params_dir)
-    cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
-    nweek = cfg.nweek
-    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
-    dataset = EpisodeDataset(nweek)
-    q_prior = q_adv_m_g09
-    with action_block_include_m(True):
-        agent = MicroQueryAgent(
-            W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
-            mu_0_rl=q_prior["mu_0"], Sigma_0_rl=q_prior["Sigma_0"],
-            sigma2_rl=q_prior["sigma2"],
-            gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
-            target_update_C=TARGET_C,
-            nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
-            nu_0_Y=nu_0_Y, Gamma_0_Y=Gamma_0_Y, sigma2_Y=sigma2_Y,
-            nu_0_tilde_Y=nu_0_tilde_Y, Gamma_0_tilde_Y=Gamma_0_tilde_Y,
-            sigma2_tilde_Y=sigma2_tilde_Y,
-            Y_1=float(oenv.CAE_all[0]),
-            rng=np.random.default_rng(seed),
-        )
-        return oenv.run_episode(
-            agent, dataset, week0_actions=week0_actions, I_hist=I_hist
-        ), oenv
-
-
-_POOLED_Q_SALT = 910010
-_POOLED_ADV_M_SALT = 910012
-COHORT_ALGORITHMS = frozenset({
-    "rl_v10_pooled_g09",
-    "rl_v12_pooled_adv_m_g09",
-})
-
-
-def run_micro_query_pooled(uid, seed=42, gamma_bar=0.9, params_dir=None):
-    raise RuntimeError(
-        "rl_v10_pooled_g09 is week-synchronous over the experiment cohort. "
-        "The driver calls run_micro_query_pooled_cohort; do not run this "
-        "per user."
-    )
-
-
-def run_micro_query_pooled_adv_m(uid, seed=42, gamma_bar=0.9, params_dir=None):
-    raise RuntimeError(
-        "rl_v12_pooled_adv_m_g09 is week-synchronous over the experiment "
-        "cohort. The driver calls run_micro_query_pooled_cohort("
-        "include_m=True); do not run this per user."
-    )
-
-
-def _walk_rl_days(oenv, agent, dataset, k, I_w, days):
-    for d in days:
-        for t in range(oenv.K):
-            d_global = oenv._day_idx(k, d)
-            step_idx = oenv._step_idx(k, d, t)
-            oenv._ensure_day_started(k, d, d_global)
-            oenv._generate_prior2hour_for_slot(k, d, t, d_global, step_idx)
-            state = make_state(oenv.get_context(k, d, t))
-            A_wdt, pi_A = agent.act(k, d, t, state)
-            dataset.record_walking(k, d, t, state, A_wdt, pi_A)
-            oenv.step_action(k, d, t, A_wdt, I_w)
-
-
-@contextmanager
-def _member_env_rng(rd_states, idx):
-    """Restore one member's legacy ``rd`` stream, then save it on exit.
-
-    ``vani_env`` draws from the global ``numpy.random`` state seeded in
-    ``OnlineEnv.__init__``. The sequential runner gives each (seed, draw)
-    a contiguous stream. The cohort loop must swap that saved state around
-    every env segment so members stay CRN-paired with the other arms.
-    ``learner.refit`` does not touch ``rd``.
-    """
-    rd.set_state(rd_states[idx])
-    try:
-        yield
-    finally:
-        rd_states[idx] = rd.get_state()
-
-
-def run_micro_query_pooled_cohort(
-    uids, exp_seed, params_dir=None, prior_mode="saved", gamma_bar=0.9,
-    include_m=False,
-):
-    """Week-synchronous pooled Q over the experiment cohort (V10 / V12).
-
-    ``include_m=False`` is V10 (same φ as V1, ``q_no_td_modify_g09``).
-    ``include_m=True`` is V12 (V11 φ, ``q_adv_m_g09`` or zeros).
-
-    ``prior_mode='loo'`` still gives each user their LOO *PF* prior. The
-    shared Q is the experiment-level prior above.
-
-    Each member keeps its own legacy ``rd`` state so environment noise is
-    the same contiguous stream the sequential runner would have drawn at
-    that (exp_seed, draw). Week-start, day-0, and days-1–5+finalize swap
-    that state in; ``learner.refit`` does not.
-    """
-    _ensure_priors_configured(params_dir)
-    src = q_adv_m_g09 if include_m else variant_q_priors["g09"]
-    q_prior = {
-        "mu_0": np.asarray(src["mu_0"], dtype=float).copy(),
-        "Sigma_0": np.asarray(src["Sigma_0"], dtype=float).copy(),
-        "sigma2": float(src["sigma2"]),
-    }
-    pooled_salt = _POOLED_ADV_M_SALT if include_m else _POOLED_Q_SALT
-    m_ctx = action_block_include_m(True) if include_m else nullcontext()
-    with m_ctx:
-        return _run_micro_query_pooled_cohort_body(
-            uids, exp_seed, q_prior, prior_mode=prior_mode,
-            params_dir=params_dir, gamma_bar=gamma_bar,
-            pooled_salt=pooled_salt,
-        )
-
-
-def _run_micro_query_pooled_cohort_body(
-    uids, exp_seed, q_prior, *, prior_mode, params_dir, gamma_bar, pooled_salt,
-):
-    learner = PooledRLSVILearner(
-        mu_0_rl=q_prior["mu_0"],
-        Sigma_0_rl=q_prior["Sigma_0"],
-        sigma2_rl=q_prior["sigma2"],
-        gamma_dt=_gamma_dt_micro(gamma_bar),
-        gamma_bar=gamma_bar,
-        B=B_ENSEMBLES,
-        target_update_C=TARGET_C,
-        rng=np.random.default_rng(
-            np.random.SeedSequence([int(exp_seed), int(pooled_salt)])
-        ),
-    )
-
-    members = []
-    rd_states = []
-    for draw_idx, uid in enumerate(uids):
-        uid = int(uid)
-        if prior_mode == "loo":
-            configure_leave_one_out_priors(uid, params_dir=params_dir)
-        draw_seed = _episode_seed(exp_seed, draw_idx)
-        cfg, env, oenv = _make_online_env(uid, seed=draw_seed, params_dir=params_dir)
-        nweek = cfg.nweek
-        week0_actions, I_hist = shared_episode_exogenous(draw_seed, nweek)
-        dataset = EpisodeDataset(nweek)
-        dataset.I_hist[:] = np.asarray(I_hist, dtype=int)
-        agent = MicroQueryPooledAgent(
-            learner,
-            W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
-            mu_0_rl=q_prior["mu_0"], Sigma_0_rl=q_prior["Sigma_0"],
-            sigma2_rl=q_prior["sigma2"],
-            gamma_dt=_gamma_dt_micro(gamma_bar), gamma_bar=gamma_bar,
-            target_update_C=TARGET_C,
-            nu_0_MY=nu_0_MY, Gamma_0_MY=Gamma_0_MY, sigma2_MY=sigma2_MY,
-            nu_0_Y=nu_0_Y, Gamma_0_Y=Gamma_0_Y, sigma2_Y=sigma2_Y,
-            nu_0_tilde_Y=nu_0_tilde_Y, Gamma_0_tilde_Y=Gamma_0_tilde_Y,
-            sigma2_tilde_Y=sigma2_tilde_Y,
-            Y_1=float(oenv.CAE_all[0]),
-            rng=np.random.default_rng(draw_seed),
-        )
-        agent.reset(dataset, week0_actions=week0_actions)
-        pf = ParticleFilterRuntime(agent, dataset, agent.rng)
-        oenv._reset_episode_state()
-        rd_states.append(rd.get_state())
-        members.append((agent, dataset, oenv, pf, nweek))
-
-    nweek = members[0][4]
-    for k in range(nweek):
-        iw_by_member = []
-        for i, (agent, dataset, oenv, pf, _) in enumerate(members):
-            with _member_env_rng(rd_states, i):
-                packet = oenv.get_week_packet(k)
-                dataset.record_week_start(
-                    k, make_state(oenv.get_context(k, QUERY_D, QUERY_T))
-                )
-                I_w = agent.begin_week(k, packet)
-                pf.update_standard(k, packet, I_w)
-                oenv.start_week(k, I_w)
-                agent.prepare_week(k)
-            iw_by_member.append(I_w)
-        for i, ((agent, dataset, oenv, pf, _), I_w) in enumerate(
-            zip(members, iw_by_member)
-        ):
-            with _member_env_rng(rd_states, i):
-                _walk_rl_days(oenv, agent, dataset, k, I_w, days=(0,))
-        learner.refit(k, [m[0] for m in members])
-        for i, ((agent, dataset, oenv, pf, _), I_w) in enumerate(
-            zip(members, iw_by_member)
-        ):
-            agent.update_rlsvi(k)
-            with _member_env_rng(rd_states, i):
-                _walk_rl_days(oenv, agent, dataset, k, I_w, days=range(1, N_RL_DAYS))
-                oenv._finalize_week(k)
-                full_ctx = oenv.get_context(k, N_RL_DAYS, 0)
-                dataset.record_full_week_mediators(k, full_ctx["M_Y"], full_ctx["M_E"])
-
-    return [
-        (agent.results(dataset), oenv)
-        for agent, dataset, oenv, _pf, _nweek in members
-    ]
-
-
 def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.5,
                                    params_dir=None, engagement_bonus=None,
                                    engagement_rho=None):
@@ -2251,7 +2150,7 @@ def _run_fixed_policy_fast(policy: str, uid, seed=42, params_dir=None):
         raise ValueError(f"unknown fixed policy {policy!r}")
 
     rng = _fixed_policy_rng_after_legacy_reset(seed)
-    _week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
+    week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
     A_hist = np.zeros((nweek, N_RL_DAYS, N_RL_SLOTS), dtype=int)
     pi_A_hist = np.full((nweek, N_RL_DAYS, N_RL_SLOTS), np.nan)
     b_hat_hist = np.full(nweek, np.nan)
@@ -2273,6 +2172,10 @@ def _run_fixed_policy_fast(policy: str, uid, seed=42, params_dir=None):
                 elif policy == "always_send":
                     pi_A = 1.0
                     action = 1
+                elif k == 0:
+                    # Same shared week-0 grid as every RL arm (CRN pairing).
+                    pi_A = 0.5
+                    action = int(week0_actions[d, t])
                 else:
                     pi_A = 0.5
                     action = int(rng.binomial(1, pi_A))
@@ -2324,8 +2227,7 @@ def run_random_send(uid, seed=42, params_dir=None):
 
 
 # Algorithm registry: V1--V6 at γ̄=0.9, V7/V8 base-discount sensitivities,
-# V9 residual CAE, V10 pooled Q, V11 mediator advantage, V12 = V10+V11,
-# then baselines.
+# V9 residual CAE, then baselines.
 ALGORITHMS = {
     "rl_v1_base_g09": (partial(run_micro_query, gamma_bar=0.9), "RL base (γ̄=0.9)"),
     "rl_v2_mtd_g09": (partial(run_micro_query_mtd, gamma_bar=0.9), "RL + bottleneck TD (γ̄=0.9)"),
@@ -2338,18 +2240,6 @@ ALGORITHMS = {
     "rl_v9_residual_g09": (
         partial(run_micro_query_residual, gamma_bar=0.9),
         "RL residual CAE (γ̄=0.9)",
-    ),
-    "rl_v10_pooled_g09": (
-        partial(run_micro_query_pooled, gamma_bar=0.9),
-        "RL pooled cohort (γ̄=0.9)",
-    ),
-    "rl_v11_adv_m_g09": (
-        partial(run_micro_query_adv_m, gamma_bar=0.9),
-        "RL mediator advantage (γ̄=0.9)",
-    ),
-    "rl_v12_pooled_adv_m_g09": (
-        partial(run_micro_query_pooled_adv_m, gamma_bar=0.9),
-        "RL pooled + mediator advantage (γ̄=0.9)",
     ),
     "never_send":   (run_never_send,  "Never send (π_A=0)"),
     "always_send":  (run_always_send, "Always send (π_A=1)"),
@@ -2590,24 +2480,6 @@ if __name__ == "__main__":
             pf_runs[name].append([])
             oenv_runs[name].append([])
 
-        cohort_cache = {}
-        for name, include_m, label in (
-            ("rl_v10_pooled_g09", False, "pooled V10"),
-            ("rl_v12_pooled_adv_m_g09", True, "pooled V12 (adv M)"),
-        ):
-            if name not in ALGORITHMS:
-                continue
-            print(
-                f"  Experiment {exp_idx}: {label} over "
-                f"{len(sampled_uids)} cohort slots ...",
-                flush=True,
-            )
-            cohort_cache[name] = run_micro_query_pooled_cohort(
-                sampled_uids, seed, params_dir=params_dir,
-                prior_mode=args.prior_mode, gamma_bar=0.9,
-                include_m=include_m,
-            )
-
         for draw_idx, uid in enumerate(sampled_uids):
             uid = int(uid)
             if args.prior_mode == "loo":
@@ -2621,10 +2493,7 @@ if __name__ == "__main__":
 
             summary_parts = []
             for name, (runner, _label) in ALGORITHMS.items():
-                if name in cohort_cache:
-                    res, oenv = cohort_cache[name][draw_idx]
-                else:
-                    res, oenv = runner(uid, seed=draw_seed, params_dir=params_dir)
+                res, oenv = runner(uid, seed=draw_seed, params_dir=params_dir)
                 snap = _snapshot_oenv(oenv)
                 if _save_trajectories_for_algo(save_mode, name):
                     oenv_runs[name][exp_idx].append(snap)
@@ -2715,6 +2584,7 @@ if __name__ == "__main__":
             "prior_mode":      args.prior_mode,
             "loo_prior_cache_size": len(_LOO_PRIOR_CACHE) if args.prior_mode == "loo" else 0,
             "action_block_include_c": include_action_c,
+            "action_block_include_time": True,
             "residual_rho_fallback": 0.89,
             "p_rl_micro":      P_RL_MICRO,
             "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID"),

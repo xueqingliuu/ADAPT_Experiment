@@ -25,14 +25,18 @@ def _env_flag(name, default=True):
     return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
 
-# Q action block is ``A * [1, E_w, b_hat, b_tilde, C]`` when True (default).
-# Set ACTION_BLOCK_C=0 to drop ``C`` from that block only (``C`` stays in the
-# state features). Call :func:`set_action_block_include_c` before building
-# phi / priors so the dimension stays consistent.
+# Q action block is ``A * [1, E_w, b_hat, b_tilde, C, weekday, slot_pm]``
+# when True (default). Set ACTION_BLOCK_C=0 to drop ``C`` from that block
+# only (``C`` stays in the state features). Call
+# :func:`set_action_block_include_c` before building phi / priors so the
+# dimension stays consistent.
 ACTION_BLOCK_INCLUDE_C = _env_flag("ACTION_BLOCK_C", True)
 # When True, also append the five mediator EWMAs to the action block so they
 # enter Q(s,1)−Q(s,0). Default off (V1–V10). V11 enables this in-process.
 ACTION_BLOCK_INCLUDE_M = _env_flag("ACTION_BLOCK_M", False)
+# A × [weekday_vs_weekend, slot_pm] is always in the walking advantage.
+N_ACTION_TIME = 2
+ACTION_TIME_NAMES = ("weekday_vs_weekend", "slot_pm")
 
 
 def set_action_block_include_c(include_c):
@@ -56,11 +60,114 @@ def action_block_include_m(enabled=True):
         set_action_block_include_m(prev)
 
 
-def action_interact_vec(E_w, b_hat, b_tilde, C_dt, M_ewma=None):
-    """Action-interaction features ``[1, E_w, b_hat, b_tilde]`` (+ ``C``, + ``M``)."""
+def action_time_vec(d=None, t=None):
+    """``[weekday_vs_weekend, slot_pm]`` for the walking advantage.
+
+    ``d`` / ``t`` None (query slot) yields zeros so the Q dimension stays
+    fixed and query actions do not load Monday-morning time features.
+    """
+    if d is None or t is None:
+        return np.zeros(N_ACTION_TIME, dtype=float)
+    weekday_vs_weekend, slot_pm = _time_features(int(d), int(t))
+    return np.array([weekday_vs_weekend, slot_pm], dtype=float)
+
+
+def action_time_insert_index():
+    """Index of ``A×weekday`` inside ``build_phi_action`` (M follows)."""
+    n_state = 6 + 5 + N_RL_CONTEXT
+    n_action_core = 4 + (N_RL_CONTEXT if ACTION_BLOCK_INCLUDE_C else 0)
+    return n_state + n_action_core
+
+
+def pad_q_prior_action_time(mu_0, Sigma_0, expected_p):
+    """Insert zero-mean / unit-variance ``A×[weekday, slot]`` into an old Q.
+
+    Priors written before these two advantage columns have
+    ``expected_p - 2`` entries. New columns are zeros on the mean and 1
+    on the diagonal (independent of the old block).
+    """
+    mu = np.asarray(mu_0, dtype=float).ravel()
+    Sigma = np.asarray(Sigma_0, dtype=float)
+    p = int(mu.size)
+    if p == int(expected_p):
+        return mu, Sigma
+    if p != int(expected_p) - N_ACTION_TIME:
+        raise ValueError(
+            f"Q prior dim {p} cannot be padded to {expected_p} "
+            f"(expected {int(expected_p) - N_ACTION_TIME} or {expected_p})"
+        )
+    if Sigma.shape != (p, p):
+        raise ValueError(f"Q prior Sigma shape {Sigma.shape} != ({p}, {p})")
+    k = action_time_insert_index()
+    if not (0 <= k <= p):
+        raise ValueError(f"action-time insert index {k} out of range for p={p}")
+    mu_new = np.concatenate([mu[:k], np.zeros(N_ACTION_TIME), mu[k:]])
+    Sigma_new = np.eye(int(expected_p), dtype=float)
+    Sigma_new[:k, :k] = Sigma[:k, :k]
+    Sigma_new[k + N_ACTION_TIME:, k + N_ACTION_TIME:] = Sigma[k:, k:]
+    Sigma_new[:k, k + N_ACTION_TIME:] = Sigma[:k, k:]
+    Sigma_new[k + N_ACTION_TIME:, :k] = Sigma[k:, :k]
+    return mu_new, Sigma_new
+
+
+def pad_prior_append(mu_0, Sigma_0, expected_p):
+    """Append zero-mean / unit-variance columns when a prior is short.
+
+    Used for Stage-1 daily-mediator η after ``A×slot_pm`` was added at the
+    end of ``build_daily_mediator_phi``.
+    """
+    mu = np.asarray(mu_0, dtype=float).ravel()
+    Sigma = np.asarray(Sigma_0, dtype=float)
+    p = int(mu.size)
+    expected_p = int(expected_p)
+    if p == expected_p:
+        return mu, Sigma
+    if p > expected_p:
+        raise ValueError(f"prior dim {p} is larger than expected {expected_p}")
+    if Sigma.shape != (p, p):
+        raise ValueError(f"prior Sigma shape {Sigma.shape} != ({p}, {p})")
+    n_new = expected_p - p
+    mu_new = np.concatenate([mu, np.zeros(n_new)])
+    Sigma_new = np.eye(expected_p, dtype=float)
+    Sigma_new[:p, :p] = Sigma
+    return mu_new, Sigma_new
+
+
+def pad_joint_prior_action_time(mu_0, Sigma_0, p_eta, expected_p_beta):
+    """Pad the walking-Q (beta) block of a joint ``(eta, beta)`` prior."""
+    mu = np.asarray(mu_0, dtype=float).ravel()
+    Sigma = np.asarray(Sigma_0, dtype=float)
+    p_eta = int(p_eta)
+    expected = p_eta + int(expected_p_beta)
+    if mu.size == expected:
+        return mu, Sigma
+    if mu.size != expected - N_ACTION_TIME:
+        raise ValueError(
+            f"joint prior dim {mu.size} cannot be padded to {expected}"
+        )
+    mu_b, Sig_b = pad_q_prior_action_time(
+        mu[p_eta:], Sigma[p_eta:, p_eta:], expected_p_beta,
+    )
+    k = action_time_insert_index()
+    cross = Sigma[:p_eta, p_eta:]
+    cross_new = np.concatenate(
+        [cross[:, :k], np.zeros((p_eta, N_ACTION_TIME)), cross[:, k:]],
+        axis=1,
+    )
+    Sig_new = np.eye(expected, dtype=float)
+    Sig_new[:p_eta, :p_eta] = Sigma[:p_eta, :p_eta]
+    Sig_new[p_eta:, p_eta:] = Sig_b
+    Sig_new[:p_eta, p_eta:] = cross_new
+    Sig_new[p_eta:, :p_eta] = cross_new.T
+    return np.concatenate([mu[:p_eta], mu_b]), Sig_new
+
+
+def action_interact_vec(E_w, b_hat, b_tilde, C_dt, M_ewma=None, d=None, t=None):
+    """Action-interaction features ``[1, E, b̂, b̃, C, weekday, slot_pm]`` (+ ``M``)."""
     parts = [np.array([1.0, float(E_w), float(b_hat), float(b_tilde)], dtype=float)]
     if ACTION_BLOCK_INCLUDE_C:
         parts.append(np.asarray(C_dt, dtype=float).ravel())
+    parts.append(action_time_vec(d, t))
     if ACTION_BLOCK_INCLUDE_M:
         if M_ewma is None:
             raise ValueError("ACTION_BLOCK_INCLUDE_M requires M_ewma")
@@ -1980,9 +2087,9 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
 
     phi = [1, d_n, t_n, E_w, b_hat, b_tilde]
         ⌢ [M_ewma (AA, SC, PV, FW, PJ), C_{w,d,t}]
-        ⌢ A * [1, E_w, b_hat, b_tilde]            if no C / M in the block
-        ⌢ A * [1, E_w, b_hat, b_tilde, C]         default
-        ⌢ A * [1, E_w, b_hat, b_tilde, C, M]      if ACTION_BLOCK_INCLUDE_M
+        ⌢ A * [1, E_w, b_hat, b_tilde, weekday, slot_pm]
+        ⌢ A * [1, E_w, b_hat, b_tilde, C, weekday, slot_pm]   default
+        ⌢ A * [..., C, weekday, slot_pm, M]                   if ACTION_BLOCK_INCLUDE_M
 
     ``d_n`` / ``t_n`` come from :func:`_time_features`. Raw ``d`` / ``t``
     select which past mediators enter the EWMA.
@@ -2002,14 +2109,14 @@ def build_phi_action(b_hat, b_tilde, state, d, t, action):
 
     Returns
     -------
-    phi : (p,) array   where  p = 6 + 5 + n_c + (4 + n_c * ACTION_BLOCK_INCLUDE_C)
+    phi : (p,) array   where  p = 6 + 5 + n_c + (4 + n_c * ACTION_BLOCK_INCLUDE_C + 2)
     """
     E_w = state['E_w']
     C_dt = np.asarray(state['C']).ravel()
     M_ewma = summarize_mediators_ewma(state['M_Y'], state['M_E'], d, t)
     state_part = build_phi_state(state, d, t, b_hat=b_hat, b_tilde=b_tilde)
     action_block = float(action) * action_interact_vec(
-        E_w, b_hat, b_tilde, C_dt, M_ewma=M_ewma,
+        E_w, b_hat, b_tilde, C_dt, M_ewma=M_ewma, d=d, t=t,
     )
     return np.concatenate([state_part, action_block])
 
@@ -2045,18 +2152,35 @@ def build_daily_mediator_phi(b_hat, b_tilde, state, d, t, action,
                              mediator=None):
     """Feature vector for the daily-mediator return decomposition.
 
-    ``mediator`` is one of ``AA``, ``FW``, or ``PJ``. Weekday/weekend is
-    omitted: both decision times on a day share the same daily outcome, so
-    a day encoding cannot identify within-day shares. ``d`` / ``t`` still
-    select which past mediators enter the EWMA.
+    Stage 1 regresses the daily outcome on ``Σ_t φ(s_{dt}, A_{dt})``.
+    Write the action block as ``A_{dt} · x_{dt}``. Without ``t`` in
+    ``x``, and with ``x_AM ≈ x_PM``, the day-level design is
+    ``(A_AM + A_PM) · x`` — both slots are forced to share one send
+    effect. ``A × slot_pm`` adds ``Σ_t A_{dt} t = A_PM`` (morning
+    ``t = 0``), so the design holds ``(A_AM + A_PM) · x`` and
+    ``A_PM``, a reparametrisation of separate AM/PM intercepts
+    ``γ_m, γ_a``. Those two are identified whenever ``A_AM`` and
+    ``A_PM`` vary independently across days, which they do under
+    Bernoulli(0.5).
+
+    A state-only slot (or weekday) column is omitted on purpose: summed
+    over the day it is a constant (collinear with the intercept) or
+    ``2 · weekend``. Stage 1 can attribute action effects to AM vs PM;
+    it cannot say which slot owns the non-action baseline of AA. Stage 2
+    only needs the action-attributable shares; the baseline can be split
+    half-half without changing which slot the policy prefers.
+
+    ``d`` / ``t`` still select which past mediators enter the EWMA.
+    ``mediator`` is one of ``AA``, ``FW``, or ``PJ``.
     """
     E_w = float(state["E_w"])
     C_dt = np.asarray(state["C"], dtype=float).ravel()
+    _, slot_pm = _time_features(d, t)
     med_ctx = np.concatenate([
         summarize_mediators_ewma(state["M_Y"], state["M_E"], d, t), C_dt
     ])
     action_ctx = float(action) * np.concatenate(
-        [[1.0, E_w, float(b_hat), float(b_tilde)], C_dt]
+        [[1.0, E_w, float(b_hat), float(b_tilde)], C_dt, [slot_pm]]
     )
     return np.concatenate([
         [1.0, E_w, float(b_hat), float(b_tilde)], med_ctx, action_ctx
@@ -2981,7 +3105,7 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
     phi = [1, d_n, t_n, E, b_hat, b_tilde]
         ⌢ [M_ewma, C_{w,d,t}]
         ⌢ [query: 1, E, b_hat, b_tilde (, C if ACTION_BLOCK_INCLUDE_C)]
-        ⌢ [walk:  1, E, b_hat, b_tilde (, C if ACTION_BLOCK_INCLUDE_C)]
+        ⌢ [walk:  1, E, b_hat, b_tilde (, C), weekday, slot_pm]
 
     Parameters
     ----------
@@ -3020,7 +3144,10 @@ def build_phi_action_query(b_hat, b_tilde, state, d, t, action,
         1.0, d_feat, t_feat, E_w, b_hat, b_tilde,
     ])
     med_ctx = np.concatenate([M_ewma, C_dt_eff])
-    interact = action_interact_vec(E_w, b_hat, b_tilde, C_dt_eff, M_ewma=M_ewma)
+    interact = action_interact_vec(
+        E_w, b_hat, b_tilde, C_dt_eff, M_ewma=M_ewma,
+        d=None if is_query else d, t=None if is_query else t,
+    )
     if action == 1:
         query_block = interact if is_query else np.zeros_like(interact)
         walk_block = np.zeros_like(interact) if is_query else interact

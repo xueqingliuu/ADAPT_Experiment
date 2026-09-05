@@ -47,9 +47,6 @@ markers = {
     "rl_v7_base_g05": "o-",
     "rl_v8_base_g099": "o--",
     "rl_v9_residual_g09": "P-",
-    "rl_v10_pooled_g09": "X--",
-    "rl_v11_adv_m_g09": "P:",
-    "rl_v12_pooled_adv_m_g09": "X:",
     "never_send": "x-",
     "always_send": "*-",
     "random_send": "+-",
@@ -780,9 +777,6 @@ def main() -> None:
     labels["rl_v7_base_g05"] = "RL base (\u03b3\u0304=0.5)"
     labels["rl_v8_base_g099"] = "RL base (\u03b3\u0304=0.99)"
     labels["rl_v9_residual_g09"] = "RL residual CAE (\u03b3\u0304=0.9)"
-    labels["rl_v10_pooled_g09"] = "RL pooled cohort (\u03b3\u0304=0.9)"
-    labels["rl_v11_adv_m_g09"] = "RL mediator advantage (\u03b3\u0304=0.9)"
-    labels["rl_v12_pooled_adv_m_g09"] = "RL pooled + mediator advantage (\u03b3\u0304=0.9)"
     nweek = cfg["nweek"]
     params_dir = resolve_denorm_params_dir(
         cfg.get("params_dir"), cli_params_dir=args.params_dir

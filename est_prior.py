@@ -1226,11 +1226,13 @@ def fit_reward_redistribution_priors(
     """Estimate empirical-Bayes priors used only by redistributed V2/V4.
 
     Stage 1 fits separate AA/FW/PJ daily regressions with the *daily sum* of
-    the two action-time features.  Stage 2 then uses the resulting predicted
-    shares in its weekly summed redistribution feature.  Pooled Stage-2 rows
-    use pooled Stage-1 coefficients; per-user Stage-2 rows use that user's
-    Stage-1 coefficients.  This mirrors the intended hierarchical prior and
-    avoids substituting observed daily mediators for their decomposed shares.
+    the two action-time features, including ``A×slot_pm`` so AM and PM
+    sends can have different intercepts.  Stage 2 then uses the resulting
+    predicted shares in its weekly summed redistribution feature.  Pooled
+    Stage-2 rows use pooled Stage-1 coefficients; per-user Stage-2 rows
+    use that user's Stage-1 coefficients.  This mirrors the intended
+    hierarchical prior and avoids substituting observed daily mediators
+    for their decomposed shares.
     """
     tensors = [
         _user_weekly_tensors(dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True))
@@ -1946,11 +1948,27 @@ def _phi_action_names() -> list[str]:
         "A*E_w",
         "A*b_hat",
         "A*b_tilde",
-    ] + [f"A*{name}" for name in _rl_context_names()]
+    ] + [f"A*{name}" for name in _rl_context_names()] + [
+        "A*weekday_vs_weekend",
+        "A*slot_pm",
+    ]
     from algorithm_helpers import ACTION_BLOCK_INCLUDE_M
     if ACTION_BLOCK_INCLUDE_M:
         action_context += [f"A*{name}" for name in _rl_my_names() + _rl_me_names()]
     return _phi_state_names() + action_context
+
+
+def _phi_daily_mediator_names() -> list[str]:
+    """Names for ``build_daily_mediator_phi`` (no state-only slot/weekday)."""
+    return (
+        ["intercept", "E_w", "b_hat", "b_tilde"]
+        + _rl_my_names()
+        + _rl_me_names()
+        + _rl_context_names()
+        + ["A", "A*E_w", "A*b_hat", "A*b_tilde"]
+        + [f"A*{name}" for name in _rl_context_names()]
+        + ["A*slot_pm"]
+    )
 
 
 def _joint_feature_names(q_joint: Dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -2136,7 +2154,8 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
     for name, prior in (redistribution.get("daily_mediators") or {}).items():
         rl_rows.extend(_summary_rows(
             prior_family="RL", model=f"redistribution_stage1_{name}", block="eta",
-            mean=prior.get("mu_0"), cov=prior.get("Sigma_0"), names=[],
+            mean=prior.get("mu_0"), cov=prior.get("Sigma_0"),
+            names=_phi_daily_mediator_names(),
         ))
     for name, prior in (redistribution.get("redistribution") or {}).items():
         rl_rows.extend(_summary_rows(
