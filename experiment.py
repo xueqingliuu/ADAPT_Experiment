@@ -19,11 +19,23 @@ from pathlib import Path
 from functools import partial
 
 
-from ewm_utils import ewma_gamma
+from ewm_utils import ewma_gamma, gamma_from_n
 
 # parameters for EWM
 EWM_WINDOW = 7
 EWM_MIN_VALUES = 4
+
+
+def _cae_ewma_weights():
+    """CAE EWMA weights over 7 days × 2 slots (Sunday unused, indices 12–13)."""
+    n_slot, n_day = 14, 7
+    gs, gd = gamma_from_n(n_slot), gamma_from_n(n_day)
+    wf = gs ** np.arange(n_slot - 1, -1, -1)
+    wa = gd ** np.arange(n_day - 1, -1, -1)
+    return wf / wf.sum(), wa / wa.sum()
+
+
+_CAE_EWMA_SLOT_W, _CAE_EWMA_DAY_W = _cae_ewma_weights()
 
 
 def _setup_log(*args, **kwargs):
@@ -715,6 +727,35 @@ class OnlineEnv:
         )
         self.logIsWeekend[0] = float(self.s["isWeekend"])
         self.logActiveDaysLast7Days[0] = float(self.s.get("activeDaysLast7Days", 0.0))
+        self.myopic_cate = np.full(
+            (self.nweek, N_RL_DAYS, N_RL_SLOTS), np.nan
+        )
+
+    def myopic_cae_cate(self, d, t):
+        """Env myopic CATE of a send on this week's CAE (normalized units)."""
+        s = self.s
+        env = self.env
+        s["decisionTimeSlot"] = float(t)
+        s["stepCountLast7DaysEma"] = self._stepCountLast7DaysEma_by_slot[int(t)]
+        df = env.gen_fourSC_mean(s, 1.0) - env.gen_fourSC_mean(s, 0.0)
+        if int(t) == 0:
+            da = env.gen_antic_mean(s, 1.0, 0.0) - env.gen_antic_mean(s, 0.0, 0.0)
+        else:
+            da = env.gen_antic_mean(s, 0.0, 1.0) - env.gen_antic_mean(s, 0.0, 0.0)
+        th = env.cfg.theta_CAE
+        return (
+            float(th[3]) * _CAE_EWMA_SLOT_W[int(d) * N_RL_SLOTS + int(t)] * float(df)
+            + float(th[4]) * _CAE_EWMA_DAY_W[int(d)] * float(da)
+        )
+
+    def week_truth_pm_minus_am(self, k):
+        """Mean PM−AM myopic CATE over Mon–Sat of week ``k``."""
+        dl = np.asarray(self.myopic_cate[k], dtype=float)
+        am = np.nanmean(dl[:, 0])
+        pm = np.nanmean(dl[:, 1])
+        if not np.isfinite(am) or not np.isfinite(pm):
+            return np.nan
+        return float(pm - am)
 
     def run_episode(self, agent, dataset, week0_actions=None, I_hist=None):
         if I_hist is not None:
@@ -754,6 +795,7 @@ class OnlineEnv:
                     self._generate_prior2hour_for_slot(k, d, t, d_global, step_idx)
                     context = self.get_context(k, d, t)
                     state = make_state(context)
+                    self.myopic_cate[k, d, t] = self.myopic_cae_cate(d, t)
                     A_wdt, pi_A = agent.act(k, d, t, state)
                     dataset.record_walking(k, d, t, state, A_wdt, pi_A)
                     self.step_action(k, d, t, A_wdt, I_w)
@@ -767,6 +809,8 @@ class OnlineEnv:
                 full_ctx = self.get_context(k, N_RL_DAYS, 0)
                 dataset.record_full_week_mediators(
                     k, full_ctx["M_Y"], full_ctx["M_E"])
+            if hasattr(agent, "record_timing_probe"):
+                agent.record_timing_probe(k, self.week_truth_pm_minus_am(k))
 
         return agent.results(dataset)
 
@@ -2256,6 +2300,59 @@ _setup_log("Runner functions defined.")
 # ``python experiment.py`` for the full driver.)
 # ──────────────────────────────────────────────────────────────────
 
+_TIMING_PROBE_ARRAYS = (
+    "stage1_gamma_pm_minus_am",
+    "stage2_r_pm_minus_am",
+    "pi_pm_minus_am",
+    "env_truth_pm_minus_am",
+    "stage1_sign_ok",
+    "stage1_sign_ok_running",
+)
+
+
+def _stack_timing_probes(per_exp):
+    """Stack per-draw timing probes to (n_exp, n_users, …)."""
+    if not per_exp or not per_exp[0]:
+        return None
+    out = {
+        key: np.stack([
+            np.stack([probe[key] for probe in users])
+            for users in per_exp
+        ])
+        for key in _TIMING_PROBE_ARRAYS
+    }
+    out["stage1_mediators"] = np.asarray(per_exp[0][0]["stage1_mediators"])
+    return out
+
+
+def _write_timing_probe_summary(path, stacked_by_algo):
+    """Human-readable Stage 1 → 2 → π snapshot for this process."""
+    lines = [
+        "V4/V6 timing-chain probe. Stage-1 γ̂_a−γ̂_m is A×slot_pm on AA/FW/PJ.",
+        "Env truth and gaps are PM−AM. sign_ok is P(sign(γ_AA)==sign(truth)).",
+        "A link that stays ~0 (or sign_ok ~0.5) is the one that died.",
+        "",
+    ]
+    weeks = (5, 12, 24, 35)
+    for name, arrs in stacked_by_algo.items():
+        so = arrs["stage1_sign_ok"]
+        g = arrs["stage1_gamma_pm_minus_am"]
+        r = arrs["stage2_r_pm_minus_am"]
+        p = arrs["pi_pm_minus_am"]
+        lines.append(f"== {name} ==")
+        for w in weeks:
+            if w >= so.shape[2]:
+                continue
+            lines.append(
+                f"  week {w:2d}: sign_ok_AA={np.nanmean(so[..., w, 0]):.2f}  "
+                f"γ_AA={np.nanmean(g[..., w, 0]):+.4f}  "
+                f"r_gap={np.nanmean(r[..., w]):+.4f}  "
+                f"π_gap={np.nanmean(p[..., w]):+.3f}"
+            )
+        lines.append("")
+    path.write_text("\n".join(lines) + "\n")
+
+
 def _snapshot_oenv(oenv):
     """Capture all per-episode trajectory arrays from an OnlineEnv as a dict.
 
@@ -2467,6 +2564,7 @@ if __name__ == "__main__":
     piA_runs   = {name: [] for name in ALGORITHMS}
     pf_runs    = {name: [] for name in ALGORITHMS}
     oenv_runs  = {name: [] for name in ALGORITHMS}
+    probe_runs = {name: [] for name in ALGORITHMS}
     cae_by_uid = {name: {} for name in ALGORITHMS}   # keyed by uid (flat across exps)
 
     for exp_idx, seed in enumerate(SEEDS):
@@ -2479,6 +2577,7 @@ if __name__ == "__main__":
             piA_runs[name].append([])
             pf_runs[name].append([])
             oenv_runs[name].append([])
+            probe_runs[name].append([])
 
         for draw_idx, uid in enumerate(sampled_uids):
             uid = int(uid)
@@ -2501,6 +2600,8 @@ if __name__ == "__main__":
                 cae_runs[name][exp_idx].append(cae_full)
                 cae_mean_runs[name][exp_idx].append(snap["CAE_mean_all"])
                 piA_runs[name][exp_idx].append(res["pi_A"].copy())
+                if res.get("timing_probe") is not None:
+                    probe_runs[name][exp_idx].append(res["timing_probe"])
                 if save_pf:
                     pf_runs[name][exp_idx].append(res["pf"])
                 cae_by_uid[name].setdefault(uid, []).append(cae_full)
@@ -2585,6 +2686,7 @@ if __name__ == "__main__":
             "loo_prior_cache_size": len(_LOO_PRIOR_CACHE) if args.prior_mode == "loo" else 0,
             "action_block_include_c": include_action_c,
             "action_block_include_time": True,
+            "timing_probe": True,
             "residual_rho_fallback": 0.89,
             "p_rl_micro":      P_RL_MICRO,
             "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID"),
@@ -2610,6 +2712,9 @@ if __name__ == "__main__":
         }
         if name in trajectories:
             npz_payload.update(trajectories[name])
+        probe = _stack_timing_probes(probe_runs[name])
+        if probe is not None:
+            npz_payload.update({f"probe_{k}": v for k, v in probe.items()})
         np.savez_compressed(OUTPUT_DIR / f"{name}.npz", **npz_payload)
 
         # cae_by_uid is heterogeneous (per-uid list lengths differ when a uid
@@ -2624,6 +2729,16 @@ if __name__ == "__main__":
         if save_pf:
             with open(OUTPUT_DIR / f"{name}_pf.pkl", "wb") as f:
                 pickle.dump(pf_runs[name], f)
+
+    probe_summary = {}
+    for name in ALGORITHMS:
+        stacked = _stack_timing_probes(probe_runs[name])
+        if stacked is not None:
+            probe_summary[name] = stacked
+    if probe_summary:
+        summary_path = OUTPUT_DIR / "timing_probe_summary.txt"
+        _write_timing_probe_summary(summary_path, probe_summary)
+        print(summary_path.read_text(), end="")
 
     print(f"\nResults saved to {OUTPUT_DIR.resolve()}")
     print("Plots and pooled summaries: python aggregate.py --results-root "

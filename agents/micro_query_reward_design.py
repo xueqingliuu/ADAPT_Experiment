@@ -60,6 +60,7 @@ class MicroQueryRewardDesignAgent:
         self.get_full_mediators = dataset.get_full_week_mediators
         self.b_hat_hist, self.b_tilde_hist = dataset.b_hat_hist, dataset.b_tilde_hist
         self.betas_store, self.z_store, self.eta_store, self.daily_eta_store = {}, {}, {}, {}
+        self._init_timing_probe()
         if week0_actions is None:
             week0_actions = self.rng.integers(0, 2, size=(N_RL_DAYS, N_RL_SLOTS))
         dataset.bootstrap_week0(np.asarray(week0_actions, dtype=int), self.rng)
@@ -72,6 +73,16 @@ class MicroQueryRewardDesignAgent:
         self.steps_since_target_update = 0
         self._current_betas_day1, self._current_betas_rest = self.betas_store[0], None
         self.lambda_hist = np.full(self.W, np.nan)
+
+    def _init_timing_probe(self):
+        """Per-week Stage 1 → Stage 2 → π diagnostics (V2/V4 only)."""
+        w = int(self.W)
+        self.probe_stage1 = np.full((w, 3), np.nan)
+        self.probe_stage2 = np.full(w, np.nan)
+        self.probe_pi = np.full(w, np.nan)
+        self.probe_env = np.full(w, np.nan)
+        self.probe_sign_ok = np.full((w, 3), np.nan)
+        self.probe_sign_ok_running = np.full((w, 3), np.nan)
 
     def begin_week(self, k, packet):
         return int(self.dataset.I_hist[k])
@@ -164,6 +175,59 @@ class MicroQueryRewardDesignAgent:
                                        state, d, t, action)
         return build_redistribution_phi(self.b_hat_hist[k], self.b_tilde_hist[k], state,
                                         d, t, action, shares, full)
+
+    def _counterfactual_slot_reward(self, k, d, t, action, daily, eta, full, state):
+        shares = daily_mediator_shares(
+            daily, self.b_hat_hist[k], self.b_tilde_hist[k], state, d, t, action)
+        phi = build_redistribution_phi(
+            self.b_hat_hist[k], self.b_tilde_hist[k], state, d, t, action,
+            shares, full)
+        return float(phi @ eta)
+
+    def record_timing_probe(self, k, env_truth_pm_minus_am):
+        """Log Stage-1 γ̂_a−γ̂_m, Stage-2 r_PM−r_AM, and π_PM−π_AM.
+
+        Called at the end of week ``k``. Stage-1/2 use the Monday-night fit
+        ``prepare_week(k)`` (weeks 0..k−1). Rewards are evaluated at A=1
+        on each day's AM state with only ``t`` flipped, so the gap is the
+        action-attributable AM/PM share. ``π`` uses the realized week-k
+        propensities. Env truth is PM−AM myopic CATE (same sign as γ̂_a−γ̂_m).
+        """
+        if self.reward_design not in {"v2", "v4"}:
+            return
+        k = int(k)
+        truth = float(env_truth_pm_minus_am)
+        self.probe_env[k] = truth
+        pi = np.asarray(self.dataset.pi_A_hist[k], dtype=float)
+        self.probe_pi[k] = float(np.nanmean(pi[:, 1] - pi[:, 0]))
+        daily = self.daily_eta_store.get(k)
+        eta = self.eta_store.get(k)
+        if daily is not None:
+            for i, name in enumerate(("AA", "FW", "PJ")):
+                coef = np.asarray(daily[name], dtype=float).ravel()
+                if coef.size:
+                    self.probe_stage1[k, i] = float(coef[-1])
+        if daily is not None and eta is not None:
+            full = self.get_full_mediators(k)
+            if full is not None:
+                gaps = []
+                eta = np.asarray(eta, dtype=float)
+                for d in range(N_RL_DAYS):
+                    state_am = self.get_state(k, d, 0)
+                    r_am = self._counterfactual_slot_reward(
+                        k, d, 0, 1, daily, eta, full, state_am)
+                    r_pm = self._counterfactual_slot_reward(
+                        k, d, 1, 1, daily, eta, full, state_am)
+                    gaps.append(r_pm - r_am)
+                self.probe_stage2[k] = float(np.mean(gaps))
+        running = np.nanmean(self.probe_env[:k + 1])
+        for i in range(3):
+            g = self.probe_stage1[k, i]
+            if np.isfinite(g) and np.isfinite(truth) and g != 0.0 and truth != 0.0:
+                self.probe_sign_ok[k, i] = float(np.sign(g) == np.sign(truth))
+            if np.isfinite(g) and np.isfinite(running) and g != 0.0 and running != 0.0:
+                self.probe_sign_ok_running[k, i] = float(
+                    np.sign(g) == np.sign(running))
 
     def _bootstrap_q(self, kp, d, t, eval_betas, select_betas):
         """Double-Q backup used by ``build_rl_training_data``: argmax on the
@@ -258,9 +322,21 @@ class MicroQueryRewardDesignAgent:
 
     def results(self, dataset=None):
         ds = dataset or self.dataset
-        return {"I": ds.I_hist, "A": ds.A_hist, "b_hat": self.b_hat_hist,
+        out = {"I": ds.I_hist, "A": ds.A_hist, "b_hat": self.b_hat_hist,
                 "b_tilde": self.b_tilde_hist, "pi_A": ds.pi_A_hist,
                 "y_hat": ds.pf_result.get("y_hat"), "v_hat": ds.pf_result.get("v_hat"),
                 "pf": ds.pf_result, "betas": _stack_param_store(self.betas_store, self.W),
                 "eta": _stack_param_store(self.eta_store, self.W),
                 "lambda_hist": np.asarray(self.lambda_hist, dtype=float)}
+        if self.reward_design in {"v2", "v4"}:
+            out["timing_probe"] = {
+                "stage1_gamma_pm_minus_am": np.asarray(self.probe_stage1, dtype=float),
+                "stage2_r_pm_minus_am": np.asarray(self.probe_stage2, dtype=float),
+                "pi_pm_minus_am": np.asarray(self.probe_pi, dtype=float),
+                "env_truth_pm_minus_am": np.asarray(self.probe_env, dtype=float),
+                "stage1_sign_ok": np.asarray(self.probe_sign_ok, dtype=float),
+                "stage1_sign_ok_running": np.asarray(
+                    self.probe_sign_ok_running, dtype=float),
+                "stage1_mediators": np.array(["AA", "FW", "PJ"]),
+            }
+        return out
