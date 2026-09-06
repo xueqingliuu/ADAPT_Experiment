@@ -2,14 +2,28 @@
 import numpy as np
 
 from algorithm_helpers import (
-    N_RL_DAYS, N_RL_SLOTS, QUERY_D, QUERY_T, _stack_param_store, build_phi_action,
+    N_RL_DAYS, N_RL_SLOTS, QUERY_D, QUERY_T, STAGE1_SHARE_NAMES,
+    _stack_param_store, build_phi_action,
     build_redistribution_phi, build_rl_training_data, _next_slot,
     clip_prob,
     compute_reward_shaping_eta, compute_rlsvi_betas,
     daily_mediator_shares, empirical_bayes_sigma2_ensemble,
     ensemble_action_prob, fit_daily_mediator_decomposition,
-    require_finite_belief,
+    pf_cae_slot_weights, require_finite_belief,
+    antic_row_with_actions, foursc_row_with_action, pf_posterior_theta_mean,
+    PF_THETA_FOURSC_NAMES, PF_THETA_ANTIC_NAMES,
 )
+
+STAGE2_MODES = ("learned", "fixed_full", "fixed_cae")
+STAGE1_SOURCES = ("ridge", "pf")
+# Index of each Stage-1 share in ``daily_mediator_shares`` output.
+_SHARE_IDX = {name: i for i, name in enumerate(STAGE1_SHARE_NAMES)}
+_TERMINAL = (N_RL_DAYS - 1, N_RL_SLOTS - 1)
+# Protocol / RCT ê mediator averages are Mon–Sat only (see ``agents.ew_hat``):
+#   PV̄ = (1/12) Σ_{d=1..6,t} PV_{d,t},  FW̄/PJ̄ = (1/6) Σ_d M_d.
+# Script 4 / script 6 / ``vani_env`` still use calendar-week /14 and /7.
+_N_PV_SLOTS = N_RL_DAYS * N_RL_SLOTS
+_N_DAILY = N_RL_DAYS
 
 
 class MicroQueryRewardDesignAgent:
@@ -26,10 +40,42 @@ class MicroQueryRewardDesignAgent:
     slot to force the week to sum to the target (V2 target
     ``b̂_{w+1} + λ ê_{w+1}``; V4 ``b̂_{w+1} + F``).
     ``ê_{w+1}`` enters only that weekly target, not Stage-2 slot features.
+
+    ``stage2_mode`` (V4 base only):
+
+    * ``"learned"`` — Stage-2 η regressed on Σψ (the original V2/V4).
+    * ``"fixed_full"`` — slot reward from the *known* map: PF CAE
+      transition ``θ_f·w_f[d,t]·ŜC_dt + θ_a·w_a[d]·ÂA_dt`` plus the
+      shaping potential split through the agent's own ê filter,
+      ``γ̄·(c_PV/12·P̂V_dt + c_FW/6·F̂W_dt + c_PJ/6·P̂J_dt)`` (Mon–Sat). The
+      action-independent remainder ``θ0 + θ1·b̂_w + γ̄(c0 + c_E·ê_w) − ê_w``
+      is added at the terminal slot. Slot shaping and the online ê filter
+      both use Mon–Sat /12 and /6, so the 12 RL slots reassemble
+      ``γ̄·(c_PV PV̄ + c_FW FW̄ + c_PJ PJ̄)``. ``J_close`` /
+      ``half_J_close`` stay in the remainder (0 in the current coef files).
+    * ``"fixed_cae"`` — CAE part only; the whole realized potential
+      ``F_w`` plus ``θ0 + θ1·b̂_w`` is added at the terminal slot (V3
+      treatment), so the timing information is the only within-week
+      action-dependent signal.
+
+    Hats are Stage-1 predictions (daily AA/FW/PJ shares, slot-level SC/PV),
+    so per-user learning is confined to how a send moves each mediator;
+    the mediator→target weights are the PF reward prior ``nu_0_Y`` and the
+    pooled ê coefficients, not fitted online.
+
+    ``stage1_source="pf"`` (fixed modes only) takes ŜC and ÂA from the
+    particle filter's mediator posteriors instead of the Stage-1 ridge: the
+    PF fourSC / antic base rows delivered in each ``WeekPacket`` are
+    re-actioned (``foursc_row_with_action`` / ``antic_row_with_actions``),
+    ``caeAverageLastWeek`` is set to ``b̂_w``, and the particle-weighted
+    posterior mean of ``theta_MY`` at the current week is applied. One model
+    then serves both the belief ``b̂`` and the credit assignment. FW/PJ/PV
+    (not modelled by the PF) stay on the ridge.
     """
     def __init__(self, *args, reward_design, engagement_bonus=None,
                  engagement_rho=0.5, daily_mediator_priors=None,
-                 redistribution_prior=None, **kwargs):
+                 redistribution_prior=None, stage2_mode="learned",
+                 ew_coefs=None, stage1_source="ridge", **kwargs):
         # Keep the constructor compatible with MicroQueryAgent's parameters.
         names = [
             "W", "J", "B", "epsilon_0", "mu_0_rl", "Sigma_0_rl", "sigma2_rl",
@@ -55,6 +101,26 @@ class MicroQueryRewardDesignAgent:
         self.update_sigma2_q_online = bool(
             values.get("update_sigma2_q_online", True)
         )
+        if stage2_mode not in STAGE2_MODES:
+            raise ValueError(f"stage2_mode must be one of {STAGE2_MODES}, got {stage2_mode!r}")
+        if stage2_mode != "learned" and reward_design != "v4":
+            raise ValueError("fixed-map Stage 2 is defined for the return-invariant design (v4) only")
+        self.stage2_mode = stage2_mode
+        if stage1_source not in STAGE1_SOURCES:
+            raise ValueError(f"stage1_source must be one of {STAGE1_SOURCES}, got {stage1_source!r}")
+        if stage1_source == "pf" and stage2_mode == "learned":
+            raise ValueError("stage1_source='pf' is only defined for the fixed-map Stage 2")
+        self.stage1_source = stage1_source
+        self._pf_rows = {}
+        self._pf_theta = None
+        self.ew_coefs = dict(ew_coefs) if ew_coefs is not None else None
+        if stage2_mode == "fixed_full" and self.ew_coefs is None:
+            raise ValueError("stage2_mode='fixed_full' needs the pooled ê coefficients (ew_coefs)")
+        self._w_f, self._w_a = pf_cae_slot_weights()
+        theta = np.asarray(self.nu_0_Y, dtype=float).ravel()
+        if theta.size != 4:
+            raise ValueError(f"nu_0_Y must be [intercept, CAE_lag, fourSC_ewma, antic_ewma]; got {theta.size}")
+        self._theta_cae = theta
         self.dataset = None
 
     def reset(self, dataset, week0_actions=None):
@@ -82,15 +148,61 @@ class MicroQueryRewardDesignAgent:
     def _init_timing_probe(self):
         """Per-week Stage 1 → Stage 2 → π diagnostics (V2/V4 only)."""
         w = int(self.W)
-        self.probe_stage1 = np.full((w, 4), np.nan)
+        n_med = len(STAGE1_SHARE_NAMES)
+        self.probe_stage1 = np.full((w, n_med), np.nan)
         self.probe_stage2 = np.full(w, np.nan)
+        self.probe_stage2_cae = np.full(w, np.nan)
+        self.probe_stage2_shaping = np.full(w, np.nan)
         self.probe_pi = np.full(w, np.nan)
         self.probe_env = np.full(w, np.nan)
-        self.probe_sign_ok = np.full((w, 4), np.nan)
-        self.probe_sign_ok_running = np.full((w, 4), np.nan)
+        self.probe_sign_ok = np.full((w, n_med), np.nan)
+        self.probe_sign_ok_running = np.full((w, n_med), np.nan)
+        # PF posterior AM/PM contrasts (fourSC Ah*slot; antic A1−A0 main effects)
+        self.probe_pf_gamma = np.full((w, 2), np.nan)
 
     def begin_week(self, k, packet):
+        if packet is not None and getattr(packet, "pf_data", None) is not None:
+            base = packet.pf_data.get("X_MY_base")
+            if base is not None and len(base) >= 2:
+                # rows describe the just-finished week k-1 (PF convention)
+                self._pf_rows[int(k) - 1] = (
+                    np.asarray(base[0], dtype=float), np.asarray(base[1], dtype=float))
         return int(self.dataset.I_hist[k])
+
+    # ---- Stage 1 from the PF mediator posteriors ---------------------
+    def _refresh_pf_theta(self, k):
+        pf = getattr(self.dataset, "pf_result", None) or {}
+        if "theta_MY_mean" not in pf:
+            self._pf_theta = None
+            return
+        th_f = pf_posterior_theta_mean(pf, 0, k)
+        th_a = pf_posterior_theta_mean(pf, 1, k)
+        self._pf_theta = None if (th_f is None or th_a is None) else (th_f, th_a)
+
+    def _pf_available(self, kp):
+        return self._pf_theta is not None and int(kp) in self._pf_rows
+
+    def _pf_sc_pred(self, kp, d, t, action):
+        """PF-model prediction of fourSC at slot (d,t) of week ``kp`` under ``action``."""
+        row = self._pf_rows[int(kp)][0][d * N_RL_SLOTS + t]
+        cae = require_finite_belief(self.b_hat_hist[kp], week=kp)
+        return float(foursc_row_with_action(row, action, cae) @ self._pf_theta[0])
+
+    def _pf_aa_share(self, kp, d, t, action):
+        """Slot share of the PF-predicted daily anticipated affect.
+
+        The state part is split half/half; the slot gets its own
+        walking-suggestion block (AM: ``A0_*``, PM: ``A1_*``), which is exactly
+        separable in the PF antic model."""
+        row = self._pf_rows[int(kp)][1][d]
+        cae = require_finite_belief(self.b_hat_hist[kp], week=kp)
+        th = self._pf_theta[1]
+        base = float(antic_row_with_actions(row, 0.0, 0.0, cae) @ th)
+        if t == 0:
+            own = float(antic_row_with_actions(row, action, 0.0, cae) @ th) - base
+        else:
+            own = float(antic_row_with_actions(row, 0.0, action, cae) @ th) - base
+        return 0.5 * base + own
 
     def _engagement(self, k):
         """Agent-visible ê_k (week-start ``E_known``)."""
@@ -153,6 +265,13 @@ class MicroQueryRewardDesignAgent:
                 self.get_state, self.get_full_mediators,
                 priors=self.daily_mediator_priors)
             self.daily_eta_store[k] = daily
+            if self.stage2_mode != "learned":
+                if self.stage1_source == "pf":
+                    self._refresh_pf_theta(k)
+                self.eta_store[k] = None
+                self._current_betas_day1 = self.betas_store.get(k - 1, self.betas_store[0])
+                self._current_betas_rest = None
+                return
             rows, y = [], []
             for kp in range(k):
                 full = self.get_full_mediators(kp)
@@ -181,6 +300,53 @@ class MicroQueryRewardDesignAgent:
         return build_redistribution_phi(self.b_hat_hist[k], self.b_tilde_hist[k], state,
                                         d, t, action, shares, full)
 
+    def _fixed_map_parts(self, k, d, t, action, daily, state):
+        """(CAE part, shaping part) of the known-map slot reward.
+
+        CAE part: ``θ_f·w_f[d,t]·ŜC_dt + θ_a·w_a[d]·ÂA_dt`` (PF reward prior,
+        PF EWMA weights). Shaping part (``fixed_full`` only):
+        ``γ̄·(c_PV·P̂V_dt/12 + c_FW·F̂W_dt/6 + c_PJ·P̂J_dt/6)`` — same
+        Mon–Sat averages as ``agents.ew_hat`` (12 PV slots, 6 FW/PJ days).
+        """
+        shares = daily_mediator_shares(
+            daily, self.b_hat_hist[k], self.b_tilde_hist[k], state, d, t, action)
+        sc_hat = float(shares[_SHARE_IDX["SC"]])
+        aa_hat = float(shares[_SHARE_IDX["AA"]])
+        if self.stage1_source == "pf" and self._pf_available(k):
+            sc_hat = self._pf_sc_pred(k, d, t, action)
+            aa_hat = self._pf_aa_share(k, d, t, action)
+        th = self._theta_cae
+        cae = (th[2] * self._w_f[d, t] * sc_hat
+               + th[3] * self._w_a[d] * aa_hat)
+        if self.stage2_mode != "fixed_full":
+            return cae, 0.0
+        c = self.ew_coefs
+        shaping = self.gamma_bar * (
+            float(c["PV_sum"]) * float(shares[_SHARE_IDX["PV"]]) / _N_PV_SLOTS
+            + float(c["FW_sum"]) * float(shares[_SHARE_IDX["FW"]]) / _N_DAILY
+            + float(c["PJ_sum"]) * float(shares[_SHARE_IDX["PJ"]]) / _N_DAILY
+        )
+        return cae, shaping
+
+    def _fixed_map_slot_reward(self, k, d, t, action, daily, state):
+        cae, shaping = self._fixed_map_parts(k, d, t, action, daily, state)
+        return cae + shaping
+
+    def _fixed_map_remainder(self, k):
+        """Action-independent part of week ``k``'s target, added at the terminal slot.
+
+        ``fixed_full``: ``θ0 + θ1·b̂_k + γ̄·(c0 + c_E·ê_k) − ê_k`` (all known on
+        Monday). ``fixed_cae``: ``θ0 + θ1·b̂_k + F_k`` with the realized
+        potential, as V3 does.
+        """
+        th = self._theta_cae
+        base = float(th[0] + th[1] * require_finite_belief(self.b_hat_hist[k], week=k))
+        if self.stage2_mode == "fixed_full":
+            c = self.ew_coefs
+            e_k = self._engagement(k)
+            return base + self.gamma_bar * (float(c.get("intercept", 0.0)) + float(c["E_lag"]) * e_k) - e_k
+        return base + self._potential(k)
+
     def _counterfactual_slot_reward(self, k, d, t, action, daily, eta, full, state):
         shares = daily_mediator_shares(
             daily, self.b_hat_hist[k], self.b_tilde_hist[k], state, d, t, action)
@@ -207,24 +373,56 @@ class MicroQueryRewardDesignAgent:
         self.probe_pi[k] = float(np.nanmean(pi[:, 1] - pi[:, 0]))
         daily = self.daily_eta_store.get(k)
         eta = self.eta_store.get(k)
+        if self.stage1_source == "pf" and self._pf_theta is not None:
+            th_f, th_a = self._pf_theta
+            self.probe_pf_gamma[k, 0] = float(th_f[PF_THETA_FOURSC_NAMES.index("Ah*decisionTimeSlot")])
+            self.probe_pf_gamma[k, 1] = float(
+                th_a[PF_THETA_ANTIC_NAMES.index("A1_afternoon")]
+                - th_a[PF_THETA_ANTIC_NAMES.index("A0_morning")])
         if daily is not None:
-            for i, name in enumerate(("AA", "FW", "PJ", "SC")):
+            for i, name in enumerate(STAGE1_SHARE_NAMES):
                 coef = np.asarray(daily.get(name, []), dtype=float).ravel()
                 if coef.size:
                     self.probe_stage1[k, i] = float(coef[-1])
-        if daily is not None and eta is not None:
+        # Action-attributable AM/PM contrast in the slot reward:
+        #   [r(t=1,A=1) − r(t=1,A=0)] − [r(t=0,A=1) − r(t=0,A=0)]
+        # on each day's AM state, so slot-visibility (M_ewma) and other
+        # state differences cancel and only the A×t term remains.
+        if daily is not None and (eta is not None or self.stage2_mode != "learned"):
             full = self.get_full_mediators(k)
-            if full is not None:
-                gaps = []
-                eta = np.asarray(eta, dtype=float)
-                for d in range(N_RL_DAYS):
-                    state_am = self.get_state(k, d, 0)
-                    r_am = self._counterfactual_slot_reward(
-                        k, d, 0, 1, daily, eta, full, state_am)
-                    r_pm = self._counterfactual_slot_reward(
-                        k, d, 1, 1, daily, eta, full, state_am)
-                    gaps.append(r_pm - r_am)
-                self.probe_stage2[k] = float(np.mean(gaps))
+            if full is not None or self.stage2_mode != "learned":
+                gaps, gaps_cae, gaps_sh = [], [], []
+                if eta is not None:
+                    eta = np.asarray(eta, dtype=float)
+                # PF rows for week k arrive with packet k+1; in pf mode the
+                # contrast is evaluated on week k-1 (latest rows) with the
+                # current posterior, which is what the next fit will use.
+                kq = k
+                if self.stage1_source == "pf":
+                    if k == 0 or not self._pf_available(k - 1):
+                        kq = None
+                    else:
+                        kq = k - 1
+                for d in range(N_RL_DAYS if kq is not None else 0):
+                    state_am = self.get_state(kq, d, 0)
+                    if self.stage2_mode == "learned":
+                        r = {(t, a): self._counterfactual_slot_reward(
+                                k, d, t, a, daily, eta, full, state_am)
+                             for t in (0, 1) for a in (0, 1)}
+                        gaps.append((r[1, 1] - r[1, 0]) - (r[0, 1] - r[0, 0]))
+                    else:
+                        parts = {(t, a): self._fixed_map_parts(kq, d, t, a, daily, state_am)
+                                 for t in (0, 1) for a in (0, 1)}
+                        dc = (parts[1, 1][0] - parts[1, 0][0]) - (parts[0, 1][0] - parts[0, 0][0])
+                        ds = (parts[1, 1][1] - parts[1, 0][1]) - (parts[0, 1][1] - parts[0, 0][1])
+                        gaps_cae.append(dc)
+                        gaps_sh.append(ds)
+                        gaps.append(dc + ds)
+                if gaps:
+                    self.probe_stage2[k] = float(np.mean(gaps))
+                if gaps_cae:
+                    self.probe_stage2_cae[k] = float(np.mean(gaps_cae))
+                    self.probe_stage2_shaping[k] = float(np.mean(gaps_sh))
         running = np.nanmean(self.probe_env[:k + 1])
         for i in range(self.probe_stage1.shape[1]):
             g = self.probe_stage1[k, i]
@@ -266,7 +464,14 @@ class MicroQueryRewardDesignAgent:
             rewards = np.empty((N_RL_DAYS, N_RL_SLOTS))
             for d in range(N_RL_DAYS):
                 for t in range(N_RL_SLOTS):
-                    rewards[d, t] = self._slot_phi(kp, d, t, full, daily) @ eta
+                    if self.stage2_mode == "learned":
+                        rewards[d, t] = self._slot_phi(kp, d, t, full, daily) @ eta
+                    else:
+                        rewards[d, t] = self._fixed_map_slot_reward(
+                            kp, d, t, self.dataset.A_hist[kp, d, t], daily,
+                            self.get_state(kp, d, t))
+            if self.stage2_mode != "learned":
+                rewards[_TERMINAL] += self._fixed_map_remainder(kp)
             for d in range(N_RL_DAYS):
                 for t in range(N_RL_SLOTS):
                     state = self.get_state(kp, d, t)
@@ -346,6 +551,11 @@ class MicroQueryRewardDesignAgent:
                 "stage1_sign_ok_running": np.asarray(
                     self.probe_sign_ok_running, dtype=float),
                 "sigma2_q": np.asarray(self.sigma2_rl_hist, dtype=float),
-                "stage1_mediators": np.array(["AA", "FW", "PJ", "SC"]),
+                "stage2_r_gap_cae": np.asarray(self.probe_stage2_cae, dtype=float),
+                "stage2_r_gap_shaping": np.asarray(self.probe_stage2_shaping, dtype=float),
+                "pf_gamma_pm_minus_am": np.asarray(self.probe_pf_gamma, dtype=float),
+                "stage1_mediators": np.array(list(STAGE1_SHARE_NAMES)),
             }
+            out["stage2_mode"] = self.stage2_mode
+            out["stage1_source"] = self.stage1_source
         return out

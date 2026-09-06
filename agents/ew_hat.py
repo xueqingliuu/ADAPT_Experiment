@@ -1,10 +1,19 @@
 """Agent-visible approximations of perceived utility (E_w) from weekly observables.
 
-``FW_sum`` / ``PJ_sum`` / ``PV_sum`` use script 4's fixed denominators
-(missing → 0). Fitbit wear missingness is coded as not wearing so Ê_w
-matches the E_w transition the simulator was fit on.
+RCT ê (this module) uses only Monday–Saturday mediators, matching the
+RCT action schedule:
 
-Ê_{w+1} uses last week's Ê (AR), this week's mediator averages
+* ``PV_sum`` = nansum of 12 Mon–Sat slots / 12
+* ``FW_sum`` = nansum of 6 Mon–Sat ``nextday_wearing`` draws / 6
+  (those draws are Tuesday–Sunday morning wear)
+* ``PJ_sum`` = nansum of 6 Mon–Sat ``daily_present`` draws / 6
+  (same-day EOD surveys)
+
+Script 6 / script 4 / ``vani_env`` keep calendar-week /14 and /7 because
+they are fit to MRT data that includes Sunday. The pooled coefficients
+are still those script-6 numbers; only the online features drop Sunday.
+
+Ê_{w+1} uses last week's Ê (AR), this week's Mon–Sat averages
 (transition), and this Sunday's ``J`` / ``J(U1+U2)/14`` (update).
 """
 
@@ -18,19 +27,42 @@ import pandas as pd
 
 from algorithm_helpers import (
     FOURSC_SLOTS_PER_WEEK,
+    N_RL_DAYS,
+    N_RL_SLOTS,
     apply_pooled_coefs,
-    weekly_pv_sum_for_ew,
 )
 from vani_env import PARAMS_DIR
 
 BASELINE_OFFSET = 1
 DEFAULT_EW_HAT = 2.0
+N_RL_PV_SLOTS = N_RL_DAYS * N_RL_SLOTS  # 12
+_SUNDAY_DOW = 7
 
 
 def load_pooled_coefs(work_dir=None):
     p = Path(work_dir or PARAMS_DIR) / "Ew_pooled_linear_coefs.json"
     with open(p, encoding="utf-8") as f:
         return {k: float(v) for k, v in json.load(f).items()}
+
+
+def rct_pv_sum(slot_pv):
+    """Mon–Sat pageview mean (12 slots / 12). Extra Sunday slots are ignored."""
+    v = np.asarray(slot_pv, dtype=float).ravel()
+    if v.size >= N_RL_PV_SLOTS:
+        v = v[:N_RL_PV_SLOTS]
+    if v.size == 0 or not np.any(np.isfinite(v)):
+        return 0.0
+    return float(np.nansum(v) / N_RL_PV_SLOTS)
+
+
+def rct_daily_sum(daily):
+    """Mon–Sat FW or PJ mean (6 days / 6). A trailing Sunday draw is ignored."""
+    v = np.asarray(daily, dtype=float).ravel()
+    if v.size >= N_RL_DAYS:
+        v = v[:N_RL_DAYS]
+    if v.size == 0:
+        return 0.0
+    return float(np.nansum(v) / N_RL_DAYS)
 
 
 def weekly_Ew_predictor_table(
@@ -44,7 +76,7 @@ def weekly_Ew_predictor_table(
     rows = []
     for (uid, wk), g in df.groupby(["ParticipantIdentifier", "week"], sort=True):
         g = g.sort_values([date_col, decision_col], na_position="last")
-        sun = g.loc[g["dow"] == 7]
+        sun = g.loc[g["dow"] == _SUNDAY_DOW]
         j_w = float(sun["week_present"].iloc[0]) if len(sun) else np.nan
         u1 = float(sun["Exp-tool-1"].iloc[0]) if len(sun) else np.nan
         u2 = float(sun["Exp-tool-2"].iloc[0]) if len(sun) else np.nan
@@ -56,17 +88,19 @@ def weekly_Ew_predictor_table(
             j_w = 0.0
         j_w = float(j_w)
         half_j_close = j_w * (u1 + u2) / 14.0
-        pv_sum = weekly_pv_sum_for_ew(g["HourlyPageviewCount_norm"].to_numpy(dtype=float))
+
+        rl = g.loc[g["dow"] != _SUNDAY_DOW]
+        pv_arr = rl["HourlyPageviewCount_norm"].to_numpy(dtype=float)
+        pv_sum = rct_pv_sum(pv_arr)
 
         fw_daily, pj_daily = [], []
-        for _, g_day in g.groupby(date_col, sort=True):
+        for _, g_day in rl.groupby(date_col, sort=True):
             g_day = g_day.sort_values(decision_col, na_position="last")
             row0 = g_day.iloc[0]
             fw_daily.append(float(row0["nextday_wearing"]) if pd.notna(row0["nextday_wearing"]) else 0.0)
             pj_daily.append(float(row0["daily_present"]) if pd.notna(row0["daily_present"]) else 0.0)
-        # /7 with missing→0; FW missingness = not wearing (script 4 / vani_env).
-        fw_sum = float(np.sum(np.asarray(fw_daily, dtype=float)) / 7.0) if fw_daily else 0.0
-        pj_sum = float(np.sum(np.asarray(pj_daily, dtype=float)) / 7.0) if pj_daily else 0.0
+        fw_sum = rct_daily_sum(fw_daily)
+        pj_sum = rct_daily_sum(pj_daily)
 
         rows.append({
             "ParticipantIdentifier": int(uid) if isinstance(uid, (int, np.integer)) else uid,
@@ -144,12 +178,12 @@ def compute_Ew_hat_from_week(
     dp_wk,
     baseline_offset=BASELINE_OFFSET,
 ):
-    """Approximate E_{w+1} from Ê_w, week ``sim_w`` mediators, and this Sunday.
+    """Approximate E_{w+1} from Ê_w, week ``sim_w`` Mon–Sat mediators, and this Sunday.
 
     ``sim_w`` is RL week ``k`` (0-based). At the end of week ``w``:
 
     * ``e_lag`` is last week's Ê (``E_known_all[sim_w]``), the AR term.
-    * PV/FW/PJ are this week's series (transition inputs for ``E_{w+1}``).
+    * PV/FW/PJ are this week's Monday–Saturday series (12 slots / 6 days).
     * ``J_close`` / ``half_J_close`` are this Sunday's ``J_{w+1}`` and
       ``J_{w+1}(U1+U2)/14`` at ``wp_all[sim_w + baseline_offset]``.
     """
@@ -163,10 +197,9 @@ def compute_Ew_hat_from_week(
     half_j_close = J_close * (u1 + u2) / 14.0
     slot_start = int(sim_w) * FOURSC_SLOTS_PER_WEEK
     slot_stop = int(sim_w + 1) * FOURSC_SLOTS_PER_WEEK
-    pv_sum = weekly_pv_sum_for_ew(pageViewNext4HourAll[slot_start:slot_stop])
-    # Same nansum/7 as script 4: missing wear → 0 (not wearing).
-    fw_sum = float(np.nansum(dw_wk) / 7.0)
-    pj_sum = float(np.nansum(dp_wk) / 7.0)
+    pv_sum = rct_pv_sum(pageViewNext4HourAll[slot_start:slot_stop])
+    fw_sum = rct_daily_sum(dw_wk)
+    pj_sum = rct_daily_sum(dp_wk)
     return apply_pooled_coefs(
         coefs, e_lag, pv_sum, fw_sum, pj_sum, J_close, half_j_close,
     )

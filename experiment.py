@@ -170,6 +170,8 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     pad_q_prior_action_time,
     pad_joint_prior_action_time,
     pad_prior_append,
+    PF_THETA_FOURSC_NAMES,
+    PF_THETA_ANTIC_NAMES,
 )
 from agents.ew_hat import (
     compute_Ew_hat_from_week,
@@ -1396,6 +1398,8 @@ P_DAILY_MEDIATOR = {
 P_DAILY_MEDIATOR["SC"] = int(
     build_foursc_stage1_phi(0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0).size
 )
+# Stage-1b page views (normalised 4-hour count) share the slot-level map.
+P_DAILY_MEDIATOR["PV"] = P_DAILY_MEDIATOR["SC"]
 P_REDISRIBUTION = int(build_redistribution_phi(
     0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0, np.zeros(4)).size)
 
@@ -1498,6 +1502,65 @@ def _save_trajectories_for_algo(save_mode, algo_name):
 # (missing file, ImportError from est_prior/statsmodels, corrupt JSON) raises
 # instead of silently installing zeros for PF and Q.
 # ──────────────────────────────────────────────────────────────────
+def _coerce_pf_fourSC_prior(nu, Gamma, *, label="fourSC"):
+    """Pad a saved PF fourSC prior that predates ``Ah*decisionTimeSlot``.
+
+    The new column is trailing, so padding appends a zero mean with unit
+    variance (the zero-centring step later floors / rescales it)."""
+    nu = np.asarray(nu, dtype=float).ravel()
+    Gamma = np.asarray(Gamma, dtype=float)
+    if nu.size == P_MY_FOURSC:
+        return nu, Gamma
+    if nu.size == P_MY_FOURSC - 1:
+        nu2, G2 = pad_prior_append(nu, Gamma, P_MY_FOURSC)
+        # Prior sd of the new A×slot column = the PF's own uncertainty about
+        # the main send effect (unit variance would swamp a mediator model).
+        j_ah = PF_THETA_FOURSC_NAMES.index("Ah")
+        G2[-1, -1] = float(Gamma[j_ah, j_ah])
+        _setup_log(
+            f"[priors] padded PF {label} prior with zero Ah*decisionTimeSlot "
+            f"({nu.size} → {P_MY_FOURSC}); rerun est_prior.py for a fitted column"
+        )
+        return nu2, G2
+    raise ValueError(f"PF {label} prior dim {nu.size} incompatible with {P_MY_FOURSC}")
+
+
+# PF timing columns whose pilot prior mean carries an AM/PM tilt. Under
+# ZERO_CENTRE_POLICY_PRIORS the fourSC ``Ah*decisionTimeSlot`` mean is set
+# to 0 and each antic (A0_morning_*, A1_afternoon_*) pair is set to its
+# average, so the pooled send effect is kept but the AM/PM contrast prior is
+# neutral. Their variances are floored at PF_TIMING_PRIOR_VAR_FLOOR (default
+# 0.01, i.e. sd 0.1) — not scaled by POLICY_PRIOR_VAR_SCALE, which is sized
+# for the Q prior and would swamp a mediator model.
+_PF_TIMING_PRIOR_VAR_FLOOR = float(os.getenv("PF_TIMING_PRIOR_VAR_FLOOR", "0.01"))
+_ANTIC_TIMING_PAIRS = (
+    ("A0_morning", "A1_afternoon"),
+    ("A0_morning_by_perceived_utility_lastweek", "A1_afternoon_by_perceived_utility_lastweek"),
+    ("A0_morning_by_CAE_avg_lastweek", "A1_afternoon_by_CAE_avg_lastweek"),
+    ("A0_morning_by_recent_burden", "A1_afternoon_by_recent_burden"),
+)
+
+
+def _zero_centre_pf_timing_priors(floor):
+    """Neutralise the AM/PM contrast in the PF mediator priors (in place)."""
+    global nu_0_MY, Gamma_0_MY
+    nu_f = np.asarray(nu_0_MY[0], dtype=float).copy()
+    G_f = np.asarray(Gamma_0_MY[0], dtype=float).copy()
+    j = PF_THETA_FOURSC_NAMES.index("Ah*decisionTimeSlot")
+    nu_f[j] = 0.0
+    G_f[j, j] = max(G_f[j, j], floor)
+    nu_a = np.asarray(nu_0_MY[1], dtype=float).copy()
+    G_a = np.asarray(Gamma_0_MY[1], dtype=float).copy()
+    for am, pm in _ANTIC_TIMING_PAIRS:
+        i, j2 = PF_THETA_ANTIC_NAMES.index(am), PF_THETA_ANTIC_NAMES.index(pm)
+        avg = 0.5 * (nu_a[i] + nu_a[j2])
+        nu_a[i] = nu_a[j2] = avg
+        for idx in (i, j2):
+            G_a[idx, idx] = max(G_a[idx, idx], floor)
+    nu_0_MY = [nu_f, nu_a]
+    Gamma_0_MY = [G_f, G_a]
+
+
 def _default_pf_priors():
     return {
         "nu_0_MY":    [np.zeros(P_MY_FOURSC), np.zeros(P_MY_ANTIC)],
@@ -1840,9 +1903,11 @@ def _zero_centre_policy_priors(*, log=False):
     Sigma_0_mtd_joint = _inflate_policy_cov(
         Sigma_0_mtd_joint, scale, floor, start=int(p_eta_mtd_joint),
     )
+    _zero_centre_pf_timing_priors(float(_PF_TIMING_PRIOR_VAR_FLOOR))
     tag = (
         f"Q/Stage-1/Stage-1b means zero-centred, "
-        f"Σ×{scale:g} (diag floor {floor:g})"
+        f"Σ×{scale:g} (diag floor {floor:g}); PF timing contrast neutral "
+        f"(floor {_PF_TIMING_PRIOR_VAR_FLOOR:g})"
     )
     if _priors_src is None or tag not in str(_priors_src):
         _priors_src = (
@@ -1851,9 +1916,10 @@ def _zero_centre_policy_priors(*, log=False):
     if log:
         _setup_log(
             "[priors] zero-centred Q, Stage-1 (AA/FW/PJ), and Stage-1b "
-            f"(SC) means; inflated those Σ by {scale:g} with diagonal "
-            f"floor {floor:g}; PF and reward-shaping priors kept; "
-            "Stage-2 η kept"
+            f"(SC/PV) means; inflated those Σ by {scale:g} with diagonal "
+            f"floor {floor:g}; PF fourSC Ah*slot mean 0 and antic AM/PM "
+            f"pairs averaged (var floor {_PF_TIMING_PRIOR_VAR_FLOOR:g}); "
+            "other PF, reward-shaping and Stage-2 η priors kept"
         )
 
 
@@ -1935,8 +2001,9 @@ def _configure_priors(params_dir=None, *, force=False):
             P_RL_BOTTLENECK, P_RL_MICRO)
     else:
         _setup_log(f"[priors] loaded estimated priors from {_priors_src}")
-        nu_0_MY        = _priors["nu_0_MY"]
-        Gamma_0_MY     = _priors["Gamma_0_MY"]
+        nu_0_MY        = list(_priors["nu_0_MY"])
+        Gamma_0_MY     = list(_priors["Gamma_0_MY"])
+        nu_0_MY[0], Gamma_0_MY[0] = _coerce_pf_fourSC_prior(nu_0_MY[0], Gamma_0_MY[0])
         sigma2_MY      = _priors["sigma2_MY"]
         nu_0_Y         = _priors["nu_0_Y"]
         Gamma_0_Y      = _priors["Gamma_0_Y"]
@@ -2109,6 +2176,8 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
                np.asarray(pf["antic"]["nu_0"], dtype=float)]
     Gamma_0_MY = [np.asarray(pf["fourSC"]["Gamma_0"], dtype=float),
                   np.asarray(pf["antic"]["Gamma_0"], dtype=float)]
+    nu_0_MY[0], Gamma_0_MY[0] = _coerce_pf_fourSC_prior(
+        nu_0_MY[0], Gamma_0_MY[0], label="LOO fourSC")
     sigma2_MY = [float(pf["fourSC"]["sigma2"]), float(pf["antic"]["sigma2"])]
     nu_0_Y, Gamma_0_Y = trim_pf_cae_prior(
         np.asarray(pf["CAE"]["nu_0"], dtype=float),
@@ -2403,7 +2472,8 @@ def run_micro_query_residual(uid, seed=42, gamma_bar=0.9, params_dir=None):
 
 def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.5,
                                    params_dir=None, engagement_bonus=None,
-                                   engagement_rho=None):
+                                   engagement_rho=None, stage2_mode="learned",
+                                   stage1_source="ridge"):
     """Run one of the protocol reward designs V1--V4.
 
     V1/V2 use the engagement-biased weekly target ``b̂_{w+1} + λ ê_{w+1}``,
@@ -2414,9 +2484,20 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
     rewards are ``φ^⊤ η`` only (no last-slot leftover).
     ``ê_{w+1}`` is used only in that weekly Stage-2 target, not in Stage-2
     slot features.
+
+    ``stage2_mode="fixed_full"`` / ``"fixed_cae"`` (V4 base) replace the
+    learned Stage-2 η with the known mediator→target map (PF CAE prior
+    ``nu_0_Y`` × PF EWMA weights; pooled ê filter coefficients for the
+    shaping part). ``stage1_source="pf"`` takes the fourSC and antic
+    predictions from the particle filter's mediator posteriors instead of
+    the Stage-1 ridge (FW/PJ/PV stay on the ridge). See
+    ``MicroQueryRewardDesignAgent``.
     """
     _ensure_priors_configured(params_dir)
     cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
+    ew_coefs = None
+    if stage2_mode != "learned":
+        ew_coefs = load_pooled_coefs(work_dir=oenv.params_dir)
     nweek = cfg.nweek
     week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
     dataset = EpisodeDataset(nweek)
@@ -2445,6 +2526,7 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
         daily_mediator_priors=daily_mediator_priors,
         redistribution_prior=redistribution_priors.get(reward_design),
         update_sigma2_q_online=True,
+        stage2_mode=stage2_mode, ew_coefs=ew_coefs, stage1_source=stage1_source,
     )
     return oenv.run_episode(agent, dataset, week0_actions=week0_actions, I_hist=I_hist), oenv
 
@@ -2562,6 +2644,22 @@ ALGORITHMS = {
     "rl_v6_invariant_redistributed": (partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9), "RL V4: return-invariant redistributed reward (γ̄=0.9)"),
     "rl_v7_base_g05": (partial(run_micro_query, gamma_bar=0.5), "RL base (γ̄=0.5 sensitivity)"),
     "rl_v8_base_g099": (partial(run_micro_query, gamma_bar=0.99), "RL base (γ̄=0.99 sensitivity)"),
+    "rl_v10_fixedmap_full": (
+        partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9,
+                stage2_mode="fixed_full"),
+        "RL V4 + known-map redistribution: CAE + shaping (γ̄=0.9)"),
+    "rl_v11_fixedmap_cae": (
+        partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9,
+                stage2_mode="fixed_cae"),
+        "RL V4 + known-map redistribution: CAE only, F at terminal (γ̄=0.9)"),
+    "rl_v12_fixedmap_full_pf": (
+        partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9,
+                stage2_mode="fixed_full", stage1_source="pf"),
+        "RL V4 + known-map redistribution, PF mediator posteriors for fourSC/AA (γ̄=0.9)"),
+    "rl_v13_fixedmap_cae_pf": (
+        partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9,
+                stage2_mode="fixed_cae", stage1_source="pf"),
+        "RL V4 + known-map CAE-only, PF mediator posteriors for fourSC/AA (γ̄=0.9)"),
     "rl_v9_residual_g09": (
         partial(run_micro_query_residual, gamma_bar=0.9),
         "RL residual CAE (γ̄=0.9)",
@@ -2584,6 +2682,9 @@ _setup_log("Runner functions defined.")
 _TIMING_PROBE_ARRAYS = (
     "stage1_gamma_pm_minus_am",
     "stage2_r_pm_minus_am",
+    "stage2_r_gap_cae",
+    "stage2_r_gap_shaping",
+    "pf_gamma_pm_minus_am",
     "pi_pm_minus_am",
     "env_truth_pm_minus_am",
     "stage1_sign_ok",
@@ -2611,9 +2712,12 @@ def _stack_timing_probes(per_exp):
 def _write_timing_probe_summary(path, stacked_by_algo, sigma2_by_algo=None):
     """Human-readable Stage 1 → 2 → π snapshot for this process."""
     lines = [
-        "V4/V6 timing-chain probe. Stage-1 A×slot_pm on AA/FW/PJ (daily) "
-        "and SC (slot fourSC). Env truth and gaps are PM−AM.",
+        "V4/V6/V10/V11 timing-chain probe. Stage-1 A×slot_pm on AA/FW/PJ "
+        "(daily) and SC/PV (slot). Env truth and gaps are PM−AM.",
         "sign_ok_SC is P(sign(β_t)==sign(truth)); AA is the daily analogue.",
+        "r_gap is the action-attributable AM/PM contrast in the slot reward, "
+        "[r(t=1,A=1)−r(t=1,A=0)]−[r(t=0,A=1)−r(t=0,A=0)] on the AM state; "
+        "for fixed-map arms it is split into r_cae + r_shaping.",
         "A link that stays ~0 (or sign_ok ~0.5) is the one that died.",
         "",
     ]
@@ -2622,6 +2726,8 @@ def _write_timing_probe_summary(path, stacked_by_algo, sigma2_by_algo=None):
         so = arrs["stage1_sign_ok"]
         g = arrs["stage1_gamma_pm_minus_am"]
         r = arrs["stage2_r_pm_minus_am"]
+        r_cae = arrs.get("stage2_r_gap_cae")
+        r_sh = arrs.get("stage2_r_gap_shaping")
         p = arrs["pi_pm_minus_am"]
         s2 = arrs.get("sigma2_q")
         lines.append(f"== {name} ==")
@@ -2637,11 +2743,17 @@ def _write_timing_probe_summary(path, stacked_by_algo, sigma2_by_algo=None):
             s2s = ""
             if s2 is not None and w < s2.shape[-1]:
                 s2s = f"  σ²_Q={np.nanmean(s2[..., w]):.3f}"
+            parts = ""
+            if r_cae is not None and np.any(np.isfinite(r_cae[..., w])):
+                parts = (
+                    f" (cae {np.nanmean(r_cae[..., w]):+.4f}, "
+                    f"shaping {np.nanmean(r_sh[..., w]):+.4f})"
+                )
             lines.append(
                 f"  week {w:2d}: {sc}"
                 f"sign_ok_AA={np.nanmean(so[..., w, 0]):.2f}  "
                 f"γ_AA={np.nanmean(g[..., w, 0]):+.4f}  "
-                f"r_gap={np.nanmean(r[..., w]):+.4f}  "
+                f"r_gap={np.nanmean(r[..., w]):+.4f}{parts}  "
                 f"π_gap={np.nanmean(p[..., w]):+.3f}"
                 f"{s2s}"
             )

@@ -1580,6 +1580,7 @@ PF_THETA_FOURSC_NAMES = [
     "Ah*activitySuggestionInteractLast7Days",
     "Ah*perceivedUtilityLastWeek",
     "Ah*caeAverageLastWeek",
+    "Ah*decisionTimeSlot",
 ]
 
 PF_THETA_ANTIC_NAMES = [
@@ -1623,7 +1624,10 @@ def build_fourSC_features(
     Reduced vs ``gen_fourSC_mean``: no 7-day pageview EMA, no yesterday
     anticipated affect, no 7-day morning Fitbit wear (nor their action
     interactions). AR-1 lag of 4-hour step count is a main effect only.
-    Weekend and AM/PM are main effects only (no action interactions).
+    Weekend is a main effect only. AM/PM enters as a main effect and as
+    ``Ah*decisionTimeSlot`` (trailing column), so the PF fourSC model can
+    carry a morning/afternoon difference in the send effect — the same
+    identification as Stage 1b and the env's own fourSC model.
 
     Pass ``cae=0.0`` for PF base rows; per-particle CAE is added via
     :func:`build_pf_data`.  ``pu`` / ``cae`` override ``perceivedUtility`` /
@@ -1647,6 +1651,7 @@ def build_fourSC_features(
         Ah * float(activitySuggestionsSentLast7Days),
         Ah * float(activitySuggestionInteractLast7Days),
         Ah * _pu, Ah * _cae,
+        Ah * float(decisionTimeSlot),
     ], dtype=float)
     if x.size != len(PF_THETA_FOURSC_NAMES):
         raise RuntimeError(
@@ -1792,6 +1797,71 @@ def build_antic_features(
             f"antic feature length {x.size} != {len(PF_THETA_ANTIC_NAMES)}"
         )
     return x
+
+
+# ---- PF-row action surgery (Stage 1 from the PF mediator posteriors) ----
+_FOURSC_MAIN_FOR_A = {
+    "Ah*yesterdayStepCount": "yesterdayStepCount",
+    "Ah*prior2HourStepCount": "prior2HourStepCount",
+    "Ah*activitySuggestionsSentLast7Days": "activitySuggestionsSentLast7Days",
+    "Ah*activitySuggestionInteractLast7Days": "activitySuggestionInteractLast7Days",
+    "Ah*perceivedUtilityLastWeek": "perceivedUtilityLastWeek",
+    "Ah*caeAverageLastWeek": "caeAverageLastWeek",
+    "Ah*decisionTimeSlot": "decisionTimeSlot",
+}
+_FOURSC_IDX = {n: i for i, n in enumerate(PF_THETA_FOURSC_NAMES)}
+_ANTIC_IDX = {n: i for i, n in enumerate(PF_THETA_ANTIC_NAMES)}
+_ANTIC_WS_COLS = {
+    0: ("A0_morning", (("A0_morning_by_perceived_utility_lastweek", "perceived_utility_lastweek"),
+                       ("A0_morning_by_CAE_avg_lastweek", "CAE_avg_lastweek"),
+                       ("A0_morning_by_recent_burden", "recent_burden"))),
+    1: ("A1_afternoon", (("A1_afternoon_by_perceived_utility_lastweek", "perceived_utility_lastweek"),
+                         ("A1_afternoon_by_CAE_avg_lastweek", "CAE_avg_lastweek"),
+                         ("A1_afternoon_by_recent_burden", "recent_burden"))),
+}
+
+
+def foursc_row_with_action(row, action, cae):
+    """Copy of a PF fourSC base row with ``caeAverageLastWeek`` set to ``cae``
+    and the whole action block rebuilt for ``action`` from the main effects."""
+    x = np.asarray(row, dtype=float).copy()
+    a = float(action)
+    x[_FOURSC_IDX["caeAverageLastWeek"]] = float(cae)
+    x[_FOURSC_IDX["Ah"]] = a
+    for inter, main in _FOURSC_MAIN_FOR_A.items():
+        x[_FOURSC_IDX[inter]] = a * x[_FOURSC_IDX[main]]
+    return x
+
+
+def antic_row_with_actions(row, ws_morning, ws_afternoon, cae):
+    """Copy of a PF antic base row with ``CAE_avg_lastweek`` set to ``cae`` and
+    both walking-suggestion blocks rebuilt from the main effects."""
+    x = np.asarray(row, dtype=float).copy()
+    x[_ANTIC_IDX["CAE_avg_lastweek"]] = float(cae)
+    for t, ws in ((0, float(ws_morning)), (1, float(ws_afternoon))):
+        main_name, inters = _ANTIC_WS_COLS[t]
+        x[_ANTIC_IDX[main_name]] = ws
+        for inter, main in inters:
+            x[_ANTIC_IDX[inter]] = ws * x[_ANTIC_IDX[main]]
+    return x
+
+
+def pf_posterior_theta_mean(pf_result, m, k):
+    """Particle-weighted posterior mean of ``theta_MY[m]`` at week ``k``.
+
+    Falls back to the latest week with finite entries (``k`` may not have
+    been updated when the PF skipped a week)."""
+    means = np.asarray(pf_result["theta_MY_mean"][m], dtype=float)  # (W, J, P)
+    weights = np.asarray(pf_result["v_hat_by_week"], dtype=float)   # (W, J)
+    for kk in range(int(k), -1, -1):
+        th = means[kk]
+        if np.all(np.isfinite(th)):
+            w = weights[kk]
+            if not np.all(np.isfinite(w)) or w.sum() <= 0:
+                w = np.ones(th.shape[0])
+            w = w / w.sum()
+            return w @ th
+    return None
 
 
 def make_state(context):
@@ -2304,28 +2374,62 @@ def fit_daily_mediator_decomposition(k_cur, A_hist, b_hat_hist, b_tilde_hist,
         yy = np.asarray(y, dtype=float)
         etas[name] = _stage1_bayes_eta(X, yy, priors.get(name, {}), p, name)
 
-    rows, y = [], []
-    for k in range(k_cur):
-        full = get_full_mediators(k) if get_full_mediators is not None else None
-        if full is None:
-            continue
-        M_Y = np.asarray(full[0], dtype=float)
-        for d in range(N_RL_DAYS):
-            for t in range(N_RL_SLOTS):
-                yt = float(M_Y[d, t])
-                if not np.isfinite(yt):
-                    continue
-                rows.append(build_foursc_stage1_phi(
-                    b_hat_hist[k], b_tilde_hist[k], get_state(k, d, t), d, t,
-                    A_hist[k, d, t]))
-                y.append(yt)
-    p_sc = build_foursc_stage1_phi(
+    # Stage 1b: slot-level mediators. ``SC`` is four-hour step count
+    # (M_Y[d, t]); ``PV`` is the normalised 4-hour page-view count
+    # (M_E[d, t], already on the HourlyPageviewCount_norm scale that
+    # RCT ê ``rct_pv_sum`` averages). Both use
+    # ``build_foursc_stage1_phi``: controls + A·(β0 + β_t t), 12 rows/week.
+    p_slot = build_foursc_stage1_phi(
         b_hat_hist[0], b_tilde_hist[0], get_state(0, 0, 0), 0, 0,
         A_hist[0, 0, 0]).size
-    X_sc = np.asarray(rows, dtype=float) if rows else np.empty((0, p_sc))
-    etas["SC"] = _stage1_bayes_eta(
-        X_sc, np.asarray(y, dtype=float), priors.get("SC", {}), p_sc, "SC")
+    for name, matrix in (("SC", 0), ("PV", 1)):
+        rows, y = [], []
+        for k in range(k_cur):
+            full = get_full_mediators(k) if get_full_mediators is not None else None
+            if full is None:
+                continue
+            M = np.asarray(full[matrix], dtype=float)
+            for d in range(N_RL_DAYS):
+                for t in range(N_RL_SLOTS):
+                    yt = float(M[d, t])
+                    if not np.isfinite(yt):
+                        continue
+                    rows.append(build_foursc_stage1_phi(
+                        b_hat_hist[k], b_tilde_hist[k], get_state(k, d, t), d, t,
+                        A_hist[k, d, t]))
+                    y.append(yt)
+        X_s = np.asarray(rows, dtype=float) if rows else np.empty((0, p_slot))
+        etas[name] = _stage1_bayes_eta(
+            X_s, np.asarray(y, dtype=float), priors.get(name, {}), p_slot, name)
     return etas
+
+
+STAGE1_SHARE_NAMES = ("AA", "FW", "PJ", "SC", "PV")
+
+
+def pf_cae_slot_weights():
+    """Per-slot / per-day weights of the PF CAE transition's mediator EWMAs.
+
+    ``build_pf_CAE_features`` compresses the Mon–Sat fourSC slots (12) and
+    antic days (6) to two EWMA scalars. Probing it with unit vectors gives
+    the exact linear weight of each slot / day, so a slot's marginal
+    contribution to next week's CAE is ``theta_f * w_f[d, t] * fourSC_dt``
+    and a day's is ``theta_a * w_a[d] * antic_d``. Returns
+    ``(w_f (N_RL_DAYS, N_RL_SLOTS), w_a (N_RL_DAYS,))``.
+    """
+    n_slots = N_RL_DAYS * N_RL_SLOTS
+    base = build_pf_CAE_features(0.0, np.zeros(n_slots), np.zeros(N_RL_DAYS))
+    w_f = np.zeros((N_RL_DAYS, N_RL_SLOTS), dtype=float)
+    w_a = np.zeros(N_RL_DAYS, dtype=float)
+    for d in range(N_RL_DAYS):
+        for t in range(N_RL_SLOTS):
+            e = np.zeros(n_slots)
+            e[d * N_RL_SLOTS + t] = 1.0
+            w_f[d, t] = build_pf_CAE_features(0.0, e, np.zeros(N_RL_DAYS))[2] - base[2]
+        e = np.zeros(N_RL_DAYS)
+        e[d] = 1.0
+        w_a[d] = build_pf_CAE_features(0.0, np.zeros(n_slots), e)[3] - base[3]
+    return w_f, w_a
 
 
 def daily_mediator_shares(etas, b_hat, b_tilde, state, d, t, action):
@@ -2337,6 +2441,10 @@ def daily_mediator_shares(etas, b_hat, b_tilde, state, d, t, action):
     if "SC" in etas:
         shares.append(
             build_foursc_stage1_phi(b_hat, b_tilde, state, d, t, action) @ etas["SC"]
+        )
+    if "PV" in etas:
+        shares.append(
+            build_foursc_stage1_phi(b_hat, b_tilde, state, d, t, action) @ etas["PV"]
         )
     return np.array(shares, dtype=float)
 

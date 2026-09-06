@@ -35,7 +35,7 @@ RL reward shaping                        -> mu_0_reward, Sigma_0_reward, sigma2_
     sum_{d,t} Delta_{d,t} psi on
     Delta_{6,2} * Y_w + gamma_bar * E_{w+1})
 
-RL redistribution, Stage 1 (AA/FW/PJ/SC) -> reward_redistribution.daily_mediators
+RL redistribution, Stage 1 (AA/FW/PJ; slot SC/PV) -> reward_redistribution.daily_mediators
    (SC is slot-level fourSC: 12 rows/week, A×[1, t])
 RL redistribution, Stage 2 (V2/V4)       -> reward_redistribution.redistribution
    (the active two-stage models in ``MicroQueryRewardDesignAgent``)
@@ -700,7 +700,8 @@ def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
       * 7-day pageview EMA, yesterday anticipated affect, and 7-day Fitbit
         wear (and their action interactions) are omitted.
       * AR-1 lag of 4-hour step count is a main effect only.
-      * Weekend and AM/PM have no action interactions.
+      * Weekend has no action interaction; AM/PM enters as a main effect and
+        as ``Ah*decisionTimeSlot`` (trailing column).
 
     Per-particle CAE substitution (``cae=0`` base + ``cae_j`` delta) is a
     runtime substitution mechanism and does **not** change the population
@@ -729,6 +730,7 @@ def _build_fourSC_design(dat: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         i7w, act_frac7, is_weekend, dt_, pu, cae,
         Ah, Ah * yest_step, Ah * prior2, Ah * rb,
         Ah * i7w, Ah * pu, Ah * cae,
+        Ah * dt_,
     ])
     y = dat["4hour_step_norm"].to_numpy(dtype=float)
     assert X.shape[1] == len(PF_THETA_FOURSC_NAMES)
@@ -1197,14 +1199,21 @@ def _phi_foursc_stage1(td: Dict[str, np.ndarray], k: int, rl_idx: int) -> np.nda
     )
 
 
-def _foursc_stage1_design(td: Dict[str, np.ndarray]):
-    """Slot-level fourSC design: 12 rows/week, A×[1, slot_pm]."""
+# Slot-level Stage-1b outcomes: fourSC from M_Y_week[k, d, t], normalised
+# 4-hour page views (HourlyPageviewCount_norm) from M_E_week[k, d, t]. Both
+# share ``build_foursc_stage1_phi`` (controls + A×[1, slot_pm]).
+_SLOT_MEDIATORS = {"SC": "M_Y_week", "PV": "M_E_week"}
+
+
+def _foursc_stage1_design(td: Dict[str, np.ndarray], mediator: str = "SC"):
+    """Slot-level design for ``mediator`` in ``_SLOT_MEDIATORS``: 12 rows/week."""
+    matrix = td[_SLOT_MEDIATORS[mediator]]
     rows, targets = [], []
     for k in range(td["n_w"]):
         for d in range(DAYS_PER_WEEK_RL):
             for t in range(SLOTS_PER_DAY):
                 rl_idx = d * SLOTS_PER_DAY + t
-                yt = float(td["M_Y_week"][k, d, t])
+                yt = float(matrix[k, d, t])
                 if not np.isfinite(yt):
                     continue
                 rows.append(_phi_foursc_stage1(td, k, rl_idx))
@@ -1214,19 +1223,21 @@ def _foursc_stage1_design(td: Dict[str, np.ndarray]):
             np.asarray(targets, dtype=float))
 
 
-def _sc_eta_for_tensor(td: Dict[str, np.ndarray]) -> np.ndarray:
-    X, y = _foursc_stage1_design(td)
+def _sc_eta_for_tensor(td: Dict[str, np.ndarray], mediator: str = "SC") -> np.ndarray:
+    X, y = _foursc_stage1_design(td, mediator)
     return _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)[0]
 
 
 def _stage1_shares(td: Dict[str, np.ndarray], k: int, rl_idx: int,
                    daily_etas: Dict[str, np.ndarray]) -> np.ndarray:
+    """[AA, FW, PJ, SC, PV] shares — same order as runtime ``daily_mediator_shares``."""
     shares = [
         _phi_daily_mediator(td, k, rl_idx, name) @ daily_etas[name]
         for name in ("AA", "FW", "PJ")
     ]
-    if "SC" in daily_etas:
-        shares.append(_phi_foursc_stage1(td, k, rl_idx) @ daily_etas["SC"])
+    for name in ("SC", "PV"):
+        if name in daily_etas:
+            shares.append(_phi_foursc_stage1(td, k, rl_idx) @ daily_etas[name])
     return np.array(shares, dtype=float)
 
 
@@ -1298,19 +1309,21 @@ def fit_reward_redistribution_priors(
             pooled, user_fits, user_s2, X_pooled=np.vstack(X_all))
         daily[mediator] = {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
         pooled_daily_eta[mediator] = pooled
-    user_fits, user_s2, X_all, y_all = [], [], [], []
-    for td in tensors:
-        X, y = _foursc_stage1_design(td)
-        theta, s2 = _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)
-        user_fits.append(theta); user_s2.append(s2); X_all.append(X); y_all.append(y)
-    pooled, _ = _ridge_fit(np.vstack(X_all), np.concatenate(y_all), alpha=RIDGE_ALPHA_RL)
-    mu, Sigma, sigma2 = _pool_user_fits(
-        pooled, user_fits, user_s2, X_pooled=np.vstack(X_all))
-    daily["SC"] = {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
-    pooled_daily_eta["SC"] = pooled
+    for slot_med in _SLOT_MEDIATORS:
+        user_fits, user_s2, X_all, y_all = [], [], [], []
+        for td in tensors:
+            X, y = _foursc_stage1_design(td, slot_med)
+            theta, s2 = _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)
+            user_fits.append(theta); user_s2.append(s2); X_all.append(X); y_all.append(y)
+        pooled, _ = _ridge_fit(np.vstack(X_all), np.concatenate(y_all), alpha=RIDGE_ALPHA_RL)
+        mu, Sigma, sigma2 = _pool_user_fits(
+            pooled, user_fits, user_s2, X_pooled=np.vstack(X_all))
+        daily[slot_med] = {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
+        pooled_daily_eta[slot_med] = pooled
     for td in tensors:
         eta = {name: _daily_eta_for_tensor(td, name) for name in _DAILY_MEDIATORS}
-        eta["SC"] = _sc_eta_for_tensor(td)
+        for slot_med in _SLOT_MEDIATORS:
+            eta[slot_med] = _sc_eta_for_tensor(td, slot_med)
         user_daily_eta.append(eta)
 
     stage2 = {}
@@ -1345,7 +1358,8 @@ def _fit_redistribution_coefficients(
 ):
     """Plug-in Stage-1/2 fits used to construct a variant-matched FQI target."""
     daily = {name: _daily_eta_for_tensor(td, name) for name in _DAILY_MEDIATORS}
-    daily["SC"] = _sc_eta_for_tensor(td)
+    for slot_med in _SLOT_MEDIATORS:
+        daily[slot_med] = _sc_eta_for_tensor(td, slot_med)
     n = td["n_w"] - 1
     X = np.stack([_redistribution_week_phi(td, k, daily) for k in range(n)])
     y_base = td["R_week"][:n]
@@ -2033,7 +2047,7 @@ def _phi_foursc_stage1_names() -> list[str]:
 
 
 def _stage1_feature_names(name: str) -> list[str]:
-    if name == "SC":
+    if name in _SLOT_MEDIATORS:
         return _phi_foursc_stage1_names()
     return _phi_daily_mediator_names()
 
