@@ -868,14 +868,25 @@ def weekly_pv_sum_for_ew(slot_pv, *, shift=None, scale=None):
     return float(np.nansum(v) / 14.0)
 
 
-def apply_pooled_coefs(coefs, half_J_tool8, PV_sum, FW_sum, PJ_sum):
-    """Apply the pooled linear approximation for agent-visible E_w."""
+def apply_pooled_coefs(coefs, E_lag, PV_sum, FW_sum, PJ_sum, J_close, half_J_close):
+    """Apply the pooled linear approximation for agent-visible E_{w+1}.
+
+    ``E_lag`` is last week's Ê (the AR term). ``J_close`` / ``half_J_close``
+    are this Sunday's survey (the measurement update of the target E).
+    """
+    if "E_lag" not in coefs:
+        raise KeyError(
+            "Ew_pooled_linear_coefs.json is missing E_lag (pre-filter formula). "
+            "Re-run 6_est_Ew_weights.py."
+        )
     return float(
         float(coefs.get("intercept", 0.0))
-        + coefs["half_J_tool8"] * float(half_J_tool8)
+        + coefs["E_lag"] * float(E_lag)
         + coefs["PV_sum"] * float(PV_sum)
         + coefs["FW_sum"] * float(FW_sum)
         + coefs["PJ_sum"] * float(PJ_sum)
+        + coefs["J_close"] * float(J_close)
+        + coefs["half_J_close"] * float(half_J_close)
     )
 
 

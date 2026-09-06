@@ -3,6 +3,9 @@
 ``FW_sum`` / ``PJ_sum`` / ``PV_sum`` use script 4's fixed denominators
 (missing → 0). Fitbit wear missingness is coded as not wearing so Ê_w
 matches the E_w transition the simulator was fit on.
+
+Ê_{w+1} uses last week's Ê (AR), this week's mediator averages
+(transition), and this Sunday's ``J`` / ``J(U1+U2)/14`` (update).
 """
 
 from __future__ import annotations
@@ -52,7 +55,7 @@ def weekly_Ew_predictor_table(
         if np.isnan(j_w):
             j_w = 0.0
         j_w = float(j_w)
-        half_J_tool8 = j_w * (u1 + u2) / 14.0
+        half_j_close = j_w * (u1 + u2) / 14.0
         pv_sum = weekly_pv_sum_for_ew(g["HourlyPageviewCount_norm"].to_numpy(dtype=float))
 
         fw_daily, pj_daily = [], []
@@ -68,29 +71,39 @@ def weekly_Ew_predictor_table(
         rows.append({
             "ParticipantIdentifier": int(uid) if isinstance(uid, (int, np.integer)) else uid,
             "week": int(wk),
-            "J_w": j_w,
-            "half_J_tool8": half_J_tool8,
+            "J_close": j_w,
+            "half_J_close": half_j_close,
             "PV_sum": pv_sum,
             "FW_sum": fw_sum,
             "PJ_sum": pj_sum,
         })
-    tbl = pd.DataFrame(rows)
-    if not tbl.empty:
-        # Script 6 uses last Sunday's product (opening J_w, U_w); week 1 → 0.
-        tbl["half_J_tool8"] = (
-            tbl.groupby("ParticipantIdentifier", sort=False)["half_J_tool8"]
-            .shift(1)
-            .fillna(0.0)
+    return pd.DataFrame(rows)
+
+
+def roll_ew_hat_series(tbl, coefs, e0=None):
+    """Roll Ê through ``tbl`` (sorted by week). Returns the final Ê."""
+    if tbl is None or tbl.empty:
+        return float(coefs.get("E_lag0", DEFAULT_EW_HAT) if e0 is None else e0)
+    e = float(coefs.get("E_lag0", DEFAULT_EW_HAT) if e0 is None else e0)
+    for _, row in tbl.sort_values("week").iterrows():
+        e = apply_pooled_coefs(
+            coefs,
+            e,
+            row["PV_sum"],
+            row["FW_sum"],
+            row["PJ_sum"],
+            row["J_close"],
+            row["half_J_close"],
         )
-    return tbl
+    return float(e)
 
 
 def initial_Ew_hat_for_user(user_id, df_fit=None, coefs=None):
     """Week-0 Ê_w: last pre-RL df_fit week, or ``DEFAULT_EW_HAT`` (2.0).
 
     ``df_fit is None`` (the experiment default) skips the table and returns
-    2.0. Pass a panel to use the pooled linear formula on that user's last
-    week.
+    2.0. Pass a panel to roll the pooled linear filter through that user's
+    weeks, starting from the E_1 pin.
     """
     if coefs is None:
         coefs = load_pooled_coefs()
@@ -107,14 +120,7 @@ def initial_Ew_hat_for_user(user_id, df_fit=None, coefs=None):
     )
     if tbl.empty:
         return DEFAULT_EW_HAT
-    last = tbl.sort_values("week").iloc[-1]
-    return apply_pooled_coefs(
-        coefs,
-        last["half_J_tool8"],
-        last["PV_sum"],
-        last["FW_sum"],
-        last["PJ_sum"],
-    )
+    return roll_ew_hat_series(tbl, coefs)
 
 
 def _finite_or(arr, idx, default):
@@ -129,6 +135,7 @@ def compute_Ew_hat_from_week(
     sim_w,
     *,
     coefs,
+    e_lag,
     wp_all,
     U1_all,
     U2_all,
@@ -137,27 +144,23 @@ def compute_Ew_hat_from_week(
     dp_wk,
     baseline_offset=BASELINE_OFFSET,
 ):
-    """Approximate E_{w+1} from week ``sim_w`` mediators and last Sunday's survey.
+    """Approximate E_{w+1} from Ê_w, week ``sim_w`` mediators, and this Sunday.
 
     ``sim_w`` is RL week ``k`` (0-based). At the end of week ``w``:
 
+    * ``e_lag`` is last week's Ê (``E_known_all[sim_w]``), the AR term.
     * PV/FW/PJ are this week's series (transition inputs for ``E_{w+1}``).
-    * ``half_J_tool8`` is last Sunday's ``J(U1+U2)/14`` — script 4's opening
-      ``J_w, U_w`` (emission of ``E_w``), standing in for the AR
-      ``E_w → E_{w+1}``. That survey lives at ``wp_all[sim_w]`` /
-      ``U1_all[sim_w]`` (``week_present_lastweek``). Week 0 has no prior
-      Sunday, so the product is 0, matching script 6.
-
-    This Sunday's ``J_{w+1}`` (index ``sim_w + baseline_offset``) is not
-    used: it is a weak emission of ``E_{w+1}``.
+    * ``J_close`` / ``half_J_close`` are this Sunday's ``J_{w+1}`` and
+      ``J_{w+1}(U1+U2)/14`` at ``wp_all[sim_w + baseline_offset]``.
     """
-    if int(sim_w) <= 0:
-        half_J_tool8 = 0.0
-    else:
-        J_w = _finite_or(wp_all, int(sim_w), 0.0)
-        u1 = _finite_or(U1_all, int(sim_w), coefs.get("U1_impute_mean", 0.0))
-        u2 = _finite_or(U2_all, int(sim_w), coefs.get("U2_impute_mean", 0.0))
-        half_J_tool8 = J_w * (u1 + u2) / 14.0
+    e_lag = float(e_lag)
+    if not np.isfinite(e_lag):
+        e_lag = float(coefs.get("E_lag0", DEFAULT_EW_HAT))
+    survey_idx = int(sim_w) + int(baseline_offset)
+    J_close = _finite_or(wp_all, survey_idx, 0.0)
+    u1 = _finite_or(U1_all, survey_idx, coefs.get("U1_impute_mean", 0.0))
+    u2 = _finite_or(U2_all, survey_idx, coefs.get("U2_impute_mean", 0.0))
+    half_j_close = J_close * (u1 + u2) / 14.0
     slot_start = int(sim_w) * FOURSC_SLOTS_PER_WEEK
     slot_stop = int(sim_w + 1) * FOURSC_SLOTS_PER_WEEK
     pv_sum = weekly_pv_sum_for_ew(pageViewNext4HourAll[slot_start:slot_stop])
@@ -165,5 +168,5 @@ def compute_Ew_hat_from_week(
     fw_sum = float(np.nansum(dw_wk) / 7.0)
     pj_sum = float(np.nansum(dp_wk) / 7.0)
     return apply_pooled_coefs(
-        coefs, half_J_tool8, pv_sum, fw_sum, pj_sum,
+        coefs, e_lag, pv_sum, fw_sum, pj_sum, J_close, half_j_close,
     )

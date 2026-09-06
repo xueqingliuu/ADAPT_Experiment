@@ -1112,14 +1112,15 @@ class OnlineEnv:
         # The agent never sees this; it gets ``E_known_all`` instead.
         self.s["perceivedUtilityLastWeek"] = pu
 
-        # E-hat for next week: this week's PV/FW/PJ with last Sunday's J/U1/U2
-        # (``wp_all[sim_w]`` / opening ``J_w``). Week 0 uses 0 (no prior
-        # Sunday). Stored at ``weekly_idx`` so ``start_week(k)`` reads
+        # E-hat for next week: last week's Ê (AR), this week's PV/FW/PJ
+        # (transition), and this Sunday's J/U (``wp_all[weekly_idx]``).
+        # Stored at ``weekly_idx`` so ``start_week(k)`` reads
         # ``E_known_all[k]``.
 
         self.E_known_all[weekly_idx] = compute_Ew_hat_from_week(
             sim_w,
             coefs=self._ew_coefs,
+            e_lag=self.E_known_all[sim_w],
             wp_all=self.wp_all,
             U1_all=self.U1_all,
             U2_all=self.U2_all,
