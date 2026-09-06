@@ -35,7 +35,8 @@ RL reward shaping                        -> mu_0_reward, Sigma_0_reward, sigma2_
     sum_{d,t} Delta_{d,t} psi on
     Delta_{6,2} * Y_w + gamma_bar * E_{w+1})
 
-RL redistribution, Stage 1 (AA/FW/PJ)    -> reward_redistribution.daily_mediators
+RL redistribution, Stage 1 (AA/FW/PJ/SC) -> reward_redistribution.daily_mediators
+   (SC is slot-level fourSC: 12 rows/week, A×[1, t])
 RL redistribution, Stage 2 (V2/V4)       -> reward_redistribution.redistribution
    (the active two-stage models in ``MicroQueryRewardDesignAgent``)
 
@@ -97,6 +98,7 @@ from algorithm_helpers import (
     build_phi_action,
     build_phi_action_rewardshaping,
     build_daily_mediator_phi,
+    build_foursc_stage1_phi,
     build_redistribution_phi,
     build_phi_bottleneck,
     build_rl_context_vector,
@@ -1187,6 +1189,47 @@ def _daily_eta_for_tensor(td: Dict[str, np.ndarray], mediator: str) -> np.ndarra
     return _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)[0]
 
 
+def _phi_foursc_stage1(td: Dict[str, np.ndarray], k: int, rl_idx: int) -> np.ndarray:
+    d, t = divmod(rl_idx, SLOTS_PER_DAY)
+    return build_foursc_stage1_phi(
+        float(td["b_hat_slot"][k, rl_idx]), 0.0, _slot_state(td, k, rl_idx),
+        d, t, int(td["A_slot"][k, rl_idx]),
+    )
+
+
+def _foursc_stage1_design(td: Dict[str, np.ndarray]):
+    """Slot-level fourSC design: 12 rows/week, A×[1, slot_pm]."""
+    rows, targets = [], []
+    for k in range(td["n_w"]):
+        for d in range(DAYS_PER_WEEK_RL):
+            for t in range(SLOTS_PER_DAY):
+                rl_idx = d * SLOTS_PER_DAY + t
+                yt = float(td["M_Y_week"][k, d, t])
+                if not np.isfinite(yt):
+                    continue
+                rows.append(_phi_foursc_stage1(td, k, rl_idx))
+                targets.append(yt)
+    p = _phi_foursc_stage1(td, 0, 0).size
+    return (np.asarray(rows, dtype=float) if rows else np.empty((0, p)),
+            np.asarray(targets, dtype=float))
+
+
+def _sc_eta_for_tensor(td: Dict[str, np.ndarray]) -> np.ndarray:
+    X, y = _foursc_stage1_design(td)
+    return _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)[0]
+
+
+def _stage1_shares(td: Dict[str, np.ndarray], k: int, rl_idx: int,
+                   daily_etas: Dict[str, np.ndarray]) -> np.ndarray:
+    shares = [
+        _phi_daily_mediator(td, k, rl_idx, name) @ daily_etas[name]
+        for name in ("AA", "FW", "PJ")
+    ]
+    if "SC" in daily_etas:
+        shares.append(_phi_foursc_stage1(td, k, rl_idx) @ daily_etas["SC"])
+    return np.array(shares, dtype=float)
+
+
 def _redistribution_week_phi(td: Dict[str, np.ndarray], k: int,
                              daily_etas: Dict[str, np.ndarray]) -> np.ndarray:
     """Un-discounted weekly Stage-2 row, matching V2/V4 runtime code."""
@@ -1196,13 +1239,9 @@ def _redistribution_week_phi(td: Dict[str, np.ndarray], k: int,
         d, t = divmod(rl_idx, SLOTS_PER_DAY)
         state = _slot_state(td, k, rl_idx)
         action = int(td["A_slot"][k, rl_idx])
-        shares = np.array([
-            _phi_daily_mediator(td, k, rl_idx, name) @ daily_etas[name]
-            for name in ("AA", "FW", "PJ")
-        ])
         phi = build_redistribution_phi(
             float(td["b_hat_slot"][k, rl_idx]), 0.0, state, d, t, action,
-            shares, full_mediators=full,
+            _stage1_shares(td, k, rl_idx, daily_etas), full_mediators=full,
         )
         out = phi.copy() if out is None else out + phi
     return out
@@ -1227,12 +1266,13 @@ def fit_reward_redistribution_priors(
 
     Stage 1 fits separate AA/FW/PJ daily regressions with the *daily sum* of
     the two action-time features, including ``A×slot_pm`` so AM and PM
-    sends can have different intercepts.  Stage 2 then uses the resulting
-    predicted shares in its weekly summed redistribution feature.  Pooled
-    Stage-2 rows use pooled Stage-1 coefficients; per-user Stage-2 rows
-    use that user's Stage-1 coefficients.  This mirrors the intended
-    hierarchical prior and avoids substituting observed daily mediators
-    for their decomposed shares.
+    sends can have different intercepts. Stage 1b fits slot-level fourSC
+    on controls + ``A·(β0 + β_t t)`` (12 rows/week). Stage 2 then uses
+    the resulting predicted shares (AA/FW/PJ/SC) in its weekly summed
+    redistribution feature. Pooled Stage-2 rows use pooled Stage-1
+    coefficients; per-user Stage-2 rows use that user's Stage-1
+    coefficients. This mirrors the intended hierarchical prior and
+    avoids substituting observed mediators for their decomposed shares.
     """
     tensors = [
         _user_weekly_tensors(dat.sort_values(["Date", "DecisionTime"]).reset_index(drop=True))
@@ -1258,9 +1298,20 @@ def fit_reward_redistribution_priors(
             pooled, user_fits, user_s2, X_pooled=np.vstack(X_all))
         daily[mediator] = {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
         pooled_daily_eta[mediator] = pooled
+    user_fits, user_s2, X_all, y_all = [], [], [], []
     for td in tensors:
-        user_daily_eta.append({name: _daily_eta_for_tensor(td, name)
-                               for name in _DAILY_MEDIATORS})
+        X, y = _foursc_stage1_design(td)
+        theta, s2 = _ridge_fit(X, y, alpha=RIDGE_ALPHA_RL)
+        user_fits.append(theta); user_s2.append(s2); X_all.append(X); y_all.append(y)
+    pooled, _ = _ridge_fit(np.vstack(X_all), np.concatenate(y_all), alpha=RIDGE_ALPHA_RL)
+    mu, Sigma, sigma2 = _pool_user_fits(
+        pooled, user_fits, user_s2, X_pooled=np.vstack(X_all))
+    daily["SC"] = {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
+    pooled_daily_eta["SC"] = pooled
+    for td in tensors:
+        eta = {name: _daily_eta_for_tensor(td, name) for name in _DAILY_MEDIATORS}
+        eta["SC"] = _sc_eta_for_tensor(td)
+        user_daily_eta.append(eta)
 
     stage2 = {}
     for variant in ("v2", "v4"):
@@ -1282,7 +1333,10 @@ def fit_reward_redistribution_priors(
         pooled, _ = _ridge_fit(np.vstack(X_all), np.concatenate(y_all), alpha=RIDGE_ALPHA_RL)
         mu, Sigma, sigma2 = _pool_user_fits(
             pooled, user_fits, user_s2, X_pooled=np.vstack(X_all))
-        stage2[variant] = {"mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2}
+        stage2[variant] = {
+            "mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2,
+            "psi_has_next_my": False,
+        }
     return {"daily_mediators": daily, "redistribution": stage2}
 
 
@@ -1291,6 +1345,7 @@ def _fit_redistribution_coefficients(
 ):
     """Plug-in Stage-1/2 fits used to construct a variant-matched FQI target."""
     daily = {name: _daily_eta_for_tensor(td, name) for name in _DAILY_MEDIATORS}
+    daily["SC"] = _sc_eta_for_tensor(td)
     n = td["n_w"] - 1
     X = np.stack([_redistribution_week_phi(td, k, daily) for k in range(n)])
     y_base = td["R_week"][:n]
@@ -1324,13 +1379,10 @@ def _redistribution_week_phi_slot(td: Dict[str, np.ndarray], k: int, rl_idx: int
                                   daily_etas: Dict[str, np.ndarray]) -> np.ndarray:
     d, t = divmod(rl_idx, SLOTS_PER_DAY)
     state = _slot_state(td, k, rl_idx)
-    shares = np.array([
-        _phi_daily_mediator(td, k, rl_idx, name) @ daily_etas[name]
-        for name in ("AA", "FW", "PJ")
-    ])
     return build_redistribution_phi(
         float(td["b_hat_slot"][k, rl_idx]), 0.0, state, d, t,
-        int(td["A_slot"][k, rl_idx]), shares,
+        int(td["A_slot"][k, rl_idx]),
+        _stage1_shares(td, k, rl_idx, daily_etas),
         full_mediators=(td["M_Y_week"][k], td["M_E_week"][k]),
     )
 
@@ -1971,6 +2023,21 @@ def _phi_daily_mediator_names() -> list[str]:
     )
 
 
+def _phi_foursc_stage1_names() -> list[str]:
+    """Names for slot-level ``build_foursc_stage1_phi``."""
+    return (
+        ["intercept", "weekday_vs_weekend", "slot_pm", "E_w", "b_hat", "b_tilde"]
+        + _rl_context_names()
+        + ["A", "A*slot_pm"]
+    )
+
+
+def _stage1_feature_names(name: str) -> list[str]:
+    if name == "SC":
+        return _phi_foursc_stage1_names()
+    return _phi_daily_mediator_names()
+
+
 def _joint_feature_names(q_joint: Dict[str, Any]) -> tuple[list[str], list[str]]:
     mu_joint = q_joint.get("mu_0")
     if mu_joint is None:
@@ -2155,7 +2222,7 @@ def build_prior_summary_tables(priors: Dict[str, Any]) -> dict[str, pd.DataFrame
         rl_rows.extend(_summary_rows(
             prior_family="RL", model=f"redistribution_stage1_{name}", block="eta",
             mean=prior.get("mu_0"), cov=prior.get("Sigma_0"),
-            names=_phi_daily_mediator_names(),
+            names=_stage1_feature_names(name),
         ))
     for name, prior in (redistribution.get("redistribution") or {}).items():
         rl_rows.extend(_summary_rows(
@@ -2467,7 +2534,8 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
         out["redistribution_priors"] = {
             name: {"mu_0": arr(prior["mu_0"]),
                    "Sigma_0": arr(prior["Sigma_0"]),
-                   "sigma2": float(prior["sigma2"])}
+                   "sigma2": float(prior["sigma2"]),
+                   "psi_has_next_my": bool(prior.get("psi_has_next_my", False))}
             for name, prior in redistribution["redistribution"].items()
         }
 

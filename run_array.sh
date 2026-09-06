@@ -24,6 +24,12 @@ PRIOR_MODE="${PRIOR_MODE:-saved}"
 # 0 = zero/identity PF+RLSVI priors. Ignored when PRIOR_MODE=loo (those files
 # are estimated). 1 = load ${ENV_VARIANT}/rl_priors.json (PRIOR_MODE=saved).
 USE_ESTIMATED_PRIORS="${USE_ESTIMATED_PRIORS:-0}"
+# 1 = keep fitted PF / reward / Stage-2; zero-centre Q + Stage-1/1b means
+# and inflate those covariances (POLICY_PRIOR_VAR_SCALE, default 10;
+# diagonal floor POLICY_PRIOR_VAR_FLOOR, default 0.1).
+ZERO_CENTRE_POLICY_PRIORS="${ZERO_CENTRE_POLICY_PRIORS:-0}"
+POLICY_PRIOR_VAR_SCALE="${POLICY_PRIOR_VAR_SCALE:-10}"
+POLICY_PRIOR_VAR_FLOOR="${POLICY_PRIOR_VAR_FLOOR:-0.1}"
 # 1 = Q action block includes C (default). 0 = A*[1, E, b̂, b̃] only.
 ACTION_BLOCK_C="${ACTION_BLOCK_C:-1}"
 
@@ -37,6 +43,9 @@ export ADAPR_PARAMS_DIR="$ENV_VARIANT"
 export ADAPR_EXPERIMENT_PARAMS_DIR="${SLURM_SUBMIT_DIR}/${ENV_VARIANT}"
 export ADAPR_PRIOR_MODE="${PRIOR_MODE}"
 export USE_ESTIMATED_PRIORS
+export ZERO_CENTRE_POLICY_PRIORS
+export POLICY_PRIOR_VAR_SCALE
+export POLICY_PRIOR_VAR_FLOOR
 export ACTION_BLOCK_C
 export SAVE_MODE=compact
 
@@ -69,6 +78,9 @@ if [ -z "${RESULTS_ROOT:-}" ]; then
   if [ "${PRIOR_MODE}" = "loo" ]; then
     RESULTS_ROOT="${RESULTS_ROOT}_loo"
   fi
+  if [ "${ZERO_CENTRE_POLICY_PRIORS}" = "1" ]; then
+    RESULTS_ROOT="${RESULTS_ROOT}_zc_qs1"
+  fi
 fi
 export RESULTS_ROOT
 # Job requests 1 CPU; stop NumPy/OpenBLAS from spawning extra threads.
@@ -81,6 +93,9 @@ echo "ENV_VARIANT=${ENV_VARIANT}"
 echo "PARAMS_DIR=${ADAPR_EXPERIMENT_PARAMS_DIR}"
 echo "PRIOR_MODE=${PRIOR_MODE}"
 echo "USE_ESTIMATED_PRIORS=${USE_ESTIMATED_PRIORS}"
+echo "ZERO_CENTRE_POLICY_PRIORS=${ZERO_CENTRE_POLICY_PRIORS}"
+echo "POLICY_PRIOR_VAR_SCALE=${POLICY_PRIOR_VAR_SCALE}"
+echo "POLICY_PRIOR_VAR_FLOOR=${POLICY_PRIOR_VAR_FLOOR}"
 echo "ACTION_BLOCK_C=${ACTION_BLOCK_C}"
 echo "NWEEK=${NWEEK}"
 echo "RESULTS_ROOT=${RESULTS_ROOT}"
@@ -90,6 +105,10 @@ echo "seed-idx=${SLURM_ARRAY_TASK_ID}"
 EXTRA_ARGS=()
 if [ "${ACTION_BLOCK_C}" = "0" ]; then
   EXTRA_ARGS+=(--no-action-c)
+fi
+if [ "${ZERO_CENTRE_POLICY_PRIORS}" = "1" ]; then
+  EXTRA_ARGS+=(--zero-centre-policy-priors)
+  EXTRA_ARGS+=(--policy-prior-var-scale "${POLICY_PRIOR_VAR_SCALE}")
 fi
 
 python experiment.py \

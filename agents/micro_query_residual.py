@@ -46,9 +46,11 @@ class MicroQueryResidualAgent(MicroQueryAgent):
                 target[idx] -= rho * lag
 
         z_prev = self.z_store.get(k - 1, self.z_store[0])
-        self.sigma2_rl = empirical_bayes_sigma2_ensemble(
-            Phi_rl, targets_rl, self.mu_0_rl, self.Sigma_0_rl, self.sigma2_rl,
-        )
+        if self.update_sigma2_q_online:
+            self.sigma2_rl = empirical_bayes_sigma2_ensemble(
+                Phi_rl, targets_rl, self.mu_0_rl, self.Sigma_0_rl, self.sigma2_rl,
+            )
+        self.sigma2_rl_hist[k] = float(self.sigma2_rl)
         self.betas_store[k], self.z_store[k] = compute_rlsvi_betas(
             Phi_rl, targets_rl,
             self.mu_0_rl, self.Sigma_0_rl, self.sigma2_rl,

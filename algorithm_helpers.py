@@ -113,8 +113,8 @@ def pad_q_prior_action_time(mu_0, Sigma_0, expected_p):
 def pad_prior_append(mu_0, Sigma_0, expected_p):
     """Append zero-mean / unit-variance columns when a prior is short.
 
-    Used for Stage-1 daily-mediator η after ``A×slot_pm`` was added at the
-    end of ``build_daily_mediator_phi``.
+    Used when a saved prior predates a trailing column: Stage-1 daily
+    ``A×slot_pm``, or Stage-2 ``SC_hat``.
     """
     mu = np.asarray(mu_0, dtype=float).ravel()
     Sigma = np.asarray(Sigma_0, dtype=float)
@@ -978,6 +978,11 @@ def empirical_bayes_sigma2(X, y, mu_0, Sigma_0, fallback=1.0):
     positivity) via :func:`scipy.optimize.minimize_scalar`.
 
     Returns ``fallback`` when there are no usable rows.
+
+    Call this on the ensemble-mean TD target (see
+    :func:`empirical_bayes_sigma2_ensemble`). Fitting per-member
+    targets folds the RLSVI ``z``-perturbation into ``σ²`` and couples
+    the maximizer to the ``Σ₀`` scale.
     """
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float).ravel()
@@ -1027,19 +1032,17 @@ def empirical_bayes_sigma2(X, y, mu_0, Sigma_0, fallback=1.0):
 
 
 def empirical_bayes_sigma2_ensemble(X, targets_per_b, mu_0, Sigma_0, fallback=1.0):
-    """Empirical-Bayes ``sigma2`` for an RLSVI head with per-ensemble targets.
+    """Empirical-Bayes ``sigma2`` on the ensemble-mean TD target.
 
-    The design ``X`` is shared across ensemble members but each member ``b`` has
-    its own (bootstrapped) target vector ``targets_per_b[b]``. We fit the scalar
-    variance separately for each member and average, matching how the RLSVI TD
-    residuals are actually formed per ensemble member.
+    ``σ²`` is the residual variance of the TD target given the posterior
+    mean. Exploration is already in the RLSVI ``z``-perturbation and is
+    not counted again. Averaging per-member EB estimates folded that
+    spread into ``σ²`` and coupled the update to the ``Σ₀`` scale.
     """
-    vals = []
-    for y_b in targets_per_b:
-        s2 = empirical_bayes_sigma2(X, y_b, mu_0, Sigma_0, fallback)
-        if np.isfinite(s2):
-            vals.append(s2)
-    return float(np.mean(vals)) if vals else float(fallback)
+    if not targets_per_b:
+        return float(fallback)
+    y_bar = np.mean(np.stack(targets_per_b), axis=0)
+    return empirical_bayes_sigma2(X, y_bar, mu_0, Sigma_0, fallback)
 
 
 def compute_rlsvi_betas(Phi, targets_per_b, mu_0, Sigma_0, sigma2,
@@ -2204,40 +2207,78 @@ def build_redistribution_phi(b_hat, b_tilde, state, d, t, action,
 
     psi = [1, d_n, E_w, b_hat, b_tilde]
         ⌢ [M_ewma (AA, SC, PV, FW, PJ), C_{w,d,t}]
-        ⌢ [M^Y_{d,t}, M^E_{d,t}, AA_hat, FW_hat, PJ_hat]
+        ⌢ [M^E_{d,t}, AA_hat, FW_hat, PJ_hat, SC_hat]
 
-    ``d_n`` is the Saturday vs Mon–Fri indicator. There is no action block;
-    action enters only through the realized between-slot mediators and the
-    Stage-1 shares. ``action`` is unused and kept for call-site symmetry.
+    Realized ``next_my`` is omitted: it is the same quantity as ``SC_hat``
+    (realized vs predicted fourSC), so only their sum is identified from
+    weekly targets, and the increment often flips sign once the fourSC
+    EWMA level is already in ψ. ``SC_hat`` is the action-attributable
+    share. ``next_me`` stays (page views do not enter CAE directly).
+    ``d_n`` is the Saturday vs Mon–Fri indicator. ``action`` is unused
+    and kept for call-site symmetry.
     """
     E_w = float(state["E_w"])
     C_dt = np.asarray(state["C"], dtype=float).ravel()
     d_feat, _ = _time_features(d, t)
     rs_state = _rewardshaping_state(state, full_mediators)
-    M_Y = np.asarray(rs_state["M_Y"], dtype=float)
     M_E = np.asarray(rs_state["M_E"], dtype=float)
-    # The between-decision-time mediators are four-hour step count and
-    # page-view; the once-daily AA/FW/PJ terms enter through daily_shares.
-    next_my = float(M_Y[d, t])
     next_me = float(M_E[d, t])
+    shares = np.asarray(daily_shares, dtype=float).ravel()
+    if shares.size < 4:
+        shares = np.concatenate([shares, np.zeros(4 - shares.size)])
     return np.concatenate([
         [1.0, d_feat, E_w, float(b_hat), float(b_tilde)],
         summarize_mediators_ewma(state["M_Y"], state["M_E"], d, t), C_dt,
-        [next_my, next_me], np.asarray(daily_shares, dtype=float).ravel(),
+        [next_me], shares[:4],
     ])
+
+
+def build_foursc_stage1_phi(b_hat, b_tilde, state, d, t, action):
+    """Slot-level Stage-1b map for four-hour step count.
+
+    ``fourSC_{d,t} ≈ controls + A · (β0 + β_t t)``. Twelve rows per week,
+    the same identification prox_slot used. A state-only ``slot_pm`` is
+    included because the outcome is slot-level, so the AM/PM baseline is
+    not collinear with the intercept (unlike daily AA/FW/PJ).
+    """
+    E_w = float(state["E_w"])
+    C_dt = np.asarray(state["C"], dtype=float).ravel()
+    weekday, slot_pm = _time_features(d, t)
+    controls = np.concatenate([
+        [1.0, weekday, slot_pm, E_w, float(b_hat), float(b_tilde)],
+        C_dt,
+    ])
+    action_ctx = float(action) * np.array([1.0, slot_pm], dtype=float)
+    return np.concatenate([controls, action_ctx])
+
+
+def _stage1_bayes_eta(X, y, prior, p, name):
+    mu = np.asarray(prior.get("mu_0", np.zeros(p)), dtype=float).ravel()
+    Sigma = np.asarray(prior.get("Sigma_0", np.eye(p)), dtype=float)
+    sigma2 = float(prior.get("sigma2", 1.0))
+    if mu.shape != (p,) or Sigma.shape != (p, p) or not np.isfinite(sigma2) or sigma2 <= 0:
+        raise ValueError(f"invalid Stage-1 prior for {name}")
+    try:
+        precision = np.linalg.inv(Sigma)
+    except np.linalg.LinAlgError:
+        precision = np.linalg.pinv(Sigma)
+    return np.linalg.solve(
+        precision + (X.T @ X) / sigma2,
+        precision @ mu + (X.T @ y) / sigma2,
+    )
 
 
 def fit_daily_mediator_decomposition(k_cur, A_hist, b_hat_hist, b_tilde_hist,
                                      get_state, get_full_mediators,
                                      priors=None):
-    """Fit Stage-1 daily decompositions under their empirical-Bayes priors.
+    """Fit Stage-1 daily (AA/FW/PJ) and Stage-1b fourSC decompositions.
 
-    ``priors`` is keyed by ``AA``, ``FW``, and ``PJ`` and contains
-    ``mu_0``, ``Sigma_0``, and ``sigma2``.  Omission retains a conservative
-    zero/identity fallback for legacy parameter folders.
+    ``priors`` is keyed by ``AA``, ``FW``, ``PJ``, and ``SC``. Omission
+    retains a conservative zero/identity fallback.
     """
     outputs = {"AA": (0, 2), "FW": (1, 2), "PJ": (1, 3)}
     etas = {}
+    priors = priors or {}
     for name, (matrix, col) in outputs.items():
         rows, y = [], []
         for k in range(k_cur):
@@ -2261,29 +2302,43 @@ def fit_daily_mediator_decomposition(k_cur, A_hist, b_hat_hist, b_tilde_hist,
             A_hist[0, 0, 0], mediator=name).size
         X = np.asarray(rows, dtype=float) if rows else np.empty((0, p))
         yy = np.asarray(y, dtype=float)
-        prior = (priors or {}).get(name, {})
-        mu = np.asarray(prior.get("mu_0", np.zeros(p)), dtype=float).ravel()
-        Sigma = np.asarray(prior.get("Sigma_0", np.eye(p)), dtype=float)
-        sigma2 = float(prior.get("sigma2", 1.0))
-        if mu.shape != (p,) or Sigma.shape != (p, p) or not np.isfinite(sigma2) or sigma2 <= 0:
-            raise ValueError(f"invalid Stage-1 prior for {name}")
-        try:
-            precision = np.linalg.inv(Sigma)
-        except np.linalg.LinAlgError:
-            precision = np.linalg.pinv(Sigma)
-        etas[name] = np.linalg.solve(
-            precision + (X.T @ X) / sigma2,
-            precision @ mu + (X.T @ yy) / sigma2,
-        )
+        etas[name] = _stage1_bayes_eta(X, yy, priors.get(name, {}), p, name)
+
+    rows, y = [], []
+    for k in range(k_cur):
+        full = get_full_mediators(k) if get_full_mediators is not None else None
+        if full is None:
+            continue
+        M_Y = np.asarray(full[0], dtype=float)
+        for d in range(N_RL_DAYS):
+            for t in range(N_RL_SLOTS):
+                yt = float(M_Y[d, t])
+                if not np.isfinite(yt):
+                    continue
+                rows.append(build_foursc_stage1_phi(
+                    b_hat_hist[k], b_tilde_hist[k], get_state(k, d, t), d, t,
+                    A_hist[k, d, t]))
+                y.append(yt)
+    p_sc = build_foursc_stage1_phi(
+        b_hat_hist[0], b_tilde_hist[0], get_state(0, 0, 0), 0, 0,
+        A_hist[0, 0, 0]).size
+    X_sc = np.asarray(rows, dtype=float) if rows else np.empty((0, p_sc))
+    etas["SC"] = _stage1_bayes_eta(
+        X_sc, np.asarray(y, dtype=float), priors.get("SC", {}), p_sc, "SC")
     return etas
 
 
 def daily_mediator_shares(etas, b_hat, b_tilde, state, d, t, action):
-    return np.array([
+    shares = [
         build_daily_mediator_phi(b_hat, b_tilde, state, d, t, action, "AA") @ etas["AA"],
         build_daily_mediator_phi(b_hat, b_tilde, state, d, t, action, "FW") @ etas["FW"],
         build_daily_mediator_phi(b_hat, b_tilde, state, d, t, action, "PJ") @ etas["PJ"],
-    ], dtype=float)
+    ]
+    if "SC" in etas:
+        shares.append(
+            build_foursc_stage1_phi(b_hat, b_tilde, state, d, t, action) @ etas["SC"]
+        )
+    return np.array(shares, dtype=float)
 
 
 def _rewardshaping_state(state_dt, full_mediators):

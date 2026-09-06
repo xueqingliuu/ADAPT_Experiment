@@ -24,6 +24,7 @@ class MicroQueryAgent:
         nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y,
         Y_1,
         rng=None,
+        update_sigma2_q_online=True,
     ):
         self.W = W
         self.J = J
@@ -48,6 +49,7 @@ class MicroQueryAgent:
 
         self.Y_1 = Y_1
         self.rng = np.random.default_rng() if rng is None else rng
+        self.update_sigma2_q_online = bool(update_sigma2_q_online)
         self.dataset = None
 
     def reset(self, dataset, week0_actions=None):
@@ -80,6 +82,8 @@ class MicroQueryAgent:
         self.steps_since_target_update = 0
         self._current_betas_day1 = self.betas_store[0]
         self._current_betas_rest = None
+        self.sigma2_rl_hist = np.full(int(self.W), np.nan)
+        self.sigma2_rl_hist[0] = float(self.sigma2_rl)
 
     def begin_week(self, k, packet):
         # Shared across variants via ``shared_episode_exogenous``; do not redraw.
@@ -105,12 +109,13 @@ class MicroQueryAgent:
         )
         z_prev = self.z_store.get(k - 1, self.z_store[0])
 
-        # Monday-night empirical-Bayes refit of the TD pseudo-noise variance
-        # sigma_Q^2, fit per ensemble member against its own bootstrapped
-        # targets y^{(b)} and averaged.
-        self.sigma2_rl = empirical_bayes_sigma2_ensemble(
-            Phi_rl, targets_rl, self.mu_0_rl, self.Sigma_0_rl, self.sigma2_rl,
-        )
+        # Monday-night empirical-Bayes refit of σ²_Q on the ensemble-mean
+        # TD target (exploration stays in the z-perturbation).
+        if self.update_sigma2_q_online:
+            self.sigma2_rl = empirical_bayes_sigma2_ensemble(
+                Phi_rl, targets_rl, self.mu_0_rl, self.Sigma_0_rl, self.sigma2_rl,
+            )
+        self.sigma2_rl_hist[k] = float(self.sigma2_rl)
 
         self.betas_store[k], self.z_store[k] = compute_rlsvi_betas(
             Phi_rl, targets_rl,
@@ -154,4 +159,5 @@ class MicroQueryAgent:
             "v_hat": ds.pf_result.get("v_hat"),
             "pf": ds.pf_result,
             "betas": _stack_param_store(self.betas_store, self.W),
+            "sigma2_rl_hist": np.asarray(self.sigma2_rl_hist, dtype=float),
         }

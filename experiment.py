@@ -141,6 +141,7 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     build_phi_action,
     build_phi_action_rewardshaping,
     build_daily_mediator_phi,
+    build_foursc_stage1_phi,
     build_redistribution_phi,
     build_phi_bottleneck,
     build_fourSC_features,
@@ -1392,8 +1393,11 @@ P_DAILY_MEDIATOR = {
         0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0, name).size)
     for name in ("AA", "FW", "PJ")
 }
+P_DAILY_MEDIATOR["SC"] = int(
+    build_foursc_stage1_phi(0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0).size
+)
 P_REDISRIBUTION = int(build_redistribution_phi(
-    0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0, np.zeros(3)).size)
+    0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0, np.zeros(4)).size)
 
 
 def _refresh_phi_dims():
@@ -1512,16 +1516,119 @@ def _default_rl_priors(p_rl):
     return (np.zeros(p_rl),  np.eye(p_rl), 1.0)
 
 
+# Old Stage-2 ψ put next_my at this index (after state + EWMA + C).
+_STAGE2_NEXT_MY_INDEX = 15
+# Fallback share sds from the 21-d vanilla LOO (AA, FW, PJ, SC). Replaced
+# at runtime by the fold spread of the current loo_priors after a refit.
+# Fitted SC_hat means are kept per design (v2 may be negative).
+_STAGE2_SHARE_FOLD_SD_FALLBACK = {
+    "v2": np.array([0.206, 0.263, 0.246, 0.099], dtype=float),
+    "v4": np.array([0.108, 0.151, 0.148, 0.113], dtype=float),
+}
+_STAGE2_FOLD_STATS = None
+_STAGE2_FOLD_STATS_DIR = None
+
+
+def _stage2_share_vector(prior):
+    """AA/FW/PJ/SC means from a saved Stage-2 prior, or None if unreadable."""
+    mu = np.asarray(prior["mu_0"], dtype=float).ravel()
+    p = int(mu.size)
+    has_next_my = bool(prior.get("psi_has_next_my", p != P_REDISRIBUTION))
+    if p == 21:
+        return mu[17:21]
+    if p == 20 and not has_next_my:
+        return mu[16:20]
+    return None
+
+
+def _refresh_stage2_fold_stats(params_dir=None):
+    """Recompute share-column fold mean/sd from ``loo_priors/*.json``."""
+    global _STAGE2_FOLD_STATS, _STAGE2_FOLD_STATS_DIR
+    params_dir = resolve_params_dir(params_dir)
+    key = str(params_dir)
+    if _STAGE2_FOLD_STATS_DIR == key and _STAGE2_FOLD_STATS is not None:
+        return _STAGE2_FOLD_STATS
+    rows = {"v2": [], "v4": []}
+    loo_dir = Path(params_dir) / "loo_priors"
+    if loo_dir.is_dir():
+        for path in sorted(loo_dir.glob("held_out_*.json")):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    redist = json.load(f)["reward_redistribution"]["redistribution"]
+            except (OSError, KeyError, json.JSONDecodeError, TypeError):
+                continue
+            for name in ("v2", "v4"):
+                prior = redist.get(name)
+                if prior is None:
+                    continue
+                shares = _stage2_share_vector(prior)
+                if shares is not None and shares.size == 4 and np.all(np.isfinite(shares)):
+                    rows[name].append(shares)
+    stats = {"n": 0, "sc_mu": {}, "sds": {}}
+    n = min((len(rows[name]) for name in ("v2", "v4")), default=0)
+    if n >= 10:
+        stats["n"] = n
+        for name in ("v2", "v4"):
+            M = np.vstack(rows[name])
+            stats["sc_mu"][name] = float(np.mean(M[:, 3]))
+            stats["sds"][name] = np.std(M, axis=0, ddof=1)
+        _setup_log(
+            f"[priors] Stage-2 share fold stats from {n} LOO files "
+            f"(fitted SC_hat kept per design): "
+            f"v2 {stats['sc_mu']['v2']:+.3f}, "
+            f"v4 {stats['sc_mu']['v4']:+.3f}"
+        )
+    else:
+        stats["sds"] = {
+            k: v.copy() for k, v in _STAGE2_SHARE_FOLD_SD_FALLBACK.items()
+        }
+    _STAGE2_FOLD_STATS = stats
+    _STAGE2_FOLD_STATS_DIR = key
+    return stats
+
+
+def _stage2_share_sds(design):
+    stats = _STAGE2_FOLD_STATS
+    if stats and design in stats.get("sds", {}):
+        return np.asarray(stats["sds"][design], dtype=float)
+    return _STAGE2_SHARE_FOLD_SD_FALLBACK.get(
+        design, _STAGE2_SHARE_FOLD_SD_FALLBACK["v4"]
+    )
+
+
+def _drop_cov_index(mu, Sigma, idx):
+    mu = np.asarray(mu, dtype=float).ravel()
+    Sigma = np.asarray(Sigma, dtype=float)
+    keep = [i for i in range(mu.size) if i != int(idx)]
+    return mu[keep], Sigma[np.ix_(keep, keep)]
+
+
+def _apply_share_priors(mu, Sigma, *, design):
+    """Keep fitted SC_hat; floor share-column sds at the LOO fold spread."""
+    mu = np.asarray(mu, dtype=float).ravel().copy()
+    Sigma = np.asarray(Sigma, dtype=float).copy()
+    sds = np.asarray(_stage2_share_sds(design), dtype=float).ravel()
+    if sds.size != 4:
+        raise ValueError(f"expected 4 share sds, got {sds.size}")
+    for i, sd in enumerate(sds):
+        idx = mu.size - 4 + i
+        var = float(sd) * float(sd)
+        if Sigma[idx, idx] < var:
+            Sigma[idx, idx] = var
+    return mu, Sigma
+
+
 def _default_reward_redistribution_priors():
     daily = {
         name: {"mu_0": np.zeros(p), "Sigma_0": np.eye(p), "sigma2": 1.0}
         for name, p in P_DAILY_MEDIATOR.items()
     }
-    stage2 = {
-        name: {"mu_0": np.zeros(P_REDISRIBUTION),
-               "Sigma_0": np.eye(P_REDISRIBUTION), "sigma2": 1.0}
-        for name in ("v2", "v4")
-    }
+    stage2 = {}
+    for name in ("v2", "v4"):
+        mu = np.zeros(P_REDISRIBUTION)
+        Sig = np.eye(P_REDISRIBUTION)
+        mu, Sig = _apply_share_priors(mu, Sig, design=name)
+        stage2[name] = {"mu_0": mu, "Sigma_0": Sig, "sigma2": 1.0}
     return daily, stage2
 
 
@@ -1573,6 +1680,70 @@ def _coerce_daily_mediator_prior(prior, expected_p, label):
     return out
 
 
+def _fill_missing_stage1_priors(daily):
+    """Insert a zero/identity Stage-1b SC prior when older JSON omits it."""
+    defaults, _ = _default_reward_redistribution_priors()
+    out = dict(daily)
+    for name, prior in defaults.items():
+        if name not in out:
+            out[name] = prior
+            _setup_log(
+                f"[priors] {name} Stage-1 prior missing; using zero/identity "
+                f"(p={P_DAILY_MEDIATOR[name]})"
+            )
+    return out
+
+
+def _coerce_redistribution_priors(priors):
+    """Map a saved Stage-2 η onto ψ without realized next_my.
+
+    Layouts:
+    * 21-d (next_my + SC_hat): drop next_my.
+    * 20-d with ``psi_has_next_my`` (default for unmarked files): drop
+      next_my and append SC_hat.
+    * 20-d tagged ``psi_has_next_my=false``: already the new map.
+
+    Fitted SC_hat is kept per design (v2 may be negative; v4 is
+    positive). Share-column sds are floored at the LOO fold spread.
+    next_me is not changed. Coefficients are not clipped.
+    """
+    out = {}
+    for name, prior in priors.items():
+        mu = np.asarray(prior["mu_0"], dtype=float).ravel()
+        Sig = np.asarray(prior["Sigma_0"], dtype=float)
+        p = int(mu.size)
+        has_next_my = bool(prior.get("psi_has_next_my", p != P_REDISRIBUTION))
+        if p == P_REDISRIBUTION + 1 and has_next_my:
+            mu, Sig = _drop_cov_index(mu, Sig, _STAGE2_NEXT_MY_INDEX)
+            _setup_log(
+                f"[priors] dropped Stage-2 {name} next_my "
+                f"({p} → {P_REDISRIBUTION})"
+            )
+        elif p == P_REDISRIBUTION and prior.get("psi_has_next_my", True):
+            mu, Sig = _drop_cov_index(mu, Sig, _STAGE2_NEXT_MY_INDEX)
+            mu, Sig = pad_prior_append(mu, Sig, P_REDISRIBUTION)
+            _setup_log(
+                f"[priors] dropped Stage-2 {name} next_my and appended SC_hat"
+            )
+        elif p < P_REDISRIBUTION:
+            mu, Sig = pad_prior_append(mu, Sig, P_REDISRIBUTION)
+            _setup_log(
+                f"[priors] padded Stage-2 {name} ({p} → {P_REDISRIBUTION})"
+            )
+        elif p > P_REDISRIBUTION:
+            raise ValueError(
+                f"Stage-2 {name} prior dim {p} > expected {P_REDISRIBUTION}"
+            )
+        mu, Sig = _apply_share_priors(mu, Sig, design=name)
+        out[name] = {
+            "mu_0": mu,
+            "Sigma_0": Sig,
+            "sigma2": float(prior.get("sigma2", 1.0)),
+            "psi_has_next_my": False,
+        }
+    return out
+
+
 def _default_rl_joint_priors(p_eta, p_beta):
     """Fallback joint prior for the modified-TD-loss RLSVI agents.
 
@@ -1588,6 +1759,107 @@ def _default_rl_joint_priors(p_eta, p_beta):
 _PRIORS_CONFIGURED_DIR = None
 _priors_src = None
 _LOO_PRIOR_CACHE = {}
+# When True, fitted PF / reward-shaping / Stage-2 priors stay as loaded;
+# Q and Stage-1 / Stage-1b means are set to 0 and those covariances are
+# inflated (floor 0.1). Online EB still updates sigma2_Q each week.
+_ZERO_CENTRE_POLICY_PRIORS = os.getenv("ZERO_CENTRE_POLICY_PRIORS", "0") == "1"
+_POLICY_PRIOR_VAR_SCALE = float(os.getenv("POLICY_PRIOR_VAR_SCALE", "10"))
+_POLICY_PRIOR_VAR_FLOOR = float(os.getenv("POLICY_PRIOR_VAR_FLOOR", "0.1"))
+
+
+def _zero_centre_policy_priors_requested():
+    return bool(_ZERO_CENTRE_POLICY_PRIORS) or (
+        os.getenv("ZERO_CENTRE_POLICY_PRIORS", "0") == "1"
+    )
+
+
+def _inflate_policy_cov(Sigma, scale, floor, start=0):
+    """Scale a covariance and floor its trailing diagonal.
+
+    ``start`` lets the joint modified-TD prior inflate only the Q (β)
+    block. Raising the diagonal cannot destroy positive-semidefiniteness.
+    """
+    S = np.asarray(Sigma, dtype=float).copy()
+    scale = float(scale)
+    floor = float(floor)
+    if S.ndim != 2 or S.shape[0] != S.shape[1]:
+        raise ValueError(f"expected square covariance, got {S.shape}")
+    if start < 0 or start > S.shape[0]:
+        raise ValueError(f"invalid covariance start {start} for p={S.shape[0]}")
+    if scale != 1.0:
+        if start == 0:
+            S = scale * S
+        else:
+            w = np.ones(S.shape[0], dtype=float)
+            w[start:] = np.sqrt(scale)
+            S = (w[:, None] * S) * w[None, :]
+    if floor > 0.0:
+        d = np.diag(S).copy()
+        d[start:] = np.maximum(d[start:], floor)
+        np.fill_diagonal(S, d)
+    return S
+
+
+def _zero_centre_policy_priors(*, log=False):
+    """Zero-centre and inflate Q / Stage-1 / Stage-1b coefficient priors.
+
+    Means go to 0. Covariances are multiplied by ``POLICY_PRIOR_VAR_SCALE``
+    (default 10) and their diagonals are floored at
+    ``POLICY_PRIOR_VAR_FLOOR`` (default 0.1, sd 0.32).     Residual σ² starts at the fitted ``sigma2_Q`` and is updated
+    online by EB on the ensemble-mean TD target.
+
+    PF (ν₀, Γ₀, σ²), reward-shaping η, and Stage-2 redistribution η are
+    not changed. The joint modified-TD prior is edited only in the Q (β)
+    block.
+    """
+    global mu_0_micro, Sigma_0_micro, mu_0_mtd_joint, Sigma_0_mtd_joint
+    global q_adv_m_g09, _priors_src
+    scale = float(_POLICY_PRIOR_VAR_SCALE)
+    floor = float(_POLICY_PRIOR_VAR_FLOOR)
+    mu_0_micro = np.zeros_like(np.asarray(mu_0_micro, dtype=float).ravel())
+    Sigma_0_micro = _inflate_policy_cov(Sigma_0_micro, scale, floor)
+    for prior in variant_q_priors.values():
+        prior["mu_0"] = np.zeros_like(
+            np.asarray(prior["mu_0"], dtype=float).ravel()
+        )
+        prior["Sigma_0"] = _inflate_policy_cov(prior["Sigma_0"], scale, floor)
+    q_adv_m_g09["mu_0"] = np.zeros_like(
+        np.asarray(q_adv_m_g09["mu_0"], dtype=float).ravel()
+    )
+    q_adv_m_g09["Sigma_0"] = _inflate_policy_cov(
+        q_adv_m_g09["Sigma_0"], scale, floor
+    )
+    for prior in daily_mediator_priors.values():
+        prior["mu_0"] = np.zeros_like(
+            np.asarray(prior["mu_0"], dtype=float).ravel()
+        )
+        prior["Sigma_0"] = _inflate_policy_cov(prior["Sigma_0"], scale, floor)
+    mu = np.asarray(mu_0_mtd_joint, dtype=float).ravel().copy()
+    mu[int(p_eta_mtd_joint):] = 0.0
+    mu_0_mtd_joint = mu
+    Sigma_0_mtd_joint = _inflate_policy_cov(
+        Sigma_0_mtd_joint, scale, floor, start=int(p_eta_mtd_joint),
+    )
+    tag = (
+        f"Q/Stage-1/Stage-1b means zero-centred, "
+        f"Σ×{scale:g} (diag floor {floor:g})"
+    )
+    if _priors_src is None or tag not in str(_priors_src):
+        _priors_src = (
+            tag if _priors_src is None else f"{_priors_src}; {tag}"
+        )
+    if log:
+        _setup_log(
+            "[priors] zero-centred Q, Stage-1 (AA/FW/PJ), and Stage-1b "
+            f"(SC) means; inflated those Σ by {scale:g} with diagonal "
+            f"floor {floor:g}; PF and reward-shaping priors kept; "
+            "Stage-2 η kept"
+        )
+
+
+def _maybe_zero_centre_policy_priors(*, log=False):
+    if _zero_centre_policy_priors_requested():
+        _zero_centre_policy_priors(log=log)
 
 
 def _load_priors(params_dir=None):
@@ -1633,6 +1905,7 @@ def _configure_priors(params_dir=None, *, force=False):
     global sigma2_Q_mtd_joint, _P_MTD_JOINT
 
     params_dir = resolve_params_dir(params_dir)
+    _refresh_stage2_fold_stats(params_dir)
     if not force and _PRIORS_CONFIGURED_DIR == str(params_dir):
         return
 
@@ -1728,13 +2001,15 @@ def _configure_priors(params_dir=None, *, force=False):
         sigma2_reward   = _priors["sigma2_reward"]
         daily_mediator_priors, redistribution_priors = _default_reward_redistribution_priors()
         if "daily_mediator_priors" in _priors and "redistribution_priors" in _priors:
-            daily_mediator_priors = {
+            daily_mediator_priors = _fill_missing_stage1_priors({
                 name: _coerce_daily_mediator_prior(
                     prior, P_DAILY_MEDIATOR[name], f"daily_mediator.{name}",
                 )
                 for name, prior in _priors["daily_mediator_priors"].items()
-            }
-            redistribution_priors = _priors["redistribution_priors"]
+            })
+            redistribution_priors = _coerce_redistribution_priors(
+                _priors["redistribution_priors"]
+            )
         else:
             _setup_log("[priors] V2/V4 redistribution priors missing; using zero/identity fallback (rerun est_prior.py).")
         # Joint (alpha, beta) prior for the modified-TD-loss RLSVI agents.
@@ -1804,6 +2079,8 @@ def _configure_priors(params_dir=None, *, force=False):
         f"({_P_MTD_JOINT}, {_P_MTD_JOINT})"
     assert p_eta_mtd_joint == P_RL_BOTTLENECK, \
         f"joint p_eta {p_eta_mtd_joint} != P_RL_BOTTLENECK={P_RL_BOTTLENECK}"
+
+    _maybe_zero_centre_policy_priors(log=True)
 
     _PRIORS_CONFIGURED_DIR = str(params_dir)
     _setup_log(
@@ -1891,17 +2168,15 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
         prior["mu_0"] = np.asarray(prior["mu_0"], dtype=float)
         prior["Sigma_0"] = np.asarray(prior["Sigma_0"], dtype=float)
         prior["sigma2"] = float(prior["sigma2"])
-    daily_mediator_priors = {
+    daily_mediator_priors = _fill_missing_stage1_priors({
         name: _coerce_daily_mediator_prior(
             prior, P_DAILY_MEDIATOR[name], f"LOO daily_mediator.{name}",
         )
         for name, prior in fitted["reward_redistribution"]["daily_mediators"].items()
-    }
-    redistribution_priors = fitted["reward_redistribution"]["redistribution"]
-    for prior in list(redistribution_priors.values()):
-        prior["mu_0"] = np.asarray(prior["mu_0"], dtype=float)
-        prior["Sigma_0"] = np.asarray(prior["Sigma_0"], dtype=float)
-        prior["sigma2"] = float(prior["sigma2"])
+    })
+    redistribution_priors = _coerce_redistribution_priors(
+        fitted["reward_redistribution"]["redistribution"]
+    )
     joint = fitted.get("q_td_modify_joint") or {}
     mu_joint = joint.get("mu_0")
     joint_ok = (
@@ -1936,6 +2211,7 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
          sigma2_Q_mtd_joint) = _default_rl_joint_priors(
             P_RL_BOTTLENECK, P_RL_MICRO)
     _priors_src = f"leave-one-out fit; held out participant {int(held_out_uid)}"
+    _maybe_zero_centre_policy_priors(log=False)
 
 
 def configure_leave_one_out_priors(held_out_uid, params_dir=None):
@@ -1945,6 +2221,7 @@ def configure_leave_one_out_priors(held_out_uid, params_dir=None):
     therefore read-only and avoids repeated FQI/PF work during experiments.
     """
     params_dir = resolve_params_dir(params_dir)
+    _refresh_stage2_fold_stats(params_dir)
     key = (str(params_dir), int(held_out_uid))
     if key not in _LOO_PRIOR_CACHE:
         path = params_dir / "loo_priors" / f"held_out_{int(held_out_uid)}.json"
@@ -2058,8 +2335,8 @@ def run_micro_query(uid, seed=42, gamma_bar=0.5, params_dir=None):
         sigma2_tilde_Y=sigma2_tilde_Y,
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
+        update_sigma2_q_online=True,
     )
-    # agent.update_sigma2_online = False
 
     result = oenv.run_episode(
         agent, dataset, week0_actions=week0_actions, I_hist=I_hist
@@ -2119,6 +2396,7 @@ def run_micro_query_residual(uid, seed=42, gamma_bar=0.9, params_dir=None):
         sigma2_tilde_Y=sigma2_tilde_Y,
         Y_1=float(oenv.CAE_all[0]),
         rng=np.random.default_rng(seed),
+        update_sigma2_q_online=True,
     )
     return oenv.run_episode(agent, dataset, week0_actions=week0_actions, I_hist=I_hist), oenv
 
@@ -2131,8 +2409,9 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
     V1/V2 use the engagement-biased weekly target ``b̂_{w+1} + λ ê_{w+1}``,
     with ``λ = ρ · sd(b̂) / sd(ê)`` unless ``engagement_bonus`` is set.
     V3/V4 keep discounted CAE and add the potential ``F = γ̄ ê_{w+1} - ê_w``.
-    V2/V4 additionally redistribute with the two-stage daily-mediator
-    decomposition. Slot TD rewards are ``φ^⊤ η`` only (no last-slot leftover).
+    V2/V4 additionally redistribute with the two-stage mediator
+    decomposition (daily AA/FW/PJ plus slot-level fourSC). Slot TD
+    rewards are ``φ^⊤ η`` only (no last-slot leftover).
     ``ê_{w+1}`` is used only in that weekly Stage-2 target, not in Stage-2
     slot features.
     """
@@ -2165,6 +2444,7 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
         engagement_bonus=engagement_bonus, engagement_rho=engagement_rho,
         daily_mediator_priors=daily_mediator_priors,
         redistribution_prior=redistribution_priors.get(reward_design),
+        update_sigma2_q_online=True,
     )
     return oenv.run_episode(agent, dataset, week0_actions=week0_actions, I_hist=I_hist), oenv
 
@@ -2308,6 +2588,7 @@ _TIMING_PROBE_ARRAYS = (
     "env_truth_pm_minus_am",
     "stage1_sign_ok",
     "stage1_sign_ok_running",
+    "sigma2_q",
 )
 
 
@@ -2315,22 +2596,24 @@ def _stack_timing_probes(per_exp):
     """Stack per-draw timing probes to (n_exp, n_users, …)."""
     if not per_exp or not per_exp[0]:
         return None
+    keys = [key for key in _TIMING_PROBE_ARRAYS if key in per_exp[0][0]]
     out = {
         key: np.stack([
             np.stack([probe[key] for probe in users])
             for users in per_exp
         ])
-        for key in _TIMING_PROBE_ARRAYS
+        for key in keys
     }
     out["stage1_mediators"] = np.asarray(per_exp[0][0]["stage1_mediators"])
     return out
 
 
-def _write_timing_probe_summary(path, stacked_by_algo):
+def _write_timing_probe_summary(path, stacked_by_algo, sigma2_by_algo=None):
     """Human-readable Stage 1 → 2 → π snapshot for this process."""
     lines = [
-        "V4/V6 timing-chain probe. Stage-1 γ̂_a−γ̂_m is A×slot_pm on AA/FW/PJ.",
-        "Env truth and gaps are PM−AM. sign_ok is P(sign(γ_AA)==sign(truth)).",
+        "V4/V6 timing-chain probe. Stage-1 A×slot_pm on AA/FW/PJ (daily) "
+        "and SC (slot fourSC). Env truth and gaps are PM−AM.",
+        "sign_ok_SC is P(sign(β_t)==sign(truth)); AA is the daily analogue.",
         "A link that stays ~0 (or sign_ok ~0.5) is the one that died.",
         "",
     ]
@@ -2340,16 +2623,39 @@ def _write_timing_probe_summary(path, stacked_by_algo):
         g = arrs["stage1_gamma_pm_minus_am"]
         r = arrs["stage2_r_pm_minus_am"]
         p = arrs["pi_pm_minus_am"]
+        s2 = arrs.get("sigma2_q")
         lines.append(f"== {name} ==")
         for w in weeks:
             if w >= so.shape[2]:
                 continue
+            sc = ""
+            if so.shape[-1] > 3:
+                sc = (
+                    f"sign_ok_SC={np.nanmean(so[..., w, 3]):.2f}  "
+                    f"γ_SC={np.nanmean(g[..., w, 3]):+.4f}  "
+                )
+            s2s = ""
+            if s2 is not None and w < s2.shape[-1]:
+                s2s = f"  σ²_Q={np.nanmean(s2[..., w]):.3f}"
             lines.append(
-                f"  week {w:2d}: sign_ok_AA={np.nanmean(so[..., w, 0]):.2f}  "
+                f"  week {w:2d}: {sc}"
+                f"sign_ok_AA={np.nanmean(so[..., w, 0]):.2f}  "
                 f"γ_AA={np.nanmean(g[..., w, 0]):+.4f}  "
                 f"r_gap={np.nanmean(r[..., w]):+.4f}  "
                 f"π_gap={np.nanmean(p[..., w]):+.3f}"
+                f"{s2s}"
             )
+        lines.append("")
+    if sigma2_by_algo:
+        lines.append(
+            "σ²_Q at week 35 (all RLSVI arms). Online EB on the "
+            "ensemble-mean TD target."
+        )
+        for name, arr in sigma2_by_algo.items():
+            arr = np.asarray(arr, dtype=float)
+            if arr.ndim < 1 or arr.shape[-1] <= 35:
+                continue
+            lines.append(f"  {name}: {np.nanmean(arr[..., 35]):.3f}")
         lines.append("")
     path.write_text("\n".join(lines) + "\n")
 
@@ -2475,6 +2781,28 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--zero-centre-policy-priors",
+        action="store_true",
+        default=os.getenv("ZERO_CENTRE_POLICY_PRIORS", "0") == "1",
+        help=(
+            "Keep fitted PF and reward-shaping priors; set the prior mean "
+            "of Q, Stage-1 (AA/FW/PJ), and Stage-1b (SC) to zero and "
+            "inflate those covariances (see --policy-prior-var-scale). "
+            "Stage-2 η is not changed. Also set by "
+            "ZERO_CENTRE_POLICY_PRIORS=1."
+        ),
+    )
+    parser.add_argument(
+        "--policy-prior-var-scale",
+        type=float,
+        default=float(os.getenv("POLICY_PRIOR_VAR_SCALE", "10")),
+        help=(
+            "Multiply Q / Stage-1 / Stage-1b prior covariances by this "
+            "factor when --zero-centre-policy-priors is on (default 10). "
+            "Diagonals are then floored at POLICY_PRIOR_VAR_FLOOR (0.1)."
+        ),
+    )
+    parser.add_argument(
         "--nweek",
         type=int,
         default=None,
@@ -2495,9 +2823,21 @@ if __name__ == "__main__":
     )
 
     params_dir = resolve_params_dir(args.params_dir)
+    _ZERO_CENTRE_POLICY_PRIORS = bool(args.zero_centre_policy_priors)
+    _POLICY_PRIOR_VAR_SCALE = float(args.policy_prior_var_scale)
     _configure_priors(params_dir=params_dir, force=True)
     print(f"Using parameter directory: {params_dir}")
     print(f"Prior mode: {args.prior_mode}")
+    print(
+        "Policy prior means: "
+        + (
+            "zero-centred Q / Stage-1 / Stage-1b "
+            f"(Σ×{_POLICY_PRIOR_VAR_SCALE:g}, diag floor "
+            f"{_POLICY_PRIOR_VAR_FLOOR:g}; PF and reward kept)"
+            if _zero_centre_policy_priors_requested()
+            else "as fitted"
+        )
+    )
     print(f"nweek={NWEEK}")
 
     if args.engagement_rho is not None:
@@ -2566,6 +2906,7 @@ if __name__ == "__main__":
     pf_runs    = {name: [] for name in ALGORITHMS}
     oenv_runs  = {name: [] for name in ALGORITHMS}
     probe_runs = {name: [] for name in ALGORITHMS}
+    sigma2_runs = {name: [] for name in ALGORITHMS}
     cae_by_uid = {name: {} for name in ALGORITHMS}   # keyed by uid (flat across exps)
 
     for exp_idx, seed in enumerate(SEEDS):
@@ -2579,6 +2920,7 @@ if __name__ == "__main__":
             pf_runs[name].append([])
             oenv_runs[name].append([])
             probe_runs[name].append([])
+            sigma2_runs[name].append([])
 
         for draw_idx, uid in enumerate(sampled_uids):
             uid = int(uid)
@@ -2603,6 +2945,10 @@ if __name__ == "__main__":
                 piA_runs[name][exp_idx].append(res["pi_A"].copy())
                 if res.get("timing_probe") is not None:
                     probe_runs[name][exp_idx].append(res["timing_probe"])
+                if res.get("sigma2_rl_hist") is not None:
+                    sigma2_runs[name][exp_idx].append(
+                        np.asarray(res["sigma2_rl_hist"], dtype=float)
+                    )
                 if save_pf:
                     pf_runs[name][exp_idx].append(res["pf"])
                 cae_by_uid[name].setdefault(uid, []).append(cae_full)
@@ -2684,6 +3030,32 @@ if __name__ == "__main__":
             "params_dir":      str(params_dir),
             "priors_source":   _priors_src,
             "prior_mode":      args.prior_mode,
+            "zero_centre_policy_priors": _zero_centre_policy_priors_requested(),
+            "zero_centre_blocks": (
+                ["Q", "stage1_AA_FW_PJ", "stage1b_SC"]
+                if _zero_centre_policy_priors_requested() else []
+            ),
+            "policy_prior_var_scale": (
+                float(_POLICY_PRIOR_VAR_SCALE)
+                if _zero_centre_policy_priors_requested() else 1.0
+            ),
+            "policy_prior_var_floor": (
+                float(_POLICY_PRIOR_VAR_FLOOR)
+                if _zero_centre_policy_priors_requested() else 0.0
+            ),
+            "hold_fitted_sigma2_q": False,
+            "update_sigma2_q_online": True,
+            "stage2_drop_next_my": True,
+            "stage2_keep_fitted_sc_hat": True,
+            "stage2_sc_hat_fold_mean": {
+                k: float(v) for k, v in
+                ((_STAGE2_FOLD_STATS or {}).get("sc_mu") or {}).items()
+            },
+            "stage2_share_fold_sd": {
+                k: [float(x) for x in _stage2_share_sds(k)]
+                for k in ("v2", "v4")
+            },
+            "stage2_fold_n": int((_STAGE2_FOLD_STATS or {}).get("n", 0)),
             "loo_prior_cache_size": len(_LOO_PRIOR_CACHE) if args.prior_mode == "loo" else 0,
             "action_block_include_c": include_action_c,
             "action_block_include_time": True,
@@ -2716,6 +3088,10 @@ if __name__ == "__main__":
         probe = _stack_timing_probes(probe_runs[name])
         if probe is not None:
             npz_payload.update({f"probe_{k}": v for k, v in probe.items()})
+        if sigma2_runs[name] and sigma2_runs[name][0]:
+            npz_payload["sigma2_rl_hist"] = np.stack([
+                np.stack(per_exp) for per_exp in sigma2_runs[name]
+            ])
         np.savez_compressed(OUTPUT_DIR / f"{name}.npz", **npz_payload)
 
         # cae_by_uid is heterogeneous (per-uid list lengths differ when a uid
@@ -2736,9 +3112,17 @@ if __name__ == "__main__":
         stacked = _stack_timing_probes(probe_runs[name])
         if stacked is not None:
             probe_summary[name] = stacked
-    if probe_summary:
+    sigma2_summary = {}
+    for name in ALGORITHMS:
+        if sigma2_runs[name] and sigma2_runs[name][0]:
+            sigma2_summary[name] = np.stack([
+                np.stack(per_exp) for per_exp in sigma2_runs[name]
+            ])
+    if probe_summary or sigma2_summary:
         summary_path = OUTPUT_DIR / "timing_probe_summary.txt"
-        _write_timing_probe_summary(summary_path, probe_summary)
+        _write_timing_probe_summary(
+            summary_path, probe_summary, sigma2_by_algo=sigma2_summary,
+        )
         print(summary_path.read_text(), end="")
 
     print(f"\nResults saved to {OUTPUT_DIR.resolve()}")

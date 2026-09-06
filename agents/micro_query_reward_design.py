@@ -20,8 +20,8 @@ class MicroQueryRewardDesignAgent:
     ``λ = ρ · sd(b̂) / sd(ê)`` from the agent-visible histories so far
     (override with a fixed ``engagement_bonus``).  V3/V4 keep the
     discounted-CAE objective and add the week-boundary potential
-    ``F = γ̄ ê_{w+1} - ê_w``.  V2/V4 fit Stage 1 daily-mediator
-    decompositions and the Stage 2 within-week redistribution.  Slot
+    ``F = γ̄ ê_{w+1} - ê_w``.  V2/V4 fit Stage 1 daily AA/FW/PJ, Stage
+    1b slot fourSC (A×[1, t]), and Stage 2 within-week redistribution.  Slot
     TD rewards are ``φ^⊤ η`` only — no leftover is added on the last
     slot to force the week to sum to the target (V2 target
     ``b̂_{w+1} + λ ê_{w+1}``; V4 ``b̂_{w+1} + F``).
@@ -52,6 +52,9 @@ class MicroQueryRewardDesignAgent:
         self.daily_mediator_priors = daily_mediator_priors or {}
         self.redistribution_prior = redistribution_prior or {}
         self.rng = np.random.default_rng() if self.rng is None else self.rng
+        self.update_sigma2_q_online = bool(
+            values.get("update_sigma2_q_online", True)
+        )
         self.dataset = None
 
     def reset(self, dataset, week0_actions=None):
@@ -73,16 +76,18 @@ class MicroQueryRewardDesignAgent:
         self.steps_since_target_update = 0
         self._current_betas_day1, self._current_betas_rest = self.betas_store[0], None
         self.lambda_hist = np.full(self.W, np.nan)
+        self.sigma2_rl_hist = np.full(int(self.W), np.nan)
+        self.sigma2_rl_hist[0] = float(self.sigma2_rl)
 
     def _init_timing_probe(self):
         """Per-week Stage 1 → Stage 2 → π diagnostics (V2/V4 only)."""
         w = int(self.W)
-        self.probe_stage1 = np.full((w, 3), np.nan)
+        self.probe_stage1 = np.full((w, 4), np.nan)
         self.probe_stage2 = np.full(w, np.nan)
         self.probe_pi = np.full(w, np.nan)
         self.probe_env = np.full(w, np.nan)
-        self.probe_sign_ok = np.full((w, 3), np.nan)
-        self.probe_sign_ok_running = np.full((w, 3), np.nan)
+        self.probe_sign_ok = np.full((w, 4), np.nan)
+        self.probe_sign_ok_running = np.full((w, 4), np.nan)
 
     def begin_week(self, k, packet):
         return int(self.dataset.I_hist[k])
@@ -203,8 +208,8 @@ class MicroQueryRewardDesignAgent:
         daily = self.daily_eta_store.get(k)
         eta = self.eta_store.get(k)
         if daily is not None:
-            for i, name in enumerate(("AA", "FW", "PJ")):
-                coef = np.asarray(daily[name], dtype=float).ravel()
+            for i, name in enumerate(("AA", "FW", "PJ", "SC")):
+                coef = np.asarray(daily.get(name, []), dtype=float).ravel()
                 if coef.size:
                     self.probe_stage1[k, i] = float(coef[-1])
         if daily is not None and eta is not None:
@@ -221,7 +226,7 @@ class MicroQueryRewardDesignAgent:
                     gaps.append(r_pm - r_am)
                 self.probe_stage2[k] = float(np.mean(gaps))
         running = np.nanmean(self.probe_env[:k + 1])
-        for i in range(3):
+        for i in range(self.probe_stage1.shape[1]):
             g = self.probe_stage1[k, i]
             if np.isfinite(g) and np.isfinite(truth) and g != 0.0 and truth != 0.0:
                 self.probe_sign_ok[k, i] = float(np.sign(g) == np.sign(truth))
@@ -300,8 +305,10 @@ class MicroQueryRewardDesignAgent:
                     )
                     for target in targets:
                         target[(kp + 1) * N_RL_DAYS * N_RL_SLOTS - 1] += bump
-        self.sigma2_rl = empirical_bayes_sigma2_ensemble(
-            Phi, targets, self.mu_0_rl, self.Sigma_0_rl, self.sigma2_rl)
+        if self.update_sigma2_q_online:
+            self.sigma2_rl = empirical_bayes_sigma2_ensemble(
+                Phi, targets, self.mu_0_rl, self.Sigma_0_rl, self.sigma2_rl)
+        self.sigma2_rl_hist[k] = float(self.sigma2_rl)
         z_prev = self.z_store.get(k - 1, self.z_store[0])
         self.betas_store[k], self.z_store[k] = compute_rlsvi_betas(
             Phi, targets, self.mu_0_rl, self.Sigma_0_rl, self.sigma2_rl,
@@ -327,7 +334,8 @@ class MicroQueryRewardDesignAgent:
                 "y_hat": ds.pf_result.get("y_hat"), "v_hat": ds.pf_result.get("v_hat"),
                 "pf": ds.pf_result, "betas": _stack_param_store(self.betas_store, self.W),
                 "eta": _stack_param_store(self.eta_store, self.W),
-                "lambda_hist": np.asarray(self.lambda_hist, dtype=float)}
+                "lambda_hist": np.asarray(self.lambda_hist, dtype=float),
+                "sigma2_rl_hist": np.asarray(self.sigma2_rl_hist, dtype=float)}
         if self.reward_design in {"v2", "v4"}:
             out["timing_probe"] = {
                 "stage1_gamma_pm_minus_am": np.asarray(self.probe_stage1, dtype=float),
@@ -337,6 +345,7 @@ class MicroQueryRewardDesignAgent:
                 "stage1_sign_ok": np.asarray(self.probe_sign_ok, dtype=float),
                 "stage1_sign_ok_running": np.asarray(
                     self.probe_sign_ok_running, dtype=float),
-                "stage1_mediators": np.array(["AA", "FW", "PJ"]),
+                "sigma2_q": np.asarray(self.sigma2_rl_hist, dtype=float),
+                "stage1_mediators": np.array(["AA", "FW", "PJ", "SC"]),
             }
         return out
