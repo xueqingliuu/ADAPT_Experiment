@@ -1,0 +1,16 @@
+V4/V6 timing-chain probe. Stage-1 γ̂_a−γ̂_m is A×slot_pm on AA/FW/PJ.
+Env truth and gaps are PM−AM. sign_ok is P(sign(γ_AA)==sign(truth)).
+A link that stays ~0 (or sign_ok ~0.5) is the one that died.
+
+== rl_v4_biased_redistributed ==
+  week  5: sign_ok_AA=0.45  γ_AA=+0.0120  r_gap=-0.0371  π_gap=+0.127
+  week 12: sign_ok_AA=0.48  γ_AA=+0.0113  r_gap=-0.0275  π_gap=+0.135
+  week 24: sign_ok_AA=0.61  γ_AA=+0.0072  r_gap=-0.0317  π_gap=+0.126
+  week 35: sign_ok_AA=0.59  γ_AA=+0.0094  r_gap=-0.0201  π_gap=+0.116
+
+== rl_v6_invariant_redistributed ==
+  week  5: sign_ok_AA=0.39  γ_AA=+0.0130  r_gap=-0.0316  π_gap=+0.025
+  week 12: sign_ok_AA=0.52  γ_AA=+0.0098  r_gap=-0.0291  π_gap=+0.016
+  week 24: sign_ok_AA=0.59  γ_AA=+0.0116  r_gap=-0.0383  π_gap=-0.028
+  week 35: sign_ok_AA=0.65  γ_AA=+0.0121  r_gap=-0.0360  π_gap=-0.078
+
