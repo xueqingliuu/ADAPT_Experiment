@@ -16,6 +16,36 @@ FIRST_D = 0
 FIRST_T = 0
 TERMINAL_D = N_RL_DAYS - 1
 TERMINAL_T = N_RL_SLOTS - 1
+STAGE1_SHARE_NAMES = ("AA", "FW", "PJ", "SC", "PV")
+
+# Canonical RCT roster. ``experiment.ALGORITHMS`` and ``aggregate.py``
+# must use this order; leftover npz from dropped arms are ignored.
+EXPERIMENT_ALGORITHMS = (
+    "rl_v1_base_g09",
+    "rl_v2_mtd_g09",
+    "rl_v5_invariant_weekly",
+    "rl_v6_invariant_redistributed",
+    "rl_v6_invariant_redistributed_resid",
+    "rl_v7_base_g05",
+    "rl_v8_base_g099",
+    "never_send",
+    "always_send",
+    "random_send",
+)
+EXPERIMENT_ALGORITHM_LABELS = {
+    "rl_v1_base_g09": "RL base (γ̄=0.9)",
+    "rl_v2_mtd_g09": "RL + bottleneck TD (γ̄=0.9)",
+    "rl_v5_invariant_weekly": "RL V3: return-invariant weekly reward (γ̄=0.9)",
+    "rl_v6_invariant_redistributed": "RL V4: return-invariant redistributed reward (γ̄=0.9)",
+    "rl_v6_invariant_redistributed_resid": (
+        "RL V4: return-invariant redistributed + terminal residual (γ̄=0.9)"
+    ),
+    "rl_v7_base_g05": "RL base (γ̄=0.5 sensitivity)",
+    "rl_v8_base_g099": "RL base (γ̄=0.99 sensitivity)",
+    "never_send": "Never send (π_A=0)",
+    "always_send": "Always send (π_A=1)",
+    "random_send": "Random send (π_A=0.5)",
+}
 
 
 def _env_flag(name, default=True):
@@ -2277,29 +2307,26 @@ def build_redistribution_phi(b_hat, b_tilde, state, d, t, action,
 
     psi = [1, d_n, E_w, b_hat, b_tilde]
         ⌢ [M_ewma (AA, SC, PV, FW, PJ), C_{w,d,t}]
-        ⌢ [M^E_{d,t}, AA_hat, FW_hat, PJ_hat, SC_hat]
+        ⌢ [AA_hat, FW_hat, PJ_hat, SC_hat, PV_hat]
 
-    Realized ``next_my`` is omitted: it is the same quantity as ``SC_hat``
-    (realized vs predicted fourSC), so only their sum is identified from
-    weekly targets, and the increment often flips sign once the fourSC
-    EWMA level is already in ψ. ``SC_hat`` is the action-attributable
-    share. ``next_me`` stays (page views do not enter CAE directly).
-    ``d_n`` is the Saturday vs Mon–Fri indicator. ``action`` is unused
-    and kept for call-site symmetry.
+    Realized ``next_my`` and ``next_me`` are omitted: they are the same
+    quantities as ``SC_hat`` / ``PV_hat`` (realized vs predicted), so only
+    their sum is identified from weekly targets. The hats are the
+    action-attributable shares. ``d_n`` is the Saturday vs Mon–Fri
+    indicator. ``action`` / ``full_mediators`` are unused and kept for
+    call-site symmetry.
     """
     E_w = float(state["E_w"])
     C_dt = np.asarray(state["C"], dtype=float).ravel()
     d_feat, _ = _time_features(d, t)
-    rs_state = _rewardshaping_state(state, full_mediators)
-    M_E = np.asarray(rs_state["M_E"], dtype=float)
-    next_me = float(M_E[d, t])
+    n_share = len(STAGE1_SHARE_NAMES)
     shares = np.asarray(daily_shares, dtype=float).ravel()
-    if shares.size < 4:
-        shares = np.concatenate([shares, np.zeros(4 - shares.size)])
+    if shares.size < n_share:
+        shares = np.concatenate([shares, np.zeros(n_share - shares.size)])
     return np.concatenate([
         [1.0, d_feat, E_w, float(b_hat), float(b_tilde)],
         summarize_mediators_ewma(state["M_Y"], state["M_E"], d, t), C_dt,
-        [next_me], shares[:4],
+        shares[:n_share],
     ])
 
 
@@ -2343,8 +2370,8 @@ def fit_daily_mediator_decomposition(k_cur, A_hist, b_hat_hist, b_tilde_hist,
                                      priors=None):
     """Fit Stage-1 daily (AA/FW/PJ) and Stage-1b fourSC decompositions.
 
-    ``priors`` is keyed by ``AA``, ``FW``, ``PJ``, and ``SC``. Omission
-    retains a conservative zero/identity fallback.
+    ``priors`` is keyed by ``AA``, ``FW``, ``PJ``, ``SC``, and ``PV``.
+    Omission retains a conservative zero/identity fallback.
     """
     outputs = {"AA": (0, 2), "FW": (1, 2), "PJ": (1, 3)}
     etas = {}
@@ -2402,9 +2429,6 @@ def fit_daily_mediator_decomposition(k_cur, A_hist, b_hat_hist, b_tilde_hist,
         etas[name] = _stage1_bayes_eta(
             X_s, np.asarray(y, dtype=float), priors.get(name, {}), p_slot, name)
     return etas
-
-
-STAGE1_SHARE_NAMES = ("AA", "FW", "PJ", "SC", "PV")
 
 
 def pf_cae_slot_weights():

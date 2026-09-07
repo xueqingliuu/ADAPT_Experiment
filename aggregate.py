@@ -12,6 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from vani_env import PARAMS_DIR, PROJECT_ROOT, denormalize_CAE
+from algorithm_helpers import EXPERIMENT_ALGORITHMS, EXPERIMENT_ALGORITHM_LABELS
 
 # Must match run_array.sh RESULTS_ROOT (env-overridable).
 DEFAULT_RESULTS_ROOT = Path(os.getenv("RESULTS_ROOT", "results_vanilla_loo"))
@@ -40,13 +41,11 @@ NOISY_FIELD = "cae_runs"         # realized (with noise)
 markers = {
     "rl_v1_base_g09": "o:",
     "rl_v2_mtd_g09": "^:",
-    "rl_v3_biased_weekly": "s:",
-    "rl_v4_biased_redistributed": "s-",
     "rl_v5_invariant_weekly": "d:",
     "rl_v6_invariant_redistributed": "d-",
+    "rl_v6_invariant_redistributed_resid": "s-",
     "rl_v7_base_g05": "o-",
     "rl_v8_base_g099": "o--",
-    "rl_v9_residual_g09": "P-",
     "never_send": "x-",
     "always_send": "*-",
     "random_send": "+-",
@@ -759,24 +758,16 @@ def main() -> None:
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-    # Union algorithms across selected configs so a newer V8 seed is not
-    # dropped just because the first folder is from an older registry.
+    # Same roster as experiment.py. Ignore leftover npz from dropped arms
+    # (biased V1/V2, residual, known-map) even if older configs list them.
     cfg = _load_config(run_dirs[0])
-    algorithms = list(cfg["algorithms"])
-    labels = dict(cfg.get("labels") or {})
-    for run_dir in run_dirs[1:]:
+    algorithms = list(EXPERIMENT_ALGORITHMS)
+    labels = dict(EXPERIMENT_ALGORITHM_LABELS)
+    for run_dir in run_dirs:
         extra = _load_config(run_dir)
-        for name in extra.get("algorithms") or []:
-            if name not in algorithms:
-                algorithms.append(name)
-        labels.update(extra.get("labels") or {})
-    if "rl_v8_base_g099" not in algorithms and any(
-        (d / "rl_v8_base_g099.npz").exists() for d in run_dirs
-    ):
-        algorithms.append("rl_v8_base_g099")
-    labels["rl_v7_base_g05"] = "RL base (\u03b3\u0304=0.5)"
-    labels["rl_v8_base_g099"] = "RL base (\u03b3\u0304=0.99)"
-    labels["rl_v9_residual_g09"] = "RL residual CAE (\u03b3\u0304=0.9)"
+        for name, lab in (extra.get("labels") or {}).items():
+            if name in EXPERIMENT_ALGORITHMS:
+                labels[name] = lab
     nweek = cfg["nweek"]
     params_dir = resolve_denorm_params_dir(
         cfg.get("params_dir"), cli_params_dir=args.params_dir

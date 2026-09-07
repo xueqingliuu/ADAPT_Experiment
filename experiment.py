@@ -170,6 +170,9 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     pad_q_prior_action_time,
     pad_joint_prior_action_time,
     pad_prior_append,
+    STAGE1_SHARE_NAMES,
+    EXPERIMENT_ALGORITHMS,
+    EXPERIMENT_ALGORITHM_LABELS,
     PF_THETA_FOURSC_NAMES,
     PF_THETA_ANTIC_NAMES,
 )
@@ -1401,7 +1404,7 @@ P_DAILY_MEDIATOR["SC"] = int(
 # Stage-1b page views (normalised 4-hour count) share the slot-level map.
 P_DAILY_MEDIATOR["PV"] = P_DAILY_MEDIATOR["SC"]
 P_REDISRIBUTION = int(build_redistribution_phi(
-    0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0, np.zeros(4)).size)
+    0.0, 0.0, _DUMMY_RL_STATE, 0, 0, 0, np.zeros(len(STAGE1_SHARE_NAMES))).size)
 
 
 def _refresh_phi_dims():
@@ -1579,28 +1582,56 @@ def _default_rl_priors(p_rl):
     return (np.zeros(p_rl),  np.eye(p_rl), 1.0)
 
 
-# Old Stage-2 ψ put next_my at this index (after state + EWMA + C).
+# After state + EWMA + C (15 cols), historical ψ put next_my then next_me.
+# Once next_my is gone, next_me sits at the same index.
 _STAGE2_NEXT_MY_INDEX = 15
-# Fallback share sds from the 21-d vanilla LOO (AA, FW, PJ, SC). Replaced
-# at runtime by the fold spread of the current loo_priors after a refit.
-# Fitted SC_hat means are kept per design (v2 may be negative).
+_STAGE2_NEXT_ME_INDEX = 15
+_STAGE2_N_SHARES = len(STAGE1_SHARE_NAMES)  # AA, FW, PJ, SC, PV
+# Fallback share sds (AA, FW, PJ, SC, PV). Replaced at runtime by the
+# fold spread of the current loo_priors after a refit. Fitted SC_hat
+# means are kept. PV sd is a conservative placeholder until a fold
+# spread is available.
 _STAGE2_SHARE_FOLD_SD_FALLBACK = {
-    "v2": np.array([0.206, 0.263, 0.246, 0.099], dtype=float),
-    "v4": np.array([0.108, 0.151, 0.148, 0.113], dtype=float),
+    "v4": np.array([0.108, 0.151, 0.148, 0.113, 0.15], dtype=float),
 }
 _STAGE2_FOLD_STATS = None
 _STAGE2_FOLD_STATS_DIR = None
 
 
+def _stage2_has_next_my(prior, p=None):
+    """True for the historical 21-d map that still carried realized next_my."""
+    if p is None:
+        p = int(np.asarray(prior["mu_0"], dtype=float).ravel().size)
+    tagged = prior.get("psi_has_next_my")
+    if tagged is not None:
+        return bool(tagged)
+    # Untagged 21-d files predate PV_hat and included next_my.
+    return p == 21 and not bool(prior.get("psi_has_pv_hat", False))
+
+
+def _stage2_has_next_me(prior, p=None):
+    """True if realized pageview ``next_me`` is still in the saved ψ."""
+    if p is None:
+        p = int(np.asarray(prior["mu_0"], dtype=float).ravel().size)
+    tagged = prior.get("psi_has_next_me")
+    if tagged is not None:
+        return bool(tagged)
+    # New map: 20-d, PV_hat, no next_my / next_me.
+    if bool(prior.get("psi_has_pv_hat", False)) and p == 20 and not _stage2_has_next_my(prior, p):
+        return False
+    return True
+
+
 def _stage2_share_vector(prior):
-    """AA/FW/PJ/SC means from a saved Stage-2 prior, or None if unreadable."""
+    """AA/FW/PJ/SC[/PV] means from a saved Stage-2 prior, or None."""
     mu = np.asarray(prior["mu_0"], dtype=float).ravel()
     p = int(mu.size)
-    has_next_my = bool(prior.get("psi_has_next_my", p != P_REDISRIBUTION))
-    if p == 21:
-        return mu[17:21]
-    if p == 20 and not has_next_my:
-        return mu[16:20]
+    if _stage2_has_next_my(prior, p):
+        return mu[17:]
+    if _stage2_has_next_me(prior, p):
+        return mu[16:] if p >= 16 else None
+    if p >= 15:
+        return mu[15:]
     return None
 
 
@@ -1611,7 +1642,7 @@ def _refresh_stage2_fold_stats(params_dir=None):
     key = str(params_dir)
     if _STAGE2_FOLD_STATS_DIR == key and _STAGE2_FOLD_STATS is not None:
         return _STAGE2_FOLD_STATS
-    rows = {"v2": [], "v4": []}
+    rows = []
     loo_dir = Path(params_dir) / "loo_priors"
     if loo_dir.is_dir():
         for path in sorted(loo_dir.glob("held_out_*.json")):
@@ -1620,26 +1651,32 @@ def _refresh_stage2_fold_stats(params_dir=None):
                     redist = json.load(f)["reward_redistribution"]["redistribution"]
             except (OSError, KeyError, json.JSONDecodeError, TypeError):
                 continue
-            for name in ("v2", "v4"):
-                prior = redist.get(name)
-                if prior is None:
-                    continue
-                shares = _stage2_share_vector(prior)
-                if shares is not None and shares.size == 4 and np.all(np.isfinite(shares)):
-                    rows[name].append(shares)
+            prior = redist.get("v4")
+            if prior is None:
+                continue
+            shares = _stage2_share_vector(prior)
+            if shares is None or shares.size < 4 or not np.all(np.isfinite(shares)):
+                continue
+            if shares.size == 4:
+                shares = np.concatenate([shares, [np.nan]])
+            rows.append(shares[:_STAGE2_N_SHARES])
     stats = {"n": 0, "sc_mu": {}, "sds": {}}
-    n = min((len(rows[name]) for name in ("v2", "v4")), default=0)
+    n = len(rows)
     if n >= 10:
         stats["n"] = n
-        for name in ("v2", "v4"):
-            M = np.vstack(rows[name])
-            stats["sc_mu"][name] = float(np.mean(M[:, 3]))
-            stats["sds"][name] = np.std(M, axis=0, ddof=1)
+        M = np.vstack(rows)
+        stats["sc_mu"]["v4"] = float(np.nanmean(M[:, 3]))
+        fallback = _STAGE2_SHARE_FOLD_SD_FALLBACK["v4"]
+        sds = np.array(fallback[:M.shape[1]], dtype=float)
+        for j in range(M.shape[1]):
+            col = M[:, j]
+            finite = col[np.isfinite(col)]
+            if finite.size >= 10:
+                sds[j] = float(np.std(finite, ddof=1))
+        stats["sds"]["v4"] = sds
         _setup_log(
             f"[priors] Stage-2 share fold stats from {n} LOO files "
-            f"(fitted SC_hat kept per design): "
-            f"v2 {stats['sc_mu']['v2']:+.3f}, "
-            f"v4 {stats['sc_mu']['v4']:+.3f}"
+            f"(fitted SC_hat kept): v4 {stats['sc_mu']['v4']:+.3f}"
         )
     else:
         stats["sds"] = {
@@ -1671,10 +1708,13 @@ def _apply_share_priors(mu, Sigma, *, design):
     mu = np.asarray(mu, dtype=float).ravel().copy()
     Sigma = np.asarray(Sigma, dtype=float).copy()
     sds = np.asarray(_stage2_share_sds(design), dtype=float).ravel()
-    if sds.size != 4:
-        raise ValueError(f"expected 4 share sds, got {sds.size}")
+    n_share = _STAGE2_N_SHARES
+    if sds.size > n_share:
+        raise ValueError(f"expected at most {n_share} share sds, got {sds.size}")
     for i, sd in enumerate(sds):
-        idx = mu.size - 4 + i
+        if not np.isfinite(sd):
+            continue
+        idx = mu.size - n_share + i
         var = float(sd) * float(sd)
         if Sigma[idx, idx] < var:
             Sigma[idx, idx] = var
@@ -1687,7 +1727,7 @@ def _default_reward_redistribution_priors():
         for name, p in P_DAILY_MEDIATOR.items()
     }
     stage2 = {}
-    for name in ("v2", "v4"):
+    for name in ("v4",):
         mu = np.zeros(P_REDISRIBUTION)
         Sig = np.eye(P_REDISRIBUTION)
         mu, Sig = _apply_share_priors(mu, Sig, design=name)
@@ -1698,16 +1738,7 @@ def _default_reward_redistribution_priors():
 def _default_variant_q_priors():
     return {
         name: {"mu_0": np.zeros(P_RL_MICRO), "Sigma_0": np.eye(P_RL_MICRO), "sigma2": 1.0}
-        for name in ("g09", "g099", "v2", "v4", "residual")
-    }
-
-
-def _default_adv_m_q_prior():
-    """Zero/identity Q for the V11 mediator-advantage map (p = P_RL_ADV_M)."""
-    return {
-        "mu_0": np.zeros(P_RL_ADV_M),
-        "Sigma_0": np.eye(P_RL_ADV_M),
-        "sigma2": 1.0,
+        for name in ("g09", "g099", "v4")
     }
 
 
@@ -1758,40 +1789,44 @@ def _fill_missing_stage1_priors(daily):
 
 
 def _coerce_redistribution_priors(priors):
-    """Map a saved Stage-2 η onto ψ without realized next_my.
+    """Map a saved Stage-2 η onto hats-only ψ (no next_my / next_me, with PV_hat).
 
     Layouts:
-    * 21-d (next_my + SC_hat): drop next_my.
-    * 20-d with ``psi_has_next_my`` (default for unmarked files): drop
-      next_my and append SC_hat.
-    * 20-d tagged ``psi_has_next_my=false``: already the new map.
+    * 21-d with next_my: drop next_my, then next_me, then append PV_hat.
+    * 20-d with next_me (current LOO): drop next_me, then append PV_hat.
+    * 20-d tagged ``psi_has_pv_hat`` and no next_me: already the new map.
 
-    Fitted SC_hat is kept per design (v2 may be negative; v4 is
-    positive). Share-column sds are floored at the LOO fold spread.
-    next_me is not changed. Coefficients are not clipped.
+    Fitted SC_hat is kept. Share-column sds are floored at the LOO
+    fold spread.
+    Coefficients are not clipped.
     """
     out = {}
+    priors = {k: v for k, v in priors.items() if k == "v4"} or dict(priors)
     for name, prior in priors.items():
         mu = np.asarray(prior["mu_0"], dtype=float).ravel()
         Sig = np.asarray(prior["Sigma_0"], dtype=float)
         p = int(mu.size)
-        has_next_my = bool(prior.get("psi_has_next_my", p != P_REDISRIBUTION))
-        if p == P_REDISRIBUTION + 1 and has_next_my:
+        if _stage2_has_next_my(prior, p):
             mu, Sig = _drop_cov_index(mu, Sig, _STAGE2_NEXT_MY_INDEX)
             _setup_log(
                 f"[priors] dropped Stage-2 {name} next_my "
+                f"({p} → {int(mu.size)})"
+            )
+            p = int(mu.size)
+            prior = dict(prior)
+            prior["psi_has_next_my"] = False
+        if _stage2_has_next_me(prior, p):
+            mu, Sig = _drop_cov_index(mu, Sig, _STAGE2_NEXT_ME_INDEX)
+            _setup_log(
+                f"[priors] dropped Stage-2 {name} next_me "
+                f"({p} → {int(mu.size)})"
+            )
+            p = int(mu.size)
+        if p < P_REDISRIBUTION:
+            mu, Sig = pad_prior_append(mu, Sig, P_REDISRIBUTION)
+            _setup_log(
+                f"[priors] padded Stage-2 {name} with PV_hat "
                 f"({p} → {P_REDISRIBUTION})"
-            )
-        elif p == P_REDISRIBUTION and prior.get("psi_has_next_my", True):
-            mu, Sig = _drop_cov_index(mu, Sig, _STAGE2_NEXT_MY_INDEX)
-            mu, Sig = pad_prior_append(mu, Sig, P_REDISRIBUTION)
-            _setup_log(
-                f"[priors] dropped Stage-2 {name} next_my and appended SC_hat"
-            )
-        elif p < P_REDISRIBUTION:
-            mu, Sig = pad_prior_append(mu, Sig, P_REDISRIBUTION)
-            _setup_log(
-                f"[priors] padded Stage-2 {name} ({p} → {P_REDISRIBUTION})"
             )
         elif p > P_REDISRIBUTION:
             raise ValueError(
@@ -1803,6 +1838,8 @@ def _coerce_redistribution_priors(priors):
             "Sigma_0": Sig,
             "sigma2": float(prior.get("sigma2", 1.0)),
             "psi_has_next_my": False,
+            "psi_has_next_me": False,
+            "psi_has_pv_hat": True,
         }
     return out
 
@@ -1876,7 +1913,7 @@ def _zero_centre_policy_priors(*, log=False):
     block.
     """
     global mu_0_micro, Sigma_0_micro, mu_0_mtd_joint, Sigma_0_mtd_joint
-    global q_adv_m_g09, _priors_src
+    global _priors_src
     scale = float(_POLICY_PRIOR_VAR_SCALE)
     floor = float(_POLICY_PRIOR_VAR_FLOOR)
     mu_0_micro = np.zeros_like(np.asarray(mu_0_micro, dtype=float).ravel())
@@ -1886,12 +1923,6 @@ def _zero_centre_policy_priors(*, log=False):
             np.asarray(prior["mu_0"], dtype=float).ravel()
         )
         prior["Sigma_0"] = _inflate_policy_cov(prior["Sigma_0"], scale, floor)
-    q_adv_m_g09["mu_0"] = np.zeros_like(
-        np.asarray(q_adv_m_g09["mu_0"], dtype=float).ravel()
-    )
-    q_adv_m_g09["Sigma_0"] = _inflate_policy_cov(
-        q_adv_m_g09["Sigma_0"], scale, floor
-    )
     for prior in daily_mediator_priors.values():
         prior["mu_0"] = np.zeros_like(
             np.asarray(prior["mu_0"], dtype=float).ravel()
@@ -1964,7 +1995,7 @@ def _configure_priors(params_dir=None, *, force=False):
     global nu_0_Y, Gamma_0_Y, sigma2_Y
     global nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y
     global mu_0_micro, Sigma_0_micro, sigma2_rl_micro
-    global variant_q_priors, q_adv_m_g09
+    global variant_q_priors
     global mu_0_reward, Sigma_0_reward, sigma2_reward
     global daily_mediator_priors, redistribution_priors
     global mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint
@@ -1990,7 +2021,6 @@ def _configure_priors(params_dir=None, *, force=False):
         sigma2_tilde_Y = _pf["sigma2_tilde_Y"]
         mu_0_micro, Sigma_0_micro, sigma2_rl_micro = _default_rl_priors(P_RL_MICRO)
         variant_q_priors = _default_variant_q_priors()
-        q_adv_m_g09 = _default_adv_m_q_prior()
         mu_0_reward, Sigma_0_reward, sigma2_reward = _default_rl_priors(
             P_RL_REWARDSHAPING
         )
@@ -2036,32 +2066,17 @@ def _configure_priors(params_dir=None, *, force=False):
                 name: _coerce_q_prior(prior, P_RL_MICRO, f"q_redistribution.{name}")
                 for name, prior in _priors["q_redistribution"].items()
             })
-        else:
-            _setup_log("[priors] variant-specific Q priors missing; V2/V4 and gamma=0.9 use zero/identity fallback (rerun est_prior.py).")
-        if "q_residual_g09" in _priors:
-            variant_q_priors["residual"] = _coerce_q_prior(
-                _priors["q_residual_g09"], P_RL_MICRO, "q_residual_g09",
-            )
-        else:
-            _setup_log(
-                "[priors] q_residual_g09 missing; residual arm uses zero/"
-                "identity Q (not q_no_td_modify_g09). Rerun est_prior.py."
-            )
-        q_adv_m_g09 = _default_adv_m_q_prior()
-        if "q_adv_m_g09" in _priors:
-            try:
-                q_adv_m_g09 = _coerce_q_prior(
-                    _priors["q_adv_m_g09"], P_RL_ADV_M, "q_adv_m_g09",
-                )
-            except ValueError:
+            missing_q = [n for n in ("v3", "v4", "v4_resid") if n not in _priors["q_redistribution"]]
+            if missing_q:
                 _setup_log(
-                    "[priors] q_adv_m_g09 has the wrong dimension; V11 uses "
-                    "zero/identity. Rerun est_prior.py."
+                    f"[priors] q_redistribution missing {missing_q}; "
+                    "V5 falls back to g09 and V6-leftover to v4 until "
+                    "est_prior.py is rerun."
                 )
         else:
             _setup_log(
-                "[priors] q_adv_m_g09 missing; V11 uses zero/identity Q "
-                "(not q_no_td_modify_g09). Rerun est_prior.py."
+                "[priors] q_redistribution missing; V5/V6 use zero/identity Q "
+                "(rerun est_prior.py)."
             )
         mu_0_reward     = _priors["mu_0_reward"]
         Sigma_0_reward  = _priors["Sigma_0_reward"]
@@ -2078,7 +2093,7 @@ def _configure_priors(params_dir=None, *, force=False):
                 _priors["redistribution_priors"]
             )
         else:
-            _setup_log("[priors] V2/V4 redistribution priors missing; using zero/identity fallback (rerun est_prior.py).")
+            _setup_log("[priors] V4 redistribution priors missing; using zero/identity fallback (rerun est_prior.py).")
         # Joint (alpha, beta) prior for the modified-TD-loss RLSVI agents.
         # Sigma_0 is the FULL joint covariance across users (not block-diagonal).
         # Falls back to the block-diagonal default if the older rl_priors.json
@@ -2128,16 +2143,12 @@ def _configure_priors(params_dir=None, *, force=False):
     for name, prior in variant_q_priors.items():
         assert prior["mu_0"].shape == (P_RL_MICRO,), f"{name} Q mean has wrong dimension"
         assert prior["Sigma_0"].shape == (P_RL_MICRO, P_RL_MICRO), f"{name} Q covariance has wrong dimension"
-    assert q_adv_m_g09["mu_0"].shape == (P_RL_ADV_M,), (
-        f"V11 Q mean dim {q_adv_m_g09['mu_0'].shape} != ({P_RL_ADV_M},)"
-    )
-    assert q_adv_m_g09["Sigma_0"].shape == (P_RL_ADV_M, P_RL_ADV_M)
     for name, p in P_DAILY_MEDIATOR.items():
         assert daily_mediator_priors[name]["mu_0"].shape == (p,)
         assert daily_mediator_priors[name]["Sigma_0"].shape == (p, p)
-    for name in ("v2", "v4"):
-        assert redistribution_priors[name]["mu_0"].shape == (P_REDISRIBUTION,)
-        assert redistribution_priors[name]["Sigma_0"].shape == (P_REDISRIBUTION, P_REDISRIBUTION)
+    assert "v4" in redistribution_priors, "V4 Stage-2 prior missing"
+    assert redistribution_priors["v4"]["mu_0"].shape == (P_REDISRIBUTION,)
+    assert redistribution_priors["v4"]["Sigma_0"].shape == (P_REDISRIBUTION, P_REDISRIBUTION)
     _P_MTD_JOINT = P_RL_BOTTLENECK + P_RL_MICRO
     assert mu_0_mtd_joint.shape    == (_P_MTD_JOINT,), \
         f"joint mu_0 dim {mu_0_mtd_joint.shape} != ({_P_MTD_JOINT},)"
@@ -2166,7 +2177,7 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
     global _priors_src
     global nu_0_MY, Gamma_0_MY, sigma2_MY, nu_0_Y, Gamma_0_Y, sigma2_Y
     global nu_0_tilde_Y, Gamma_0_tilde_Y, sigma2_tilde_Y
-    global mu_0_micro, Sigma_0_micro, sigma2_rl_micro, variant_q_priors, q_adv_m_g09
+    global mu_0_micro, Sigma_0_micro, sigma2_rl_micro, variant_q_priors
     global mu_0_reward, Sigma_0_reward, sigma2_reward
     global daily_mediator_priors, redistribution_priors
     global mu_0_mtd_joint, Sigma_0_mtd_joint, p_eta_mtd_joint, sigma2_Q_mtd_joint
@@ -2199,39 +2210,11 @@ def _apply_fitted_loo_priors(fitted, held_out_uid):
     )
     variant_q_priors.update({
         name: _coerce_q_prior(prior, P_RL_MICRO, f"LOO q_redistribution.{name}")
-        for name, prior in fitted["q_redistribution"].items()
+        for name, prior in (fitted.get("q_redistribution") or {}).items()
     })
     if fitted.get("q_no_td_modify_g099"):
         variant_q_priors["g099"] = _coerce_q_prior(
             fitted["q_no_td_modify_g099"], P_RL_MICRO, "LOO q_no_td_modify_g099",
-        )
-    if fitted.get("q_residual_g09"):
-        variant_q_priors["residual"] = _coerce_q_prior(
-            fitted["q_residual_g09"], P_RL_MICRO, "LOO q_residual_g09",
-        )
-    else:
-        _setup_log(
-            f"[priors] WARNING: LOO q_residual_g09 missing for held-out "
-            f"user {int(held_out_uid)}; residual arm uses zero/identity Q "
-            "(not q_no_td_modify_g09)."
-        )
-    q_adv_m_g09 = _default_adv_m_q_prior()
-    if fitted.get("q_adv_m_g09"):
-        try:
-            q_adv_m_g09 = _coerce_q_prior(
-                fitted["q_adv_m_g09"], P_RL_ADV_M, "LOO q_adv_m_g09",
-            )
-        except ValueError:
-            _setup_log(
-                f"[priors] WARNING: LOO q_adv_m_g09 dim "
-                f"{np.asarray(fitted['q_adv_m_g09']['mu_0']).shape} != "
-                f"({P_RL_ADV_M},) for held-out user {int(held_out_uid)}; "
-                "V11 uses zero/identity Q."
-            )
-    else:
-        _setup_log(
-            f"[priors] WARNING: LOO q_adv_m_g09 missing for held-out "
-            f"user {int(held_out_uid)}; V11 uses zero/identity Q."
         )
     for prior in variant_q_priors.values():
         prior["mu_0"] = np.asarray(prior["mu_0"], dtype=float)
@@ -2445,15 +2428,16 @@ def run_micro_query_mtd(uid, seed=42, gamma_bar=0.5, params_dir=None):
 def run_micro_query_residual(uid, seed=42, gamma_bar=0.9, params_dir=None):
     """Base RLSVI with residual weekly reward ``b̂_{w+1} − ρ̂_w b̂_w``.
 
-    Uses ``q_residual_g09`` when present; never falls back to
-    ``q_no_td_modify_g09``. No engagement term and no Stage-2 η.
+    Unused leftover runner. The residual CAE arm is no longer in the
+    roster; this keeps the function importable.
     """
     _ensure_priors_configured(params_dir)
     cfg, env, oenv = _make_online_env(uid, seed=seed, params_dir=params_dir)
     nweek = cfg.nweek
     week0_actions, I_hist = shared_episode_exogenous(seed, nweek)
     dataset = EpisodeDataset(nweek)
-    q_prior = variant_q_priors["residual"]
+    q_prior = variant_q_priors.get("g09") or {
+        "mu_0": mu_0_micro, "Sigma_0": Sigma_0_micro, "sigma2": sigma2_rl_micro}
     agent = MicroQueryResidualAgent(
         W=nweek, J=J_PARTICLES, B=B_ENSEMBLES, epsilon_0=EPSILON_0,
         mu_0_rl=q_prior["mu_0"], Sigma_0_rl=q_prior["Sigma_0"], sigma2_rl=q_prior["sigma2"],
@@ -2473,7 +2457,8 @@ def run_micro_query_residual(uid, seed=42, gamma_bar=0.9, params_dir=None):
 def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.5,
                                    params_dir=None, engagement_bonus=None,
                                    engagement_rho=None, stage2_mode="learned",
-                                   stage1_source="ridge"):
+                                   stage1_source="ridge",
+                                   add_terminal_residual=False):
     """Run one of the protocol reward designs V1--V4.
 
     V1/V2 use the engagement-biased weekly target ``b̂_{w+1} + λ ê_{w+1}``,
@@ -2481,7 +2466,8 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
     V3/V4 keep discounted CAE and add the potential ``F = γ̄ ê_{w+1} - ê_w``.
     V2/V4 additionally redistribute with the two-stage mediator
     decomposition (daily AA/FW/PJ plus slot-level fourSC). Slot TD
-    rewards are ``φ^⊤ η`` only (no last-slot leftover).
+    rewards are ``φ^⊤ η`` only unless ``add_terminal_residual`` puts the
+    Stage-2 leftover on Saturday afternoon.
     ``ê_{w+1}`` is used only in that weekly Stage-2 target, not in Stage-2
     slot features.
 
@@ -2505,11 +2491,15 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
         engagement_rho = ENGAGEMENT_RHO
     if engagement_bonus is None:
         engagement_bonus = ENGAGEMENT_BONUS
-    if reward_design in variant_q_priors:
+    if add_terminal_residual:
+        q_prior = variant_q_priors.get("v4_resid") or variant_q_priors.get("v4")
+    elif reward_design in variant_q_priors:
         q_prior = variant_q_priors[reward_design]
-    elif float(gamma_bar) == 0.9:
-        q_prior = variant_q_priors["g09"]
     else:
+        q_prior = None
+    if q_prior is None and float(gamma_bar) == 0.9:
+        q_prior = variant_q_priors["g09"]
+    if q_prior is None:
         q_prior = {
             "mu_0": mu_0_micro, "Sigma_0": Sigma_0_micro, "sigma2": sigma2_rl_micro}
     agent = MicroQueryRewardDesignAgent(
@@ -2527,6 +2517,7 @@ def run_micro_query_reward_design(uid, seed=42, reward_design="v4", gamma_bar=0.
         redistribution_prior=redistribution_priors.get(reward_design),
         update_sigma2_q_online=True,
         stage2_mode=stage2_mode, ew_coefs=ew_coefs, stage1_source=stage1_source,
+        add_terminal_residual=add_terminal_residual,
     )
     return oenv.run_episode(agent, dataset, week0_actions=week0_actions, I_hist=I_hist), oenv
 
@@ -2633,40 +2624,32 @@ def run_random_send(uid, seed=42, params_dir=None):
     return _run_fixed_policy(RandomSendAgent, uid, seed=seed, params_dir=params_dir)
 
 
-# Algorithm registry: V1--V6 at γ̄=0.9, V7/V8 base-discount sensitivities,
-# V9 residual CAE, then baselines.
+# Algorithm registry: same names / order as ``EXPERIMENT_ALGORITHMS``.
+_ALGORITHM_RUNNERS = {
+    "rl_v1_base_g09": partial(run_micro_query, gamma_bar=0.9),
+    "rl_v2_mtd_g09": partial(run_micro_query_mtd, gamma_bar=0.9),
+    "rl_v5_invariant_weekly": partial(
+        run_micro_query_reward_design, reward_design="v3", gamma_bar=0.9),
+    "rl_v6_invariant_redistributed": partial(
+        run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9),
+    "rl_v6_invariant_redistributed_resid": partial(
+        run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9,
+        add_terminal_residual=True),
+    "rl_v7_base_g05": partial(run_micro_query, gamma_bar=0.5),
+    "rl_v8_base_g099": partial(run_micro_query, gamma_bar=0.99),
+    "never_send": run_never_send,
+    "always_send": run_always_send,
+    "random_send": run_random_send,
+}
+if set(_ALGORITHM_RUNNERS) != set(EXPERIMENT_ALGORITHMS):
+    raise RuntimeError(
+        "experiment runners and EXPERIMENT_ALGORITHMS drifted: "
+        f"runners={sorted(_ALGORITHM_RUNNERS)} "
+        f"roster={list(EXPERIMENT_ALGORITHMS)}"
+    )
 ALGORITHMS = {
-    "rl_v1_base_g09": (partial(run_micro_query, gamma_bar=0.9), "RL base (γ̄=0.9)"),
-    "rl_v2_mtd_g09": (partial(run_micro_query_mtd, gamma_bar=0.9), "RL + bottleneck TD (γ̄=0.9)"),
-    "rl_v3_biased_weekly": (partial(run_micro_query_reward_design, reward_design="v1", gamma_bar=0.9), "RL V1: biased weekly reward (γ̄=0.9)"),
-    "rl_v4_biased_redistributed": (partial(run_micro_query_reward_design, reward_design="v2", gamma_bar=0.9), "RL V2: biased redistributed reward (γ̄=0.9)"),
-    "rl_v5_invariant_weekly": (partial(run_micro_query_reward_design, reward_design="v3", gamma_bar=0.9), "RL V3: return-invariant weekly reward (γ̄=0.9)"),
-    "rl_v6_invariant_redistributed": (partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9), "RL V4: return-invariant redistributed reward (γ̄=0.9)"),
-    "rl_v7_base_g05": (partial(run_micro_query, gamma_bar=0.5), "RL base (γ̄=0.5 sensitivity)"),
-    "rl_v8_base_g099": (partial(run_micro_query, gamma_bar=0.99), "RL base (γ̄=0.99 sensitivity)"),
-    "rl_v10_fixedmap_full": (
-        partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9,
-                stage2_mode="fixed_full"),
-        "RL V4 + known-map redistribution: CAE + shaping (γ̄=0.9)"),
-    "rl_v11_fixedmap_cae": (
-        partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9,
-                stage2_mode="fixed_cae"),
-        "RL V4 + known-map redistribution: CAE only, F at terminal (γ̄=0.9)"),
-    "rl_v12_fixedmap_full_pf": (
-        partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9,
-                stage2_mode="fixed_full", stage1_source="pf"),
-        "RL V4 + known-map redistribution, PF mediator posteriors for fourSC/AA (γ̄=0.9)"),
-    "rl_v13_fixedmap_cae_pf": (
-        partial(run_micro_query_reward_design, reward_design="v4", gamma_bar=0.9,
-                stage2_mode="fixed_cae", stage1_source="pf"),
-        "RL V4 + known-map CAE-only, PF mediator posteriors for fourSC/AA (γ̄=0.9)"),
-    "rl_v9_residual_g09": (
-        partial(run_micro_query_residual, gamma_bar=0.9),
-        "RL residual CAE (γ̄=0.9)",
-    ),
-    "never_send":   (run_never_send,  "Never send (π_A=0)"),
-    "always_send":  (run_always_send, "Always send (π_A=1)"),
-    "random_send":  (run_random_send, "Random send (π_A=0.5)"),
+    name: (_ALGORITHM_RUNNERS[name], EXPERIMENT_ALGORITHM_LABELS[name])
+    for name in EXPERIMENT_ALGORITHMS
 }
 
 
@@ -3144,7 +3127,7 @@ if __name__ == "__main__":
             "prior_mode":      args.prior_mode,
             "zero_centre_policy_priors": _zero_centre_policy_priors_requested(),
             "zero_centre_blocks": (
-                ["Q", "stage1_AA_FW_PJ", "stage1b_SC"]
+                ["Q", "stage1_AA_FW_PJ", "stage1b_SC", "stage1b_PV"]
                 if _zero_centre_policy_priors_requested() else []
             ),
             "policy_prior_var_scale": (
@@ -3158,14 +3141,14 @@ if __name__ == "__main__":
             "hold_fitted_sigma2_q": False,
             "update_sigma2_q_online": True,
             "stage2_drop_next_my": True,
+            "stage2_drop_next_me": True,
             "stage2_keep_fitted_sc_hat": True,
             "stage2_sc_hat_fold_mean": {
                 k: float(v) for k, v in
                 ((_STAGE2_FOLD_STATS or {}).get("sc_mu") or {}).items()
             },
             "stage2_share_fold_sd": {
-                k: [float(x) for x in _stage2_share_sds(k)]
-                for k in ("v2", "v4")
+                "v4": [float(x) for x in _stage2_share_sds("v4")]
             },
             "stage2_fold_n": int((_STAGE2_FOLD_STATS or {}).get("n", 0)),
             "loo_prior_cache_size": len(_LOO_PRIOR_CACHE) if args.prior_mode == "loo" else 0,

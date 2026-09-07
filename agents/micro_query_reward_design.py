@@ -36,10 +36,12 @@ class MicroQueryRewardDesignAgent:
     discounted-CAE objective and add the week-boundary potential
     ``F = γ̄ ê_{w+1} - ê_w``.  V2/V4 fit Stage 1 daily AA/FW/PJ, Stage
     1b slot fourSC (A×[1, t]), and Stage 2 within-week redistribution.  Slot
-    TD rewards are ``φ^⊤ η`` only — no leftover is added on the last
-    slot to force the week to sum to the target (V2 target
-    ``b̂_{w+1} + λ ê_{w+1}``; V4 ``b̂_{w+1} + F``).
-    ``ê_{w+1}`` enters only that weekly target, not Stage-2 slot features.
+    TD rewards are ``φ^⊤ η`` only unless ``add_terminal_residual`` is set,
+    in which case the Stage-2 leftover
+    ``(week target − Σ φ^⊤ η)`` is added on Saturday afternoon so the
+    week sums to the target (V2: ``b̂_{w+1} + λ ê_{w+1}``; V4:
+    ``b̂_{w+1} + F``). ``ê_{w+1}`` enters only that weekly target, not
+    Stage-2 slot features.
 
     ``stage2_mode`` (V4 base only):
 
@@ -75,7 +77,8 @@ class MicroQueryRewardDesignAgent:
     def __init__(self, *args, reward_design, engagement_bonus=None,
                  engagement_rho=0.5, daily_mediator_priors=None,
                  redistribution_prior=None, stage2_mode="learned",
-                 ew_coefs=None, stage1_source="ridge", **kwargs):
+                 ew_coefs=None, stage1_source="ridge",
+                 add_terminal_residual=False, **kwargs):
         # Keep the constructor compatible with MicroQueryAgent's parameters.
         names = [
             "W", "J", "B", "epsilon_0", "mu_0_rl", "Sigma_0_rl", "sigma2_rl",
@@ -111,6 +114,9 @@ class MicroQueryRewardDesignAgent:
         if stage1_source == "pf" and stage2_mode == "learned":
             raise ValueError("stage1_source='pf' is only defined for the fixed-map Stage 2")
         self.stage1_source = stage1_source
+        self.add_terminal_residual = bool(add_terminal_residual)
+        if self.add_terminal_residual and stage2_mode != "learned":
+            raise ValueError("add_terminal_residual is only defined for learned Stage 2")
         self._pf_rows = {}
         self._pf_theta = None
         self.ew_coefs = dict(ew_coefs) if ew_coefs is not None else None
@@ -455,8 +461,10 @@ class MicroQueryRewardDesignAgent:
     def _redistributed_training_data(self, k_cur, eval_betas, select_betas, daily, eta):
         """TD rows using Stage-2 slot rewards ``φ^⊤ η`` (V2 and V4).
 
-        Approximation error vs the weekly target stays in ``η``; it is not
-        dumped onto Saturday afternoon.
+        By default the Stage-2 residual stays in ``η``. With
+        ``add_terminal_residual`` the leftover
+        ``week target − Σ φ^⊤ η`` is added on Saturday afternoon so the
+        week sums to the target.
         """
         rows, targets = [], [[] for _ in range(self.B)]
         for kp in range(k_cur):
@@ -472,6 +480,9 @@ class MicroQueryRewardDesignAgent:
                             self.get_state(kp, d, t))
             if self.stage2_mode != "learned":
                 rewards[_TERMINAL] += self._fixed_map_remainder(kp)
+            elif self.add_terminal_residual:
+                leftover = self._week_return_target(kp) - float(np.sum(rewards))
+                rewards[_TERMINAL] += leftover
             for d in range(N_RL_DAYS):
                 for t in range(N_RL_SLOTS):
                     state = self.get_state(kp, d, t)
@@ -558,4 +569,5 @@ class MicroQueryRewardDesignAgent:
             }
             out["stage2_mode"] = self.stage2_mode
             out["stage1_source"] = self.stage1_source
+            out["add_terminal_residual"] = self.add_terminal_residual
         return out
