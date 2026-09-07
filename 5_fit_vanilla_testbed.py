@@ -11,9 +11,12 @@ response, ≥1 CAE week, and the high-CAE ceiling: min weekly CAE_avg ≥ 6 or
 week-1 CAE_avg = 7). This script fits whoever remains in ``df_fit.csv``.
 Writes ``params_env_<uid>.json`` (mediator/outcome blocks and residuals),
 ``pred_<uid>.json``, ``user_ids.txt``, and ``population_residuals.json``.
-Does not overwrite the E_w / PV / FW / PJ blocks from script 4 (including
-the ``J_w`` ``query_Jw_*`` suffix on PV/FW/PJ).
-Next: ``6_est_Ew_weights.py``.
+Does not overwrite the E_w / PV / FW / PJ / J blocks from script 4 (including
+the ``J_w`` ``query_Jw_*`` suffix and ``week_norm`` on PV/FW/PJ/J).
+Script 4 fits those emissions; this script only reuses the same 11-week
+``week_norm`` scale for CAE. Generation stretches that scale onto the
+simulation horizon, matching CAE.
+Next: ``5b_patch_generator.py``, then ``6_est_Ew_weights.py``.
 """
 import json
 import os
@@ -33,7 +36,11 @@ from sklearn.linear_model import (
     RidgeCV,
 )
 
-from vani_env import assert_complete_week_slots, cae_mediator_ewma_rows
+from vani_env import (
+    assert_complete_week_slots,
+    cae_mediator_ewma_rows,
+    study_week_norm,
+)
 
 # %%
 # read data
@@ -74,7 +81,6 @@ df_fit["week"] = df_fit["week"] - 1
 
 # Re-index calendar covariates on the retained rows (after week drop/relabel).
 VANILLA_DAY_RANGE = 84
-VANILLA_WEEK_RANGE = 11
 df_fit["Date"] = pd.to_datetime(df_fit["Date"], errors="coerce")
 df_fit["day"] = (
     df_fit.groupby("ParticipantIdentifier", sort=False)["Date"]
@@ -83,9 +89,7 @@ df_fit["day"] = (
 df_fit["day_norm"] = (
     df_fit["day"] - (1 + VANILLA_DAY_RANGE) / 2
 ) / ((VANILLA_DAY_RANGE - 1) / 2)
-df_fit["week_norm"] = (
-    df_fit["week"] - (1 + VANILLA_WEEK_RANGE) / 2
-) / ((VANILLA_WEEK_RANGE - 1) / 2)
+df_fit["week_norm"] = study_week_norm(df_fit["week"].to_numpy(dtype=float))
 assert_complete_week_slots(df_fit)
 # %%
 # import warnings

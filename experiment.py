@@ -125,6 +125,7 @@ from vani_env import (
     zscore_value,
     PARAMS_DIR as DEFAULT_PARAMS_DIR,
     trim_pf_cae_prior,
+    study_week_norm,
 )
 from agents import (
     MicroQueryAgent,
@@ -171,6 +172,7 @@ from algorithm_helpers import (  # WeekPacket.k = RL week (0-based)
     pad_joint_prior_action_time,
     pad_prior_append,
     STAGE1_SHARE_NAMES,
+    STAGE2_PSI_SHARE_NAMES,
     EXPERIMENT_ALGORITHMS,
     EXPERIMENT_ALGORITHM_LABELS,
     PF_THETA_FOURSC_NAMES,
@@ -326,6 +328,8 @@ class OnlineEnv:
                 f"env.W * env.K={self.W_days * self.K}"
             )
         self.nweek = nweek if nweek is not None else env.cfg.nweek
+        self.env.cfg.nweek = self.nweek
+        self.env.cfg.D = self.nweek * self.env.cfg.W
         self.D = self.nweek * self.W_days
         self.T = self.D * self.K
         self.start_dow = start_dow
@@ -853,11 +857,18 @@ class OnlineEnv:
         prior2HourStepCount = float(self.prior2HourStepCountAll[step_idx])
 
         fourSC = self.env.gen_fourSC(self.s, Ah, step_idx)
-        pv = self.env.gen_pageview(self.s, Ah, self._jw_week(sim_w), step_idx)
-
-        # Interaction history should not include the current slot until after
-        # ``ws_interaction`` has been generated.
-        ws_interaction = self.env.gen_ws_interaction(self.s, step_idx, Ah)
+        # When the interaction/page-view calibration is on, draw interaction
+        # first and condition page-view occurrence on I - p_I. Otherwise keep
+        # the historical call order so baseline RNG streams stay comparable.
+        if self.env.cfg.interaction_pageview_calibration:
+            ws_interaction = self.env.gen_ws_interaction(self.s, step_idx, Ah)
+            pv = self.env.gen_pageview(
+                self.s, Ah, self._jw_week(sim_w), step_idx,
+                ws_interaction=ws_interaction,
+            )
+        else:
+            pv = self.env.gen_pageview(self.s, Ah, self._jw_week(sim_w), step_idx)
+            ws_interaction = self.env.gen_ws_interaction(self.s, step_idx, Ah)
 
         self.stepCountNext4HourAll[step_idx] = fourSC
         self.pageViewNext4HourAll[step_idx] = pv
@@ -1023,10 +1034,8 @@ class OnlineEnv:
         Jw = self._jw_week(sim_w)
         d_w_sun = SUNDAY_D_W
         d_global = self._day_idx(sim_w, d_w_sun)
-        # Match df_fit / 1.1_standardization: (week - (1+n)/2) / ((n-1)/2) → week ∈ {1,…,n} maps to [-1, 1]
-        wk = sim_w + 1
-        n = self.nweek
-        week_norm = 0.0 if n <= 1 else (wk - (1.0 + n) / 2.0) / ((n - 1.0) / 2.0)
+        # Same stretch as CAE: week ∈ {1,…,n} maps to [-1, 1]
+        week_norm = study_week_norm(sim_w + 1, n_weeks=self.nweek)
 
         if (sim_w, d_w_sun) not in self._day_started:
             self._day_started[(sim_w, d_w_sun)] = True
@@ -1138,9 +1147,7 @@ class OnlineEnv:
         self._week_finalized[sim_w] = True
 
     def _week_norm(self, sim_w):
-        wk = sim_w + 1
-        n = self.nweek
-        return 0.0 if n <= 1 else (wk - (1.0 + n) / 2.0) / ((n - 1.0) / 2.0)
+        return study_week_norm(sim_w + 1, n_weeks=self.nweek)
 
     def _stepCountLast7DaysEma_for_slot(self, slot):
         """EWM of prior ≤7 same-slot *raw* 4-hour counts, then EMA z-score.
@@ -1583,16 +1590,15 @@ def _default_rl_priors(p_rl):
 
 
 # After state + EWMA + C (15 cols), historical ψ put next_my then next_me.
-# Once next_my is gone, next_me sits at the same index.
+# Current map: next_me at 15, then AA/FW/PJ/SC hats.
 _STAGE2_NEXT_MY_INDEX = 15
 _STAGE2_NEXT_ME_INDEX = 15
-_STAGE2_N_SHARES = len(STAGE1_SHARE_NAMES)  # AA, FW, PJ, SC, PV
-# Fallback share sds (AA, FW, PJ, SC, PV). Replaced at runtime by the
+_STAGE2_N_SHARES = len(STAGE2_PSI_SHARE_NAMES)  # AA, FW, PJ, SC
+# Fallback share sds (AA, FW, PJ, SC). Replaced at runtime by the
 # fold spread of the current loo_priors after a refit. Fitted SC_hat
-# means are kept. PV sd is a conservative placeholder until a fold
-# spread is available.
+# means are kept.
 _STAGE2_SHARE_FOLD_SD_FALLBACK = {
-    "v4": np.array([0.108, 0.151, 0.148, 0.113, 0.15], dtype=float),
+    "v4": np.array([0.108, 0.151, 0.148, 0.113], dtype=float),
 }
 _STAGE2_FOLD_STATS = None
 _STAGE2_FOLD_STATS_DIR = None
@@ -1616,23 +1622,27 @@ def _stage2_has_next_me(prior, p=None):
     tagged = prior.get("psi_has_next_me")
     if tagged is not None:
         return bool(tagged)
-    # New map: 20-d, PV_hat, no next_my / next_me.
+    # Hats-only 20-d files replaced next_me with PV_hat.
     if bool(prior.get("psi_has_pv_hat", False)) and p == 20 and not _stage2_has_next_my(prior, p):
         return False
     return True
 
 
 def _stage2_share_vector(prior):
-    """AA/FW/PJ/SC[/PV] means from a saved Stage-2 prior, or None."""
+    """AA/FW/PJ/SC means from a saved Stage-2 prior, or None."""
     mu = np.asarray(prior["mu_0"], dtype=float).ravel()
     p = int(mu.size)
     if _stage2_has_next_my(prior, p):
-        return mu[17:]
-    if _stage2_has_next_me(prior, p):
-        return mu[16:] if p >= 16 else None
-    if p >= 15:
-        return mu[15:]
-    return None
+        shares = mu[17:]
+    elif _stage2_has_next_me(prior, p):
+        shares = mu[16:] if p >= 16 else None
+    elif p >= 15:
+        shares = mu[15:]
+    else:
+        return None
+    if shares is None:
+        return None
+    return shares[:_STAGE2_N_SHARES]
 
 
 def _refresh_stage2_fold_stats(params_dir=None):
@@ -1655,10 +1665,8 @@ def _refresh_stage2_fold_stats(params_dir=None):
             if prior is None:
                 continue
             shares = _stage2_share_vector(prior)
-            if shares is None or shares.size < 4 or not np.all(np.isfinite(shares)):
+            if shares is None or shares.size < _STAGE2_N_SHARES or not np.all(np.isfinite(shares)):
                 continue
-            if shares.size == 4:
-                shares = np.concatenate([shares, [np.nan]])
             rows.append(shares[:_STAGE2_N_SHARES])
     stats = {"n": 0, "sc_mu": {}, "sds": {}}
     n = len(rows)
@@ -1701,6 +1709,19 @@ def _drop_cov_index(mu, Sigma, idx):
     Sigma = np.asarray(Sigma, dtype=float)
     keep = [i for i in range(mu.size) if i != int(idx)]
     return mu[keep], Sigma[np.ix_(keep, keep)]
+
+
+def _insert_cov_index(mu, Sigma, idx, *, mean=0.0, var=1.0):
+    mu = np.asarray(mu, dtype=float).ravel()
+    Sigma = np.asarray(Sigma, dtype=float)
+    idx = int(idx)
+    mu_new = np.concatenate([mu[:idx], [float(mean)], mu[idx:]])
+    p = mu_new.size
+    Sig_new = np.zeros((p, p), dtype=float)
+    old = [i for i in range(p) if i != idx]
+    Sig_new[np.ix_(old, old)] = Sigma
+    Sig_new[idx, idx] = float(var)
+    return mu_new, Sig_new
 
 
 def _apply_share_priors(mu, Sigma, *, design):
@@ -1789,12 +1810,13 @@ def _fill_missing_stage1_priors(daily):
 
 
 def _coerce_redistribution_priors(priors):
-    """Map a saved Stage-2 η onto hats-only ψ (no next_my / next_me, with PV_hat).
+    """Map a saved Stage-2 η onto ψ with realized next_me and no PV_hat.
 
     Layouts:
-    * 21-d with next_my: drop next_my, then next_me, then append PV_hat.
-    * 20-d with next_me (current LOO): drop next_me, then append PV_hat.
-    * 20-d tagged ``psi_has_pv_hat`` and no next_me: already the new map.
+    * 21-d with next_my: drop next_my (leaves next_me + AA/FW/PJ/SC).
+    * 20-d with next_me and no PV_hat: already the current map.
+    * 20-d tagged ``psi_has_pv_hat``: drop PV_hat, insert next_me at 15
+      (zero mean until ``est_prior.py --loo`` is rerun).
 
     Fitted SC_hat is kept. Share-column sds are floored at the LOO
     fold spread.
@@ -1815,17 +1837,22 @@ def _coerce_redistribution_priors(priors):
             p = int(mu.size)
             prior = dict(prior)
             prior["psi_has_next_my"] = False
-        if _stage2_has_next_me(prior, p):
-            mu, Sig = _drop_cov_index(mu, Sig, _STAGE2_NEXT_ME_INDEX)
+        if bool(prior.get("psi_has_pv_hat", False)) and not _stage2_has_next_me(prior, p):
+            if p == P_REDISRIBUTION:
+                mu, Sig = _drop_cov_index(mu, Sig, p - 1)
+                p = int(mu.size)
+            mu, Sig = _insert_cov_index(
+                mu, Sig, _STAGE2_NEXT_ME_INDEX, mean=0.0, var=1.0)
             _setup_log(
-                f"[priors] dropped Stage-2 {name} next_me "
-                f"({p} → {int(mu.size)})"
+                f"[priors] Stage-2 {name}: replaced PV_hat with a zero "
+                f"next_me column ({p} → {int(mu.size)}). Rerun "
+                "est_prior.py --loo for a fitted next_me prior."
             )
             p = int(mu.size)
         if p < P_REDISRIBUTION:
             mu, Sig = pad_prior_append(mu, Sig, P_REDISRIBUTION)
             _setup_log(
-                f"[priors] padded Stage-2 {name} with PV_hat "
+                f"[priors] padded Stage-2 {name} "
                 f"({p} → {P_REDISRIBUTION})"
             )
         elif p > P_REDISRIBUTION:
@@ -1838,8 +1865,8 @@ def _coerce_redistribution_priors(priors):
             "Sigma_0": Sig,
             "sigma2": float(prior.get("sigma2", 1.0)),
             "psi_has_next_my": False,
-            "psi_has_next_me": False,
-            "psi_has_pv_hat": True,
+            "psi_has_next_me": True,
+            "psi_has_pv_hat": False,
         }
     return out
 
@@ -3141,7 +3168,8 @@ if __name__ == "__main__":
             "hold_fitted_sigma2_q": False,
             "update_sigma2_q_online": True,
             "stage2_drop_next_my": True,
-            "stage2_drop_next_me": True,
+            "stage2_drop_next_me": False,
+            "stage2_use_realized_pv": True,
             "stage2_keep_fitted_sc_hat": True,
             "stage2_sc_hat_fold_mean": {
                 k: float(v) for k, v in

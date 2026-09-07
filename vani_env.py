@@ -19,10 +19,19 @@ Page views are a two-part hurdle whose coefficients come from script 4
 (``theta_penalized_PV``): logistic ``P(count>0)`` and, given a positive
 count, a Gaussian on ``log(x)`` then z-scored among positives. Count 0
 sits at ``log(0.5)`` on that axis. Both parts include ``E_w``,
-weekend, slot, burden, lag1, ``A``, ``A×E_w``, and the opening ``J_w``
+weekend, slot, burden, ``week_norm``, lag1, ``A``, ``A×E_w``, and the opening ``J_w``
 query (``week_present_lastweek``) on the linear predictor. ``I_w`` is not in this model. STE-tuned folders
 carry edited action slopes in JSON, so they enter both parts directly.
-FW/PJ stay on their original logits.
+FW/PJ/J include the same ``week_norm`` as CAE: fit on the 11-week
+scale ``(w-6)/5``, then stretch onto ``[-1, 1]`` over the simulation
+horizon (``EnvConfig.nweek``).
+
+Optional post-fit generator calibrations are read from
+``<params_dir>/generator_calibration.json`` (written by
+``5b_patch_generator.py``). They do not overwrite fitted parameter JSON.
+These are: support-aware FourSC lag remapping, AM-FourSC to same-day PM
+prior-2h residual coupling, and a delivered-slot interaction/page-view
+joint draw. Set ``ADAPR_GENERATOR_CALIBRATION=0`` to disable all of them.
 """
 from __future__ import annotations
 
@@ -53,6 +62,27 @@ PARAMS_DIR = (
 # interval. Change it here only (``4_perceived_utility`` imports these names).
 E_QUAD_LO = -4.0
 E_QUAD_HI = 4.0
+# Fit uses n_weeks=11 so weeks 1..11 map to [-1, 1]. Generation uses the
+# simulation horizon (same stretch as ``experiment.OnlineEnv._week_norm``).
+VANILLA_WEEK_RANGE = 11
+
+
+def study_week_norm(week, *, n_weeks=None):
+    """Map 1-based study week onto ``[-1, 1]`` over ``n_weeks``.
+
+    Default ``n_weeks=11`` is the MRT fit scale ``(w - 6) / 5``. Pass the
+    simulation horizon to stretch the same endpoints over a longer run.
+    """
+    if n_weeks is None:
+        n_weeks = VANILLA_WEEK_RANGE
+    w = np.asarray(week, dtype=float)
+    n = float(n_weeks)
+    denom = (n - 1.0) / 2.0
+    center = (1.0 + n) / 2.0
+    out = np.where(denom == 0.0, 0.0, (w - center) / denom)
+    if np.ndim(week) == 0:
+        return float(out)
+    return out
 
 
 def _load_json(path: Path):
@@ -254,12 +284,20 @@ CAE_FOURSC_SLOTS_RL = 12
 CAE_ANTIC_DAYS = 7
 CAE_ANTIC_DAYS_RL = 6
 _CAE_WEEK_IDX = THETA_CAE_NAMES.index("week")
-PV_ML_BASE = 8
+PV_ML_BASE_LEGACY = 8
+PV_ML_BASE = 9  # includes week_norm after recent_burden
 PV_ML_QUERY = 3
-# Full hurdle JSON: occurrence (8+3) + intensity (8+3) + sigma_PV.
+# Full hurdle JSON: occurrence (9+3) + intensity (9+3) + sigma_PV.
 PV_ML_HURDLE = PV_ML_BASE + PV_ML_QUERY + PV_ML_BASE + PV_ML_QUERY + 1
-FW_ML_BASE = 9
-PJ_ML_BASE = 9
+PV_ML_HURDLE_LEGACY = (
+    PV_ML_BASE_LEGACY + PV_ML_QUERY + PV_ML_BASE_LEGACY + PV_ML_QUERY + 1
+)
+_PV_WEEK_INSERT = 5  # after intercept, E_w, weekend, slot, burden
+FW_ML_BASE_LEGACY = 9
+FW_ML_BASE = 10  # includes week_norm after recent_burden
+PJ_ML_BASE_LEGACY = 9
+PJ_ML_BASE = 10
+_FW_PJ_WEEK_INSERT = 4  # after intercept, E_w, weekend, burden
 # Query suffix: J_w × (intercept, E_w, recent_burden), jointly fit in script 4.
 # Added to the linear predictor when J_w=1; I_w is not in the PV/FW/PJ model.
 FW_ML_QUERY = 3
@@ -661,25 +699,60 @@ def _split_ml_query(
     return base, q
 
 
+def _insert_week_coef(base, insert_at: int, new_len: int) -> np.ndarray:
+    """Pad a pre-week_norm coefficient vector with a 0 at ``insert_at``."""
+    b = np.asarray(base, dtype=float).ravel()
+    if b.size == new_len:
+        return b.copy()
+    if b.size == new_len - 1:
+        return np.concatenate([b[:insert_at], [0.0], b[insert_at:]])
+    padded = np.zeros(max(new_len - 1, b.size), dtype=float)
+    padded[: b.size] = b
+    padded = padded[: new_len - 1]
+    return np.concatenate([padded[:insert_at], [0.0], padded[insert_at:]])
+
+
 def _split_ml_pv_hurdle(theta: np.ndarray):
     """Split script-4 PV hurdle theta.
 
-    Current JSON (23): occurrence 8+3, intensity 8+3, ``sigma_PV``.
+    Current JSON (25): occurrence 9+3, intensity 9+3, ``sigma_PV``.
+    Pre-week_norm hurdle (23) inserts a 0 week coefficient.
     Legacy occurrence-only (11, or 12 with a trailing Gaussian σ dropped)
     returns ``int_base is None`` so the generator can fall back to resampling.
     """
     t = np.asarray(theta, dtype=float).ravel()
     if t.size >= PV_ML_HURDLE:
-        occ, rest = t[:11], t[11:]
+        occ_len = PV_ML_BASE + PV_ML_QUERY
+        occ, rest = t[:occ_len], t[occ_len:]
         occ_base, occ_q = occ[:PV_ML_BASE], occ[PV_ML_BASE:]
         int_base, int_q = rest[:PV_ML_BASE], rest[PV_ML_BASE:PV_ML_BASE + PV_ML_QUERY]
         sigma = float(rest[PV_ML_BASE + PV_ML_QUERY]) if rest.size > PV_ML_BASE + PV_ML_QUERY else 0.1
         if not np.isfinite(sigma) or sigma <= 0.0:
             sigma = 0.1
         return occ_base, occ_q, int_base, int_q, sigma
-    if t.size in (9, 12) and t.size > PV_ML_BASE:
-        t = np.concatenate([t[:PV_ML_BASE], t[PV_ML_BASE + 1 :]])
-    occ_base, occ_q = _split_ml_query(t, PV_ML_BASE, PV_ML_QUERY, _PV_QUERY_LEGACY_KEEP)
+    if t.size >= PV_ML_HURDLE_LEGACY:
+        occ_len = PV_ML_BASE_LEGACY + PV_ML_QUERY
+        occ, rest = t[:occ_len], t[occ_len:]
+        occ_base = _insert_week_coef(occ[:PV_ML_BASE_LEGACY], _PV_WEEK_INSERT, PV_ML_BASE)
+        occ_q = occ[PV_ML_BASE_LEGACY:]
+        int_base = _insert_week_coef(
+            rest[:PV_ML_BASE_LEGACY], _PV_WEEK_INSERT, PV_ML_BASE
+        )
+        int_q = rest[PV_ML_BASE_LEGACY:PV_ML_BASE_LEGACY + PV_ML_QUERY]
+        sigma = (
+            float(rest[PV_ML_BASE_LEGACY + PV_ML_QUERY])
+            if rest.size > PV_ML_BASE_LEGACY + PV_ML_QUERY
+            else 0.1
+        )
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            sigma = 0.1
+        return occ_base, occ_q, int_base, int_q, sigma
+    if t.size in (9, 12) and t.size > PV_ML_BASE_LEGACY:
+        t = np.concatenate([t[:PV_ML_BASE_LEGACY], t[PV_ML_BASE_LEGACY + 1 :]])
+    occ_base, occ_q = _split_ml_query(
+        t, PV_ML_BASE_LEGACY, PV_ML_QUERY, _PV_QUERY_LEGACY_KEEP
+    )
+    occ_base = _insert_week_coef(occ_base, _PV_WEEK_INSERT, PV_ML_BASE)
     return occ_base, occ_q, None, None, None
 
 
@@ -689,11 +762,19 @@ def _split_ml_pv_full(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _split_ml_fw(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    return _split_ml_query(theta, FW_ML_BASE, FW_ML_QUERY, _FW_PJ_QUERY_LEGACY_KEEP)
+    t = np.asarray(theta, dtype=float).ravel()
+    if t.size >= FW_ML_BASE + FW_ML_QUERY:
+        return t[:FW_ML_BASE].copy(), t[FW_ML_BASE:FW_ML_BASE + FW_ML_QUERY].copy()
+    base, q = _split_ml_query(t, FW_ML_BASE_LEGACY, FW_ML_QUERY, _FW_PJ_QUERY_LEGACY_KEEP)
+    return _insert_week_coef(base, _FW_PJ_WEEK_INSERT, FW_ML_BASE), q
 
 
 def _split_ml_pj(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    return _split_ml_query(theta, PJ_ML_BASE, PJ_ML_QUERY, _FW_PJ_QUERY_LEGACY_KEEP)
+    t = np.asarray(theta, dtype=float).ravel()
+    if t.size >= PJ_ML_BASE + PJ_ML_QUERY:
+        return t[:PJ_ML_BASE].copy(), t[PJ_ML_BASE:PJ_ML_BASE + PJ_ML_QUERY].copy()
+    base, q = _split_ml_query(t, PJ_ML_BASE_LEGACY, PJ_ML_QUERY, _FW_PJ_QUERY_LEGACY_KEEP)
+    return _insert_week_coef(base, _FW_PJ_WEEK_INSERT, PJ_ML_BASE), q
 
 
 def _ml_query_features(s) -> np.ndarray:
@@ -719,6 +800,39 @@ def _ml_query_applied_shift(q, s, Jw: int) -> float:
 def _foursc_closed_loop_proxy_enabled() -> bool:
     raw = os.environ.get("ADAPR_FOURSC_CLOSED_LOOP_PROXY", "1").strip().lower()
     return raw not in {"0", "false", "no", "off"}
+
+
+def _generator_calibration_enabled() -> bool:
+    raw = os.environ.get("ADAPR_GENERATOR_CALIBRATION", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _activity_carryover_calibration_enabled() -> bool:
+    raw = os.environ.get("ADAPR_ACTIVITY_CARRYOVER_CALIBRATION", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _interaction_pageview_calibration_enabled() -> bool:
+    raw = os.environ.get("ADAPR_INTERACTION_PAGEVIEW_CALIBRATION", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _generator_calibration_for_params_dir(params_dir) -> dict:
+    """Load optional post-fit generator calibration metadata.
+
+    Fitted ``params_env_<uid>.json`` files stay the source of model
+    coefficients. Returning ``{}`` preserves historical generation when the
+    file is absent or calibrations are disabled.
+    """
+    if not _generator_calibration_enabled():
+        return {}
+    path = Path(params_dir).expanduser().resolve() / "generator_calibration.json"
+    if not path.is_file():
+        return {}
+    obj = _load_json(path)
+    if not isinstance(obj, dict):
+        raise ValueError(f"generator calibration must be a JSON object: {path}")
+    return obj
 
 
 def _uid_key(uid):
@@ -957,6 +1071,64 @@ def _foursc_proxy_bundle_for_params_dir(params_dir) -> dict:
                 f"FourSC closed-loop proxy translation: n={len(r2s)} "
                 f"median R^2={float(np.nanmedian(r2s)):.4f}"
             )
+    return bundle
+
+
+_FOURSC_LAG_SUPPORT_BUNDLE: dict = {}
+
+
+def _foursc_lag_support_bundle_for_params_dir(params_dir) -> dict:
+    """Summarize observed support for the previous-slot FourSC covariate.
+
+    Script 5 mean-fills ``FourSC_lag1`` before fitting. When a participant has
+    no observed adjacent FourSC slots, that filled column is constant on every
+    observed outcome row, so the lag slope is not identified separately from
+    the intercept.
+    """
+    params_dir = Path(params_dir).expanduser().resolve()
+    cached = _FOURSC_LAG_SUPPORT_BUNDLE.get(params_dir)
+    if cached is not None:
+        return cached
+
+    bundle: dict = {}
+    df_path = params_dir / "df_fit_11week.csv"
+    if not df_path.is_file():
+        _FOURSC_LAG_SUPPORT_BUNDLE[params_dir] = bundle
+        return bundle
+
+    df = pd.read_csv(df_path)
+    required = {
+        "ParticipantIdentifier",
+        "Date",
+        "DecisionTime",
+        "4hour_step_norm",
+        "FourSC_lag1",
+    }
+    if not required.issubset(df.columns):
+        _FOURSC_LAG_SUPPORT_BUNDLE[params_dir] = bundle
+        return bundle
+
+    df["ParticipantIdentifier"] = df["ParticipantIdentifier"].map(_uid_key)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.sort_values(
+        ["ParticipantIdentifier", "Date", "DecisionTime"],
+        kind="mergesort",
+    )
+    for uid, g in df.groupby("ParticipantIdentifier", sort=False):
+        y = _df_numeric_col(g, "4hour_step_norm")
+        lag = _df_numeric_col(g, "FourSC_lag1", "fourSC_lag1")
+        finite_lag = lag[np.isfinite(lag)]
+        fill_constant = float(np.mean(finite_lag)) if finite_lag.size else 0.0
+        observed = np.isfinite(y)
+        adjacent_pairs = int(np.sum(observed[:-1] & observed[1:]))
+        bundle[_uid_key(uid)] = {
+            "fit_time_lag_constant": fill_constant,
+            "n_observed_fourSC": int(np.sum(observed)),
+            "n_observed_adjacent_pairs": adjacent_pairs,
+            "n_finite_lag_at_observed_rows": int(np.sum(np.isfinite(lag[observed]))),
+        }
+
+    _FOURSC_LAG_SUPPORT_BUNDLE[params_dir] = bundle
     return bundle
 
 
@@ -1270,6 +1442,9 @@ class EnvConfig:
         )
         self._validate_shapes()
         self._apply_foursc_closed_loop_proxy()
+        self._apply_foursc_support_aware_lag()
+        self._load_activity_carryover_calibration()
+        self._load_interaction_pageview_calibration()
         self._apply_pv_hurdle()
 
     def _validate_shapes(self) -> None:
@@ -1327,6 +1502,165 @@ class EnvConfig:
             "r2": rec["r2"],
             "yesterday_init": rec["yesterday_init"],
             "pageview_init": rec["pageview_init"],
+        }
+
+    def _apply_foursc_support_aware_lag(self) -> None:
+        """Remap unidentified FourSC lag slopes after closed-loop translation.
+
+        For a configured participant, the previous-slot lag is replaced by a
+        reference estimated from people with observed adjacent FourSC slots.
+        The removed contribution at the fit-time fill constant moves to the
+        intercept: ``new_a + new_b c = old_a + old_b c``.
+        """
+        self.foursc_support_aware_lag = None
+        root = _generator_calibration_for_params_dir(self.params_dir)
+        section = root.get("fourSC_support_aware_lag", {})
+        if not isinstance(section, dict) or not bool(section.get("enabled", False)):
+            return
+
+        participants = section.get("participants", {})
+        if not isinstance(participants, dict):
+            raise ValueError("fourSC_support_aware_lag.participants must be a JSON object")
+        uid = _uid_key(self.userid)
+        spec = participants.get(str(uid), participants.get(uid))
+        if spec is None:
+            return
+        if not isinstance(spec, dict):
+            raise ValueError(f"FourSC support-aware specification for {uid} must be an object")
+
+        support = _foursc_lag_support_bundle_for_params_dir(self.params_dir).get(uid)
+        if support is None:
+            raise ValueError(f"cannot find FourSC lag-support data for participant {uid}")
+
+        expected_pairs = spec.get("expected_observed_adjacent_pairs")
+        if expected_pairs is not None and int(support["n_observed_adjacent_pairs"]) != int(expected_pairs):
+            raise ValueError(
+                f"participant {uid}: FourSC adjacent-pair count changed from "
+                f"expected {int(expected_pairs)} to {int(support['n_observed_adjacent_pairs'])}; "
+                "recalibrate the support-aware mapping"
+            )
+        expected_finite = spec.get("expected_finite_lag_at_observed_rows")
+        if expected_finite is not None and int(support["n_finite_lag_at_observed_rows"]) != int(expected_finite):
+            raise ValueError(
+                f"participant {uid}: finite FourSC lags at observed rows changed from "
+                f"expected {int(expected_finite)} to {int(support['n_finite_lag_at_observed_rows'])}; "
+                "recalibrate the support-aware mapping"
+            )
+
+        lag_idx = THETA_FOURSC_NAMES.index("fourSC_lag1")
+        intercept_idx = THETA_FOURSC_NAMES.index("intercept")
+        old_lag = float(self.theta_fourSC[lag_idx])
+        old_intercept = float(self.theta_fourSC[intercept_idx])
+        expected_old_lag = spec.get("expected_operational_lag_coefficient")
+        tolerance = float(spec.get("validation_tolerance", 1e-8))
+        if expected_old_lag is not None and not np.isclose(
+            old_lag, float(expected_old_lag), atol=tolerance, rtol=0.0
+        ):
+            raise ValueError(
+                f"participant {uid}: operational FourSC lag coefficient changed from "
+                f"expected {float(expected_old_lag):.12g} to {old_lag:.12g}; "
+                "recalibrate the support-aware mapping"
+            )
+
+        fit_constant = float(support["fit_time_lag_constant"])
+        expected_constant = spec.get("expected_fit_time_lag_constant")
+        if expected_constant is not None and not np.isclose(
+            fit_constant, float(expected_constant), atol=tolerance, rtol=0.0
+        ):
+            raise ValueError(
+                f"participant {uid}: FourSC fit-time lag constant changed from "
+                f"expected {float(expected_constant):.12g} to {fit_constant:.12g}; "
+                "recalibrate the support-aware mapping"
+            )
+
+        new_lag = float(spec.get(
+            "reference_lag_coefficient",
+            section.get("reference_lag_coefficient"),
+        ))
+        new_intercept = old_intercept + (old_lag - new_lag) * fit_constant
+        self.theta_fourSC = np.asarray(self.theta_fourSC, dtype=float).copy()
+        self.theta_fourSC[intercept_idx] = new_intercept
+        self.theta_fourSC[lag_idx] = new_lag
+        self.foursc_support_aware_lag = {
+            "participant_id": uid,
+            "fit_time_lag_constant": fit_constant,
+            "old_lag_coefficient": old_lag,
+            "new_lag_coefficient": new_lag,
+            "old_intercept": old_intercept,
+            "new_intercept": new_intercept,
+            "n_observed_adjacent_pairs": int(support["n_observed_adjacent_pairs"]),
+            "n_finite_lag_at_observed_rows": int(support["n_finite_lag_at_observed_rows"]),
+        }
+
+    def _load_activity_carryover_calibration(self) -> None:
+        """Load AM FourSC residual → same-day PM prior-2h residual coupling."""
+        self.activity_carryover_calibration = None
+        if not _activity_carryover_calibration_enabled():
+            return
+        root = _generator_calibration_for_params_dir(self.params_dir)
+        section = root.get("activity_carryover_calibration", {})
+        if not isinstance(section, dict) or not bool(section.get("enabled", False)):
+            return
+        form = str(section.get("form", "am_foursc_residual_to_same_day_pm_prior2hour"))
+        if form != "am_foursc_residual_to_same_day_pm_prior2hour":
+            raise ValueError(f"unsupported activity carryover form: {form}")
+        rho = float(section.get("coupling_rho", 0.0))
+        if not np.isfinite(rho) or abs(rho) >= 1.0:
+            raise ValueError("activity carryover coupling_rho must be finite and in (-1, 1)")
+        from_slot = int(section.get("from_decision_slot", 0))
+        to_slot = int(section.get("to_decision_slot", 1))
+        if (from_slot, to_slot) != (0, 1):
+            raise ValueError("activity carryover currently supports only AM slot 0 to PM slot 1")
+        min_sd = float(section.get("minimum_residual_sd", 1e-8))
+        if not np.isfinite(min_sd) or min_sd <= 0:
+            raise ValueError("activity carryover minimum_residual_sd must be positive")
+        self.activity_carryover_calibration = {
+            "form": form,
+            "coupling_rho": rho,
+            "from_decision_slot": from_slot,
+            "to_decision_slot": to_slot,
+            "minimum_residual_sd": min_sd,
+            "preserve_prior2hour_residual_variance": bool(
+                section.get("preserve_prior2hour_residual_variance", True)
+            ),
+        }
+
+    def _load_interaction_pageview_calibration(self) -> None:
+        """Load an interaction-residual offset for page-view occurrence."""
+        self.interaction_pageview_calibration = None
+        if not _interaction_pageview_calibration_enabled():
+            return
+        root = _generator_calibration_for_params_dir(self.params_dir)
+        section = root.get("interaction_pageview_calibration", {})
+        if not isinstance(section, dict) or not bool(section.get("enabled", False)):
+            return
+        form = str(section.get("form", "interaction_residual_logit_offset"))
+        if form != "interaction_residual_logit_offset":
+            raise ValueError(f"unsupported interaction-pageview calibration form: {form}")
+        by_slot = section.get("parameters_by_decision_slot", {})
+        if not isinstance(by_slot, dict):
+            raise ValueError("interaction_pageview_calibration.parameters_by_decision_slot must be an object")
+        clean = {}
+        for slot in (0, 1):
+            spec = by_slot.get(str(slot))
+            if not isinstance(spec, dict):
+                raise ValueError(f"missing interaction-pageview parameters for slot {slot}")
+            intercept = float(spec.get("intercept_shift", 0.0))
+            coefficient = float(spec.get("interaction_residual_coefficient", 0.0))
+            if not np.isfinite(intercept) or not np.isfinite(coefficient):
+                raise ValueError("interaction-pageview parameters must be finite")
+            clean[slot] = {
+                "intercept_shift": intercept,
+                "interaction_residual_coefficient": coefficient,
+            }
+        eps = float(section.get("probability_epsilon", 1e-10))
+        if not np.isfinite(eps) or eps <= 0.0 or eps >= 0.5:
+            raise ValueError("interaction-pageview probability_epsilon must lie in (0,0.5)")
+        self.interaction_pageview_calibration = {
+            "form": form,
+            "action_value": float(section.get("action_value", 1.0)),
+            "parameters_by_decision_slot": clean,
+            "probability_epsilon": eps,
         }
 
     def _apply_pv_hurdle(self) -> None:
@@ -1425,6 +1759,82 @@ class Env:
         # fresh Env (created per simulated episode) starts with fresh state.
         self._ar_prev: dict = {}
         self._ar_rho_cache: dict = {}
+        self._activity_last_foursc = None
+        self._activity_carryover_application_count = 0
+        self._activity_residual_stats = self._build_activity_residual_stats()
+        self._last_ws_interaction_record = None
+        self._last_pageview_occurrence_record = None
+        self._interaction_pageview_application_count = 0
+
+    @staticmethod
+    def _finite_mean_sd(values, minimum_sd=1e-8):
+        a = np.asarray(values, dtype=float)
+        a = a[np.isfinite(a)]
+        if a.size == 0:
+            return 0.0, 0.0, 0
+        mu = float(np.mean(a))
+        sd = float(np.std(a, ddof=1)) if a.size > 1 else 0.0
+        if not np.isfinite(sd) or sd < float(minimum_sd):
+            sd = 0.0
+        return mu, sd, int(a.size)
+
+    def _build_activity_residual_stats(self):
+        cal = self.cfg.activity_carryover_calibration
+        min_sd = float(cal["minimum_residual_sd"]) if cal else 1e-8
+        f_mu, f_sd, f_n = self._finite_mean_sd(self.cfg.resid_fourSC, min_sd)
+        p_mu, p_sd, p_n = self._finite_mean_sd(
+            self.cfg.resid_prior2hour_step_count, min_sd
+        )
+        return {
+            "fourSC_mean": f_mu,
+            "fourSC_sd": f_sd,
+            "fourSC_n": f_n,
+            "prior2hour_mean": p_mu,
+            "prior2hour_sd": p_sd,
+            "prior2hour_n": p_n,
+        }
+
+    def _record_foursc_for_activity_carryover(self, *, step_idx, slot, mean, value):
+        if not self.cfg.activity_carryover_calibration:
+            return
+        self._activity_last_foursc = {
+            "step_idx": int(step_idx),
+            "slot": int(slot),
+            "residual": float(value) - float(mean),
+        }
+
+    def _couple_prior2hour_residual(self, *, state, step_idx, base_noise):
+        """Mix the PM prior-2h residual with the just-realized AM FourSC residual."""
+        cal = self.cfg.activity_carryover_calibration
+        if not cal or self._activity_last_foursc is None:
+            return float(base_noise)
+        current_slot = int(round(float(state.get("decisionTimeSlot", -1))))
+        prev = self._activity_last_foursc
+        if not (
+            current_slot == int(cal["to_decision_slot"])
+            and int(prev["slot"]) == int(cal["from_decision_slot"])
+            and int(step_idx) == int(prev["step_idx"]) + 1
+        ):
+            return float(base_noise)
+
+        st = self._activity_residual_stats
+        f_sd = float(st["fourSC_sd"])
+        p_sd = float(st["prior2hour_sd"])
+        if f_sd <= 0.0 or p_sd <= 0.0:
+            return float(base_noise)
+        z_four = (float(prev["residual"]) - float(st["fourSC_mean"])) / f_sd
+        z_prior = (float(base_noise) - float(st["prior2hour_mean"])) / p_sd
+        rho = float(cal["coupling_rho"])
+        if bool(cal["preserve_prior2hour_residual_variance"]):
+            z_new = rho * z_four + math.sqrt(max(1.0 - rho ** 2, 0.0)) * z_prior
+        else:
+            z_new = z_prior + rho * z_four
+        self._activity_carryover_application_count += 1
+        return float(st["prior2hour_mean"] + p_sd * z_new)
+
+    def _sim_week_norm(self, study_week):
+        """Stretch ``week_norm`` onto ``[-1, 1]`` over ``cfg.nweek``, like CAE."""
+        return study_week_norm(study_week, n_weeks=self.cfg.nweek)
 
     def _sample_noise(self, resid, idx, obs_resid=None, name=None):
         if obs_resid is None:
@@ -1519,6 +1929,9 @@ class Env:
         noise = self._sample_noise(
             self.cfg.resid_prior2hour_step_count, step_idx, name="prior2hour_step_count"
         )
+        noise = self._couple_prior2hour_residual(
+            state=s, step_idx=step_idx, base_noise=noise
+        )
         return float(np.clip(mean + noise, *self.cfg.limits_prior2hour_step_count))
 
     def gen_active_status_mean(self, s, return_logit=False):
@@ -1567,10 +1980,17 @@ class Env:
         base_p = self._sigmoid(eta)
         noise = self._sample_noise(self.cfg.resid_ws_interaction, step_idx, name="ws_interaction")
         p = float(np.clip(base_p + noise, *self.cfg.limits_ws_interaction))
-        draw = float(rd.binomial(1, p))
-        if float(Ah) == 0.0:
-            return 0.0
-        return draw
+        latent_draw = float(rd.binomial(1, p))
+        draw = latent_draw if float(Ah) != 0.0 else 0.0
+        self._last_ws_interaction_record = {
+            "step_idx": int(step_idx),
+            "action": float(Ah),
+            "base_probability": float(base_p),
+            "effective_probability": float(p),
+            "latent_draw": float(latent_draw),
+            "observed_draw": float(draw),
+        }
+        return float(draw)
 
     def gen_fourSC_mean(self, s, Ah):
         """
@@ -1622,14 +2042,21 @@ class Env:
     def gen_fourSC(self, s, Ah, step_idx):
         mean = self.gen_fourSC_mean(s, Ah)
         noise = self._sample_noise(self.cfg.resid_fourSC, step_idx, name="fourSC")
-        return float(np.clip(mean + noise, *self.cfg.limits_fourSC))
+        value = float(np.clip(mean + noise, *self.cfg.limits_fourSC))
+        self._record_foursc_for_activity_carryover(
+            step_idx=step_idx,
+            slot=int(round(float(s.get("decisionTimeSlot", -1)))),
+            mean=mean,
+            value=value,
+        )
+        return value
 
     def _ml_pv_query_shift(self, s, Jw: int, q=None) -> float:
         if q is None:
             _, q = _split_ml_pv_full(self.cfg.theta_ml_PV)
         return _ml_query_applied_shift(q, s, Jw)
 
-    def _ml_pv_linpred(self, s, Ah: float, Jw: int, base, q) -> float:
+    def _ml_pv_linpred(self, s, Ah: float, Jw: int, base, q, *, step_idx=None) -> float:
         Ew = float(s["perceivedUtilityLastWeek"])
         (
             b0,
@@ -1637,32 +2064,41 @@ class Env:
             b2_isWeekend,
             b2_dt,
             b2_rb,
+            b2_week,
             b_ar1,
             b3,
             b4,
         ) = np.asarray(base, dtype=float).ravel()
         lag1 = float(s["pageViewNext4HourLag1"])
+        week_n = 0.0
+        if step_idx is not None:
+            slots_per_week = int(self.K) * int(self.W)
+            study_week = int(step_idx) // max(slots_per_week, 1) + 1
+            week_n = self._sim_week_norm(study_week)
         eta = (
             b0
             + b1 * Ew
             + b2_isWeekend * float(s["isWeekend"])
             + b2_dt * float(s["decisionTimeSlot"])
             + b2_rb * float(s["activitySuggestionsSentLast7Days"])
+            + b2_week * week_n
             + b_ar1 * lag1
             + Ah * (b3 + b4 * Ew)
         )
         return float(eta + self._ml_pv_query_shift(s, Jw, q=q))
 
-    def _ml_pv_logit(self, s, Ah: float, Jw: int) -> float:
+    def _ml_pv_logit(self, s, Ah: float, Jw: int, step_idx=None) -> float:
         """Script-4 hurdle logit for ``P(pageview count > 0)``."""
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
         occ_base, occ_q, _int_base, _int_q, _sigma = _split_ml_pv_hurdle(
             self.cfg.theta_ml_PV
         )
-        return self._ml_pv_linpred(s, float(Ah), int(Jw), occ_base, occ_q)
+        return self._ml_pv_linpred(
+            s, float(Ah), int(Jw), occ_base, occ_q, step_idx=step_idx
+        )
 
-    def _ml_pv_intensity_mean(self, s, Ah: float, Jw: int):
+    def _ml_pv_intensity_mean(self, s, Ah: float, Jw: int, step_idx=None):
         """Mean log-then-z pageview given count>0, or None if not in JSON."""
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
@@ -1671,19 +2107,23 @@ class Env:
         )
         if int_base is None:
             return None, None
-        mu = self._ml_pv_linpred(s, float(Ah), int(Jw), int_base, int_q)
+        mu = self._ml_pv_linpred(
+            s, float(Ah), int(Jw), int_base, int_q, step_idx=step_idx
+        )
         return float(mu), float(sigma)
 
-    def _pv_hurdle_occurrence(self, s, Ah: float, Jw: int):
+    def _pv_hurdle_occurrence(self, s, Ah: float, Jw: int, step_idx=None):
         rec = self.cfg.pv_hurdle
-        p = float(self._sigmoid(self._ml_pv_logit(s, float(Ah), int(Jw))))
+        p = float(self._sigmoid(self._ml_pv_logit(s, float(Ah), int(Jw), step_idx=step_idx)))
         pool = _pv_hurdle_positive_pool(rec, Ah, self.cfg.pv_hurdle_population)
         shift = float(self.cfg.pageview_log_shift)
         scale = float(self.cfg.pageview_log_scale)
         zc = float(self.cfg.pageview_zero_count)
         z_zero = _standardize_pageview_count(0.0, shift, scale, zero_count=zc)
         z_one = _standardize_pageview_count(1.0, shift, scale, zero_count=zc)
-        mu_int, sigma_int = self._ml_pv_intensity_mean(s, float(Ah), int(Jw))
+        mu_int, sigma_int = self._ml_pv_intensity_mean(
+            s, float(Ah), int(Jw), step_idx=step_idx
+        )
         if mu_int is None:
             z_pos = np.array(
                 [
@@ -1696,17 +2136,97 @@ class Env:
             sigma_int = 0.1
         return p, pool, z_zero, z_one, float(mu_int), float(sigma_int)
 
-    def gen_pageview_mean(self, s, Ah, Jw=0):
+    def _interaction_conditioned_pageview_probability(
+        self, *, base_probability, s, Ah, step_idx, ws_interaction
+    ):
+        """Add the calibrated interaction-residual term to the PV hurdle logit."""
+        p_v = float(np.clip(base_probability, 0.0, 1.0))
+        cal = self.cfg.interaction_pageview_calibration
+        if not cal or float(Ah) != float(cal["action_value"]):
+            self._last_pageview_occurrence_record = {
+                "step_idx": int(step_idx),
+                "applied": False,
+                "base_probability": p_v,
+                "conditional_probability": p_v,
+                "interaction_probability": np.nan,
+                "interaction_draw": float(ws_interaction),
+                "intercept_shift": 0.0,
+                "interaction_residual_coefficient": 0.0,
+            }
+            return p_v
+        rec = self._last_ws_interaction_record
+        if rec is None or int(rec.get("step_idx", -999999)) != int(step_idx):
+            raise RuntimeError(
+                "interaction/page-view coupling requires interaction to be "
+                "generated first at the same step"
+            )
+        if float(rec.get("action", np.nan)) != float(Ah):
+            raise RuntimeError("interaction/page-view action mismatch")
+        draw = float(ws_interaction)
+        if draw not in (0.0, 1.0) or draw != float(rec.get("observed_draw")):
+            raise RuntimeError("interaction/page-view draw mismatch")
+        slot = int(round(float(s.get("decisionTimeSlot", -1))))
+        if slot not in (0, 1):
+            raise ValueError(
+                f"invalid decisionTimeSlot for interaction/page-view coupling: {slot}"
+            )
+        spec = cal["parameters_by_decision_slot"][slot]
+        p_i = float(np.clip(rec["base_probability"], 0.0, 1.0))
+        eps = float(cal["probability_epsilon"])
+        pv_clip = float(np.clip(p_v, eps, 1.0 - eps))
+        eta = math.log(pv_clip / (1.0 - pv_clip))
+        interaction_residual = draw - p_i
+        eta_new = (
+            eta
+            + float(spec["intercept_shift"])
+            + float(spec["interaction_residual_coefficient"]) * interaction_residual
+        )
+        p_cond = self._sigmoid(eta_new)
+        self._interaction_pageview_application_count += 1
+        self._last_pageview_occurrence_record = {
+            "step_idx": int(step_idx),
+            "applied": True,
+            "base_probability": p_v,
+            "conditional_probability": p_cond,
+            "interaction_probability": p_i,
+            "interaction_draw": draw,
+            "interaction_residual": interaction_residual,
+            "intercept_shift": float(spec["intercept_shift"]),
+            "interaction_residual_coefficient": float(
+                spec["interaction_residual_coefficient"]
+            ),
+        }
+        return float(p_cond)
+
+    def gen_pageview_mean(self, s, Ah, Jw=0, step_idx=None):
         p_hat, _pool, z_zero, _z_one, mu_int, _sigma = self._pv_hurdle_occurrence(
-            s, float(Ah), int(Jw)
+            s, float(Ah), int(Jw), step_idx=step_idx
         )
         mu = (1.0 - p_hat) * z_zero + p_hat * mu_int
         return float(np.clip(mu, *self.cfg.limits_pageview))
 
-    def gen_pageview(self, s, Ah, Jw, step_idx):
-        p_hat, pool, z_zero, z_one, mu_int, sigma_int = self._pv_hurdle_occurrence(
-            s, float(Ah), int(Jw)
+    def gen_pageview(self, s, Ah, Jw, step_idx, ws_interaction=None):
+        p_base, pool, z_zero, z_one, mu_int, sigma_int = self._pv_hurdle_occurrence(
+            s, float(Ah), int(Jw), step_idx=step_idx
         )
+        if ws_interaction is None:
+            p_hat = float(p_base)
+            self._last_pageview_occurrence_record = {
+                "step_idx": int(step_idx),
+                "applied": False,
+                "base_probability": float(p_base),
+                "conditional_probability": float(p_base),
+                "interaction_probability": np.nan,
+                "interaction_draw": np.nan,
+            }
+        else:
+            p_hat = self._interaction_conditioned_pageview_probability(
+                base_probability=p_base,
+                s=s,
+                Ah=float(Ah),
+                step_idx=int(step_idx),
+                ws_interaction=float(ws_interaction),
+            )
         u = rd.random()
         # Always consume intensity noise so policies that differ on P(count=0)
         # stay aligned on the global RNG stream.
@@ -1782,20 +2302,29 @@ class Env:
         noise = self._sample_noise(self.cfg.resid_antic, day_idx, name="antic")
         return float(np.clip(mean + noise, *self.cfg.limits_antic))
 
-    def _ml_fw_eta(self, s, ws_morning, ws_afternoon, Jw: int, return_logit: bool):
+    def _ml_fw_eta(self, s, ws_morning, ws_afternoon, Jw: int, return_logit: bool, day_idx=None):
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
         Ew = float(s["perceivedUtilityLastWeek"])
         base, q = _split_ml_fw(self.cfg.theta_ml_FW)
-        beta0, beta1, b2_isWeekend, b2_rb, beta_ar1, beta3, beta4, beta5, beta6 = base
+        (
+            beta0, beta1, b2_isWeekend, b2_rb, b2_week, beta_ar1,
+            beta3, beta4, beta5, beta6,
+        ) = base
         is_weekend = float(s["isWeekend"])
         rb = float(s["activitySuggestionsSentLast7Days"])
         y_lag = float(s["morningFitbitWearYesterday"])
+        week_n = 0.0
+        if day_idx is not None:
+            week_n = self._sim_week_norm(
+                int(day_idx) // max(int(self.W), 1) + 1
+            )
         eta = (
             beta0
             + beta1 * Ew
             + b2_isWeekend * is_weekend
             + b2_rb * rb
+            + b2_week * week_n
             + beta_ar1 * y_lag
             + ws_morning * (beta3 + beta4 * Ew)
             + ws_afternoon * (beta5 + beta6 * Ew)
@@ -1803,11 +2332,15 @@ class Env:
         eta += _ml_query_applied_shift(q, s, Jw)
         return eta if return_logit else self._sigmoid(eta)
 
-    def gen_fitbitwearing_mean(self, s, ws_morning, ws_afternoon, Jw=0, return_logit=False):
-        return self._ml_fw_eta(s, ws_morning, ws_afternoon, int(Jw), return_logit)
+    def gen_fitbitwearing_mean(self, s, ws_morning, ws_afternoon, Jw=0, return_logit=False, day_idx=None):
+        return self._ml_fw_eta(
+            s, ws_morning, ws_afternoon, int(Jw), return_logit, day_idx=day_idx
+        )
 
     def gen_fitbitwearing(self, s, ws_morning, ws_afternoon, Jw, day_idx):
-        eta = self._ml_fw_eta(s, ws_morning, ws_afternoon, int(Jw), return_logit=True)
+        eta = self._ml_fw_eta(
+            s, ws_morning, ws_afternoon, int(Jw), return_logit=True, day_idx=day_idx
+        )
         base_p = self._sigmoid(eta)
         noise = self._sample_noise(
             self.cfg.resid_ml_nextday_wearing, day_idx, name="nextday_wearing"
@@ -1817,20 +2350,26 @@ class Env:
         p = float(np.clip(base_p + noise, *self.cfg.limits_fitbitwearing))
         return float(rd.binomial(1, p))
 
-    def _ml_pj_eta(self, s, ws_morning, ws_afternoon, Jw: int, return_logit: bool):
+    def _ml_pj_eta(self, s, ws_morning, ws_afternoon, Jw: int, return_logit: bool, day_idx=None):
         if not self.cfg.has_ml_stack:
             raise RuntimeError("ML parameters missing from params JSON")
         Ew = float(s["perceivedUtilityLastWeek"])
         base, q = _split_ml_pj(self.cfg.theta_ml_PJ)
-        t0, t1, t2_isWeekend, t2_rb, t_ar1, t3, t4, t5, t6 = base
+        t0, t1, t2_isWeekend, t2_rb, t2_week, t_ar1, t3, t4, t5, t6 = base
         is_weekend = float(s["isWeekend"])
         rb = float(s["activitySuggestionsSentLast7Days"])
         y_lag = float(s["dailySurveyCompleteYesterday"])
+        week_n = 0.0
+        if day_idx is not None:
+            week_n = self._sim_week_norm(
+                int(day_idx) // max(int(self.W), 1) + 1
+            )
         eta = (
             t0
             + t1 * Ew
             + t2_isWeekend * is_weekend
             + t2_rb * rb
+            + t2_week * week_n
             + t_ar1 * y_lag
             + ws_morning * (t3 + t4 * Ew)
             + ws_afternoon * (t5 + t6 * Ew)
@@ -1838,11 +2377,15 @@ class Env:
         eta += _ml_query_applied_shift(q, s, Jw)
         return eta if return_logit else self._sigmoid(eta)
 
-    def gen_dailysurvey_mean(self, s, ws_morning, ws_afternoon, Jw=0, return_logit=False):
-        return self._ml_pj_eta(s, ws_morning, ws_afternoon, int(Jw), return_logit)
+    def gen_dailysurvey_mean(self, s, ws_morning, ws_afternoon, Jw=0, return_logit=False, day_idx=None):
+        return self._ml_pj_eta(
+            s, ws_morning, ws_afternoon, int(Jw), return_logit, day_idx=day_idx
+        )
 
     def gen_dailysurvey(self, s, ws_morning, ws_afternoon, Jw, day_idx):
-        eta = self._ml_pj_eta(s, ws_morning, ws_afternoon, int(Jw), return_logit=True)
+        eta = self._ml_pj_eta(
+            s, ws_morning, ws_afternoon, int(Jw), return_logit=True, day_idx=day_idx
+        )
         base_p = self._sigmoid(eta)
         noise = self._sample_noise(
             self.cfg.resid_ml_daily_present, day_idx, name="daily_present"
@@ -1898,15 +2441,25 @@ class Env:
         noise = float(rd.normal(0.0, sigma_e))
         return float(np.clip(mean + noise, *self.cfg.limits_perceivedUtility))
 
-    def gen_week_present_mean(self, perceivedUtility, return_logit=False):
+    def gen_week_present_mean(self, perceivedUtility, return_logit=False, study_week=None):
         if self.cfg.theta_ml_J.size < 2:
             raise RuntimeError("theta_ml_J required for week_present (J_week)")
         b0, b1 = float(self.cfg.theta_ml_J[0]), float(self.cfg.theta_ml_J[1])
-        eta = b0 + b1 * float(perceivedUtility)
+        b2 = float(self.cfg.theta_ml_J[2]) if self.cfg.theta_ml_J.size >= 3 else 0.0
+        week_n = 0.0 if study_week is None else self._sim_week_norm(study_week)
+        eta = b0 + b1 * float(perceivedUtility) + b2 * week_n
         return eta if return_logit else self._sigmoid(eta)
 
     def gen_week_present(self, perceivedUtility, week_idx):
-        eta = self.gen_week_present_mean(perceivedUtility, return_logit=True)
+        # ``week_idx`` is the weekly-array index of this J (``sim_w + 1``),
+        # i.e. opening J of 0-based week ``week_idx`` = 1-based study week
+        # ``week_idx + 1``. Stretch week_norm over the simulation horizon,
+        # matching CAE.
+        eta = self.gen_week_present_mean(
+            perceivedUtility,
+            return_logit=True,
+            study_week=int(week_idx) + 1,
+        )
         base_p = self._sigmoid(eta)
         noise = self._sample_noise(self.cfg.resid_ml_J_week, week_idx, name="J_week")
         if not np.isfinite(noise):

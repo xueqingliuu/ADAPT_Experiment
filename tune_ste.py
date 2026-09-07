@@ -191,6 +191,7 @@ SUPPORTING_FILES = (
     "Ew_pooled_linear_coefs.json",
     "population_residuals.json",
     "rl_priors.json",
+    "generator_calibration.json",
 )
 
 # ---------------------------------------------------------------------------
