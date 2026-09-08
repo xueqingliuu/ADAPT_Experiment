@@ -17,10 +17,6 @@ FIRST_T = 0
 TERMINAL_D = N_RL_DAYS - 1
 TERMINAL_T = N_RL_SLOTS - 1
 STAGE1_SHARE_NAMES = ("AA", "FW", "PJ", "SC", "PV")
-# Stage-2 ψ uses realized PV (next_me), not PV_hat. Share columns are
-# the CAE / daily-ê hats only. PV stays in STAGE1_SHARE_NAMES for
-# Stage-1b and the known-map shaping term.
-STAGE2_PSI_SHARE_NAMES = ("AA", "FW", "PJ", "SC")
 
 # Canonical RCT roster. ``experiment.ALGORITHMS`` and ``aggregate.py``
 # must use this order; leftover npz from dropped arms are ignored.
@@ -2311,28 +2307,26 @@ def build_redistribution_phi(b_hat, b_tilde, state, d, t, action,
 
     psi = [1, d_n, E_w, b_hat, b_tilde]
         ⌢ [M_ewma (AA, SC, PV, FW, PJ), C_{w,d,t}]
-        ⌢ [M^E_{d,t}, AA_hat, FW_hat, PJ_hat, SC_hat]
+        ⌢ [AA_hat, FW_hat, PJ_hat, SC_hat, PV_hat]
 
-    Realized ``next_my`` is omitted (same quantity as ``SC_hat``).
-    Realized ``next_me`` stays: it is the slot page-view that enters ê,
-    not a second copy of the Stage-1b fourSC map. ``PV_hat`` is not in
-    ψ. ``d_n`` is the Saturday vs Mon–Fri indicator. ``action`` is
-    unused and kept for call-site symmetry.
+    Realized ``next_my`` and ``next_me`` are omitted: they are the same
+    quantities as ``SC_hat`` / ``PV_hat`` (realized vs predicted), so only
+    their sum is identified from weekly targets. The hats are the
+    action-attributable shares. ``d_n`` is the Saturday vs Mon–Fri
+    indicator. ``action`` / ``full_mediators`` are unused and kept for
+    call-site symmetry.
     """
     E_w = float(state["E_w"])
     C_dt = np.asarray(state["C"], dtype=float).ravel()
     d_feat, _ = _time_features(d, t)
-    rs_state = _rewardshaping_state(state, full_mediators)
-    M_E = np.asarray(rs_state["M_E"], dtype=float)
-    next_me = float(M_E[d, t])
-    n_share = len(STAGE2_PSI_SHARE_NAMES)
+    n_share = len(STAGE1_SHARE_NAMES)
     shares = np.asarray(daily_shares, dtype=float).ravel()
     if shares.size < n_share:
         shares = np.concatenate([shares, np.zeros(n_share - shares.size)])
     return np.concatenate([
         [1.0, d_feat, E_w, float(b_hat), float(b_tilde)],
         summarize_mediators_ewma(state["M_Y"], state["M_E"], d, t), C_dt,
-        [next_me], shares[:n_share],
+        shares[:n_share],
     ])
 
 

@@ -11,7 +11,8 @@ Writes ``<params-dir>/generator_calibration.json`` used by ``vani_env.EnvConfig`
      page-view occurrence logit by ``a + b (I - p_I)``.
 
 Revision 2 (post-fit week engagement calibration) is intentionally omitted:
-script 4 already has ``week_norm`` in PV/FW/PJ/J.
+do not add ``week_norm`` to PV/FW/PJ/J and do not apply the capped week
+engagement overlay.
 """
 from __future__ import annotations
 
@@ -259,7 +260,7 @@ def estimate_interaction_pageview(params_dir: Path, df: pd.DataFrame) -> dict:
         "estimation_note": (
             "Slot-specific coefficients are delivered-slot offset-logistic "
             "maximum-likelihood estimates. The fixed offset is the script-4 "
-            "page-view occurrence logit (including week_norm); the extra "
+            "page-view occurrence logit (no week_norm in PV/FW/PJ/J); the extra "
             "predictor is observed interaction minus the fitted interaction "
             "probability. No study-time engagement calibration is applied."
         ),

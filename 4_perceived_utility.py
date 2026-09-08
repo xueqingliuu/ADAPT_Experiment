@@ -29,12 +29,8 @@ given a positive count, a Gaussian on ``log(x)`` then z-scored among
 positives (``HourlyPageviewCount_norm``). Count 0 is placed at
 ``log(0.5)`` on that same axis so the 14-slot PV summary still sits
 below count 1. Both parts share the same covariate
-design (``E_w``, weekend, slot, burden, ``week_norm``, lag1, ``A``,
-``A×E_w``, ``J_w`` query). FW / PJ stay Bernoulli on wear / daily
-check-in and include the same ``week_norm``. ``J_w`` is
-``b0 + b1 E_w + b2 week_norm``. ``week_norm`` uses the 11-week fit
-scale ``(w-6)/5``; the simulator stretches it onto ``[-1, 1]`` over
-the run, the same way CAE does.
+design (``E_w``, weekend, slot, burden, lag1, ``A``, ``A×E_w``, ``J_w``
+query). FW / PJ stay Bernoulli on wear / daily check-in.
 
 Index: ``J_w``, ``E_w``, ``U_{w,1}``, ``U_{w,2}`` sit at the end of week
 ``w-1`` / start of week ``w``. In the MRT table that is
@@ -67,7 +63,7 @@ from scipy.optimize import minimize
 from scipy.special import logsumexp
 import json
 
-from vani_env import E_QUAD_HI, E_QUAD_LO, pv_hurdle_occurrence_z_gap, study_week_norm
+from vani_env import E_QUAD_HI, E_QUAD_LO, pv_hurdle_occurrence_z_gap
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +78,11 @@ QUERY_JW_INTENSITY_NAMES = (
     "intensity_query_Jw_Ew",
     "intensity_query_Jw_recent_burden",
 )
-# Packed theta: 54 emission/AR coeffs + 12 J_w query coeffs
+# Packed theta: 49 emission/AR coeffs + 12 J_w query coeffs
 # (PV occurrence, PV intensity, FW, PJ × intercept, E_w, recent_burden).
-# +5 vs the pre-week_norm packing: J, PV occ, PV intensity, FW, PJ.
-_THETA_DIM_BASE = 66
+_THETA_DIM_BASE = 61
 # Packed log-σ indices (unpack_theta exponentiates these). σ_E, σ_U1, σ_U2, σ_PV.
-_LOG_SIGMA_INDICES = (5, 11, 14, 35)
+_LOG_SIGMA_INDICES = (5, 10, 13, 32)
 # Baseline levels / prevalences. Ridge does not shrink these (or log-σ)
 # except for strong-pool users, who also penalize a0 and log σ_E toward
 # the pooled MLE (see ``strong_pool_uids``).
@@ -269,8 +264,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     i += 1
     b1 = theta[i]
     i += 1
-    b2_week_norm = theta[i]
-    i += 1
 
     c0 = theta[i]
     i += 1
@@ -296,8 +289,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     i += 1
     alpha2_rb = theta[i]
     i += 1
-    alpha2_week_norm = theta[i]
-    i += 1
     alpha3 = theta[i]
     i += 1
     alpha4 = theta[i]
@@ -320,8 +311,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     gamma2_dt = theta[i]
     i += 1
     gamma2_rb = theta[i]
-    i += 1
-    gamma2_week_norm = theta[i]
     i += 1
     gamma3 = theta[i]
     i += 1
@@ -354,8 +343,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     i += 1
     beta2_rb = theta[i]
     i += 1
-    beta2_week_norm = theta[i]
-    i += 1
     beta_ar1 = theta[i]
     i += 1
     beta_q0 = theta[i]
@@ -381,8 +368,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
     i += 1
     theta2_rb = theta[i]
     i += 1
-    theta2_week_norm = theta[i]
-    i += 1
     theta_ar1 = theta[i]
     i += 1
     theta_q0 = theta[i]
@@ -401,7 +386,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "sigma_E": sigma_E,
         "b0": b0,
         "b1": b1,
-        "b2_week_norm": b2_week_norm,
         "c0": c0,
         "c1": c1,
         "sigma_U1": sigma_U1,
@@ -413,7 +397,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "alpha2_is_weekend": alpha2_is_weekend,
         "alpha2_dt": alpha2_dt,
         "alpha2_rb": alpha2_rb,
-        "alpha2_week_norm": alpha2_week_norm,
         "alpha3": alpha3,
         "alpha4": alpha4,
         "alpha_ar1": alpha_ar1,
@@ -425,7 +408,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "gamma2_is_weekend": gamma2_is_weekend,
         "gamma2_dt": gamma2_dt,
         "gamma2_rb": gamma2_rb,
-        "gamma2_week_norm": gamma2_week_norm,
         "gamma3": gamma3,
         "gamma4": gamma4,
         "sigma_PV": sigma_PV,
@@ -441,7 +423,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "beta6": beta6,
         "beta2_is_weekend": beta2_is_weekend,
         "beta2_rb": beta2_rb,
-        "beta2_week_norm": beta2_week_norm,
         "beta_ar1": beta_ar1,
         "beta_q0": beta_q0,
         "beta_qE": beta_qE,
@@ -454,7 +435,6 @@ def unpack_theta(theta: np.ndarray, *, e1_known: bool) -> dict:
         "theta6": theta6,
         "theta2_is_weekend": theta2_is_weekend,
         "theta2_rb": theta2_rb,
-        "theta2_week_norm": theta2_week_norm,
         "theta_ar1": theta_ar1,
         "theta_q0": theta_q0,
         "theta_qE": theta_qE,
@@ -606,27 +586,27 @@ def log_pooled_theta(
 
     groups = [
         ("E_w AR", ["a0", "a1", "a2", "a3", "a4", "sigma_E"]),
-        ("J_week", ["b0", "b1", "b2_week_norm"]),
+        ("J_week", ["b0", "b1"]),
         ("U1", ["c0", "c1", "sigma_U1"]),
         ("U2", ["d0", "d1", "sigma_U2"]),
         ("PV hurdle occurrence", [
             "alpha0", "alpha1", "alpha2_is_weekend", "alpha2_dt", "alpha2_rb",
-            "alpha2_week_norm", "alpha3", "alpha4", "alpha_ar1",
+            "alpha3", "alpha4", "alpha_ar1",
             "alpha_q0", "alpha_qE", "alpha_qrb",
         ]),
         ("PV hurdle intensity", [
             "gamma0", "gamma1", "gamma2_is_weekend", "gamma2_dt", "gamma2_rb",
-            "gamma2_week_norm", "gamma3", "gamma4", "sigma_PV", "gamma_ar1",
+            "gamma3", "gamma4", "sigma_PV", "gamma_ar1",
             "gamma_q0", "gamma_qE", "gamma_qrb",
         ]),
         ("FW", [
             "beta0", "beta1", "beta3", "beta4", "beta5", "beta6",
-            "beta2_is_weekend", "beta2_rb", "beta2_week_norm", "beta_ar1",
+            "beta2_is_weekend", "beta2_rb", "beta_ar1",
             "beta_q0", "beta_qE", "beta_qrb",
         ]),
         ("PJ", [
             "theta0", "theta1", "theta3", "theta4", "theta5", "theta6",
-            "theta2_is_weekend", "theta2_rb", "theta2_week_norm", "theta_ar1",
+            "theta2_is_weekend", "theta2_rb", "theta_ar1",
             "theta_q0", "theta_qE", "theta_qrb",
         ]),
     ]
@@ -701,7 +681,6 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         np.log(0.5),
         np.log(pJ / (1.0 - pJ)),
         0.1,
-        0.0,  # b2_week_norm
         muU1,
         0.1,
         np.log(max(sdU1, 0.1)),
@@ -713,7 +692,6 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         0.0,
         0.0,
         0.0,
-        0.0,  # alpha2_week_norm
         0.0,
         0.0,
         0.0,  # alpha_ar1
@@ -723,7 +701,6 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         0.0,
         0.0,
         0.0,
-        0.0,  # gamma2_week_norm
         0.0,
         0.0,
         np.log(max(sdZ, 0.1)),
@@ -737,7 +714,6 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         0.0,
         0.0,
         0.0,
-        0.0,  # beta2_week_norm
         0.0,  # beta_ar1
         0.0, 0.0, 0.0,  # beta_q0, beta_qE, beta_qrb
         0.0,
@@ -748,7 +724,6 @@ def initial_theta_from_blocks(blocks, *, e1_known: bool) -> np.ndarray:
         0.0,
         0.0,
         0.0,
-        0.0,  # theta2_week_norm
         0.0,  # theta_ar1
         0.0, 0.0, 0.0,  # theta_q0, theta_qE, theta_qrb
     ]
@@ -1077,7 +1052,6 @@ def build_user_blocks(
         b["U2_open"] = prev_u2
         prev_u1 = b.get("U1", np.nan)
         prev_u2 = b.get("U2", np.nan)
-        b["week_norm"] = float(study_week_norm(b["week"]))
 
     return blocks
 
@@ -1090,21 +1064,6 @@ def _block_jw(block) -> float:
     return float(j)
 
 
-def _block_week_norm(block, *, extra=0) -> float:
-    """Fit-scale ``week_norm`` for this block; ``extra=1`` for closing J_{W+1}."""
-    wn = block.get("week_norm")
-    w = block.get("week")
-    if extra:
-        if w is None or not np.isfinite(w):
-            return 0.0
-        return float(study_week_norm(float(w) + extra))
-    if wn is not None and np.isfinite(wn):
-        return float(wn)
-    if w is not None and np.isfinite(w):
-        return float(study_week_norm(w))
-    return 0.0
-
-
 def _jw_query_shift(q0, qE, qrb, j_w, e, rb):
     """``J_w * (q0 + qE * E + qrb * rb)``. ``e`` may be a quadrature grid."""
     j = 0.0 if j_w is None or not np.isfinite(j_w) else float(j_w)
@@ -1114,7 +1073,7 @@ def _jw_query_shift(q0, qE, qrb, j_w, e, rb):
     return j * (q0 + qE * e + qrb * rb_f)
 
 
-def _pv_linpred(par, pfx, grid, row, a, y_lag, j_w, week_norm=0.0):
+def _pv_linpred(par, pfx, grid, row, a, y_lag, j_w):
     """Linear predictor for PV occurrence (``alpha``) or intensity (``gamma``)."""
     coef2 = np.array(
         [par[f"{pfx}2_is_weekend"], par[f"{pfx}2_dt"], par[f"{pfx}2_rb"]],
@@ -1124,7 +1083,6 @@ def _pv_linpred(par, pfx, grid, row, a, y_lag, j_w, week_norm=0.0):
         par[f"{pfx}0"]
         + par[f"{pfx}1"] * grid
         + float(row @ coef2)
-        + par[f"{pfx}2_week_norm"] * float(week_norm)
         + par[f"{pfx}_ar1"] * y_lag
         + a * (par[f"{pfx}3"] + par[f"{pfx}4"] * grid)
         + _jw_query_shift(
@@ -1134,50 +1092,12 @@ def _pv_linpred(par, pfx, grid, row, a, y_lag, j_w, week_norm=0.0):
     )
 
 
-def _fw_linpred(par, grid, weekend_d, bd_d, y_lag, a0, a1, j_w, week_norm=0.0):
-    return (
-        par["beta0"]
-        + par["beta1"] * grid
-        + par["beta2_is_weekend"] * weekend_d
-        + par["beta2_rb"] * bd_d
-        + par["beta2_week_norm"] * float(week_norm)
-        + par["beta_ar1"] * y_lag
-        + a0 * (par["beta3"] + par["beta4"] * grid)
-        + a1 * (par["beta5"] + par["beta6"] * grid)
-        + _jw_query_shift(
-            par["beta_q0"], par["beta_qE"], par["beta_qrb"],
-            j_w, grid, bd_d,
-        )
-    )
-
-
-def _pj_linpred(par, grid, weekend_d, bd_d, y_lag, a0, a1, j_w, week_norm=0.0):
-    return (
-        par["theta0"]
-        + par["theta1"] * grid
-        + par["theta2_is_weekend"] * weekend_d
-        + par["theta2_rb"] * bd_d
-        + par["theta2_week_norm"] * float(week_norm)
-        + par["theta_ar1"] * y_lag
-        + a0 * (par["theta3"] + par["theta4"] * grid)
-        + a1 * (par["theta5"] + par["theta6"] * grid)
-        + _jw_query_shift(
-            par["theta_q0"], par["theta_qE"], par["theta_qrb"],
-            j_w, grid, bd_d,
-        )
-    )
-
-
-def _j_eta(par, grid, week_norm=0.0):
-    return par["b0"] + par["b1"] * grid + par["b2_week_norm"] * float(week_norm)
-
-
-def _ju_loglik_on_grid(grid, j, u1, u2, par, week_norm=0.0) -> np.ndarray:
+def _ju_loglik_on_grid(grid, j, u1, u2, par) -> np.ndarray:
     """log p(J, U | E = grid). Missing ``j`` contributes 0."""
     ll = np.zeros_like(grid)
     if j is None or not np.isfinite(j):
         return ll
-    eta = _j_eta(par, grid, week_norm)
+    eta = par["b0"] + par["b1"] * grid
     ll += bernoulli_logpmf(j, eta)
     if int(round(float(j))) != 1:
         return ll
@@ -1204,7 +1124,6 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
         block.get("U1_open", np.nan),
         block.get("U2_open", np.nan),
         par,
-        week_norm=_block_week_norm(block),
     )
 
     pv_y = block["pv_y"]
@@ -1228,7 +1147,6 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
         )
         eta = _pv_linpred(
             par, "alpha", grid, row, a, y_lag, _block_jw(block),
-            week_norm=_block_week_norm(block),
         )
         ll += bernoulli_logpmf(y, eta)
         if int(round(float(y))) == 1 and pv_z is not None and j < len(pv_z):
@@ -1236,7 +1154,6 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             if np.isfinite(z):
                 mu_z = _pv_linpred(
                     par, "gamma", grid, row, a, y_lag, _block_jw(block),
-                    week_norm=_block_week_norm(block),
                 )
                 ll += normal_logpdf(z, mu_z, par["sigma_PV"])
 
@@ -1260,9 +1177,18 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             if fl is not None and len(fl) > d and not np.isnan(fl[d])
             else 0.0
         )
-        eta = _fw_linpred(
-            par, grid, weekend_d, bd_d, y_lag, a0, a1, _block_jw(block),
-            week_norm=_block_week_norm(block),
+        eta = (
+            par["beta0"]
+            + par["beta1"] * grid
+            + par["beta2_is_weekend"] * weekend_d
+            + par["beta2_rb"] * bd_d
+            + par["beta_ar1"] * y_lag
+            + a0 * (par["beta3"] + par["beta4"] * grid)
+            + a1 * (par["beta5"] + par["beta6"] * grid)
+            + _jw_query_shift(
+                par["beta_q0"], par["beta_qE"], par["beta_qrb"],
+                _block_jw(block), grid, bd_d,
+            )
         )
         ll += bernoulli_logpmf(y, eta)
 
@@ -1286,9 +1212,18 @@ def _week_loglik_components_on_grid(grid: np.ndarray, block: dict, par: dict) ->
             if pl is not None and len(pl) > d and not np.isnan(pl[d])
             else 0.0
         )
-        eta = _pj_linpred(
-            par, grid, weekend_d, bd_d, y_lag, a0, a1, _block_jw(block),
-            week_norm=_block_week_norm(block),
+        eta = (
+            par["theta0"]
+            + par["theta1"] * grid
+            + par["theta2_is_weekend"] * weekend_d
+            + par["theta2_rb"] * bd_d
+            + par["theta_ar1"] * y_lag
+            + a0 * (par["theta3"] + par["theta4"] * grid)
+            + a1 * (par["theta5"] + par["theta6"] * grid)
+            + _jw_query_shift(
+                par["theta_q0"], par["theta_qE"], par["theta_qrb"],
+                _block_jw(block), grid, bd_d,
+            )
         )
         ll += bernoulli_logpmf(y, eta)
 
@@ -1364,12 +1299,10 @@ def penalized_json_export(
         "theta_penalized_J": [
             r3(par["b0"]),
             r3(par["b1"]),
-            r3(par["b2_week_norm"]),
         ],
         "theta_penalized_J_names": [
             "b0",
             "b1_Ew",
-            "b2_week_norm",
         ],
 
         "theta_penalized_U1": [
@@ -1400,7 +1333,6 @@ def penalized_json_export(
             r3(par["alpha2_is_weekend"]),
             r3(par["alpha2_dt"]),
             r3(par["alpha2_rb"]),
-            r3(par["alpha2_week_norm"]),
             r3(par["alpha_ar1"]),
             r3(par["alpha3"]),
             r3(par["alpha4"]),
@@ -1412,7 +1344,6 @@ def penalized_json_export(
             r3(par["gamma2_is_weekend"]),
             r3(par["gamma2_dt"]),
             r3(par["gamma2_rb"]),
-            r3(par["gamma2_week_norm"]),
             r3(par["gamma_ar1"]),
             r3(par["gamma3"]),
             r3(par["gamma4"]),
@@ -1427,7 +1358,6 @@ def penalized_json_export(
             "alpha2_is_weekend",
             "alpha2_decision_time",
             "alpha2_recent_burden",
-            "alpha2_week_norm",
             "alpha_ar1_hourly_pageview_lag1",
             "alpha3_action",
             "alpha4_action_by_Ew",
@@ -1437,7 +1367,6 @@ def penalized_json_export(
             "gamma2_is_weekend",
             "gamma2_decision_time",
             "gamma2_recent_burden",
-            "gamma2_week_norm",
             "gamma_ar1_hourly_pageview_lag1",
             "gamma3_action",
             "gamma4_action_by_Ew",
@@ -1450,7 +1379,6 @@ def penalized_json_export(
             r3(par["beta1"]),
             r3(par["beta2_is_weekend"]),
             r3(par["beta2_rb"]),
-            r3(par["beta2_week_norm"]),
             r3(par["beta_ar1"]),
             r3(par["beta3"]),
             r3(par["beta4"]),
@@ -1465,7 +1393,6 @@ def penalized_json_export(
             "beta1_Ew",
             "beta2_is_weekend",
             "beta2_recent_burden",
-            "beta2_week_norm",
             "beta_ar1_morning_wearing",
             "beta3_A0_morning",
             "beta4_A0_morning_by_Ew",
@@ -1479,7 +1406,6 @@ def penalized_json_export(
             r3(par["theta1"]),
             r3(par["theta2_is_weekend"]),
             r3(par["theta2_rb"]),
-            r3(par["theta2_week_norm"]),
             r3(par["theta_ar1"]),
             r3(par["theta3"]),
             r3(par["theta4"]),
@@ -1494,7 +1420,6 @@ def penalized_json_export(
             "theta1_Ew",
             "theta2_is_weekend",
             "theta2_recent_burden",
-            "theta2_week_norm",
             "theta_ar1_daily_present_yesterday",
             "theta3_A0_morning",
             "theta4_A0_morning_by_Ew",
@@ -1540,7 +1465,7 @@ def penalized_json_export(
         e = float(E[t]) if t < len(E) and np.isfinite(E[t]) else 0.0
 
         # Weekly J_w: week_present_lastweek, one entry per week
-        eta_J = _j_eta(par, e, _block_week_norm(block))
+        eta_J = par["b0"] + par["b1"] * e
         ph_J = float(_sigm(eta_J))
 
         j_w = block.get("J_lag", np.nan)
@@ -1599,10 +1524,7 @@ def penalized_json_export(
                 else 0.0
             )
             eta = float(
-                _pv_linpred(
-                    par, "alpha", e, row, A, y_lag, _block_jw(block),
-                    week_norm=_block_week_norm(block),
-                )
+                _pv_linpred(par, "alpha", e, row, A, y_lag, _block_jw(block))
             )
             pPV.append(r3(float(_sigm(eta))))
             occ = (not np.isnan(y)) and int(round(float(y))) == 1
@@ -1613,10 +1535,7 @@ def penalized_json_export(
             )
             if occ and np.isfinite(z):
                 mu_z = float(
-                    _pv_linpred(
-                        par, "gamma", e, row, A, y_lag, _block_jw(block),
-                        week_norm=_block_week_norm(block),
-                    )
+                    _pv_linpred(par, "gamma", e, row, A, y_lag, _block_jw(block))
                 )
                 rPV.append(r3(z - mu_z))
             else:
@@ -1669,9 +1588,18 @@ def penalized_json_export(
                 else 0.0
             )
 
-            eta = _fw_linpred(
-                par, e, weekend_d, burden_d, lag_d, A0, A1, _block_jw(block),
-                week_norm=_block_week_norm(block),
+            eta = (
+                par["beta0"]
+                + par["beta1"] * e
+                + par["beta2_is_weekend"] * weekend_d
+                + par["beta2_rb"] * burden_d
+                + par["beta_ar1"] * lag_d
+                + A0 * (par["beta3"] + par["beta4"] * e)
+                + A1 * (par["beta5"] + par["beta6"] * e)
+                + _jw_query_shift(
+                    par["beta_q0"], par["beta_qE"], par["beta_qrb"],
+                    _block_jw(block), e, burden_d,
+                )
             )
 
             ph = float(_sigm(eta))
@@ -1729,9 +1657,18 @@ def penalized_json_export(
                 else 0.0
             )
 
-            eta = _pj_linpred(
-                par, e, weekend_d, burden_d, lag_d, A0, A1, _block_jw(block),
-                week_norm=_block_week_norm(block),
+            eta = (
+                par["theta0"]
+                + par["theta1"] * e
+                + par["theta2_is_weekend"] * weekend_d
+                + par["theta2_rb"] * burden_d
+                + par["theta_ar1"] * lag_d
+                + A0 * (par["theta3"] + par["theta4"] * e)
+                + A1 * (par["theta5"] + par["theta6"] * e)
+                + _jw_query_shift(
+                    par["theta_q0"], par["theta_qE"], par["theta_qrb"],
+                    _block_jw(block), e, burden_d,
+                )
             )
 
             ph = float(_sigm(eta))
@@ -1748,7 +1685,7 @@ def penalized_json_export(
         e_term = float(e_term) if e_term is not None and np.isfinite(e_term) else 0.0
         last = blocks[-1]
         j_close = last.get("J_week", np.nan)
-        eta_J = _j_eta(par, e_term, _block_week_norm(last, extra=1))
+        eta_J = par["b0"] + par["b1"] * e_term
         ph_J = float(_sigm(eta_J))
         pJ.append(r3(ph_J))
         rJ.append(
@@ -1989,7 +1926,6 @@ def _score_closing_sunday(
         return loglik, terminal_mean
     log_ell = _ju_loglik_on_grid(
         grid, j, last.get("U1", np.nan), last.get("U2", np.nan), par,
-        week_norm=_block_week_norm(last, extra=1),
     )
     m = np.max(log_ell)
     num = np.exp(log_ell - m) * q
@@ -3183,12 +3119,12 @@ def plot_quadrature_diagnostics(
     fig_s.tight_layout()
     _maybe_save_close(fig_s, "params_group_sigma.png")
 
-    # --- b_0, b_1, b_2 (J_w = week_present_lastweek) ---
-    fig_b, axes_b = plt.subplots(1, 3, figsize=(14, 3.2), squeeze=False)
+    # --- b_0, b_1 (J_w = week_present_lastweek) ---
+    fig_b, axes_b = plt.subplots(1, 2, figsize=(10, 3.2), squeeze=False)
     _bar_users_one_series(
         axes_b[0][0],
         "Estimate",
-        r"$b_0$ — $\mathrm{logit}(p_w)= b_0 + b_1 E_w + b_2 \mathrm{week\_norm}$",
+        r"$b_0$ — $\mathrm{logit}(p_w)= b_0 + b_1 E_w$",
         [float(filtered_states[u]["params"]["b0"]) for u in _users],
     )
     _bar_users_one_series(
@@ -3196,12 +3132,6 @@ def plot_quadrature_diagnostics(
         "Estimate",
         r"$b_1$ — coefficient on $E_w$ for $J_w^{\mathrm{week}}$",
         [float(filtered_states[u]["params"]["b1"]) for u in _users],
-    )
-    _bar_users_one_series(
-        axes_b[0][2],
-        "Estimate",
-        r"$b_2$ — $\mathrm{week\_norm}$",
-        [float(filtered_states[u]["params"]["b2_week_norm"]) for u in _users],
     )
     fig_b.suptitle(r"Bernoulli emission ($J_w^{\mathrm{week}}$)", fontsize=11, y=1.05)
     fig_b.tight_layout()

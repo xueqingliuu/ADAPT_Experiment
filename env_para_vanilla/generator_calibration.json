@@ -3,7 +3,7 @@
   "scope": "vanilla simulator revisions 1, 3, and 4 (no engagement-time patch)",
   "fourSC_support_aware_lag": {
     "enabled": true,
-    "reference_lag_coefficient": -0.00024367389818792497,
+    "reference_lag_coefficient": 0.0001252700542141158,
     "reference_definition": "Mean operational fourSC_lag1 coefficient among the 25 vanilla participants with at least 3 observed adjacent-slot FourSC pairs.",
     "preserve_fit_time_conditional_mean": true,
     "n_supported": 25,
@@ -12,21 +12,21 @@
       "22": {
         "expected_observed_adjacent_pairs": 0,
         "expected_finite_lag_at_observed_rows": 0,
-        "expected_operational_lag_coefficient": 0.0924120542747107,
+        "expected_operational_lag_coefficient": 0.09836872975402643,
         "expected_fit_time_lag_constant": -0.2337785104911291,
         "validation_tolerance": 1e-08
       },
       "269": {
         "expected_observed_adjacent_pairs": 0,
         "expected_finite_lag_at_observed_rows": 0,
-        "expected_operational_lag_coefficient": 0.7667683783704804,
+        "expected_operational_lag_coefficient": 0.8085905705236586,
         "expected_fit_time_lag_constant": -2.3760172732804783,
         "validation_tolerance": 1e-08
       },
       "277": {
         "expected_observed_adjacent_pairs": 0,
         "expected_finite_lag_at_observed_rows": 0,
-        "expected_operational_lag_coefficient": 0.9090646355183686,
+        "expected_operational_lag_coefficient": 0.9390285293069613,
         "expected_fit_time_lag_constant": -3.904533295012841,
         "validation_tolerance": 1e-08
       }
@@ -38,10 +38,10 @@
     "from_decision_slot": 0,
     "to_decision_slot": 1,
     "coupling_rho": 0.3,
-    "target_empirical_residual_correlation": 0.30006417453822376,
+    "target_empirical_residual_correlation": 0.2997051981029726,
     "target_bootstrap_95_interval": [
-      0.25477492273547436,
-      0.3487741122372223
+      0.2541842615739982,
+      0.34854565066436854
     ],
     "n_pairs": 1709,
     "transition_scope": "same calendar day AM FourSC to PM prior-2-hour steps only",
@@ -56,12 +56,12 @@
     "action_value": 1.0,
     "parameters_by_decision_slot": {
       "0": {
-        "intercept_shift": -0.01945103,
-        "interaction_residual_coefficient": 3.82893082
+        "intercept_shift": 0.03729253,
+        "interaction_residual_coefficient": 3.90127712
       },
       "1": {
-        "intercept_shift": -0.23053414,
-        "interaction_residual_coefficient": 2.28448954
+        "intercept_shift": -0.16284309,
+        "interaction_residual_coefficient": 2.32272914
       }
     },
     "probability_epsilon": 1e-10,
@@ -70,6 +70,6 @@
       "PM_delivered_slots": 1069,
       "participants": 28
     },
-    "estimation_note": "Slot-specific coefficients are delivered-slot offset-logistic maximum-likelihood estimates. The fixed offset is the script-4 page-view occurrence logit (including week_norm); the extra predictor is observed interaction minus the fitted interaction probability. No study-time engagement calibration is applied."
+    "estimation_note": "Slot-specific coefficients are delivered-slot offset-logistic maximum-likelihood estimates. The fixed offset is the script-4 page-view occurrence logit (no week_norm in PV/FW/PJ/J); the extra predictor is observed interaction minus the fitted interaction probability. No study-time engagement calibration is applied."
   }
 }

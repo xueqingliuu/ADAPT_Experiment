@@ -35,7 +35,7 @@ RL reward shaping (legacy JSON) -> mu_0_reward, Sigma_0_reward, sigma2_reward
 RL redistribution, Stage 1      -> reward_redistribution.daily_mediators
    AA/FW/PJ daily; slot SC/PV on ``build_foursc_stage1_phi`` (A×[1, t])
 RL redistribution, Stage 2 V4   -> reward_redistribution.redistribution.v4
-   20-d ψ: realized next_me + AA/FW/PJ/SC hats (no next_my / PV_hat).
+   Hats-only 20-d ψ (no next_my / next_me).
    y = Y + γ̄ E_{w+1} − E_w. Used by V6 and V6+leftover.
 
 RL Q (no TD modify, weekly CAE)
@@ -1273,8 +1273,8 @@ def fit_reward_redistribution_priors(
     the two action-time features, including ``A×slot_pm`` so AM and PM
     sends can have different intercepts. Stage 1b fits slot-level fourSC
     and PV on controls + ``A·(β0 + β_t t)`` (12 rows/week). Stage 2 then
-    uses realized slot PV plus predicted AA/FW/PJ/SC shares in its
-    weekly summed ψ. Pooled Stage-2 rows use pooled Stage-1 coefficients;
+    uses the predicted shares (AA/FW/PJ/SC/PV) in its weekly summed
+    hats-only ψ. Pooled Stage-2 rows use pooled Stage-1 coefficients;
     per-user Stage-2 rows use that user's Stage-1 coefficients.
     """
     tensors = [
@@ -1335,8 +1335,8 @@ def fit_reward_redistribution_priors(
         "v4": {
             "mu_0": mu, "Sigma_0": Sigma, "sigma2": sigma2,
             "psi_has_next_my": False,
-            "psi_has_next_me": True,
-            "psi_has_pv_hat": False,
+            "psi_has_next_me": False,
+            "psi_has_pv_hat": True,
         }
     }
     return {"daily_mediators": daily, "redistribution": stage2}
@@ -2482,8 +2482,8 @@ def load_estimated_priors(path: Path = OUTPUT_PATH) -> Dict[str, Any]:
                    "Sigma_0": arr(prior["Sigma_0"]),
                    "sigma2": float(prior["sigma2"]),
                    "psi_has_next_my": bool(prior.get("psi_has_next_my", False)),
-                   "psi_has_next_me": bool(prior.get("psi_has_next_me", True)),
-                   "psi_has_pv_hat": bool(prior.get("psi_has_pv_hat", False))}
+                   "psi_has_next_me": bool(prior.get("psi_has_next_me", False)),
+                   "psi_has_pv_hat": bool(prior.get("psi_has_pv_hat", True))}
             for name, prior in redistribution["redistribution"].items()
         }
 

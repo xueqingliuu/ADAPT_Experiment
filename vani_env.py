@@ -19,12 +19,12 @@ Page views are a two-part hurdle whose coefficients come from script 4
 (``theta_penalized_PV``): logistic ``P(count>0)`` and, given a positive
 count, a Gaussian on ``log(x)`` then z-scored among positives. Count 0
 sits at ``log(0.5)`` on that axis. Both parts include ``E_w``,
-weekend, slot, burden, ``week_norm``, lag1, ``A``, ``A×E_w``, and the opening ``J_w``
-query (``week_present_lastweek``) on the linear predictor. ``I_w`` is not in this model. STE-tuned folders
-carry edited action slopes in JSON, so they enter both parts directly.
-FW/PJ/J include the same ``week_norm`` as CAE: fit on the 11-week
-scale ``(w-6)/5``, then stretch onto ``[-1, 1]`` over the simulation
-horizon (``EnvConfig.nweek``).
+weekend, slot, burden, lag1, ``A``, ``A×E_w``, and the opening ``J_w``
+query (``week_present_lastweek``) on the linear predictor. ``I_w`` is not
+in this model. Pre-``week_norm`` JSON is zero-padded so those emissions
+do not get a study-week slope; CAE still uses its own ``week_norm``.
+STE-tuned folders carry edited action slopes in JSON, so they enter
+both hurdle parts directly.
 
 Optional post-fit generator calibrations are read from
 ``<params_dir>/generator_calibration.json`` (written by
