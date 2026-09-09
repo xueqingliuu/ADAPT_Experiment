@@ -47,3 +47,10 @@ df_fit_11week.csv
 **/df_fit_11week.csv
 df_fit.csv
 df_merged.csv
+
+# Local notes and exploratory notebooks (kept on disk, not published)
+CODE_REVIEW*.md
+rl_failure_diagnosis.md
+joint_model_subsection.tex
+docs/
+ipynb/
