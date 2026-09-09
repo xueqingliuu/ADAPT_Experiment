@@ -1,0 +1,28 @@
+# Diagnostic outputs are derived from private MRT data and must not be shared.
+results/
+output/
+private_results/
+
+# Data-bearing and rendered artifacts.
+*.csv
+*.tsv
+*.json
+*.npz
+*.npy
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.rds
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.zip
+
+# Local environments/caches.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
