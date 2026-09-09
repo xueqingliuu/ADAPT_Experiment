@@ -114,12 +114,12 @@ from vani_env import (
 PROJECT_ROOT = Path(
     os.getenv("ADAPR_PROJECT_ROOT", str(Path(__file__).resolve().parent))
 ).expanduser().resolve()
-COMBINED_DIR = Path(
-    os.getenv(
-        "ADAPR_COMBINED_DIR",
-        "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing",
+_combined = os.getenv("ADAPR_COMBINED_DIR", "").strip()
+if not _combined:
+    raise SystemExit(
+        "Set ADAPR_COMBINED_DIR to the folder with extracted MRT tables."
     )
-).expanduser().resolve()
+COMBINED_DIR = Path(_combined).expanduser().resolve()
 # Priors are written into WORK_DIR. The design still comes from that
 # folder's ``df_fit_11week.csv`` (RCT panel). Tuned STE folders only copy
 # that CSV — they do not contain κ-scaled trajectories — so STE-folder
@@ -235,7 +235,6 @@ def load_df_fit(path: Optional[Path] = None) -> pd.DataFrame:
     df = _filter_users_with_cae_obs(_week_fix_and_filter(pd.read_csv(p)))
     assert_complete_week_slots(df)
     return df
-
 
 
 def _fill_nan(x: np.ndarray, default: float = 0.0) -> np.ndarray:

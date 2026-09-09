@@ -35,15 +35,16 @@ from sklearn.linear_model import (
 
 from vani_env import assert_complete_week_slots, cae_mediator_ewma_rows
 
-# %%
-# read data
-PROJECT_ROOT = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed")
+PROJECT_ROOT = Path(
+    os.environ.get("ADAPR_PROJECT_ROOT", Path(__file__).resolve().parent)
+).expanduser().resolve()
 COMBINED_DIR = Path(
-    os.environ.get(
-        "ADAPR_COMBINED_DIR",
-        "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing",
+    os.environ.get("ADAPR_COMBINED_DIR", "")
+).expanduser()
+if not os.environ.get("ADAPR_COMBINED_DIR"):
+    raise SystemExit(
+        "Set ADAPR_COMBINED_DIR to the folder with extracted MRT tables."
     )
-)
 WORK_DIR = Path(os.environ.get("ADAPR_VANILLA_ENV_DIR", PROJECT_ROOT / "env_para_vanilla"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -87,9 +88,8 @@ df_fit["week_norm"] = (
     df_fit["week"] - (1 + VANILLA_WEEK_RANGE) / 2
 ) / ((VANILLA_WEEK_RANGE - 1) / 2)
 assert_complete_week_slots(df_fit)
-# %%
-# import warnings
-# from sklearn.exceptions import UndefinedMetricWarning
+
+
 def json_float(x, digits=3):
     """Round finite values; convert NaN/inf/None to JSON null."""
     if x is None:
@@ -647,7 +647,6 @@ THETA_WS_INTERACTION_NAMES = [
 ]
 
 
-
 THETA_FOURSC_NAMES = [
     "intercept",
     "fourSC_lag1",
@@ -983,28 +982,17 @@ for i, userid in enumerate(userid_all):
     dat_user = dat_user.sort_values(['Date', 'DecisionTime'], na_position='last').reset_index(drop=True)
     assert_complete_week_slots(dat_user)
 
-    # fill in initial values (last week's affective association, and perceived utility)
-    # set the first 0-13 days to 0
-    # if len(dat_user) > 0:
-    #     dat_user.loc[dat_user.index[:14], 'week_present_lastweek'] = 0
-    #     dat_user.loc[dat_user.index[:14], 'CAE_avg_lastweek_norm'] = 0
-    #     dat_user.loc[dat_user.index[:14], 'perceived_utility_lastweek_norm'] = 0
-    #     dat_user.loc[dat_user.index[:2], 'view_status_lastdecision'] = 0
-
     # extract the response
     # M^Y_{w,d,t}
     fourSC = dat_user['4hour_step_norm'].to_numpy()
     fourSC_lag1 = dat_user['FourSC_lag1'].to_numpy()
 
-
     # M^Y_{w,d}
     anticipated_affect = dat_user['anticipated_affect_norm'].to_numpy()
     anticipated_affect_yesterday = dat_user['anticipated_affect_yesterday_norm'].to_numpy()
-    # anticipated_affect_lag1 = dat_user['anticipated_affect_lag1'].to_numpy()
 
     # Y_w: CAE
     CAE_avg = dat_user['CAE_avg_norm'].to_numpy()
-    # print(userid, CAE_avg_norm.shape)
     CAE_avg_lastweek = dat_user['CAE_avg_lastweek_norm'].to_numpy()
     # tilde Y_w
     CAE_short_avg = dat_user['CAE_short_avg_norm'].to_numpy()
@@ -1053,17 +1041,13 @@ for i, userid in enumerate(userid_all):
     week_present_lastweek = dat_user['week_present_lastweek'].to_numpy()
     
     WalkingSuggestion = dat_user['WalkingSuggestion'].to_numpy()
-    # WalkingSuggestion_lag1 = dat_user['WalkingSuggestion_lag1'].to_numpy()
-    # planning_prompt = dat_user['planning_prompt'].to_numpy()
-    # yesterday_planning_prompt = dat_user['yesterday_planning_prompt'].to_numpy()
 
     is_weekend = dat_user['is_weekend'].to_numpy(dtype=float)
     day = dat_user['day_norm'].to_numpy()
-    week = dat_user['week_norm'].to_numpy() #TODO: check this
+    week = dat_user['week_norm'].to_numpy()
     decision_time = dat_user['DecisionTime'].to_numpy()
     
     
-
     # fill in missing values (NAN) with mean for predictors except for FourSC and Intercept
     fourSC_lag1 = fill_nan_with_mean(fourSC_lag1)
     yesterday_step_count = fill_nan_with_mean(yesterday_step_count)
@@ -1080,7 +1064,6 @@ for i, userid in enumerate(userid_all):
 
     # Delivered-only lag; NaN when the prior 14 slots had no sends.
     Interacted_7d_walk = fill_nan_with_mean(Interacted_7d_walk)
-    # anticipated_affect = np.where(np.isnan(anticipated_affect), np.nanmean(anticipated_affect), anticipated_affect)
     anticipated_affect_yesterday = fill_nan_with_mean(anticipated_affect_yesterday)
     
     CAE_avg_lastweek = fill_nan_with_mean(CAE_avg_lastweek)
@@ -1382,7 +1365,6 @@ for i, userid in enumerate(userid_all):
     #### Model 5: Anticipated affect model ####
     # Daily outcome: one row per calendar day (morning row). Predictors from that row except treatment,
     # which enters as both ws_morning_day and ws_afternoon_day for that day.
-    # planning_prompt_filled = np.where(np.isnan(planning_prompt), 0, planning_prompt)
     _am = idx_morning
     anticipated_affect_cond_day = np.stack([
         Intercept[_am],
@@ -1498,89 +1480,6 @@ for i, userid in enumerate(userid_all):
 
     print(f"The full random-coefficient Bayesian CAE fit is ready for user {userid}")
 
-
-
-    # change the length of the condition matrix
-    # K = 14
-    # CAE_avg_sw = CAE_avg.reshape(-1, K)[:, 0]
-    # # perceived_utility_norm_sw = perceived_utility_norm.reshape(-1, K)[:, 0]
-    # CAE_avg_lastweek_sw = CAE_avg_lastweek.reshape(-1, K)[:, 0]
-    # week_sw = week.reshape(-1, K)[:, 0]
-    # Intercept_sw = np.ones(len(week_sw))
-    
-    # # FourSC: 14 decision slots/week. Anticipated affect is daily (repeated across 2 decisions/day) → 7 columns/week
-    # foursc_wk = fourSC.reshape(-1, K)
-    # _mu_foursc = safe_nanmean(fourSC)
-    # _mu_antic = safe_nanmean(anticipated_affect)
-    # foursc_wk = np.where(np.isnan(foursc_wk), _mu_foursc, foursc_wk)
-    # _af = anticipated_affect.reshape(-1, K)
-    # _af = np.where(np.isnan(_af), _mu_antic, _af)
-    # antic_wk = _af.reshape(-1, 7, 2).mean(axis=2)
-    # antic_wk = np.where(np.isnan(antic_wk), _mu_antic, antic_wk)
-
-    # CAE_cond = np.hstack([
-    #     Intercept_sw[:, None],
-    #     CAE_avg_lastweek_sw[:, None],
-    #     week_sw[:, None],
-    #     foursc_wk,
-    #     antic_wk
-    # ])
-
-    # ncv_w = 2
-    
-    # idx_obs_CAE = ~np.isnan(CAE_avg_sw)
-    # CAE_cond_obs = CAE_cond[idx_obs_CAE, :]
-    # CAE_avg_sw_obs = CAE_avg_sw[idx_obs_CAE]
-
-    # # print(len(AA_avg_norm_sw_obs))
-
-    # has_cae_obs = CAE_avg_sw_obs.size > 0
-    # if has_cae_obs and CAE_avg_sw_obs.size >= 2 and np.var(CAE_avg_sw_obs) > 0:
-    #     model_CAE = RidgeCV(
-    #         alphas=alpha_l2_list,
-    #         fit_intercept=False,
-    #         cv=None,
-    #     )
-    #     model_CAE.fit(CAE_cond_obs, CAE_avg_sw_obs)
-
-    #     alpha_CAE_l2 = model_CAE.alpha_
-    #     theta_CAE_mean = model_CAE.coef_
-    #     pred_CAE = model_CAE.predict(CAE_cond)
-
-    #     resid_obs_CAE = CAE_avg_sw_obs - pred_CAE[idx_obs_CAE]
-    #     resid_CAE = np.full_like(CAE_avg_sw, np.nan, dtype=float)
-    #     resid_CAE[idx_obs_CAE] = resid_obs_CAE
-    #     sigma2_CAE_mean = np.var(resid_obs_CAE)
-
-    # elif has_cae_obs:
-    #     print(
-    #         f"CAE (Y_w) variance is 0 or fewer than 2 observations for user {userid}; "
-    #         "using constant fallback"
-    #     )
-    #     const = float(safe_nanmean(CAE_avg_sw_obs, default=0.0))
-    #     alpha_CAE_l2 = float(alpha_l2_list[0])
-    #     theta_CAE_mean = np.zeros(CAE_cond.shape[1], dtype=float)
-    #     theta_CAE_mean[0] = const
-    #     pred_CAE = np.full(len(CAE_avg_sw), const, dtype=float)
-    #     resid_CAE = np.full_like(CAE_avg_sw, np.nan, dtype=float)
-    #     resid_CAE[idx_obs_CAE] = 0.0
-    #     sigma2_CAE_mean = 0.0
-
-    # else:
-    #     print(f"no observed CAE (Y_w) values for user {userid}; using zero fallback")
-
-    #     alpha_CAE_l2 = 1.0
-    #     theta_CAE_mean = np.zeros(CAE_cond.shape[1], dtype=float)
-    #     pred_CAE = np.zeros(len(CAE_avg_sw), dtype=float)
-
-    #     resid_CAE = np.full_like(CAE_avg_sw, np.nan, dtype=float)
-    #     sigma2_CAE_mean = 0.0
-    
-    
-    
-    # print(f"The fit of CAE is good for user {userid}")
-
-
     #### Model 13: CAE short average model #### 
 
     CAE_short_avg_sw = CAE_short_avg.reshape(-1, K)[:, 0]
@@ -1627,83 +1526,6 @@ for i, userid in enumerate(userid_all):
     )
 
     print(f"The full random-coefficient Bayesian CAE_short_avg fit is ready for user {userid}")
-
-    # if j = 1, then the emission is 3 questions from CAE
-    # CAE_short_avg_sw = CAE_short_avg.reshape(-1, K)[:, 0]
-    # CAE_avg_sw_filled = fill_nan_with_mean(CAE_avg_sw)
-    # idx_obs_CAE_short_avg = ~np.isnan(CAE_short_avg_sw)
-    # CAE_short_avg_sw_obs = CAE_short_avg_sw[idx_obs_CAE_short_avg]
-    
-    # CAE_short_avg_cond = np.stack([
-    #     Intercept_sw,
-    #     CAE_avg_sw_filled,
-    # ], axis=1)
-    
-    # idx_obs_CAE_short_avg = ~np.isnan(CAE_short_avg_sw)
-    # CAE_short_avg_cond_obs = CAE_short_avg_cond[idx_obs_CAE_short_avg, :]
-    # CAE_short_avg_sw_obs = CAE_short_avg_sw[idx_obs_CAE_short_avg]
-
-    # if CAE_short_avg_sw_obs.size >= 2:
-    #     # Use Generalized Cross-Validation; no explicit folds.
-    #     model_CAE_short_avg = RidgeCV(
-    #         alphas=alpha_l2_list,
-    #         fit_intercept=False,
-    #         cv=None,
-    #     )
-    #     model_CAE_short_avg.fit(CAE_short_avg_cond_obs, CAE_short_avg_sw_obs)
-
-    #     alpha_CAE_short_avg_l2 = model_CAE_short_avg.alpha_
-    #     theta_CAE_short_avg_mean = model_CAE_short_avg.coef_
-    #     pred_CAE_short_avg = model_CAE_short_avg.predict(CAE_short_avg_cond)
-
-    #     resid_obs_CAE_short_avg = (
-    #         CAE_short_avg_sw_obs
-    #         - pred_CAE_short_avg[idx_obs_CAE_short_avg]
-    #     )
-
-    #     resid_CAE_short_avg = np.full_like(CAE_short_avg_sw, np.nan, dtype=float)
-    #     resid_CAE_short_avg[idx_obs_CAE_short_avg] = resid_obs_CAE_short_avg
-
-    #     sigma2_CAE_short_avg_mean = np.var(resid_obs_CAE_short_avg)
-
-    # elif CAE_short_avg_sw_obs.size == 1:
-    #     print(f"fallback to fixed alpha for CAE_short_avg model for user {userid}")
-
-    #     alpha_CAE_short_avg_l2 = 1.0
-
-    #     model_CAE_short_avg = Ridge(
-    #         alpha=alpha_CAE_short_avg_l2,
-    #         fit_intercept=False,
-    #     )
-    #     model_CAE_short_avg.fit(CAE_short_avg_cond_obs, CAE_short_avg_sw_obs)
-
-    #     theta_CAE_short_avg_mean = model_CAE_short_avg.coef_
-    #     pred_CAE_short_avg = model_CAE_short_avg.predict(CAE_short_avg_cond)
-
-    #     resid_obs_CAE_short_avg = (
-    #         CAE_short_avg_sw_obs
-    #         - pred_CAE_short_avg[idx_obs_CAE_short_avg]
-    #     )
-
-    #     resid_CAE_short_avg = np.full_like(CAE_short_avg_sw, np.nan, dtype=float)
-    #     resid_CAE_short_avg[idx_obs_CAE_short_avg] = resid_obs_CAE_short_avg
-
-    #     sigma2_CAE_short_avg_mean = np.var(resid_obs_CAE_short_avg)
-
-    # else:
-    #     print(f"no observed CAE_short_avg values for user {userid}; using zero fallback")
-
-    #     alpha_CAE_short_avg_l2 = float(alpha_l2_list[0])
-
-    #     theta_CAE_short_avg_mean = np.zeros(CAE_short_avg_cond.shape[1], dtype=float)
-
-    #     pred_CAE_short_avg = np.zeros(len(CAE_short_avg_sw), dtype=float)
-
-    #     resid_CAE_short_avg = np.full_like(CAE_short_avg_sw, np.nan, dtype=float)
-
-    #     sigma2_CAE_short_avg_mean = 0.0
-    
-    # print(f"The fit of CAE_short_avg is good for user {userid}")
 
     #### Store the parameters and residuals #### 
  
@@ -1783,7 +1605,6 @@ for i, userid in enumerate(userid_all):
     merge_json_file(p_pred_path, predicted)
 
 
-    
 np.savetxt(file_user_ids, userid_all, fmt='%d')
 
 # save df_fit.csv with the predicted columns
@@ -1804,5 +1625,3 @@ with open(work_folder / "population_residuals.json", "w", encoding="utf-8") as f
     json.dump(population_residuals_out, f, allow_nan=False)
 for key, vals in population_resid_pools.items():
     print(f"{key}: n={len(vals)}")
-
-# %%

@@ -1,4 +1,3 @@
-# %%
 from __future__ import annotations
 
 import csv
@@ -12,11 +11,15 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-# %%
 # ---------- CONFIG ----------
-BASE_DIR = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/")   # e.g. ".../exports"
+_raw_root = os.environ.get("ADAPR_RAW_DIR", "").strip()
+if not _raw_root:
+    raise SystemExit(
+        "Set ADAPR_RAW_DIR to the ADAPT_MRT folder that contains rawdata/."
+    )
+BASE_DIR = Path(_raw_root).expanduser().resolve()
 ROOT_DIR = BASE_DIR / "rawdata"
-OUT_DIR = BASE_DIR / "Xueqing"   # where combined JSON/CSV will go
+OUT_DIR = BASE_DIR / "Xueqing"
 
 DATE_START = "2024-11-01"
 DATE_END = "2026-07-26"
@@ -203,7 +206,6 @@ def combine_dataset_streaming(dataset: str, paths: list[Path]) -> None:
     print(f"[OK] {dataset}: {written} records -> {out_json.name}, {out_csv.name}")
 
 
-# %%
 PATTERN = "FitbitIntradayCombined_*.json"
 
 
@@ -250,7 +252,6 @@ def list_types_from_one_file() -> set[str]:
 # --- Run ---
 # types = list_types_from_one_file()
 
-# %%
 TARGET_TYPES = {
     "activities-steps": "filtered_activities-steps.json",
     # "hrv": "filtered_hrv.json",
@@ -552,7 +553,6 @@ def extract_types_per_date_folder() -> None:
             print(f"  {t}: {counts.get(t, 0)} rows -> {TARGET_TYPES[t]}")
 
 
-# %%
 # ---------- MAIN ----------
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -586,7 +586,6 @@ def main() -> None:
         combine_dataset_streaming(dataset, sorted(paths))
 
 
-# %%
 # Extract data from ProjectDeviceData_clean
 # timeZone, phase, participantidentifier, utcOffset, Value-timestamp
 

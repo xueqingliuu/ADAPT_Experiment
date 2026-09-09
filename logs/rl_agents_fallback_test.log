@@ -1,2 +1,0 @@
-{"timestamp": "2026-07-12T23:09:48.729696+00:00", "level": "green", "logger": "RL_agents", "message": "RL_agents logging configured", "context": {"alert_level": "green", "log_path": "logs/rl_agents_fallback_test.log"}}
-{"timestamp": "2026-07-12T23:09:48.731498+00:00", "level": "yellow", "logger": "RL_agents.query.Query", "message": "using week from context; enrollment metadata missing", "context": {"alert_level": "yellow", "action_type": "weekly_query", "user_id": "u1", "w": 2}}

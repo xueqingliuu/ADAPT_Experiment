@@ -98,10 +98,15 @@ _STRONG_POOL_UIDS_DEFAULT = "248"
 E_QUAD_POOLED_N = 161
 E_QUAD_USER_N = 321
 
-# %%
-# read data
-PROJECT_ROOT = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed")
-COMBINED_DIR = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing")
+PROJECT_ROOT = Path(
+    os.environ.get("ADAPR_PROJECT_ROOT", Path(__file__).resolve().parent)
+).expanduser().resolve()
+_combined = os.environ.get("ADAPR_COMBINED_DIR", "").strip()
+if not _combined:
+    raise SystemExit(
+        "Set ADAPR_COMBINED_DIR to the folder with extracted MRT tables."
+    )
+COMBINED_DIR = Path(_combined).expanduser().resolve()
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2172,7 +2177,6 @@ def quadrature_loglik(
         "params": par,
         "e1_known": e1_known,
     }
-
 
 
 # ``a1`` (theta[1]) is E_w's own week-to-week persistence, box-constrained to

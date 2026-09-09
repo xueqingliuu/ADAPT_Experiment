@@ -1283,7 +1283,6 @@ def pv_hurdle_occurrence_z_gap(std: dict) -> float:
     return float(-_standardize_pageview_count(0.0, shift, scale, zero_count=zc))
 
 
-# %%
 class EnvConfig:
     """Load environment parameters from ``params_env_{userid}.json``."""
 
@@ -1691,7 +1690,6 @@ class EnvConfig:
         self.pv_hurdle_population = pop.copy()
 
 
-# %%
 def _lag1_autocorr(resid) -> float:
     """Pearson correlation between consecutive *observed* residuals.
 

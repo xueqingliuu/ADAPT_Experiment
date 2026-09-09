@@ -114,7 +114,6 @@ def _delivered_interaction_fraction(actions, interactions, window=14, fallback=0
     if not np.any(delivered):
         return float(fallback)
     return float(np.mean(i[delivered]))
-# %%
 from vani_env import (
     Env,
     EnvConfig,
@@ -197,7 +196,6 @@ def resolve_params_dir(params_dir=None):
     return Path(raw).expanduser().resolve()
 
 
-# %%
 # ──────────────────────────────────────────────────────────────────
 # Episode dataset (RL history lives outside MicroQueryAgent)
 # ──────────────────────────────────────────────────────────────────
@@ -274,7 +272,6 @@ class EpisodeDataset:
         return self.med_full_hist.get(k)
 
 
-# %%
 # ──────────────────────────────────────────────────────────────────
 # OnlineEnv: adapter that wraps Env for slot-by-slot interaction
 # with the RL algorithms.
@@ -1329,7 +1326,6 @@ class OnlineEnv:
 
 _setup_log("OnlineEnv defined.")
 
-# %%
 # ──────────────────────────────────────────────────────────────────
 # Placeholder priors and hyperparameters
 # ──────────────────────────────────────────────────────────────────
@@ -2317,7 +2313,6 @@ def configure_leave_one_out_priors(held_out_uid, params_dir=None):
 
 _configure_priors()
 
-# %%
 # ──────────────────────────────────────────────────────────────────
 # Run one participant with a given algorithm
 # ──────────────────────────────────────────────────────────────────
@@ -2682,7 +2677,6 @@ ALGORITHMS = {
 
 _setup_log("Runner functions defined.")
 
-# %%
 # ──────────────────────────────────────────────────────────────────
 # Main experiment: run both algorithms for all users
 # (guarded so ``import experiment`` does not start long jobs — use ``%run`` or

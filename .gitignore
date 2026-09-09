@@ -7,14 +7,17 @@ __pycache__/
 .venv-*/
 venv/
 
-# macOS
+# macOS / editor
 .DS_Store
+.Rhistory
+.cursor/
 
 # Experiment outputs (see RESULTS_ROOT in experiment.py / aggregate.py)
 results/
 results_*/
 
-# SLURM job logs
+# SLURM / job logs
+logs/
 experiment_*.out
 experiment_*.err
 aggregate_*.out
@@ -22,16 +25,25 @@ aggregate_*.err
 
 # Runtime caches
 .matplotlib/
+.matplotlib_cache/
+.mplconfig/
 d3rlpy_logs/
 tensorboard_logs/
-logs/
-# tune_ste.py scratch / smoke-test parameter directories
 .ste_*/
+.pycache-check/
 
-# Data artifacts
+# Generated figures and binary artifacts
 *.npz
 *.npy
 *.pkl
 *.png
 *.pdf
 /RL_agents/
+check_trend_outputs/
+figures/
+
+# Real participant panels (not for public release)
+df_fit_11week.csv
+**/df_fit_11week.csv
+df_fit.csv
+df_merged.csv

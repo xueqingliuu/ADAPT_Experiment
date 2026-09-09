@@ -50,6 +50,9 @@ markers = {
     "always_send": "*-",
     "random_send": "+-",
 }
+# Distinct fallbacks so a new experiment arm is still visible if markers
+# has not been updated yet.
+_FALLBACK_STYLES = ("P-", "X-", "v-", "D--", "s--", "^--", "h-", "p-")
 
 # Normal 95% interval half-width on the replication-clustered SE.
 Z95 = 1.96
@@ -58,6 +61,50 @@ NEVER_SEND_BASELINE = "never_send"
 ALWAYS_SEND_BASELINE = "always_send"
 # γ̄=0.99 base is a sensitivity in the registry; omit from figures.
 OMIT_FROM_PLOTS = frozenset({"rl_v8_base_g099"})
+
+
+def _style_for(name):
+    """Marker/linestyle for an experiment arm."""
+    if name in markers:
+        return markers[name]
+    acc = 0
+    for ch in name:
+        acc = (acc * 31 + ord(ch)) & 0xFFFFFFFF
+    return _FALLBACK_STYLES[acc % len(_FALLBACK_STYLES)]
+
+
+def _roster_names(all_cae, *, omit_plots=False):
+    """Current ``EXPERIMENT_ALGORITHMS`` order, only arms that have data."""
+    names = [n for n in EXPERIMENT_ALGORITHMS if n in all_cae]
+    if omit_plots:
+        names = [n for n in names if n not in OMIT_FROM_PLOTS]
+    return names
+
+
+def _plot_algorithm_names(all_cae):
+    """Figure roster: current experiment arms, minus plot-only omissions."""
+    return _roster_names(all_cae, omit_plots=True)
+
+
+def _discover_run_algorithms(run_dirs: list[Path]) -> tuple[list[str], dict[str, str]]:
+    """Same roster as ``experiment.py``; leftover npz from dropped arms ignored."""
+    labels = dict(EXPERIMENT_ALGORITHM_LABELS)
+    for run_dir in run_dirs:
+        for name, lab in (_load_config(run_dir).get("labels") or {}).items():
+            if name in EXPERIMENT_ALGORITHMS:
+                labels[name] = lab
+    return list(EXPERIMENT_ALGORITHMS), labels
+
+
+def _new_fig(n_names):
+    if n_names > 8:
+        return plt.subplots(figsize=(9.0, 6.0))
+    return plt.subplots(figsize=(7.5, 5))
+
+
+def _apply_legend(ax, n_names):
+    ncol = 2 if n_names > 8 else 1
+    ax.legend(fontsize=6.5 if n_names > 8 else 8, ncol=ncol)
 
 
 def cumulative_average(x):
@@ -453,7 +500,7 @@ def _plot_cae_vs_reference(ax, names, *, cum_mean, cum_se, labels, weeks,
     for name in names:
         m = cum_mean[name]
         s = cum_se[name]
-        ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
+        ax.plot(weeks, m, _style_for(name), label=labels.get(name, name))
         ax.fill_between(weeks, m - _ci95(s), m + _ci95(s), alpha=0.25)
     if vs_never:
         ax.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--")
@@ -466,7 +513,7 @@ def _plot_cae_vs_reference(ax, names, *, cum_mean, cum_se, labels, weeks,
         {n: cum_se[n] for n in names},
         on=ylim_on,
     ))
-    ax.legend(fontsize=8)
+    _apply_legend(ax, len(names))
     ax.grid(True, alpha=0.3)
 
 
@@ -474,7 +521,7 @@ def _plot_p25(ax, names, *, pooled, labels, weeks, ylabel, hline=None):
     """Pooled 25th percentile of slot-level values at each week."""
     for name in names:
         ax.plot(
-            weeks, pooled[name], markers.get(name, "o-"),
+            weeks, pooled[name], _style_for(name),
             label=labels.get(name, name),
         )
     if hline is not None:
@@ -486,7 +533,7 @@ def _plot_p25(ax, names, *, pooled, labels, weeks, ylabel, hline=None):
         {n: np.zeros_like(pooled[n]) for n in names},
         on="means",
     ))
-    ax.legend(fontsize=8)
+    _apply_legend(ax, len(names))
     ax.grid(True, alpha=0.3)
 
 
@@ -499,7 +546,7 @@ def _save_p25_family(out, stem, names, *, pooled, labels, weeks,
     ):
         if not plot_names:
             continue
-        fig, ax = plt.subplots(figsize=(7.5, 5))
+        fig, ax = _new_fig(len(plot_names))
         _plot_p25(
             ax, plot_names,
             pooled=pooled, labels=labels, weeks=weeks,
@@ -511,7 +558,7 @@ def _save_p25_family(out, stem, names, *, pooled, labels, weeks,
 def make_overview(stats, _kind, suffix, *, out, labels, all_piA, weeks, rl_weeks,
                   uids=None):
     """Write CAE (with and without always-send) and action-probability figures."""
-    names = [n for n in stats["all_cae"] if n not in OMIT_FROM_PLOTS]
+    names = _plot_algorithm_names(stats["all_cae"])
     cum_mean, cum_se, vs_never = _cumsum_vs_reference(
         stats["all_cae"], uids=uids,
     )
@@ -521,7 +568,7 @@ def make_overview(stats, _kind, suffix, *, out, labels, all_piA, weeks, rl_weeks
     )
     no_always = [n for n in plotted if n != ALWAYS_SEND_BASELINE]
 
-    fig, ax = plt.subplots(figsize=(7.5, 5))
+    fig, ax = _new_fig(len(plotted))
     _plot_cae_vs_reference(
         ax, plotted,
         cum_mean=cum_mean, cum_se=cum_se, labels=labels, weeks=weeks,
@@ -530,7 +577,7 @@ def make_overview(stats, _kind, suffix, *, out, labels, all_piA, weeks, rl_weeks
     _save_fig(fig, out, f"cae_{suffix}")
 
     if no_always and no_always != plotted:
-        fig, ax = plt.subplots(figsize=(7.5, 5))
+        fig, ax = _new_fig(len(no_always))
         _plot_cae_vs_reference(
             ax, no_always,
             cum_mean=cum_mean, cum_se=cum_se, labels=labels, weeks=weeks,
@@ -550,11 +597,11 @@ def make_overview(stats, _kind, suffix, *, out, labels, all_piA, weeks, rl_weeks
     ):
         if not plot_names:
             continue
-        fig, ax = plt.subplots(figsize=(7.5, 5))
+        fig, ax = _new_fig(len(plot_names))
         for name in plot_names:
             m = avg_mean[name]
             s = avg_se[name]
-            ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
+            ax.plot(weeks, m, _style_for(name), label=labels.get(name, name))
             ax.fill_between(weeks, m - _ci95(s), m + _ci95(s), alpha=0.25)
         ax.set_xlabel("Week")
         if avg_vs_never:
@@ -566,7 +613,7 @@ def make_overview(stats, _kind, suffix, *, out, labels, all_piA, weeks, rl_weeks
             {n: avg_mean[n] for n in plot_names},
             {n: avg_se[n] for n in plot_names},
         ))
-        ax.legend(fontsize=8)
+        _apply_legend(ax, len(plot_names))
         ax.grid(True, alpha=0.3)
         _save_fig(fig, out, f"cae_avg_{suffix}{stem_extra}")
 
@@ -578,11 +625,11 @@ def make_overview(stats, _kind, suffix, *, out, labels, all_piA, weeks, rl_weeks
     ):
         if not plot_names:
             continue
-        fig, ax = plt.subplots(figsize=(7.5, 5))
+        fig, ax = _new_fig(len(plot_names))
         for name in plot_names:
             m = level_mean[name]
             s = level_se[name]
-            ax.plot(weeks, m, markers.get(name, "o-"), label=labels.get(name, name))
+            ax.plot(weeks, m, _style_for(name), label=labels.get(name, name))
             ax.fill_between(weeks, m - _ci95(s), m + _ci95(s), alpha=0.25)
         ax.set_xlabel("Week")
         ax.set_ylabel("Cumulative CAE / week")
@@ -590,7 +637,7 @@ def make_overview(stats, _kind, suffix, *, out, labels, all_piA, weeks, rl_weeks
             {n: level_mean[n] for n in plot_names},
             {n: level_se[n] for n in plot_names},
         ))
-        ax.legend(fontsize=8)
+        _apply_legend(ax, len(plot_names))
         ax.grid(True, alpha=0.3)
         _save_fig(fig, out, f"cae_avg_level_{suffix}{stem_extra}")
 
@@ -629,15 +676,15 @@ def make_overview(stats, _kind, suffix, *, out, labels, all_piA, weeks, rl_weeks
         ylabel="25th pct cumulative CAE / week",
     )
 
-    fig, ax = plt.subplots(figsize=(7.5, 5))
+    fig, ax = _new_fig(len(names))
     for name in names:
         piA_all = all_piA[name]
         piA_mean = np.nanmean(piA_all[:, :, 1:, :, :], axis=(0, 1, 3, 4))
-        ax.plot(rl_weeks, piA_mean, markers.get(name, "o-"), label=labels.get(name, name))
+        ax.plot(rl_weeks, piA_mean, _style_for(name), label=labels.get(name, name))
     ax.set_xlabel("Week")
     ax.set_ylabel("Mean P(walking suggestion = 1)")
     ax.set_ylim(0.0, 1.0)
-    ax.legend(fontsize=8)
+    _apply_legend(ax, len(names))
     ax.grid(True, alpha=0.3)
     _save_fig(fig, out, f"action_prob_{suffix}")
 
@@ -690,7 +737,7 @@ def _se_across_replications_scalar(arr):
 
 def write_summary(stats, kind, suffix, *, out):
     """Raw-scale summary table for one CAE variant."""
-    names = list(stats["all_cae"].keys())
+    names = _roster_names(stats["all_cae"])
     all_cae = stats["all_cae"]
     headers = ["Metric"] + names
     col_w = max(28, max(len(h) for h in headers) + 2)
@@ -758,16 +805,9 @@ def main() -> None:
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-    # Same roster as experiment.py. Ignore leftover npz from dropped arms
-    # (biased V1/V2, residual, known-map) even if older configs list them.
     cfg = _load_config(run_dirs[0])
-    algorithms = list(EXPERIMENT_ALGORITHMS)
-    labels = dict(EXPERIMENT_ALGORITHM_LABELS)
-    for run_dir in run_dirs:
-        extra = _load_config(run_dir)
-        for name, lab in (extra.get("labels") or {}).items():
-            if name in EXPERIMENT_ALGORITHMS:
-                labels[name] = lab
+    algorithms, labels = _discover_run_algorithms(run_dirs)
+    print(f"Algorithms from EXPERIMENT_ALGORITHMS ({len(algorithms)}): {algorithms}")
     nweek = cfg["nweek"]
     params_dir = resolve_denorm_params_dir(
         cfg.get("params_dir"), cli_params_dir=args.params_dir

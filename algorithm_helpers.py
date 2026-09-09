@@ -2542,8 +2542,6 @@ def build_phi_bottleneck(b_hat, b_tilde, state):
 # ──────────────────────────────────────────────────────────────────
 
 
-
-
 def build_rl_training_data(k_cur, A_hist, b_hat_hist, b_tilde_hist,
                            betas_eval, betas_select, gamma_dt,
                            get_state, phi_fn=None,

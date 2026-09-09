@@ -1,5 +1,4 @@
-# %% [markdown]
-# # Extract MRT raw exports into analysis CSVs
+# Extract MRT raw exports into analysis CSVs
 #
 # Reads the ADAPTS MRT source tables under `DATA_FOLDER` and writes one CSV per
 # stream (surveys, schedule, page views, walking suggestions, wearables, steps).
@@ -8,10 +7,8 @@
 # hand-picked ID list.
 # Next: `2_combine_data_frame.py`.
 
-# %% [markdown]
-# ## 0. Setup
+# 0. Setup
 
-# %%
 import datetime
 import json
 import os
@@ -30,9 +27,12 @@ from ewm_utils import ewma_gamma, mean_prior_delivered_fraction
 
 plt.ion()
 
-DATA_FOLDER = Path(
-    "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing"
-)
+_combined = os.environ.get("ADAPR_COMBINED_DIR", "").strip()
+if not _combined:
+    raise SystemExit(
+        "Set ADAPR_COMBINED_DIR to the folder with extracted MRT tables."
+    )
+DATA_FOLDER = Path(_combined).expanduser().resolve()
 folder = DATA_FOLDER
 
 # ---------------------------------------------------------------------------
@@ -113,15 +113,12 @@ EXCLUDED_PARTICIPANT_IDS: tuple[str, ...] = ()
 # July 26 extract had 31 after also dropping 248, 259, 291, 327, 339 for
 # FourSC < 20 under UTC wall-clock conversion; 259 still fails daily.
 
-# %%
 # Device metadata (timezone lookup source)
 
 project_device_data = pd.read_csv(folder / "ProjectDeviceData_selected_fields_combined.csv")
 
-# %% [markdown]
-# ## 1a. Timezone lookup (UTC → participant local)
+# 1a. Timezone lookup (UTC → participant local)
 
-# %%
 # project_device_data should already contain:
 # ParticipantIdentifier (or participantidentifier), date, timeZone, utcOffset
 
@@ -370,10 +367,8 @@ def _groupby_pid_frames(df, pid_col="ParticipantIdentifier"):
     return {pid: g for pid, g in df.groupby(pid_col, sort=False)}
 
 
-# %% [markdown]
-# ## 1b. Participant cohort
+# 1b. Participant cohort
 
-# %%
 testers = pd.read_csv(
     folder / "Testers.csv"
 )
@@ -392,11 +387,8 @@ real_participant_ids = all_participant_ids[~np.isin(all_participant_ids, testers
 print(real_participant_ids)
 
 
+# 2. Survey tasks & results
 
-# %% [markdown]
-# ## 2. Survey tasks & results
-
-# %%
 # survey task and survey question are linked by surveykey (surveytask.surveykey = surveyquestion.surveykey)
 # but this does not distinguish between different days and different participants and different questions
 # participantidentifier
@@ -450,10 +442,8 @@ surveytask = surveytask[~surveytask.ParticipantIdentifier.isin(testers_id)]
 surveyquestionresults = surveyquestionresults[~surveyquestionresults.ParticipantIdentifier.isin(testers_id)]
 
 print(surveyquestionresults.head())
-# %% [markdown]
-# ## 1c. Active-phase span (daily EOD survey tasks)
+# 1c. Active-phase span (daily EOD survey tasks)
 
-# %%
 # survey_task_active = surveytask[surveytask.surveyname == 'MRT - Salience - Message Display']
 survey_task_active = surveytask[
     (surveytask.SurveyName == 'MRT - Daily End of day survey and Planning Exercise')
@@ -471,7 +461,6 @@ summary_surveytask = (
 # make participantidentifier a column name
 summary_surveytask.reset_index(inplace=True)
 summary_surveytask.rename(columns={'ParticipantIdentifier': 'ParticipantIdentifier'}, inplace=True)
-
 
 
 # correct for missing day 0 for participant 22
@@ -515,19 +504,13 @@ summary_surveytask["ParticipantIdentifier"] = summary_surveytask[
 surveytask = surveytask[surveytask['ParticipantIdentifier'].isin(complete_participant_ids)]
 surveyquestionresults = surveyquestionresults[surveyquestionresults['ParticipantIdentifier'].isin(complete_participant_ids)]
 
-# print(surveytask.ParticipantIdentifier.unique())
-# print(surveyquestionresults.ParticipantIdentifier.unique())
 
 # sort surveytask and surveyquestionresults by participantidentifier and date
 surveytask = surveytask.sort_values(by=['ParticipantIdentifier', 'date'])
 surveyquestionresults = surveyquestionresults.sort_values(by=['ParticipantIdentifier', 'date'])
 
-# print(surveytask.head())
-# print(surveyquestionresults.head())
 
-
-# %% [markdown]
-# ## Extract four variables from weekly survey: affective valuation, CAE, perceived helpfulness, perceived pleasantness
+# Extract four variables from weekly survey: affective valuation, CAE, perceived helpfulness, perceived pleasantness
 # - keep participant identifier
 # - keep delivery date and time
 # - when the surveys are not responded, we use NA to indicate missingness
@@ -540,10 +523,8 @@ surveyquestionresults = surveyquestionresults.sort_values(by=['ParticipantIdenti
 # 
 # - time zone issue: since it's daily 6pm, even though due to the use of UTC, it will be around 10pm. This will not flow to the next day, so it's fine for now!!!!!!!!
 
-# %% [markdown]
-# ### 3a. Flatten nested SurveyResults JSON
+# 3a. Flatten nested SurveyResults JSON
 
-# %%
 
 def _to_obj(x):
     if isinstance(x, (list, dict)):
@@ -646,7 +627,6 @@ survey_results_flat = flatten_survey_results(surveyquestionresults)
 print(survey_results_flat.shape)
 survey_results_flat.head()
 
-# %%
 questions = ["AffectiveValuation", "Exp-tool-1", "Exp-tool-2"] + [f"CAE-{i}" for i in range(1, 13)]
 
 tmp = (
@@ -683,7 +663,6 @@ df_weekly_survey = (
 
 df_weekly_survey.head()
 
-# %%
 # extract weekly survey from survey task
 survey_task_weekly = surveytask.loc[
     surveytask["SurveyName"].isin([
@@ -699,7 +678,6 @@ survey_task_weekly.loc[:, "date"] = pd.to_datetime(
 
 print(survey_task_weekly.head())
 
-# %%
 # force both to pandas datetime64[ns] (naive midnight)
 df_weekly_survey["date"] = pd.to_datetime(df_weekly_survey["date"], errors="coerce").dt.normalize()
 survey_task_weekly["date"] = pd.to_datetime(survey_task_weekly["date"], errors="coerce").dt.normalize()
@@ -707,7 +685,6 @@ survey_task_weekly["date"] = pd.to_datetime(survey_task_weekly["date"], errors="
 print(df_weekly_survey["date"].dtype)
 print(survey_task_weekly["date"].dtype)
 
-# %%
 def fill_weekly_12(df1, df2, id_col="ParticipantIdentifier", date_col="date",
                          tolerance_days=2, weeks=12):
     """Map observed weekly surveys onto a 12-week Sunday slot grid.
@@ -803,7 +780,6 @@ df_weekly_filled["week"] = (
     df_weekly_filled.groupby("ParticipantIdentifier").cumcount() + 1
 )
 
-# print(df_weekly_filled)
 
 # print the number of adherence=1 for each participant
 all_counts = (
@@ -815,19 +791,16 @@ print(all_counts)
 # print the number of survey results for each participant in the original dataframe
 print(df_weekly_survey.groupby("ParticipantIdentifier").size())
 
-# # check what happens to participant 33
-# print(df_weekly_survey[df_weekly_survey.ParticipantIdentifier == "117"])
+# check what happens to participant 33
 
-# # check what happens to participant 33 in the filled dataframe
-# print(df_weekly_filled[df_weekly_filled.ParticipantIdentifier == "117"])
+# check what happens to participant 33 in the filled dataframe
 
 # participant 33 completed a survey on 2025-10-09 which is not within the 12 weeks
 
 # save the filled dataframe
 df_weekly_filled.to_csv(folder / "df_weekly_filled.csv", index=False)
 
-# %% [markdown]
-# ## Extract variables from end-of-day survey: affective reflection, anticipated affect
+# Extract variables from end-of-day survey: affective reflection, anticipated affect
 # 
 # - keep participant identifier
 # - keep delivery date and time
@@ -845,7 +818,6 @@ df_weekly_filled.to_csv(folder / "df_weekly_filled.csv", index=False)
 # - Let's do a minus 4 for all users 
 # - ignore winter time or other time zones in addition to eastern time.
 
-# %%
 questions = ["AffectiveReflection", "AnticipatedAffect", "ActivityCheck"]    
 
 tmp = (
@@ -898,14 +870,12 @@ for c in desired_cols:
 df_daily_survey = df_daily_survey[desired_cols].sort_values(["ParticipantIdentifier", "date"])
 print(df_daily_survey.head())
 
-# %%
 # extract daily survey from survey task
 survey_task_eod = surveytask.loc[surveytask.SurveyName == 'MRT - Daily End of day survey and Planning Exercise'].copy()
 survey_task_eod['date'] = pd.to_datetime(survey_task_eod['InsertedDate'])
 
 print(survey_task_eod)
 
-# %%
 def fill_daily_84(
     df1,
     participant_ids,
@@ -1262,7 +1232,6 @@ df_daily_filled["day"] = (
 )
 
 
-
 # print the number of missingness=1 for each participant
 print(df_daily_filled[df_daily_filled.daily_present == 1].groupby("ParticipantIdentifier").size())
 
@@ -1270,19 +1239,15 @@ print(df_daily_filled[df_daily_filled.daily_present == 1].groupby("ParticipantId
 print(df_daily_survey.groupby("ParticipantIdentifier").size())
 
 # check what happens to participant 33
-# print(df_daily_survey[df_daily_survey.ParticipantIdentifier == 75])
 
 # check what happens to participant 33 in the filled dataframe
-# print(df_daily_filled[df_daily_filled.participantidentifier == 75])
 
 df_daily_filled.to_csv(folder / "df_daily_filled.csv", index=False)
 
 
-# %% [markdown]
-# ## 4. Wakeup and bedtime schedule
+# 4. Wakeup and bedtime schedule
 # - this is useful for filling in the walking suggestions delivery time!
 
-# %%
 # get baseline surveykey
 # survey_key_baseline = surveytask[surveytask.surveyname == 'MRT - Personalize HeartSteps'].surveykey.values[0]
 
@@ -1296,7 +1261,6 @@ weekend_bedtime_all = []
 question_enddate_all = []
 
 for participant_id in complete_participant_ids:
-    # print(participant_id)
     subset = survey_results_flat[survey_results_flat.ParticipantIdentifier == participant_id]
     wake_weekday = (
         subset[subset.ResultIdentifier == 'Weekday Wakeup']['AnswersRaw']
@@ -1756,13 +1720,11 @@ def _slot_rows_nearest_deliveries(
     return rows
 
 
-# %% [markdown]
-# ## 5. Daily engagement (page views)
+# 5. Daily engagement (page views)
 # 
 # - for engagement, we may have yesterday's engagement data for day 1
 # - this is different from survey variables...
 
-# %%
 # Select date range based on daily survey start and end date
 pageview = pd.read_csv(folder / 'AnalyticsEvents_ViewViewed.csv')
 pageview = convert_utc_columns_to_user_local(
@@ -1790,9 +1752,7 @@ for participant_id in complete_participant_ids:
 
 pageview_selected = pd.concat(pageview_selected)
 pageview_selected = pageview_selected[["ParticipantIdentifier", "Timestamp"]]
-# print(pageview_selected[pageview_selected['ParticipantIdentifier'] == 37])
 
-# %%
 
 daily_pageview_list = []
 for participant_id in complete_participant_ids:
@@ -1806,7 +1766,6 @@ for participant_id in complete_participant_ids:
 
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
-        # print(date)
         wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
         start_dt, end_dt = _wake_bed_interval(date, wakeup_time, bedtime_time)
 
@@ -1860,17 +1819,12 @@ df_daily_pageview['Past7DaysPageviewEMA'] = (
 
 
 df_daily_pageview.to_csv(os.path.join(folder, 'df_daily_pageview.csv'), index=False)
-# print(df_daily_pageview[df_daily_pageview['participantidentifier'] == 31])
-
 
 
 # remove the last row for each participant
 df_daily_pageview = df_daily_pageview.groupby('ParticipantIdentifier').apply(lambda x: x.iloc[:-1])
 
 print(df_daily_pageview)
-
-
-# %%
 
 
 hourly_pageview_list = []
@@ -1912,7 +1866,6 @@ for participant_id in complete_participant_ids:
             ]
             
 
-            
             # Calculate time span of valid data in this hour
             if view_data.shape[0] > 0:
                 valid_count = view_data.shape[0]
@@ -1957,25 +1910,23 @@ df_hourly_pageview['Past7DaysHourlyPageviewEMA'] = (
 df_hourly_pageview.to_csv(folder / 'hourly_pageview.csv', index=False)
 
 
-# %% [markdown]
-# ## 6. Interventions (push notifications & survey display)
+# 6. Interventions (push notifications & survey display)
 # - twice daily walking suggestions map to hourly, twice-daily, daily, and weekly
 # - daily planning prompts map to hourly, twice-daily, daily, and weekly
 # 
 # 
 # - Time zone: timestamp minus 4 hours for now!!!
 # 
-# ## Notes on click data
+# Notes on click data
 # - for walking suggestions, an important variable is whether the user opens the notification
 # - for planning prompts, an important variable is whether the user fills in the survey!
 # 
 # - maybe the users saw the notifictaion but didn't open it... so perhaps we can also ignore this for now!!!!!!!
 # 
-# ### Missing data problem:
+# Missing data problem:
 # - for user 13, end-of-day survey + planning action delivery information is missing on day 7/26 and 8/3. This is weired. 
 # - TODO: check project device data, which is more accurate than notification sent csv...
 
-# %%
 # load analytics_event_push data
 push_sent = pd.read_csv(folder / 'AnalyticsEvents_PushNotificationSent.csv')
 
@@ -1999,7 +1950,6 @@ push_open = convert_utc_columns_to_user_local(
 )
 
 
-# %%
 gif_rows      = push_sent.loc[push_sent['Properties.NotificationIdentifier'].str.startswith('gif', na=False)].copy()
 end_rows      = push_sent.loc[push_sent['Properties.NotificationIdentifier'].str.startswith('endOfDay', na=False)].copy()
 
@@ -2007,22 +1957,14 @@ end_rows      = push_sent.loc[push_sent['Properties.NotificationIdentifier'].str
 gif_rows = gif_rows.drop_duplicates()
 end_rows = end_rows.drop_duplicates()
 
-# print(end_rows[end_rows['ParticipantIdentifier'] == "117"])
-# print(end_rows.head())
-
 
 gif_rows_open      = push_open.loc[push_open['Properties.NotificationIdentifier'].str.startswith('gif', na=False)].copy()
-# end_rows_open      = push_open.loc[push_open['notification_id'].str.startswith('endOfDay', na=False)].copy()
-
-# print(gif_rows_open[gif_rows_open['participantidentifier'] == 75])
 
 
-# %%
 # check the date range of the end of day survey for each participant
 min_date_list = []
 max_date_list = []
 date_range_length_list = []
-# complete_participant_ids = [complete_participant_ids, "251"]
 for participant_id in complete_participant_ids:
     end_rows_participant = end_rows.loc[end_rows['ParticipantIdentifier'] == participant_id].copy()
     end_rows_participant['Timestamp'] = pd.to_datetime(end_rows_participant['Timestamp'])
@@ -2049,8 +1991,6 @@ print(f"Participant 251 end of day survey date range: {min_date_251} to {max_dat
 print(end_rows_251)
 
 
-
-# %%
 # print walkings suggestions range
 # check the date range of the end of day survey for each participant
 min_date_list_gif = []
@@ -2063,7 +2003,6 @@ for participant_id in complete_participant_ids:
     min_date = gif_rows_participant['Timestamp'].min()
     max_date = gif_rows_participant['Timestamp'].max()
 
-    # print(f"Participant {participant_id} gif date range: {min_date} to {max_date}")
     min_date_list_gif.append(min_date)
     max_date_list_gif.append(max_date)
 
@@ -2071,9 +2010,6 @@ for participant_id in complete_participant_ids:
     date_range_length_gif = (max_date - min_date).days + 1
     date_range_length_list_gif.append(date_range_length_gif)
 
-# print(min_date_list_gif)
-# print(max_date_list_gif)
-# print(date_range_length_list_gif)
 
 gif_rows_251 = gif_rows.loc[gif_rows['ParticipantIdentifier'] == "251"].copy()
 gif_rows_251['Timestamp'] = pd.to_datetime(gif_rows_251['Timestamp'])
@@ -2083,16 +2019,8 @@ print(f"Participant 251 gif date range: {min_date_251} to {max_date_251}")
 print(gif_rows_251)
 
 
-# print(gif_rows_251.head())
-
-# print(gif_rows_251.tail())
-
-
-
-# %%
 end_rows['planning_prompt'] = 0
 end_rows.loc[end_rows['Properties.NotificationIdentifier'].str.startswith('endOfDay_Planning', na=False), 'planning_prompt'] = 1
-# print(end_rows.head())
 
 end_rows['Timestamp'] = pd.to_datetime(end_rows['Timestamp'])
 end_rows['date'] = end_rows['Timestamp'].dt.date
@@ -2129,14 +2057,11 @@ if fills:
     df_end_all = pd.concat([df_end_all, pd.DataFrame(fills)], ignore_index=True)
     df_end_all = df_end_all.sort_values(['ParticipantIdentifier', 'date']).reset_index(drop=True)
 
-# print(df_end_all[df_end_all['participantidentifier'] == 31])
 print(df_end_all)
 # save the dataframe
 df_end_all.to_csv(os.path.join(folder, 'df_end_all.csv'), index=False)
 
 
-
-# %%
 # the above rows do not contain no delivery data, so we need to complete the data
 # first, complete walking suggestions
 
@@ -2194,7 +2119,6 @@ for n in range(len(complete_participant_ids)):
 
     for i in range(date_range_length):
         date = min_date + pd.Timedelta(days=i)
-        # print(date)
         wakeup_time = resolve_wakeup_for_date(df_wakeup_bedtime_participant, date)
 
         wake_td = pd.Timedelta(hours=wakeup_time.hour, minutes=wakeup_time.minute, seconds=wakeup_time.second)
@@ -2205,7 +2129,6 @@ for n in range(len(complete_participant_ids)):
         gif_row = gif_rows_participant.loc[(gif_rows_participant['date'] == date)].copy()
         # gif_row_open = gif_rows_open_participant.loc[(gif_rows_open_participant['date'] == date)]
         tmp_par_date = tmp_participant.loc[(tmp_participant['date'] == date)].copy()
-        # print(tmp_par_date.head())
 
         
         # valid_count = [
@@ -2293,18 +2216,15 @@ df_gif_all = df_gif_all.merge(
 
 print(df_gif_all)
 print(df_gif_all.Interacted.value_counts())
-# print(df_gif_all[df_gif_all['participantidentifier'] == 75].head(50))
 # save the dataframe
 df_gif_all.to_csv(os.path.join(folder, 'df_gif_all.csv'), index=False)
 
 
-# %% [markdown]
-# ## 7. Wearables — heart rate, steps, wear flags
+# 7. Wearables — heart rate, steps, wear flags
 # - case 1- missing hours: user receive walking suggestions at 9am, but only started wearing fitbit until 10 am 
 #   treatment: 
 # - case 2- missing days: user didn't wear fitbit for most hours between the wakeup and bedtime
 
-# %%
 # using heartrate to define drop out...etc
 # Filter to cohort BEFORE timezone conversion (huge win on multi-GB files).
 _hr_usecols = ["DateTime", "ParticipantIdentifier", "Value"]
@@ -2324,7 +2244,6 @@ heartratebymin = convert_utc_columns_to_user_local(
 )
 print(heartratebymin.head())
 
-# %%
 # for the active phase, we require 12*7 = 84 days of step count data
 heartratebymin["DateTime"] = pd.to_datetime(heartratebymin["DateTime"], errors="coerce")
 heartratebymin["Date"] = _as_calendar_dates(heartratebymin["DateTime"])
@@ -2340,7 +2259,6 @@ summary = (
 )
 print(summary)
 
-# %%
 # Select date range based on daily survey start and end date
 heartratebymin_selected = _filter_wearable_to_participant_windows(
     heartratebymin, complete_participant_ids, summary_surveytask, pad_before=7, span_days=91
@@ -2350,7 +2268,6 @@ heartratebymin_selected = heartratebymin_selected[
 ]
 print(heartratebymin_selected[heartratebymin_selected["ParticipantIdentifier"] == "118"])
 
-# %%
 # read step count data by minute — filter cohort before TZ conversion
 _step_usecols = ["DateTime", "ParticipantIdentifier", "Value"]
 stepcountbymin = pd.read_csv(folder / "filtered_activities-steps.csv", usecols=_step_usecols)
@@ -2368,7 +2285,6 @@ stepcountbymin = convert_utc_columns_to_user_local(
     join_date_col="DateTime",
 )
 
-# %%
 stepcountbymin["DateTime"] = pd.to_datetime(stepcountbymin["DateTime"], errors="coerce")
 stepcountbymin["Date"] = _as_calendar_dates(stepcountbymin["DateTime"])
 stepcountbymin = stepcountbymin.sort_values(by=["ParticipantIdentifier", "DateTime"])
@@ -2383,7 +2299,6 @@ summary = (
 )
 print(summary)
 
-# %%
 stepcountbymin_selected = _filter_wearable_to_participant_windows(
     stepcountbymin, complete_participant_ids, summary_surveytask, pad_before=7, span_days=91
 )
@@ -2392,7 +2307,6 @@ stepcountbymin_selected = stepcountbymin_selected[
 ]
 print(stepcountbymin_selected[stepcountbymin_selected["ParticipantIdentifier"] == "118"])
 
-# %%
 # check missing days by filtering out the days with less than 8 hours of wearing fitbit
 # within the wakeup and bedtime)
 
@@ -2546,10 +2460,8 @@ df_missing_days['past7days_daywearing'] = (
 df_missing_days.to_csv(os.path.join(folder, 'missing_days.csv'), index=False)
 
 
-# %%
 print(df_missing_days[df_missing_days['ParticipantIdentifier'] == "219"][51:100])
 
-# %%
 ## extract hourly level missingness (4h post-decision windows)
 
 missing_hours_list = []
@@ -2618,7 +2530,6 @@ print(df_missing_hours[df_missing_hours["ParticipantIdentifier"] == "219"])
 df_missing_hours.to_csv(os.path.join(folder, "missing_hours.csv"), index=False)
 
 
-# %%
 ## extract 2 hours level missingness (prior-to-decision windows)
 
 missing_2hours_list = []
@@ -2688,7 +2599,6 @@ print(prop)
 df_2hours.to_csv(os.path.join(folder, 'missing_2hours.csv'), index=False)
 
 
-# %%
 # generate a 2x2 table of wearing in the morning (wakeup-1 hour to wakeup+1 hour)
 # vs wearing in the rest of that day (after wakeup+1 hour to bedtime)
 
@@ -2929,7 +2839,6 @@ wear_day['past7days_morning_wearing'] = (
 # save the next morning wearing data
 wear_day.to_csv(folder/ 'wear_day.csv', index=False)
 
-# %%
 # extract hourly step counts in between wakeup and bedtime
 
 hourly_step_counts = []
@@ -2941,7 +2850,6 @@ for participant_id in complete_participant_ids:
     min_date = summary_surveytask.loc[
         summary_surveytask['ParticipantIdentifier'] == participant_id
     ].iloc[0].date_min - pd.Timedelta(days=7)
-    # print(min_date)
     date_range_length = 92
 
     for i in range(date_range_length):
@@ -2949,8 +2857,6 @@ for participant_id in complete_participant_ids:
         
         wakeup_time, bedtime_time = resolve_schedule_for_date(df_wakeup_bedtime_participant, date)
 
-        # print(participant_id)
-        # print(date, wakeup_time, bedtime_time)
 
         # wake up set to floor
         # anchor_date = pd.Timestamp('2000-01-01')  
@@ -2977,7 +2883,6 @@ for participant_id in complete_participant_ids:
         ]
         
 
-        
         # Generate hourly time bins
         decision_time = 0
         num_decisions = 2 # 2 decision points per day wakeup + 1, wakeup + 6
@@ -3044,8 +2949,6 @@ df_hourly_step_counts["EMA_StepCount"] = (
     ].transform(lambda s: _ewm_prior_rows(s))
 )
 
-# print(df_hourly_step_counts[df_hourly_step_counts['participantidentifier'] == 22])
-# print((df_hourly_step_counts[df_hourly_step_counts['ParticipantIdentifier'] == 31]))
 
 # print the proportion of wearing == 0 but valid_sc !=0
 print(len(df_hourly_step_counts[df_hourly_step_counts['CheckStatus'] == 1]) / len(df_hourly_step_counts))
@@ -3055,10 +2958,8 @@ nan_ratio = (
 )
 print(nan_ratio)
 
-# %%
 print(df_hourly_step_counts[df_hourly_step_counts['ParticipantIdentifier'] == "219"][101:150])
 
-# %%
 
 today_step_counts = []
 
@@ -3069,7 +2970,6 @@ for participant_id in complete_participant_ids:
     min_date = summary_surveytask.loc[
         summary_surveytask['ParticipantIdentifier'] == participant_id
     ].iloc[0].date_min - pd.Timedelta(days=7)
-    # print(min_date)
     date_range_length = 92
 
     for i in range(date_range_length):
@@ -3086,8 +2986,6 @@ for participant_id in complete_participant_ids:
         ]
         
 
-        
- 
             # read heart rate data for this hour
         missing_days_participant_date = df_missing_days[
             (df_missing_days['ParticipantIdentifier'] == participant_id) &
@@ -3143,7 +3041,6 @@ print(df_today_step_counts[df_today_step_counts['ParticipantIdentifier'] == "151
 print(len(df_today_step_counts[df_today_step_counts['TodayStepCount'].isna()]) / len(df_today_step_counts))
 
 
-# %%
 # Prior-2h step counts: same [decision-2h, decision) window as HourWearing.
 
 prior_2hours_step_counts = []
@@ -3204,7 +3101,6 @@ df_prior_2hours_step_counts["EMA_Prior2HourStepCount"] = (
     ].transform(lambda s: _ewm_prior_rows(s))
 )
 
-# print(df_hourly_step_counts[df_hourly_step_counts['participantidentifier'] == 22])
 print((df_prior_2hours_step_counts[df_prior_2hours_step_counts['ParticipantIdentifier'] == 31]))
 
 # print the proportion of wearing == 1 but valid_sc !=0
@@ -3291,7 +3187,6 @@ if "wear_day" in globals():
 # Prefer analysis sample for any remaining cohort loops
 complete_participant_ids = analysis_participant_ids
 
-# %%
 # save the dataframe
 df_today_step_counts.to_csv(os.path.join(folder, "today_step_counts.csv"), index=False)
 df_hourly_step_counts.to_csv(os.path.join(folder, "hourly_step_counts.csv"), index=False)
@@ -3304,7 +3199,6 @@ df_2hours.to_csv(os.path.join(folder, "missing_2hours.csv"), index=False)
 df_weekly_filled.to_csv(folder / "df_weekly_filled.csv", index=False)
 df_daily_filled.to_csv(folder / "df_daily_filled.csv", index=False)
 
-# %%
 # Align earlier cohort exports with the final rule-based analysis sample
 _analysis_id_set = set(map(str, complete_participant_ids))
 _cohort_csv_names = [

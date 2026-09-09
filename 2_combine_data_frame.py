@@ -1,15 +1,13 @@
-# %% [markdown]
-# # Merge extraction CSVs into one decision-time panel
+# Merge extraction CSVs into one decision-time panel
 #
 # Reads the tables from `1_data_extraction.py`, builds two rows per day
 # (morning / afternoon), merges surveys, wear, page views, and interventions,
 # drops burn-in and weeks 0/13, and writes `df_merged.csv`.
 # Next: `3_standardization.py`.
 
-# %% [markdown]
-# ## 0. Setup
+# 0. Setup
 
-# %%
+import os
 from pathlib import Path
 
 import numpy as np
@@ -17,9 +15,12 @@ import pandas as pd
 
 from ewm_utils import mean_prior_delivered_fraction
 
-DATA_FOLDER = Path(
-    "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing"
-)
+_combined = os.environ.get("ADAPR_COMBINED_DIR", "").strip()
+if not _combined:
+    raise SystemExit(
+        "Set ADAPR_COMBINED_DIR to the folder with extracted MRT tables."
+    )
+DATA_FOLDER = Path(_combined).expanduser().resolve()
 folder = DATA_FOLDER
 
 # Extraction grids start 7 days before study date_min (92 calendar days,
@@ -76,10 +77,8 @@ def _correct_one_to_seven_zeros(df, columns, *, source):
     return df
 
 
-# %% [markdown]
-# ## 1. Load extracted tables
+# 1. Load extracted tables
 
-# %%
 df_4hour_step = _as_str_id(pd.read_csv(folder / "hourly_step_counts.csv"))
 df_today_step = _as_str_id(pd.read_csv(folder / "today_step_counts.csv"))
 df_prior2hours_step = _as_str_id(pd.read_csv(folder / "prior_2hours_step_counts.csv"))
@@ -106,10 +105,8 @@ df_planning = _as_str_id(pd.read_csv(folder / "df_end_all.csv"))
 df_notwearing = _as_str_id(pd.read_csv(folder / "missing_days.csv"))
 df_wearing_morning = _as_str_id(pd.read_csv(folder / "wear_day.csv"))
 
-# %% [markdown]
-# ## 2. Parse dates
+# 2. Parse dates
 
-# %%
 df_4hour_step["Date"] = pd.to_datetime(df_4hour_step["Date"])
 df_today_step["Date"] = pd.to_datetime(df_today_step["Date"])
 df_prior2hours_step["Date"] = pd.to_datetime(df_prior2hours_step["Date"])
@@ -139,10 +136,8 @@ df_planning["Date"] = pd.to_datetime(df_planning["date"])
 df_notwearing["Date"] = pd.to_datetime(df_notwearing["Date"])
 df_wearing_morning["Date"] = pd.to_datetime(df_wearing_morning["Date"])
 
-# %% [markdown]
-# ## 3. Base panel + wearable / engagement merges
+# 3. Base panel + wearable / engagement merges
 
-# %%
 print(f"Before merging: {len(df_4hour_step)} decision-time rows")
 
 df_merged = df_4hour_step.copy()
@@ -164,8 +159,7 @@ df_merged = df_merged.merge(
 
 print(df_merged.head())
 
-# %% [markdown]
-# ## 4. Weekly survey (ISO week join + `_lastweek` lags)
+# 4. Weekly survey (ISO week join + `_lastweek` lags)
 #
 # Emission-only contract: `fill_weekly_12` places surveys on Sunday slots
 # (±2 days, so Monday/Tuesday completions still attach to that Sunday).
@@ -177,7 +171,6 @@ print(df_merged.head())
 # Tuesday completion slotted to last Sunday can still appear on a few next
 # Mondays (~1% of rows).
 
-# %%
 # ISO week/year keys for joining weekly survey to daily decision rows
 df_weekly["iso_week"] = pd.to_datetime(df_weekly["date"]).dt.isocalendar().week
 df_weekly["iso_year"] = pd.to_datetime(df_weekly["date"]).dt.isocalendar().year
@@ -236,10 +229,8 @@ df_merged = df_merged.merge(
 
 print(f"After weekly merge: {len(df_merged)} rows")
 
-# %% [markdown]
-# ## 5. Daily EOD survey (+ yesterday lags)
+# 5. Daily EOD survey (+ yesterday lags)
 
-# %%
 for col in DAILY_SURVEY_COLS:
     if col in df_daily.columns:
         df_daily[f"{col}_yesterday"] = df_daily.groupby("ParticipantIdentifier")[col].shift(1)
@@ -255,10 +246,8 @@ df_merged = df_merged.merge(df_daily[daily_merge_cols], on=["ParticipantIdentifi
 # eligible participants with no daily-survey result rows at all.
 df_merged["daily_present"] = df_merged["daily_present"].fillna(0).astype(int)
 
-# %% [markdown]
-# ## 6. Interventions (planning, walking suggestions)
+# 6. Interventions (planning, walking suggestions)
 
-# %%
 planning_cols = [
     c for c in df_planning.columns if c not in ["ParticipantIdentifier", "Date", "time", "date"]
 ]
@@ -283,10 +272,8 @@ df_merged = df_merged.merge(
     how="left",
 )
 
-# %% [markdown]
-# ## 7. Column cleanup after overlapping merges
+# 7. Column cleanup after overlapping merges
 
-# %%
 print(df_merged.columns)
 
 drop_cols = [c for c in ["date", "Time_x", "Time_y", "iso_week", "iso_year"] if c in df_merged.columns]
@@ -309,10 +296,8 @@ _leftover = [c for c in df_merged.columns if c.endswith("_x") or c.endswith("_y"
 if _leftover:
     print("WARNING: unresolved merge-suffix columns:", _leftover)
 
-# %% [markdown]
-# ## 8. Burn-in filter + calendar indices
+# 8. Burn-in filter + calendar indices
 
-# %%
 df_merged = df_merged.copy()
 df_merged["Date"] = pd.to_datetime(df_merged["Date"], errors="coerce").dt.normalize()
 
@@ -351,10 +336,8 @@ df_merged = df_merged.sort_values(sort_cols)
 print(df_merged.groupby("ParticipantIdentifier")["Date"].nunique())
 print(df_merged.groupby("ParticipantIdentifier").size())
 
-# %% [markdown]
-# ## 9. Derived weekly summaries + week filter
+# 9. Derived weekly summaries + week filter
 
-# %%
 cae_cols = [f"CAE-{i}" for i in range(1, 13)]
 cae_lastweek_cols = [f"CAE-{i}_lastweek" for i in range(1, 13)]
 
@@ -377,9 +360,7 @@ df_merged["day"] = (
 print(df_merged.groupby("ParticipantIdentifier")["week"].unique())
 print(df_merged.groupby("ParticipantIdentifier").size())
 
-# %% [markdown]
-# ## 10. Save
+# 10. Save
 
-# %%
 df_merged.to_csv(folder / "df_merged.csv", index=False)
 print(f"Wrote {folder / 'df_merged.csv'} ({len(df_merged)} rows)")

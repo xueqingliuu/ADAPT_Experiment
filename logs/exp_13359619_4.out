@@ -1,9 +1,0 @@
-fourSC features dim: 31 (expect 31)
-CAE features dim:    24
-CAE_short feat dim:  2
-OnlineEnv defined.
-PF mediator dims: P_MY_FOURSC=31, P_MY_ANTIC=22, P_CAE=24, P_TY=2
-Priors ready:  p_rl(micro)=81, p_rs=62, p_b=4
-Runner functions defined.
-Running a single seed from index 4: seed=3 (N_EXPERIMENTS=100)
-  Experiment 0, draw 1/100, user 204, seed 3 ... 

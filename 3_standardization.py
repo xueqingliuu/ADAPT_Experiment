@@ -1,5 +1,4 @@
-# %% [markdown]
-# # Standardize the merged panel
+# Standardize the merged panel
 #
 # Reads `df_merged.csv`, log-transforms most counts in place, z-scores
 # continuous features, maps Likert items to [-1, 1], and writes `df_fit.csv`
@@ -9,18 +8,24 @@
 # (no ``+1``); count 0 sits at ``log(0.5)`` so PV_sum / lag1 stay below 1.
 # Next: ``4_perceived_utility.py``.
 
-# %% [markdown]
-# ## 0. Setup
+# 0. Setup
 
-# %%
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPR-MRT-Testbed")
-COMBINED_DIR = Path("/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing")
+PROJECT_ROOT = Path(
+    os.environ.get("ADAPR_PROJECT_ROOT", Path(__file__).resolve().parent)
+).expanduser().resolve()
+_combined = os.environ.get("ADAPR_COMBINED_DIR", "").strip()
+if not _combined:
+    raise SystemExit(
+        "Set ADAPR_COMBINED_DIR to the folder with extracted MRT tables."
+    )
+COMBINED_DIR = Path(_combined).expanduser().resolve()
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -207,10 +212,8 @@ def _hourly_pv_log_axis(raw, zero_count=PV_ZERO_ON_LOG_AXIS):
     return out, v, pos
 
 
-# %% [markdown]
-# ## 1. Load merged panel
+# 1. Load merged panel
 
-# %%
 df_merged = pd.read_csv(COMBINED_DIR / "df_merged.csv")
 print("COMBINED_DIR:", COMBINED_DIR.resolve())
 print("WORK_DIR:   ", WORK_DIR.resolve())
@@ -224,31 +227,25 @@ use_cols = [c for c in FIT_COLUMNS if c in df_merged.columns]
 df_fit = df_merged[use_cols].copy()
 print(df_fit.shape)
 
-# %% [markdown]
-# ## 2. Calendar normalization
+# 2. Calendar normalization
 
-# %%
 df_fit["day_norm"] = (df_fit["day"] - (1 + DAY_RANGE) / 2) / ((DAY_RANGE - 1) / 2)
 df_fit["week_norm"] = (df_fit["week"] - (1 + WEEK_RANGE) / 2) / ((WEEK_RANGE - 1) / 2)
 df_fit["dow_norm"] = (df_fit["dow"] - (1 + 7) / 2) / ((7 - 1) / 2)
 
-# %% [markdown]
-# ## 3. Log transforms (counts / pageviews)
+# 3. Log transforms (counts / pageviews)
 #
 # Most count columns are overwritten with ``log(x+1)``. Hourly pageview
 # stays raw. Its ``*_norm`` is ``log(x)`` for positive counts (hurdle
 # intensity does not need ``+1``); zeros sit at ``log(0.5)`` so the weekly
 # PV summary still has a point below count 1.
 
-# %%
 for col in LOG_COLUMNS:
     if col in df_fit.columns:
         df_fit[col] = np.log(df_fit[col] + 1)
 
-# %% [markdown]
-# ## 4. Z-score + fixed-scale ordinal normalization
+# 4. Z-score + fixed-scale ordinal normalization
 
-# %%
 std_params = {}
 
 for src, norm, shift_key, scale_key, limit_key in ZSCORE_SPECS:
@@ -299,19 +296,15 @@ for col, limit_key in RAW_UNIT_INTERVAL_COLS:
             np.round(df_fit[col].max(), DIGITS),
         ]
 
-# %% [markdown]
-# ## 5. Save `std_params.json`
+# 5. Save `std_params.json`
 
-# %%
 std_params_path = work_folder / "std_params.json"
 with open(std_params_path, "w") as f:
     json.dump(std_params, f)
 print(f"Wrote {std_params_path}")
 
-# %% [markdown]
-# ## 6. Decision-slot lags + save `df_fit.csv`
+# 6. Decision-slot lags + save `df_fit.csv`
 
-# %%
 df_fit = df_fit.sort_values(
     ["ParticipantIdentifier", "Date", "DecisionTime"],
     kind="mergesort",

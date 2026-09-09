@@ -33,12 +33,12 @@ from algorithm_helpers import apply_pooled_coefs
 PROJECT_ROOT = Path(
     os.getenv("ADAPR_PROJECT_ROOT", str(Path(__file__).resolve().parent))
 ).expanduser().resolve()
-COMBINED_DIR = Path(
-    os.getenv(
-        "ADAPR_COMBINED_DIR",
-        "/Users/xueqingliu/Harvard University Dropbox/Liu Xueqing/ADAPT_MRT/Xueqing",
+_combined = os.getenv("ADAPR_COMBINED_DIR", "").strip()
+if not _combined:
+    raise SystemExit(
+        "Set ADAPR_COMBINED_DIR to the folder with extracted MRT tables."
     )
-).expanduser().resolve()
+COMBINED_DIR = Path(_combined).expanduser().resolve()
 WORK_DIR = PROJECT_ROOT / "env_para_vanilla"
 EW_POOLED_COEF_JSON = WORK_DIR / "Ew_pooled_linear_coefs.json"
 COEF_DECIMALS = 3
