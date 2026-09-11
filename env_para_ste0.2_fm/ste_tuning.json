@@ -1,0 +1,301 @@
+{
+  "target_mean_ste": null,
+  "achieved_mean_ste": null,
+  "knob": "burden_path",
+  "kappa": 0.3,
+  "kappa_hi": null,
+  "stable": true,
+  "apply": {
+    "A_to_ME_PV_main": "subtract",
+    "A_to_ME_FW_main": "subtract",
+    "A_to_ME_PJ_main": "subtract",
+    "ME_to_E_PV": "subtract",
+    "ME_to_E_FW": "subtract",
+    "ME_to_E_PJ": "subtract",
+    "E_to_MY": "subtract"
+  },
+  "multipliers": {
+    "A_to_ME_PV_main": 0.3,
+    "A_to_ME_FW_main": 0.3,
+    "A_to_ME_PJ_main": 0.3,
+    "E_to_MY": -0.3
+  },
+  "source_params_dir": "/n/home09/xliu08/ADAPT_RCT_Experiment/env_para_vanilla",
+  "loop_gains": [
+    {
+      "userid": 13,
+      "g_zero": 0.15855835265288973,
+      "g_always": 0.2207324860506225,
+      "cae_g_zero": 0.43007100000000004,
+      "cae_g_always": 0.442858
+    },
+    {
+      "userid": 18,
+      "g_zero": -0.26933831263696084,
+      "g_always": -0.17159099222586965,
+      "cae_g_zero": 0.512524,
+      "cae_g_always": 0.518106
+    },
+    {
+      "userid": 22,
+      "g_zero": 0.16442960367099418,
+      "g_always": 0.16433555409136785,
+      "cae_g_zero": 0.645958,
+      "cae_g_always": 0.668466
+    },
+    {
+      "userid": 31,
+      "g_zero": 0.4296500278279898,
+      "g_always": 0.4091431178348146,
+      "cae_g_zero": 0.40918600000000005,
+      "cae_g_always": 0.404426
+    },
+    {
+      "userid": 33,
+      "g_zero": 0.18509149764504784,
+      "g_always": -0.18059294912853496,
+      "cae_g_zero": 0.320263,
+      "cae_g_always": 0.321214
+    },
+    {
+      "userid": 72,
+      "g_zero": 0.1802728587385692,
+      "g_always": 0.2334749830525666,
+      "cae_g_zero": 0.312884,
+      "cae_g_always": 0.29742999999999997
+    },
+    {
+      "userid": 75,
+      "g_zero": 0.148230006267187,
+      "g_always": -0.21583234048952107,
+      "cae_g_zero": 0.05904,
+      "cae_g_always": 0.106412
+    },
+    {
+      "userid": 86,
+      "g_zero": 0.11249904830858769,
+      "g_always": 0.13858876261275485,
+      "cae_g_zero": 0.325715,
+      "cae_g_always": 0.329843
+    },
+    {
+      "userid": 106,
+      "g_zero": 0.45554309457474873,
+      "g_always": 0.43579411766826426,
+      "cae_g_zero": 0.7533240000000001,
+      "cae_g_always": 0.7707569999999999
+    },
+    {
+      "userid": 118,
+      "g_zero": -0.19395828962457307,
+      "g_always": -0.13545366015972551,
+      "cae_g_zero": 0.413908,
+      "cae_g_always": 0.42174
+    },
+    {
+      "userid": 128,
+      "g_zero": -0.19894856000524072,
+      "g_always": -0.09007017867695208,
+      "cae_g_zero": 0.421022,
+      "cae_g_always": 0.425912
+    },
+    {
+      "userid": 129,
+      "g_zero": 0.5781916211576812,
+      "g_always": 0.5803105113802075,
+      "cae_g_zero": 0.436732,
+      "cae_g_always": 0.450816
+    },
+    {
+      "userid": 143,
+      "g_zero": -0.25893843981984394,
+      "g_always": 0.3364561348739631,
+      "cae_g_zero": 0.21487599999999998,
+      "cae_g_always": 0.210468
+    },
+    {
+      "userid": 170,
+      "g_zero": 0.2576109855842815,
+      "g_always": -0.24768652889183942,
+      "cae_g_zero": 0.42859200000000003,
+      "cae_g_always": 0.427579
+    },
+    {
+      "userid": 184,
+      "g_zero": 0.4471566739595074,
+      "g_always": 0.6582136136898586,
+      "cae_g_zero": 0.429918,
+      "cae_g_always": 0.433443
+    },
+    {
+      "userid": 195,
+      "g_zero": -0.4785298225201378,
+      "g_always": -0.5969096716232081,
+      "cae_g_zero": 0.5264220000000001,
+      "cae_g_always": 0.542079
+    },
+    {
+      "userid": 204,
+      "g_zero": -0.14064671781023907,
+      "g_always": 0.1974268890170714,
+      "cae_g_zero": 0.245528,
+      "cae_g_always": 0.255265
+    },
+    {
+      "userid": 239,
+      "g_zero": 0.8758488716948623,
+      "g_always": 0.8916398838974589,
+      "cae_g_zero": 0.729592,
+      "cae_g_always": 0.735304
+    },
+    {
+      "userid": 248,
+      "g_zero": 0.5134703876054636,
+      "g_always": 0.5179377306020543,
+      "cae_g_zero": 0.251452,
+      "cae_g_always": 0.259234
+    },
+    {
+      "userid": 252,
+      "g_zero": -0.2985394227984617,
+      "g_always": -0.2598715052840904,
+      "cae_g_zero": 0.399865,
+      "cae_g_always": 0.419187
+    },
+    {
+      "userid": 269,
+      "g_zero": -0.2677979848835841,
+      "g_always": -0.07752175942616236,
+      "cae_g_zero": 0.45552200000000004,
+      "cae_g_always": 0.466136
+    },
+    {
+      "userid": 277,
+      "g_zero": 0.11281078140068186,
+      "g_always": -0.15122969849556847,
+      "cae_g_zero": 0.42313300000000004,
+      "cae_g_always": 0.43063300000000004
+    },
+    {
+      "userid": 291,
+      "g_zero": 0.36049760952764826,
+      "g_always": 0.36354470696928526,
+      "cae_g_zero": 0.365434,
+      "cae_g_always": 0.36758599999999997
+    },
+    {
+      "userid": 299,
+      "g_zero": -0.21216440310168644,
+      "g_always": 0.31271992360146195,
+      "cae_g_zero": 0.421224,
+      "cae_g_always": 0.429132
+    },
+    {
+      "userid": 307,
+      "g_zero": 0.8422175438197937,
+      "g_always": 0.8209794248627995,
+      "cae_g_zero": 0.572716,
+      "cae_g_always": 0.5684680000000001
+    },
+    {
+      "userid": 327,
+      "g_zero": 0.5198737046853232,
+      "g_always": 0.5685554000245756,
+      "cae_g_zero": 0.17674800000000002,
+      "cae_g_always": 0.176352
+    },
+    {
+      "userid": 333,
+      "g_zero": 0.21197781089010495,
+      "g_always": -0.17362329548122715,
+      "cae_g_zero": 0.44951599999999997,
+      "cae_g_always": 0.451208
+    },
+    {
+      "userid": 339,
+      "g_zero": 0.06239418767334218,
+      "g_always": 0.11137249097977597,
+      "cae_g_zero": 0.415006,
+      "cae_g_always": 0.41845899999999997
+    }
+  ],
+  "n_coefficients_scaled": 263,
+  "stack": [
+    {
+      "knob": "burden_path",
+      "kappa": 0.3,
+      "apply": {
+        "A_to_ME_PV_main": "subtract",
+        "A_to_ME_FW_main": "subtract",
+        "A_to_ME_PJ_main": "subtract",
+        "ME_to_E_PV": "subtract",
+        "ME_to_E_FW": "subtract",
+        "ME_to_E_PJ": "subtract",
+        "E_to_MY": "subtract"
+      }
+    }
+  ],
+  "sign_violations": {
+    "A->PV main <= 0": [
+      13,
+      31,
+      72,
+      106,
+      118,
+      129,
+      143,
+      170,
+      184,
+      204,
+      239,
+      252,
+      307,
+      327,
+      333
+    ],
+    "A->PV intensity main <= 0": [
+      13,
+      18,
+      31,
+      33,
+      75,
+      86,
+      106,
+      128,
+      143,
+      195,
+      239,
+      333
+    ],
+    "A->FW main <= 0": [
+      22,
+      72,
+      72,
+      75,
+      184,
+      269,
+      291,
+      291,
+      299,
+      333
+    ],
+    "A->PJ main <= 0": [
+      31,
+      118,
+      269,
+      333
+    ],
+    "fourSC->Y >= 0": [
+      239
+    ]
+  },
+  "params_dir": "/n/home09/xliu08/ADAPT_RCT_Experiment/env_para_ste0.2_fm",
+  "burden_path_a_me_kappa": 0.3,
+  "fatigue_e_shift": 0.3,
+  "fatigue_me_to_e_min": 0.05,
+  "pathways": [
+    "A_to_ME_main (search)",
+    "ME_to_E (floor at fatigue_me_to_e_min)",
+    "E_to_MY (fixed \u03ba_e)"
+  ]
+}

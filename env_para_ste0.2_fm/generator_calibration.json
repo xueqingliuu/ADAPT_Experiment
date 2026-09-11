@@ -1,0 +1,75 @@
+{
+  "schema_version": 5,
+  "scope": "vanilla simulator revisions 1, 3, and 4 (no engagement-time patch)",
+  "fourSC_support_aware_lag": {
+    "enabled": true,
+    "reference_lag_coefficient": 0.0001252700542141591,
+    "reference_definition": "Mean operational fourSC_lag1 coefficient among the 25 vanilla participants with at least 3 observed adjacent-slot FourSC pairs.",
+    "preserve_fit_time_conditional_mean": true,
+    "n_supported": 25,
+    "n_unsupported": 3,
+    "participants": {
+      "22": {
+        "expected_observed_adjacent_pairs": 0,
+        "expected_finite_lag_at_observed_rows": 0,
+        "expected_operational_lag_coefficient": 0.09836872975402641,
+        "expected_fit_time_lag_constant": -0.2337785104911291,
+        "validation_tolerance": 1e-08
+      },
+      "269": {
+        "expected_observed_adjacent_pairs": 0,
+        "expected_finite_lag_at_observed_rows": 0,
+        "expected_operational_lag_coefficient": 0.8085905705236571,
+        "expected_fit_time_lag_constant": -2.3760172732804783,
+        "validation_tolerance": 1e-08
+      },
+      "277": {
+        "expected_observed_adjacent_pairs": 0,
+        "expected_finite_lag_at_observed_rows": 0,
+        "expected_operational_lag_coefficient": 0.9390285293069615,
+        "expected_fit_time_lag_constant": -3.904533295012841,
+        "validation_tolerance": 1e-08
+      }
+    }
+  },
+  "activity_carryover_calibration": {
+    "enabled": true,
+    "form": "am_foursc_residual_to_same_day_pm_prior2hour",
+    "from_decision_slot": 0,
+    "to_decision_slot": 1,
+    "coupling_rho": 0.3,
+    "target_empirical_residual_correlation": 0.29970519810297247,
+    "target_bootstrap_95_interval": [
+      0.2541842615739981,
+      0.3485456506643685
+    ],
+    "n_pairs": 1709,
+    "transition_scope": "same calendar day AM FourSC to PM prior-2-hour steps only",
+    "window_overlap_note": "AM FourSC covers wake+1h to wake+5h; PM prior-2-hour steps cover wake+4h to wake+6h, so the windows overlap for one hour.",
+    "preserve_prior2hour_residual_variance": true,
+    "minimum_residual_sd": 1e-08,
+    "estimation_note": "Pooled within-participant residual correlation after both fitted conditional means were removed. coupling_rho is that correlation rounded to two decimals. Overnight PM-to-next-AM is left uncoupled."
+  },
+  "interaction_pageview_calibration": {
+    "enabled": true,
+    "form": "interaction_residual_logit_offset",
+    "action_value": 1.0,
+    "parameters_by_decision_slot": {
+      "0": {
+        "intercept_shift": 0.33728752,
+        "interaction_residual_coefficient": 3.90129064
+      },
+      "1": {
+        "intercept_shift": 0.13715725,
+        "interaction_residual_coefficient": 2.32272752
+      }
+    },
+    "probability_epsilon": 1e-10,
+    "calibration_sample_sizes": {
+      "AM_delivered_slots": 1121,
+      "PM_delivered_slots": 1069,
+      "participants": 28
+    },
+    "estimation_note": "Slot-specific coefficients are delivered-slot offset-logistic maximum-likelihood estimates. The fixed offset is the script-4 page-view occurrence logit (no week_norm in PV/FW/PJ/J); the extra predictor is observed interaction minus the fitted interaction probability. No study-time engagement calibration is applied."
+  }
+}
