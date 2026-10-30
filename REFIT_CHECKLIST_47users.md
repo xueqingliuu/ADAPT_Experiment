@@ -138,57 +138,45 @@ a check before the next.
 
 ## 6. CLUSTER: after the 47-user refit (do not run these before the refit)
 
-The seven Layer-1 folders are derived from vanilla, so they must be re-tuned
-after the 47-user refit. STE tuning and confirmation always use activity off
-(no gaps). Do not run these before the refit.
+The two STE folders are derived from vanilla, so they must be re-tuned
+after the 47-user refit. STE tuning and confirmation use activity on and
+ψ = 0.5. Do not run these before the refit.
 
-- [ ] (i) Tune Layer 1 (7 environments) with activity off:
-      `sbatch --export=ALL,TUNE_PHASE=layer1 run_tune_ste.sh`
-      (forces `ADAPR_ACTIVITY=off`). Two-dial search on `kappa_b` only.
-      Uniform (`kappa_m = kappa_b`, knob `action`) → `env_para_ste0.2` /
-      `0.5` / `0.8`. Benefit only (`kappa_m = 0`) → `ste0.2_benefitonly` /
-      `ste0.8_benefitonly`. Heavy burden (`kappa_m = 2`, ME→E floored at
-      0.05, E→MY +0.3 centered) → `ste0.2_heavyburden` /
-      `ste0.8_heavyburden`; if 0.8 is unattainable with stability, retry
-      `kappa_m = 1.5` then `1.0` (keep the strengthened transmission) and
-      record which `kappa_m` was used or the max attainable STE. Each
-      folder stores the burden share
-      `1 - proxy_STE / proxy_STE(kappa_m=0, same kappa_b)`; `TUNE_PHASE=ratio`
-      later stores the confirmed share. Auto-submits confirmation CQL jobs
-      for written folders. Then `TUNE_PHASE=validate bash run_tune_ste.sh`
-      and `TUNE_PHASE=ratio`. Re-tune any folder off target with
-      `TUNE_PROXY_TO_TRUE=from:<folder>`. Each newly tuned
-      `env_para_ste*/generator_calibration.json` must still carry vanilla's
-      `activity_process` block (`tune_ste.py` copies it). Then
-      `python 05_check_refit.py --stage ste`.
-      Dry run (lists the seven targets with their `kappa_m`):
-      `python tune_ste.py layer1 --dry-run`.
+- [ ] (i) Tune STE 0.2 / 0.5 with activity on, ψ = 0.5:
+      `sbatch --export=ALL,TUNE_PHASE=tune run_tune_ste.sh`
+      Uniform action knob only (`kappa_m = kappa_b`) → `env_para_ste0.2` /
+      `0.5`. Confirm DiscreteCQL STE at ψ = 0.5; at the same κ report the
+      proxy STE at ψ = 0 and 0.25. Each folder stores the burden share
+      `1 - proxy_STE / proxy_STE(kappa_m=0, same kappa_b)` at ψ = 0.5;
+      `TUNE_PHASE=ratio` later stores the confirmed share. Auto-submits
+      confirmation CQL jobs for written folders. Then
+      `TUNE_PHASE=validate bash run_tune_ste.sh` and `TUNE_PHASE=ratio`.
+      Re-tune any folder off target with `TUNE_PROXY_TO_TRUE=from:<folder>`.
+      Each newly tuned `env_para_ste*/generator_calibration.json` must
+      still carry vanilla's `activity_process` block (`tune_ste.py` copies
+      it). Then `python 05_check_refit.py --stage ste`.
+      Dry run: `python tune_ste.py tune --dry-run`.
 - [ ] (ii) Calibrate misspec A and B once per params dir:
       ```
       python calibrate_misspec.py --params-dir env_para_ste0.2
       python calibrate_misspec.py --params-dir env_para_ste0.5
-      python calibrate_misspec.py --params-dir env_para_ste0.8
       ```
-      or `python calibrate_misspec.py --all-ste`. A uses `--nweek 12` by default
-      (11-week fitting-panel horizon for `alpha^Y_SC` / `alpha^Y_AA`); B uses 36
-      weeks. Writes `misspec_calibration.json` (`lam_SC`, `lam_AA` for A; `beta_D`
+      or `python calibrate_misspec.py --all-ste`. Both use `--nweek 12`
+      (random-0.5, engagement off, CRN vs the unmodified environment).
+      Writes `misspec_calibration.json` (`lam_SC`, `lam_AA` for A; `beta_D`
       for B). No re-tuning.
-- [ ] (iii) Screen the 12 Layer-3 testbeds with the proxy STE:
+- [ ] (iii) Screen the 24 Layer-2 testbeds with the proxy STE:
       `python proxy_ste.py --screen-layer3`. Flag any with proxy STE < 0.1.
-      The no-gap proxy uses activity off; the effective proxy uses activity on
-      (and misspec D when that is the spec). Also reports a *scaled proxy STE* =
-      proxy STE × the confirmed/proxy ratio in `<params_dir>/ste_tuning.json`
-      (from `TUNE_PHASE=ratio` on the uniform folder); that is an approximate
-      full STE. Do not run
-      `ste_vanilla.py` for Layer 3 now. Full DiscreteCQL STE for Layer 3 is
-      optional later if time allows.
-- [ ] (iv) Run the RL arrays for all 28 testbeds (7 Layer 1 + 9 Layer 2 + 12 Layer 3).
-      Example Layer 2:
+      The proxy uses engagement on. Also reports a *scaled proxy STE* =
+      proxy STE × the confirmed/proxy ratio at ψ = 0.5 in
+      `<params_dir>/ste_tuning.json` (from `TUNE_PHASE=ratio`).
+- [ ] (iv) Run the RL arrays for all 30 testbeds (6 Layer 1 + 24 Layer 2).
+      Example Layer 1:
       `sbatch --export=ALL,PRIOR_MODE=loo,ENV_VARIANT=env_para_ste0.5,ADAPR_ACTIVITY=on,ADAPR_STAYER_FRACTION=0.25,ADAPR_MISSPEC=none run_array.sh`
-      Example Layer 3:
-      `sbatch --export=ALL,PRIOR_MODE=loo,ENV_VARIANT=env_para_ste0.5,ADAPR_ACTIVITY=on,ADAPR_STAYER_FRACTION=0,ADAPR_MISSPEC=A run_array.sh`
-      Layer 1 uses `ADAPR_ACTIVITY=off`. Folders are
-      `results_<steX.Y>_<gapon|gapoff>_psi<frac>_misspec<letter>` so specs never mix.
+      Example Layer 2:
+      `sbatch --export=ALL,PRIOR_MODE=loo,TESTBED_INDEX=6 run_array.sh`
+      Folders are
+      `results_<steX.Y>_gapon_psi<frac>_misspec<letter>` so specs never mix.
       Then `sbatch --export=ALL,... run_aggregate.sh` for each spec.
 - [ ] Rerun the (B) subgroup comparison on the 47 refit models: 43 non-dropout models vs 82/138/259/379
       (replaces the provisional 39-model result in `docs/dropout_check_20261017/report.md`)

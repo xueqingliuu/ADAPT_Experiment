@@ -67,7 +67,7 @@ from algorithm_helpers import (
 from experiment import OnlineEnv
 from testbed import (
     add_testbed_arguments,
-    log_ste_activity_off,
+    log_ste_spec,
     resolve_testbed_spec,
 )
 from vani_env import Env, EnvConfig, resolve_params_dir
@@ -78,11 +78,11 @@ def _ste_env_config(
     params_dir: Path | None = None,
     nweek: int | None = None,
     *,
-    activity: str = "off",
+    activity: str = "on",
     misspec: str | None = None,
     stayer_fraction: float | None = None,
 ) -> EnvConfig:
-    """STE EnvConfig. Callers that want no-gap STE pass ``activity='off'``."""
+    """STE EnvConfig. Uses the testbed activity unless ``activity='off'``."""
     kwargs = {"userid": userid, "activity": activity}
     if params_dir is not None:
         kwargs["params_dir"] = params_dir
@@ -100,8 +100,9 @@ def resolve_ste_run_spec(
     activity=None,
     stayer_fraction=None,
     misspec=None,
+    ste_activity=None,
 ):
-    """Requested testbed spec plus the no-gap STE spec (activity forced off)."""
+    """Requested testbed plus the STE spec (same activity/ψ unless diagnostic off)."""
     requested = resolve_testbed_spec(
         params_dir,
         activity=activity,
@@ -109,8 +110,11 @@ def resolve_ste_run_spec(
         misspec=misspec,
         warn_stayer=False,
     )
-    ste = requested.ste_spec()
-    log_ste_activity_off(requested)
+    override = None
+    if ste_activity is not None and str(ste_activity).strip() != "":
+        override = ste_activity
+    ste = requested.ste_spec(override)
+    log_ste_spec(ste, diagnostic_off=(ste.activity == "off"))
     return requested, ste
 
 
@@ -290,8 +294,8 @@ def build_ste_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0) -> np.ndarray:
 def build_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int) -> np.ndarray:
     """Continuing-task DiscreteCQL state (frozen 20-d map).
 
-    Drops ``b_tilde``: with ``I_w = J_w = 1`` there is no CAE measurement
-    uncertainty, so that slot would only be a constant zero.
+    Drops ``b_tilde``. STE keeps ``I_w = 1``; ``J_w`` follows the Sun–Tue
+    window, so measurement uncertainty is no longer a constant zero.
     """
     st = make_state(oenv.get_context(k, d, t))
     b_hat = known_weekly_cae(oenv, k)
@@ -349,7 +353,6 @@ def collect_mdp_episode(
         packet = oenv.get_week_packet(k)
         _ = packet
         i_w = int(i_w_fixed)
-        oenv.wp_all[k] = 1.0
         oenv.start_week(k, i_w)
 
         for d in range(N_RL_DAYS):
@@ -384,7 +387,6 @@ def collect_mdp_episode(
     # becomes S_{W+1} for the final real transition and enables bootstrapping.
     boundary_k = n_transition_weeks
     _ = oenv.get_week_packet(boundary_k)
-    oenv.wp_all[boundary_k] = 1.0
     oenv.start_week(boundary_k, int(i_w_fixed))
     boundary_state = prepare_ste_state_vector(oenv, boundary_k, 0, 0)
     states.append(boundary_state)
@@ -411,7 +413,7 @@ def build_offline_buffer(
     base_seed: int,
     noise: str = "ar1",
     params_dir: Path | None = None,
-    activity: str = "off",
+    activity: str = "on",
     misspec: str | None = None,
     stayer_fraction: float | None = None,
 ) -> dict:
@@ -428,7 +430,9 @@ def build_offline_buffer(
             stayer_fraction=stayer_fraction,
         )
         env = Env(cfg, noise=noise)
-        oenv = OnlineEnv(env, nweek=simulation_weeks, seed=base_seed + i)
+        oenv = OnlineEnv(
+            env, nweek=simulation_weeks, seed=base_seed + i, ste_mode=True
+        )
         ep = collect_mdp_episode(
             oenv,
             walk_prob,
@@ -500,7 +504,7 @@ def rollout_totals_for_seeds(
     noise: str,
     dqn=None,
     params_dir: Path | None = None,
-    activity: str = "off",
+    activity: str = "on",
     misspec: str | None = None,
     stayer_fraction: float | None = None,
 ) -> np.ndarray:
@@ -561,7 +565,7 @@ def summarize_paired_policy(
     g_zero: np.ndarray,
     prefix: str,
     params_dir: Path | None = None,
-    activity: str = "off",
+    activity: str = "on",
     misspec: str | None = None,
     stayer_fraction: float | None = None,
 ) -> dict:
@@ -598,6 +602,9 @@ def mean_delta_vs_zero(
     seeds: np.ndarray,
     g_zero: np.ndarray,
     params_dir: Path | None = None,
+    activity: str = "on",
+    misspec: str | None = None,
+    stayer_fraction: float | None = None,
 ) -> float:
     g_pi = rollout_totals_for_seeds(
         userid,
@@ -607,6 +614,9 @@ def mean_delta_vs_zero(
         noise=noise,
         dqn=dqn,
         params_dir=params_dir,
+        activity=activity,
+        misspec=misspec,
+        stayer_fraction=stayer_fraction,
     )
     return float(np.mean(g_pi) - np.mean(g_zero))
 
@@ -629,6 +639,9 @@ def train_dqn_ste(
     n_val: int = N_VAL_EPISODES,
     val_every: int = VAL_EVERY_STEPS,
     params_dir: Path | None = None,
+    activity: str = "on",
+    misspec: str | None = None,
+    stayer_fraction: float | None = None,
 ) -> dict:
     _require_d3()
     d3rlpy.seed(seed)
@@ -675,6 +688,9 @@ def train_dqn_ste(
             policy="zero",
             noise=noise,
             params_dir=params_dir,
+            activity=activity,
+            misspec=misspec,
+            stayer_fraction=stayer_fraction,
         )
     best: dict = {"delta": -np.inf, "step": None}
     history: list[dict] = []
@@ -689,6 +705,9 @@ def train_dqn_ste(
                 seeds=seeds,
                 g_zero=g_zero,
                 params_dir=params_dir,
+                activity=activity,
+                misspec=misspec,
+                stayer_fraction=stayer_fraction,
             )
         history.append(
             {"epoch": int(epoch), "step": int(total_step), "val_delta": float(delta)}
@@ -743,7 +762,7 @@ def rollout_total_cae(
     params_dir: Path | None = None,
     return_weekly: bool = False,
     return_stats: bool = False,
-    activity: str = "off",
+    activity: str = "on",
     misspec: str | None = None,
     stayer_fraction: float | None = None,
 ):
@@ -756,8 +775,10 @@ def rollout_total_cae(
     rescaled copy to evaluate alternative effect sizes.  With ``return_weekly``
     the per-week CAE vector is returned alongside the total.  With
     ``return_stats`` the walking-suggestion rate is also returned.
-    STE callers pass ``activity="off"`` (no-gap). Effective STE uses the
-    testbed's own activity setting.
+    Default STE uses the testbed activity and ψ. Pass ``activity="off"``
+    for the diagnostic no-gap STE. ``I_w = 1`` every week; ``J_w`` follows
+    the Sun–Tue engagement window. ``G`` is the sum of true weekly CAE over
+    all simulated weeks, including weeks after dropout.
     """
     rd.seed(seed)
     cfg = _ste_env_config(
@@ -769,7 +790,7 @@ def rollout_total_cae(
         stayer_fraction=stayer_fraction,
     )
     env = Env(cfg, noise=noise)
-    oenv = OnlineEnv(env, nweek=nweek, seed=seed)
+    oenv = OnlineEnv(env, nweek=nweek, seed=seed, ste_mode=True)
     rng = np.random.default_rng(seed)
 
     oenv._reset_episode_state()
@@ -780,15 +801,11 @@ def rollout_total_cae(
         packet = oenv.get_week_packet(k)
         _ = packet
         i_w = int(i_w_fixed)
-        oenv.wp_truth_all[k] = 1.0
-        oenv.wp_all[k] = 0.0 if oenv.dropped_out else 1.0
         oenv.start_week(k, i_w)
 
         for d in range(N_RL_DAYS):
             d_global = oenv._day_idx(k, d)
             oenv._ensure_day_started(k, d, d_global)
-            if oenv.dropped_out:
-                i_w = 0
             for t_slot in range(N_RL_SLOTS):
                 if oenv.dropped_out or policy == "zero":
                     a = 0
@@ -843,20 +860,21 @@ def eval_ste_job(
     activity=None,
     stayer_fraction=None,
     misspec=None,
+    ste_activity=None,
     effective_ste: bool = False,
 ) -> None:
     """Write rows ``[sum_CAE_zero, sum_CAE_opt]`` for one validated evaluation run."""
     _require_d3()
     params_path = _resolve_params_dir(params_dir)
     requested, ste_spec = resolve_ste_run_spec(
-        params_path, activity, stayer_fraction, misspec
+        params_path, activity, stayer_fraction, misspec, ste_activity=ste_activity
     )
     uid_path = Path(userid_path) if userid_path else params_path / "user_ids.txt"
     userid_all = np.loadtxt(uid_path, dtype=int)
     userid = _userid_from_job(jobid, userid_all)
 
     if nweek is None:
-        nweek = int(EnvConfig(userid, params_dir=params_path, activity="off").nweek)
+        nweek = int(EnvConfig(userid, params_dir=params_path, activity=ste_spec.activity).nweek)
 
     logger_dir = Path("d3rlpy_logs") / f"ste_exp_{exp}"
     experiment_name = f"user{userid}"
@@ -884,7 +902,7 @@ def eval_ste_job(
         "bootstrap_lookahead_weeks": 1,
         "params_dir": str(params_path),
         "params_sha256": params_fingerprint(params_path, userid),
-        "activity": "off",
+        "activity": ste_spec.activity,
     }
     for key, value in expected.items():
         if metadata.get(key) != value:
@@ -911,7 +929,7 @@ def eval_ste_job(
             policy="zero",
             noise=noise,
             params_dir=params_path,
-            activity="off",
+            activity=ste_spec.activity,
             misspec=ste_spec.misspec,
             stayer_fraction=ste_spec.stayer_fraction,
         )
@@ -924,7 +942,7 @@ def eval_ste_job(
             dqn=dqn,
             noise=noise,
             params_dir=params_path,
-            activity="off",
+            activity=ste_spec.activity,
             misspec=ste_spec.misspec,
             stayer_fraction=ste_spec.stayer_fraction,
         )
@@ -937,7 +955,7 @@ def eval_ste_job(
     spec_payload = {
         "testbed": requested.as_dict(),
         "ste": ste_spec.as_dict(),
-        "activity_forced": "off",
+        "activity_forced": ste_spec.activity,
         "userid": userid,
         "exp": exp,
     }
@@ -989,12 +1007,13 @@ def train_ste_job(
     activity=None,
     stayer_fraction=None,
     misspec=None,
+    ste_activity=None,
 ) -> None:
     """Train DiscreteCQL for ``userid = user_ids[jobid]``."""
     _require_d3()
     params_path = _resolve_params_dir(params_dir)
     requested, ste_spec = resolve_ste_run_spec(
-        params_path, activity, stayer_fraction, misspec
+        params_path, activity, stayer_fraction, misspec, ste_activity=ste_activity
     )
     uid_path = Path(userid_path) if userid_path else params_path / "user_ids.txt"
     userid_all = np.loadtxt(uid_path, dtype=int)
@@ -1002,7 +1021,7 @@ def train_ste_job(
     seed = 2024 + int(jobid)
 
     if nweek is None:
-        nweek = int(EnvConfig(userid, params_dir=params_path, activity="off").nweek)
+        nweek = int(EnvConfig(userid, params_dir=params_path, activity=ste_spec.activity).nweek)
     _assert_seed_ranges_disjoint(n_val, n_gate)
 
     rd.seed(seed)
@@ -1014,7 +1033,7 @@ def train_ste_job(
         base_seed=seed,
         noise=noise,
         params_dir=params_path,
-        activity="off",
+        activity=ste_spec.activity,
         misspec=ste_spec.misspec,
         stayer_fraction=ste_spec.stayer_fraction,
     )
@@ -1039,6 +1058,9 @@ def train_ste_job(
         n_val=n_val,
         val_every=val_every,
         params_dir=params_path,
+        activity=ste_spec.activity,
+        misspec=ste_spec.misspec,
+        stayer_fraction=ste_spec.stayer_fraction,
     )
     dqn = d3rlpy.load_learnable(str(model_dir))
     selection.pop("g_zero", None)
@@ -1050,7 +1072,7 @@ def train_ste_job(
         policy="zero",
         noise=noise,
         params_dir=params_path,
-        activity="off",
+        activity=ste_spec.activity,
         misspec=ste_spec.misspec,
         stayer_fraction=ste_spec.stayer_fraction,
     )
@@ -1063,7 +1085,7 @@ def train_ste_job(
         g_zero=g_zero_gate,
         prefix="gate",
         params_dir=params_path,
-        activity="off",
+        activity=ste_spec.activity,
         misspec=ste_spec.misspec,
         stayer_fraction=ste_spec.stayer_fraction,
     )
@@ -1102,11 +1124,12 @@ def train_ste_job(
         "bootstrap_lookahead_weeks": 1,
         "params_dir": str(params_path),
         "params_sha256": params_fingerprint(params_path, userid),
-        "activity": "off",
+        "activity": ste_spec.activity,
+        "stayer_fraction": ste_spec.stayer_fraction,
         "testbed": requested.as_dict(),
         "ste": ste_spec.as_dict(),
         "i_w_fixed": 1,
-        "j_w_fixed": 1,
+        "j_w_fixed": 0,
         "seed": seed,
         "val_seed0": VAL_SEED0,
         "gate_seed0": GATE_SEED0,
@@ -1342,6 +1365,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Parameter folder (default: vani_env.PARAMS_DIR / ADAPR_PARAMS_DIR)",
     )
     add_testbed_arguments(pt)
+    pt.add_argument(
+        "--ste-activity",
+        choices=("on", "off"),
+        default=None,
+        help="Override STE activity. Default: the testbed's own activity. "
+             "'off' is the diagnostic no-gap STE.",
+    )
 
     pe = sub.add_parser("eval", help="Evaluate zero vs DiscreteCQL for user_ids[jobid]")
     pe.add_argument("jobid", type=int)
@@ -1360,9 +1390,17 @@ def main(argv: list[str] | None = None) -> None:
     )
     add_testbed_arguments(pe)
     pe.add_argument(
+        "--ste-activity",
+        choices=("on", "off"),
+        default=None,
+        help="Override STE activity. Default: the testbed's own activity. "
+             "'off' is the diagnostic no-gap STE.",
+    )
+    pe.add_argument(
         "--effective-ste",
         action="store_true",
-        help="Also evaluate with the testbed's own activity setting.",
+        help="Deprecated: STE already uses the testbed activity. Kept to "
+             "aggregate old companion files.",
     )
 
     pa = sub.add_parser("aggregate", help="Print average user STE from saved eval files")
@@ -1372,9 +1410,15 @@ def main(argv: list[str] | None = None) -> None:
     pa.add_argument("--params-dir", type=str, default=None)
     add_testbed_arguments(pa)
     pa.add_argument(
+        "--ste-activity",
+        choices=("on", "off"),
+        default=None,
+        help="Override STE activity when locating eval files.",
+    )
+    pa.add_argument(
         "--effective-ste",
         action="store_true",
-        help="Aggregate the effective-STE companion files.",
+        help="Aggregate the old effective-STE companion files.",
     )
 
     pr = sub.add_parser(
@@ -1414,7 +1458,7 @@ def main(argv: list[str] | None = None) -> None:
             stayer_fraction=getattr(args, "stayer_fraction", None),
             misspec=getattr(args, "misspec", None),
             warn_stayer=False,
-        ).ste_spec()
+        ).ste_spec(getattr(args, "ste_activity", None))
 
     if args.cmd == "train":
         train_ste_job(
@@ -1435,6 +1479,7 @@ def main(argv: list[str] | None = None) -> None:
             activity=args.activity,
             stayer_fraction=args.stayer_fraction,
             misspec=args.misspec,
+            ste_activity=getattr(args, "ste_activity", None),
         )
     elif args.cmd == "eval":
         eval_ste_job(
@@ -1448,6 +1493,7 @@ def main(argv: list[str] | None = None) -> None:
             activity=args.activity,
             stayer_fraction=args.stayer_fraction,
             misspec=args.misspec,
+            ste_activity=getattr(args, "ste_activity", None),
             effective_ste=args.effective_ste,
         )
     elif args.cmd == "report":

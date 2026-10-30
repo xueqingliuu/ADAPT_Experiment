@@ -42,11 +42,13 @@ STE_N_EVAL="${STE_N_EVAL:-500}"
 STE_N_STEPS="${STE_N_STEPS:-100000}"
 ENV_VARIANT="${ENV_VARIANT:-${ADAPR_PARAMS_DIR:-env_para_vanilla}}"
 export ADAPR_PARAMS_DIR="${ADAPR_PARAMS_DIR:-$ENV_VARIANT}"
-# STE always runs with activity off. The testbed activity is ignored.
-export ADAPR_ACTIVITY=off
-ADAPR_STAYER_FRACTION="${ADAPR_STAYER_FRACTION:-0}"
+# STE uses the testbed's own activity and ψ. Override with STE_ACTIVITY=off
+# for the diagnostic no-gap STE.
+ADAPR_ACTIVITY="${ADAPR_ACTIVITY:-on}"
+ADAPR_STAYER_FRACTION="${ADAPR_STAYER_FRACTION:-0.5}"
 ADAPR_MISSPEC="${ADAPR_MISSPEC:-none}"
-export ADAPR_STAYER_FRACTION ADAPR_MISSPEC
+STE_ACTIVITY="${STE_ACTIVITY:-}"
+export ADAPR_ACTIVITY ADAPR_STAYER_FRACTION ADAPR_MISSPEC
 USER_IDS="${STE_USER_IDS:-${ADAPR_PARAMS_DIR}/user_ids.txt}"
 STE_EFFECTIVE="${STE_EFFECTIVE:-0}"
 
@@ -56,8 +58,8 @@ echo "Host: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID:-local}  Task ID: ${SLURM_ARRAY_TASK_ID:-none}"
 echo "STE_PHASE=${STE_PHASE}  STE_EXP=${STE_EXP}  STE_NOISE=${STE_NOISE}"
 echo "STE_N_TRAIN=${STE_N_TRAIN}  STE_N_EVAL=${STE_N_EVAL}  STE_N_STEPS=${STE_N_STEPS}"
-echo "ADAPR_PARAMS_DIR=${ADAPR_PARAMS_DIR}  ADAPR_ACTIVITY=off (forced)  ADAPR_MISSPEC=${ADAPR_MISSPEC}"
-echo "ADAPR_STAYER_FRACTION=${ADAPR_STAYER_FRACTION}  STE_EFFECTIVE=${STE_EFFECTIVE}"
+echo "ADAPR_PARAMS_DIR=${ADAPR_PARAMS_DIR}  ADAPR_ACTIVITY=${ADAPR_ACTIVITY}  ADAPR_MISSPEC=${ADAPR_MISSPEC}"
+echo "ADAPR_STAYER_FRACTION=${ADAPR_STAYER_FRACTION}  STE_ACTIVITY=${STE_ACTIVITY:-<testbed>}  STE_EFFECTIVE=${STE_EFFECTIVE}"
 
 test -f "${USER_IDS}"
 test -f ste_vanilla.py
@@ -78,10 +80,13 @@ COMMON_ARGS=(
   --user-ids "${USER_IDS}"
   --noise "${STE_NOISE}"
   --params-dir "${ADAPR_PARAMS_DIR}"
-  --activity off
+  --activity "${ADAPR_ACTIVITY}"
   --stayer-fraction "${ADAPR_STAYER_FRACTION}"
   --misspec "${ADAPR_MISSPEC}"
 )
+if [[ -n "${STE_ACTIVITY}" ]]; then
+  COMMON_ARGS+=(--ste-activity "${STE_ACTIVITY}")
+fi
 EFFECTIVE_ARGS=()
 if [[ "${STE_EFFECTIVE}" == "1" ]]; then
   EFFECTIVE_ARGS=(--effective-ste)
@@ -108,9 +113,10 @@ run_aggregate() {
     --exp "${STE_EXP}" \
     --user-ids "${USER_IDS}" \
     --params-dir "${ADAPR_PARAMS_DIR}" \
-    --activity off \
+    --activity "${ADAPR_ACTIVITY}" \
     --stayer-fraction "${ADAPR_STAYER_FRACTION}" \
     --misspec "${ADAPR_MISSPEC}" \
+    ${STE_ACTIVITY:+--ste-activity "${STE_ACTIVITY}"} \
     "${EFFECTIVE_ARGS[@]+"${EFFECTIVE_ARGS[@]}"}"
 }
 

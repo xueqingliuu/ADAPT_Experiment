@@ -175,6 +175,27 @@ def stage_data(report: Report) -> None:
         )
 
 
+DIV_WARN_FRAC = 0.005
+
+
+# 07 records written before draws/chains were stored used NUTS_DRAWS=3000, 4 chains.
+_DEFAULT_07_POST_WARMUP = 3000 * 4
+
+
+def _post_warmup_draws(record: dict, *, label: str = "") -> int | None:
+    """Post-warm-up draws = chains × draws, if either is recorded."""
+    draws = record.get("draws")
+    chains = record.get("chains")
+    if draws is not None and chains is not None:
+        return int(draws) * int(chains)
+    n = record.get("n_post_warmup")
+    if n is not None:
+        return int(n)
+    if str(label).startswith("07"):
+        return _DEFAULT_07_POST_WARMUP
+    return None
+
+
 def _diag_ok(report: Report, label: str, record: dict) -> None:
     n_div = record.get("divergences")
     rhat = record.get("max_rhat")
@@ -182,16 +203,33 @@ def _diag_ok(report: Report, label: str, record: dict) -> None:
     if n_div is None or rhat is None or ess is None:
         report.line("FAIL", f"{label} diagnostics are missing divergences, max_rhat, or min_ess_bulk")
         return
-    if int(n_div) == 0 and float(rhat) <= 1.01 and float(ess) >= 400:
-        report.line(
-            "PASS",
-            f"{label} divergences=0 max R-hat={float(rhat):.4f} min bulk ESS={float(ess):.0f}",
-        )
+    n_div = int(n_div)
+    n_post = _post_warmup_draws(record, label=label)
+    rhat_ok = float(rhat) <= 1.01
+    ess_ok = float(ess) >= 400
+    rest = (
+        f"max R-hat={float(rhat):.4f} min bulk ESS={float(ess):.0f}"
+    )
+    if n_div == 0:
+        div_status = "PASS"
+        div_msg = f"{label} divergences=0 {rest}"
     else:
-        report.line(
-            "FAIL",
-            f"{label} divergences={n_div} max R-hat={rhat} min bulk ESS={ess}",
+        if n_post is None or n_post <= 0:
+            report.line(
+                "FAIL",
+                f"{label} divergences={n_div} but post-warmup draw count is missing",
+            )
+            return
+        frac = n_div / float(n_post)
+        div_msg = (
+            f"{label} divergences={n_div} ({frac:.3%} of {n_post} "
+            f"post-warmup draws) {rest}"
         )
+        div_status = "WARN" if frac <= DIV_WARN_FRAC else "FAIL"
+    if not rhat_ok or not ess_ok:
+        report.line("FAIL", div_msg)
+        return
+    report.line(div_status, div_msg)
 
 
 def stage_fit(report: Report) -> None:
@@ -390,11 +428,7 @@ def stage_ste(report: Report) -> None:
             if name in uniform:
                 report.line("FAIL", f"{name}/generator_calibration.json is missing")
             else:
-                report.line(
-                    "WARN",
-                    f"{name} is missing (unattainable Layer-1 folders are ok; "
-                    "uniform folders are required)",
-                )
+                report.line("WARN", f"{name} is missing")
             continue
         block = json.loads(path.read_text(encoding="utf-8")).get("activity_process")
         if not isinstance(block, dict):

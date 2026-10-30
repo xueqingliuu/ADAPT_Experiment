@@ -52,6 +52,19 @@ def month_c_of(day: int) -> float:
 DROPOUT_RNG_SALT = 771337
 
 
+def assert_shared_engagement_path(status_a, status_b, *, misspec: str = "none") -> None:
+    """Reference and never-send must share the path except under misspec D."""
+    if str(misspec).strip().upper() == "D":
+        return
+    a = np.asarray(status_a)
+    b = np.asarray(status_b)
+    if a.shape != b.shape or not np.array_equal(a, b):
+        raise AssertionError(
+            "reference and never-send must share the engagement path "
+            f"(SeedSequence([seed, uid, {DROPOUT_RNG_SALT}]))"
+        )
+
+
 def dropout_seed_sequence(seed, uid) -> np.random.SeedSequence:
     """Activity-path RNG. The main episode seed does not include the participant."""
     dropout_seed = 0 if seed is None else int(seed)
@@ -251,7 +264,9 @@ class ActivityStepper:
             + self.u
         )
         if burden_z is not None:
-            eta = eta + math.log(1.5) * float(burden_z)
+            from misspec import burden_dropout_shift
+
+            eta = eta + burden_dropout_shift(burden_z)
         return float(eta)
 
     def ensure_day(self, day_0based: int, burden_z: float = 0.0) -> int:

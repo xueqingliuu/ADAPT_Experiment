@@ -45,16 +45,14 @@
 #TUNE_PROXY_TO_TRUE=from:env_para_ste<t>,TUNE_OVERWRITE=1 run_tune_ste.sh
 #   5. validate again (and ratio, to record the final confirmed STE)
 #
-# Layer 1 from vanilla (activity off; after the 47-user refit, not now):
-#   uniform        action         kappa_m = kappa_b  -> env_para_ste0.2 / 0.5 / 0.8
-#   benefit only   benefit_only   kappa_m = 0        -> env_para_ste0.2_benefitonly / ste0.8_benefitonly
-#   heavy burden   heavy_burden   kappa_m = 2        -> env_para_ste0.2_heavyburden / ste0.8_heavyburden
-#                   (STE 0.8 falls back to kappa_m = 1.5 then 1.0)
-#   sbatch --export=ALL,TUNE_PHASE=layer1 run_tune_ste.sh
-#   python tune_ste.py layer1 --dry-run
+# Tune from vanilla (activity on, ψ = 0.5; after the 47-user refit, not now):
+#   uniform action knob  kappa_m = kappa_b  -> env_para_ste0.2 / 0.5
+#   sbatch --export=ALL,TUNE_PHASE=tune run_tune_ste.sh
+#   python tune_ste.py tune --dry-run
+#   TUNE_PHASE=layer1 is an alias for tune.
 #
 # Overrides (sbatch --export=ALL,VAR=value,...):
-#   TUNE_PHASE        diagnose|eval|scan|apply|calibrate|layer1|protocol|validate|ratio  default calibrate
+#   TUNE_PHASE        diagnose|eval|scan|apply|calibrate|tune|layer1|protocol|validate|ratio  default calibrate
 #   TUNE_PARAMS_DIR   source fit to rescale                    default env_para_vanilla
 #   TUNE_KNOB         burden_path|benefit_foursc|fatigue|... (burden_shift = fatigue)
 #   TUNE_STE02_TARGET     protocol low-STE target              default 0.2
@@ -65,7 +63,7 @@
 #   TUNE_HIGH_FALLBACK_KAPPA0  benefit_foursc fallback start     default 2
 #   TUNE_OVERWRITE    1 to pass --overwrite (needed when replacing folders
 #                     written under an older knob name/semantics)  default 0
-#   TUNE_TARGETS      target mean STE values                   default "0.2 0.5 0.8"
+#   TUNE_TARGETS      target mean STE values                   default "0.2 0.5"
 #   TUNE_KAPPA        apply-phase knob value                   default 0.4
 #   TUNE_OUT_DIR      apply-phase destination                  default
 #                     env_para_burden_shift_large (burden_shift) or
@@ -90,13 +88,13 @@
 #   TUNE_SCRATCH      working dir for candidate params     default
 #                     .ste_tune_scratch_<knob>_<jobid>
 #
-# layer1 writes the attainable Layer-1 folders (7 targets; 0.8_heavyburden
-# retries kappa_m = 1.5 then 1.0 if 2 is unattainable). Every written folder
-# carries vanilla's activity_process and a ste_tuning.json (knob, kappa_b,
-# kappa_m, target, proxy STE, burden share; ratio fills in confirmed STE
-# and the confirmed burden share later). The *proxy* STE is transferred
-# vanilla CQL vs never-suggest, Δ clipped at 0. Confirmation uses the same
-# clip. On success the script submits one run_ste.sh array per written folder.
+# tune writes env_para_ste0.2 / 0.5 (action knob, activity on, ψ = 0.5).
+# Every written folder carries vanilla's activity_process and a
+# ste_tuning.json (knob, kappa, target, proxy STE, burden share; ratio
+# fills in confirmed STE and the confirmed burden share later). The
+# *proxy* STE is transferred vanilla CQL vs never-suggest, Δ clipped at 0.
+# Confirmation is the in-folder DiscreteCQL STE at ψ = 0.5. On success
+# the script submits one run_ste.sh array per written folder.
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")}"
@@ -121,13 +119,13 @@ export MPLCONFIGDIR="${SLURM_SUBMIT_DIR:-$PWD}/.matplotlib"
 TUNE_PHASE="${TUNE_PHASE:-calibrate}"
 TUNE_DRY_RUN="${TUNE_DRY_RUN:-0}"
 TUNE_PARAMS_DIR="${TUNE_PARAMS_DIR:-env_para_vanilla}"
-# STE tuning always uses activity off (no-gap).
-export ADAPR_ACTIVITY=off
-ADAPR_STAYER_FRACTION="${ADAPR_STAYER_FRACTION:-0}"
+# Default tune: activity on, stayer fraction 0.5.
+export ADAPR_ACTIVITY="${ADAPR_ACTIVITY:-on}"
+ADAPR_STAYER_FRACTION="${ADAPR_STAYER_FRACTION:-0.5}"
 ADAPR_MISSPEC="${ADAPR_MISSPEC:-none}"
 export ADAPR_STAYER_FRACTION ADAPR_MISSPEC ADAPR_PARAMS_DIR="${TUNE_PARAMS_DIR}"
 TUNE_KNOB="${TUNE_KNOB:-action}"
-TUNE_TARGETS="${TUNE_TARGETS:-0.2 0.5 0.8}"
+TUNE_TARGETS="${TUNE_TARGETS:-0.2 0.5}"
 TUNE_STE02_TARGET="${TUNE_STE02_TARGET:-0.2}"
 TUNE_BURDEN_KAPPA0="${TUNE_BURDEN_KAPPA0:-0.3}"
 TUNE_STE02_BENEFIT_KAPPA0="${TUNE_STE02_BENEFIT_KAPPA0:-0.5}"
@@ -279,7 +277,7 @@ COMMON_ARGS=(
   --episodes "${TUNE_EPISODES}"
   --seed "${TUNE_SEED}"
   --noise "${TUNE_NOISE}"
-  --activity off
+  --activity "${ADAPR_ACTIVITY}"
   --stayer-fraction "${ADAPR_STAYER_FRACTION}"
   --misspec "${ADAPR_MISSPEC}"
   "${POLICY_GRID_ARGS[@]+"${POLICY_GRID_ARGS[@]}"}"
@@ -355,7 +353,7 @@ if [[ "${TUNE_OVERWRITE}" == "1" ]]; then
 fi
 
 case "${TUNE_PHASE}" in
-  layer1)
+  tune|layer1)
     STABLE_FLAG=(--require-stable)
     if [[ "${TUNE_REQUIRE_STABLE}" == "0" ]]; then
       STABLE_FLAG=(--no-require-stable)
@@ -365,7 +363,11 @@ case "${TUNE_PHASE}" in
       DRY_FLAG=(--dry-run)
     fi
     set +e
-    "${PY}" tune_ste.py layer1 "${COMMON_ARGS[@]}" \
+    TUNE_CMD="tune"
+    if [[ "${TUNE_PHASE}" == "layer1" ]]; then
+      TUNE_CMD="layer1"
+    fi
+    "${PY}" tune_ste.py "${TUNE_CMD}" "${COMMON_ARGS[@]}" \
       --out-prefix "${TUNE_OUT_PREFIX}" \
       --scratch "${TUNE_SCRATCH}" \
       --tol "${TUNE_TOL}" \
@@ -573,9 +575,7 @@ case "${TUNE_PHASE}" in
       RATIO_DIRS=("${TUNE_VALIDATE_DIR}")
     else
       RATIO_DIRS=(
-        "${TUNE_OUT_PREFIX}0.2" "${TUNE_OUT_PREFIX}0.5" "${TUNE_OUT_PREFIX}0.8"
-        "${TUNE_OUT_PREFIX}0.2_benefitonly" "${TUNE_OUT_PREFIX}0.8_benefitonly"
-        "${TUNE_OUT_PREFIX}0.2_heavyburden" "${TUNE_OUT_PREFIX}0.8_heavyburden"
+        "${TUNE_OUT_PREFIX}0.2" "${TUNE_OUT_PREFIX}0.5"
       )
     fi
     for dir in "${RATIO_DIRS[@]}"; do
@@ -583,7 +583,7 @@ case "${TUNE_PHASE}" in
     done
     ;;
   *)
-    echo "ERROR: unknown TUNE_PHASE=${TUNE_PHASE} (use diagnose, eval, scan, apply, calibrate, layer1, protocol, validate, or ratio)" >&2
+    echo "ERROR: unknown TUNE_PHASE=${TUNE_PHASE} (use diagnose, eval, scan, apply, calibrate, tune, layer1, protocol, validate, or ratio)" >&2
     exit 1
     ;;
 esac

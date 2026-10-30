@@ -2403,7 +2403,7 @@ class Env:
         if miss == "A":
             mu = mu + float(self.cfg.misspec_lam_Y) * float(self.cfg.sigma_Y) * self._confounder_at_week()
         if miss == "B" and self._week_action_frac is not None:
-            mu = mu + float(self.cfg.misspec_beta_D) * (float(self._week_action_frac) - 0.5)
+            mu = mu + float(self.cfg.misspec_beta_D) * float(self._week_action_frac)
         return mu
 
     def gen_CAE(self, CAE_lastweek, foursc_wk, antic_wk, week_idx):

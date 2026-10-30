@@ -15,6 +15,17 @@
 #   ENV_VARIANT=env_para_ste0.5 sbatch run_array.sh
 ENV_VARIANT="${ENV_VARIANT:-env_para_vanilla}"
 # Testbed spec (sbatch --export=ALL,ENV_VARIANT=env_para_ste0.5,ADAPR_ACTIVITY=on,ADAPR_STAYER_FRACTION=0.25,ADAPR_MISSPEC=none).
+# Or select catalog()[i] with TESTBED_INDEX=0..29 (overrides ENV_VARIANT / activity / ψ / misspec).
+if [[ -n "${TESTBED_INDEX:-}" ]]; then
+  eval "$(python3 -c "
+from testbed import catalog
+s = catalog()[int('${TESTBED_INDEX}')]
+print(f'ENV_VARIANT={s.params_dir.name}')
+print(f'ADAPR_ACTIVITY={s.activity}')
+print(f'ADAPR_STAYER_FRACTION={s.stayer_fraction}')
+print(f'ADAPR_MISSPEC={s.misspec}')
+")"
+fi
 ADAPR_ACTIVITY="${ADAPR_ACTIVITY:-on}"
 ADAPR_STAYER_FRACTION="${ADAPR_STAYER_FRACTION:-0}"
 ADAPR_MISSPEC="${ADAPR_MISSPEC:-none}"
@@ -99,6 +110,7 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 echo "ENV_VARIANT=${ENV_VARIANT}"
+echo "TESTBED_INDEX=${TESTBED_INDEX:-<unset>}"
 echo "ADAPR_ACTIVITY=${ADAPR_ACTIVITY}"
 echo "ADAPR_STAYER_FRACTION=${ADAPR_STAYER_FRACTION}"
 echo "ADAPR_MISSPEC=${ADAPR_MISSPEC}"

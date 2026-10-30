@@ -50,24 +50,24 @@ the dropout table. `algorithm_helpers.py`, `derived_covariates.py`,
 `est_prior.py` and `stability.py` stay importable under those names.
 `ste_vanilla.py` is the STE evaluation used by `tune_ste.py`.
 
-## 28 testbeds
+## 30 testbeds
 
 A testbed is `(params dir, activity, stayer fraction, misspec)`. Select it
 with `ADAPR_PARAMS_DIR` / `--params-dir`, `ADAPR_ACTIVITY` / `--activity`
 (default `on`), `ADAPR_STAYER_FRACTION` / `--stayer-fraction` (0, 0.25, 0.5),
 and `ADAPR_MISSPEC` / `--misspec` (`none`, `A`, `B`, `C`, `D`; default `none`).
-Results folders are `results_<steX.Y>_<gapon|gapoff>_psi<frac>_misspec<letter>`.
-STE tuning and STE evaluation always force activity `off` (no gaps) and log
-that. Layer 1 is seven folders tuned from vanilla with a two-dial design
-(`kappa_b` on A→MY, `kappa_m` on A→ME; mediator→CAE alphas are not
-scaled): three uniform (`kappa_m = kappa_b`), two benefit-only
-(`kappa_m = 0`), two heavy-burden (`kappa_m = 2` plus floored ME→E and
-centered E→MY +0.3). Layers 2 and 3 use only the three uniform folders. `python proxy_ste.py` reports the no-gap proxy STE, the
-effective proxy STE under the testbed's own activity, and a scaled proxy
-STE (proxy × the confirmed/proxy ratio in the uniform folder's
-`ste_tuning.json`). `python calibrate_misspec.py` writes A/B strengths
-into `<params_dir>/misspec_calibration.json` (A on 12-week episodes, B on
-36).
+Or `TESTBED_INDEX=0..29` in `run_array.sh`. Results folders are
+`results_<steX.Y>_gapon_psi<frac>_misspec<letter>`.
+
+STE of a testbed uses that testbed's own activity and ψ. The optional
+`--ste-activity off` flag is the diagnostic no-gap STE. Tuning uses the
+uniform action knob (`kappa_m = kappa_b`) at ψ = 0.5 with activity on and
+writes `env_para_ste0.2` / `0.5`. `python proxy_ste.py` reports the
+engagement-on proxy STE and a scaled proxy STE (proxy × the
+confirmed/proxy ratio at ψ = 0.5 of the same environment).
+`python calibrate_misspec.py` writes A/B strengths into
+`<params_dir>/misspec_calibration.json` (both on 12-week random-0.5
+episodes, engagement off).
 
 Misspecifications (off by default; the simulator is unchanged when they are off):
 
@@ -76,16 +76,15 @@ Misspecifications (off by default; the simulator is unchanged when they are off)
 | none | Fitted generator; no extra misspecification. |
 | A | Unmeasured weekly confounder of SC, AA, and Y; causal SC/AA→Y halved. |
 | B | Unmeasured direct A→Y path; mediator action effects halved. |
-| C | Action effects on SC/AA decay from week 1, halving every 12 weeks, scaled so their mean over weeks 1–12 equals the fitted effect (x1.35 in week 1, x0.71 in week 12, x0.18 in week 36). |
+| C | Action effects on SC/AA decay from week 1 as `m(w)=2^{-(w-1)/12}` (c=1: m(1)=1, m(12)≈0.53, m(36)≈0.132). |
 | D | Recent burden raises the gap-start hazard; activity must be on. |
 
 | Layer | Count | params dir | activity | stayer | misspec |
 | --- | ---: | --- | --- | ---: | --- |
-| 1 | 7 | three uniform (`ste0.2`/`0.5`/`0.8`, `kappa_m = kappa_b`); `ste0.2_benefitonly`/`ste0.8_benefitonly` (`kappa_m = 0`); `ste0.2_heavyburden`/`ste0.8_heavyburden` (`kappa_m = 2`, then 1.5 / 1.0 if 0.8 is unattainable; ME→E floored at 0.05, E→MY +0.3 centered) | off | 0 | none |
-| 2 | 9 | the three uniform folders | on | 0, 0.25, 0.5 | none |
-| 3 | 12 | the three uniform folders | on | 0 | A, B, C, D |
+| 1 | 6 | `ste0.2` / `ste0.5` | on | 0, 0.25, 0.5 | none |
+| 2 | 24 | `ste0.2` / `ste0.5` | on | 0, 0.25, 0.5 | A, B, C, D |
 
-Example: Layer 2, STE 0.5, 25% stayers::
+Example: Layer 1, STE 0.5, 25% stayers::
 
     sbatch --export=ALL,ENV_VARIANT=env_para_ste0.5,ADAPR_ACTIVITY=on,ADAPR_STAYER_FRACTION=0.25,ADAPR_MISSPEC=none,PRIOR_MODE=loo run_array.sh
 
@@ -139,6 +138,6 @@ bash run_array.sh
 python aggregate.py
 ```
 
-`ADAPR_PARAMS_DIR=env_para_ste0.8` selects an STE copy. Add `--activity off`
-for Layer 1 (no gaps), `--stayer-fraction 0.25` for a Layer 2 stayer mix,
-or `--misspec A` for a Layer 3 confounder.
+`ADAPR_PARAMS_DIR=env_para_ste0.5` selects an STE copy. Add
+`--stayer-fraction 0.25` or `--misspec A`. For the diagnostic no-gap STE,
+`python ste_vanilla.py eval 0 --ste-activity off`.

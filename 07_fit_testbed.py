@@ -174,11 +174,15 @@ class _BayesianRandomCoefResult:
         self.n_divergences = n_div
         self.max_rhat = max_rhat
         self.converged = bool(n_div == 0 and max_rhat < 1.01)
+        n_draws = int(post.sizes["draw"])
+        n_chains = int(post.sizes["chain"])
         _FIT_DIAGNOSTICS.append(
             {
                 "divergences": n_div,
                 "max_rhat": max_rhat,
                 "min_ess_bulk": min_ess,
+                "draws": n_draws,
+                "chains": n_chains,
             }
         )
 

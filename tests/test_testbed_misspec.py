@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 import experiment
-from misspec import DECAY_C, MISSPEC_C_BLURB, decay_c, decay_m, draw_confounder
+from misspec import DECAY_C, MISSPEC_C_BLURB, decay_m, draw_confounder
 from testbed import (
     MISSPEC_BLURBS,
     catalog,
@@ -40,23 +40,61 @@ def _traj(oenv):
     }
 
 
-def test_catalog_has_28_distinct_folder_names():
+def test_catalog_has_exactly_30_testbeds():
     rows = catalog(ROOT)
-    assert len(rows) == 28
+    assert len(rows) == 30
     suffixes = [r.suffix for r in rows]
-    assert len(set(suffixes)) == 28
+    assert len(set(suffixes)) == 30
     roots = [r.results_root for r in rows]
-    assert len(set(roots)) == 28
+    assert len(set(roots)) == 30
     layer1 = [r for r in rows if r.layer == 1]
     layer2 = [r for r in rows if r.layer == 2]
-    layer3 = [r for r in rows if r.layer == 3]
-    assert len(layer1) == 7 and all(r.activity == "off" and r.misspec == "none" for r in layer1)
-    assert len(layer2) == 9 and all(r.activity == "on" and r.misspec == "none" for r in layer2)
-    assert len(layer3) == 12 and all(r.activity == "on" and r.stayer_fraction == 0.0 for r in layer3)
-    layer2_dirs = {r.params_dir.name for r in layer2}
-    layer3_dirs = {r.params_dir.name for r in layer3}
-    assert layer2_dirs == {"env_para_ste0.2", "env_para_ste0.5", "env_para_ste0.8"}
-    assert layer3_dirs == layer2_dirs
+    assert len(layer1) == 6 and all(r.activity == "on" and r.misspec == "none" for r in layer1)
+    assert len(layer2) == 24 and all(r.activity == "on" for r in layer2)
+    assert {r.misspec for r in layer2} == {"A", "B", "C", "D"}
+    assert {r.stayer_fraction for r in rows} == {0.0, 0.25, 0.5}
+    dirs = {r.params_dir.name for r in rows}
+    assert dirs == {"env_para_ste0.2", "env_para_ste0.5"}
+    assert not any("0.8" in r.params_dir.name for r in rows)
+    assert not any("benefitonly" in r.params_dir.name for r in rows)
+    assert not any("heavyburden" in r.params_dir.name for r in rows)
+
+
+def test_catalog_cli_lists_indices_0_to_29(capsys):
+    from testbed import main
+
+    main([])
+    out = [ln for ln in capsys.readouterr().out.splitlines() if ln]
+    assert out[-1] == "30 testbeds (indices 0..29)"
+    assert out[0].lstrip().startswith("0  ")
+    assert any(line.startswith("29  ") for line in out)
+    assert len(out) == 31
+
+
+def test_fit_divergence_tolerance(capsys):
+    from importlib.machinery import SourceFileLoader
+
+    check = SourceFileLoader(
+        "check_refit_05", str(ROOT / "05_check_refit.py")
+    ).load_module()
+    report = check.Report()
+    check._diag_ok(
+        report, "06",
+        {"divergences": 0, "max_rhat": 1.004, "min_ess_bulk": 877, "chains": 4, "draws": 1000},
+    )
+    check._diag_ok(
+        report, "06",
+        {"divergences": 5, "max_rhat": 1.004, "min_ess_bulk": 877, "chains": 4, "draws": 1000},
+    )
+    check._diag_ok(
+        report, "06",
+        {"divergences": 30, "max_rhat": 1.004, "min_ess_bulk": 877, "chains": 4, "draws": 1000},
+    )
+    out = capsys.readouterr().out
+    assert "PASS 06 divergences=0" in out
+    assert "WARN 06 divergences=5 (0.125% of 4000 post-warmup draws)" in out
+    assert "FAIL 06 divergences=30" in out
+    assert report.failed
 
 
 def test_results_suffix_changes_with_each_axis():
@@ -117,20 +155,15 @@ def test_confounder_and_activity_identical_across_policies():
     np.testing.assert_array_equal(never._activity_status, always._activity_status)
 
 
-def test_decay_m_mean_and_week36_and_policy_independence():
-    c = decay_c()
-    assert c == pytest.approx(DECAY_C)
-    weeks = np.arange(1, 13)
-    mean12 = float(np.mean([decay_m(w) for w in weeks]))
-    assert mean12 == pytest.approx(1.0, abs=1e-12)
-    assert decay_m(1) == pytest.approx(1.35, abs=0.01)
-    assert decay_m(12) == pytest.approx(0.71, abs=0.01)
-    assert decay_m(36) == pytest.approx(c * 2 ** (-35 / 12), rel=1e-12)
-    assert decay_m(36) == pytest.approx(0.18, abs=0.02)
+def test_decay_m_c1_week1_and_week36():
+    assert DECAY_C == 1.0
+    assert decay_m(1) == pytest.approx(1.0)
+    assert decay_m(12) == pytest.approx(0.5, abs=0.04)
+    assert decay_m(36) == pytest.approx(2 ** (-35 / 12), rel=1e-12)
+    assert decay_m(36) == pytest.approx(0.1324, abs=0.0002)
     assert decay_m(5) == decay_m(5)
-    assert "decay from week 1" in MISSPEC_C_BLURB
+    assert "c=1" in MISSPEC_C_BLURB
     assert MISSPEC_BLURBS["C"] == MISSPEC_C_BLURB
-    assert "decay after the 12-week" not in MISSPEC_C_BLURB
 
 
 def test_misspec_A_B_require_calibration_or_explicit_strengths():
@@ -172,13 +205,14 @@ def test_misspec_d_requires_activity_on():
         resolve_testbed_spec(PARAMS, activity="off", misspec="D")
 
 
-def test_calibrate_misspec_A_defaults_to_12_weeks():
-    """A OLS episodes match the 11-week fit panel; B stays at 36."""
+def test_calibrate_misspec_defaults_to_12_weeks():
+    """A and B both use 12-week random-0.5, activity-off episodes."""
     from calibrate_misspec import _run_A_episode, build_parser
 
     args = build_parser().parse_args([])
     assert args.nweek == 12
-    assert args.nweek_b == 36
+    assert args.nweek_b == 12
+    assert args.max_episodes == 256
     X, y = _run_A_episode(PARAMS, 13, 1, args.nweek, 0.3, 0.3)
     assert y.size == 12
     assert X.shape == (12, 4)
@@ -345,3 +379,143 @@ def test_d_random_send_matches_pooled_84day_table():
             se = (max(level, 0.0) * (1.0 - min(level, 1.0)) / n_got) ** 0.5
             tol = max(3.0 * se, 0.02)
         assert diff <= tol, f"{key}: {got[key]} vs {expected[key]} (tol {tol})"
+
+
+def test_ste_checkin_window_jw_and_iw_always_one():
+    """Sun–Tue all inactive → J_w = 0; any engaged day → J_w = 1; I_w = 1."""
+    from experiment import (
+        N_RL_DAYS,
+        N_RL_SLOTS,
+        SUNDAY_D_W,
+        checkin_window_jw,
+        _make_online_env,
+    )
+
+    status = np.ones(21, dtype=int)
+    sunday = 6
+    assert checkin_window_jw(status, sunday) == 0
+    for offset in (0, 1, 2):
+        path = status.copy()
+        path[sunday + offset] = 0
+        assert checkin_window_jw(path, sunday) == 1
+    saturday_only = status.copy()
+    saturday_only[sunday - 1] = 0
+    assert checkin_window_jw(saturday_only, sunday) == 0
+    assert checkin_window_jw(None, sunday) == 1
+
+    cfg, env, oenv = _make_online_env(
+        13, seed=4, params_dir=PARAMS, activity="on", misspec="none",
+        nweek=2, ste_mode=True,
+    )
+    oenv._reset_episode_state()
+    path = np.zeros(oenv._activity_status.shape, dtype=np.int8)
+    sunday_idx = oenv._day_idx(0, SUNDAY_D_W)
+    path[sunday_idx:sunday_idx + 3] = 1
+    oenv._activity_status = path
+    if oenv._activity_stepper is not None:
+        oenv._activity_stepper.status_hist = path
+    oenv.start_week(0, 1)
+    for d in range(N_RL_DAYS):
+        d_global = oenv._day_idx(0, d)
+        oenv._ensure_day_started(0, d, d_global)
+        for t in range(N_RL_SLOTS):
+            oenv.step_action(0, d, t, 0.0, 1)
+    oenv._finalize_week(0)
+    weekly_idx = oenv._weekly_idx(0)
+    assert oenv.wp_truth_all[weekly_idx] == 0.0
+    assert int(oenv._Iw_per_week[0]) == 1
+
+    oenv2 = _make_online_env(
+        13, seed=4, params_dir=PARAMS, activity="on", misspec="none",
+        nweek=2, ste_mode=True,
+    )[2]
+    oenv2._reset_episode_state()
+    engaged = np.zeros(oenv2._activity_status.shape, dtype=np.int8)
+    oenv2._activity_status = engaged
+    if oenv2._activity_stepper is not None:
+        oenv2._activity_stepper.status_hist = engaged
+    oenv2.start_week(0, 1)
+    for d in range(N_RL_DAYS):
+        d_global = oenv2._day_idx(0, d)
+        oenv2._ensure_day_started(0, d, d_global)
+        for t in range(N_RL_SLOTS):
+            oenv2.step_action(0, d, t, 0.0, 1)
+    oenv2._finalize_week(0)
+    assert oenv2.wp_truth_all[oenv2._weekly_idx(0)] == 1.0
+    assert int(oenv2._Iw_per_week[0]) == 1
+
+
+def _ste_roll(uid, seed, policy, *, misspec="none", strengths=None, nweek=4):
+    from experiment import N_RL_DAYS, N_RL_SLOTS, OnlineEnv
+    from vani_env import Env, EnvConfig
+
+    cfg = EnvConfig(
+        uid, params_dir=PARAMS, nweek=nweek, activity="on", misspec=misspec,
+        misspec_strengths=strengths, activity_stayer_fraction=0.5,
+    )
+    env = Env(cfg, noise="ar1")
+    oenv = OnlineEnv(env, nweek=nweek, seed=seed, ste_mode=True)
+    rng = np.random.default_rng(seed)
+    oenv._reset_episode_state()
+    for k in range(oenv.nweek):
+        oenv.start_week(k, 1)
+        for d in range(N_RL_DAYS):
+            d_global = oenv._day_idx(k, d)
+            oenv._ensure_day_started(k, d, d_global)
+            for t in range(N_RL_SLOTS):
+                if oenv.dropped_out or policy == "zero":
+                    a = 0
+                else:
+                    a = 1 if policy == "always" else int(rng.random() < 0.5)
+                oenv.step_action(k, d, t, float(a), 1)
+        oenv._finalize_week(k)
+    return oenv
+
+
+def test_ste_reference_and_never_send_share_engagement_path():
+    from activity_process import assert_shared_engagement_path
+
+    never = _ste_roll(13, 9, "zero")
+    ref = _ste_roll(13, 9, "bernoulli")
+    assert_shared_engagement_path(never._activity_status, ref._activity_status, misspec="none")
+    never_a = _ste_roll(13, 9, "zero", misspec="A", strengths=TEST_STRENGTHS_A)
+    ref_a = _ste_roll(13, 9, "always", misspec="A", strengths=TEST_STRENGTHS_A)
+    assert_shared_engagement_path(never_a._activity_status, ref_a._activity_status, misspec="A")
+    never_d = _ste_roll(13, 9, "zero", misspec="D")
+    always_d = _ste_roll(13, 9, "always", misspec="D")
+    assert_shared_engagement_path(
+        never_d._activity_status, always_d._activity_status, misspec="D"
+    )
+    if not np.array_equal(never_d._activity_status, always_d._activity_status):
+        with pytest.raises(AssertionError, match="share the engagement path"):
+            assert_shared_engagement_path(
+                never_d._activity_status, always_d._activity_status, misspec="none"
+            )
+
+
+def test_misspec_b_never_send_matches_unmodified():
+    _n, none = experiment.run_never_send(
+        13, seed=3, params_dir=PARAMS, activity="off", misspec="none", nweek=6,
+    )
+    _b, b = experiment.run_never_send(
+        13, seed=3, params_dir=PARAMS, activity="off", misspec="B",
+        misspec_strengths={"beta_D": 0.4}, nweek=6,
+    )
+    for name, arr in _traj(none).items():
+        np.testing.assert_array_equal(arr, _traj(b)[name], err_msg=name)
+
+
+def test_d_eta_calls_burden_dropout_shift():
+    import math
+
+    from misspec import BURDEN_DROPOUT_OR, burden_dropout_shift
+
+    assert burden_dropout_shift(1.0) == pytest.approx(math.log(BURDEN_DROPOUT_OR))
+    assert burden_dropout_shift(0.0) == pytest.approx(0.0)
+
+
+def test_ste_g_sums_true_cae_including_after_dropout():
+    oenv = _ste_roll(13, 2, "zero", nweek=4)
+    weekly = np.asarray(oenv.CAE_all[1 : oenv.nweek + 1], dtype=float)
+    assert weekly.size == 4
+    assert np.all(np.isfinite(weekly))

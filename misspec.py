@@ -23,7 +23,6 @@ CONFOUNDER_LAM_Y = 0.5
 CAUSAL_ALPHA_SCALE = 0.5
 PATHWAY_ACTION_SCALE = 0.5
 DECAY_HALF_LIFE_WEEKS = 12.0
-DECAY_MEAN_WEEKS = 12
 BURDEN_DROPOUT_OR = 1.5
 CALIBRATION_NAME = "misspec_calibration.json"
 
@@ -47,30 +46,20 @@ CAE_SC_IDX = THETA_CAE_NAMES.index("fourSC_ewma")
 CAE_AA_IDX = THETA_CAE_NAMES.index("anticipated_affect_ewma")
 
 
-def decay_c(n_weeks: int = DECAY_MEAN_WEEKS, half_life: float = DECAY_HALF_LIFE_WEEKS) -> float:
-    """Scale so the mean of ``m(w)`` over weeks 1..``n_weeks`` is 1."""
-    weeks = np.arange(1, int(n_weeks) + 1, dtype=float)
-    raw = 2.0 ** (-(weeks - 1.0) / float(half_life))
-    return float(n_weeks / raw.sum())
-
-
-DECAY_C = decay_c()
+DECAY_C = 1.0
 
 MISSPEC_C_BLURB = (
-    "Action effects on SC/AA decay from week 1, halving every 12 weeks, "
-    "scaled so their mean over weeks 1–12 equals the fitted effect "
-    "(x1.35 in week 1, x0.71 in week 12, x0.18 in week 36)."
+    "Action effects on SC/AA decay from week 1 as m(w)=2^{-(w-1)/12} "
+    "(c=1: m(1)=1, m(12)≈0.53, m(36)≈0.132)."
 )
 
 
-def decay_m(week, *, c: float | None = None, half_life: float = DECAY_HALF_LIFE_WEEKS) -> float:
+def decay_m(week, *, c: float = DECAY_C, half_life: float = DECAY_HALF_LIFE_WEEKS) -> float:
     """``m(w) = c * 2^(-(w-1)/12)``. ``week`` is the 1-based protocol week.
 
-    Scaled so the mean over weeks 1–12 equals the fitted effect
-    (x1.35 in week 1, x0.71 in week 12, x0.18 in week 36).
+    Default ``c = 1`` (no mean-1 normalization): m(1)=1, m(12)≈0.53,
+    m(36)≈0.132.
     """
-    if c is None:
-        c = DECAY_C
     w = int(week)
     return float(c) * (2.0 ** (-(w - 1) / float(half_life)))
 

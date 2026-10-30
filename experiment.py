@@ -301,6 +301,21 @@ class EpisodeDataset:
 # Anticipated affect is still gated on daily-survey completion.
 # ──────────────────────────────────────────────────────────────────
 
+def checkin_window_jw(status, sunday_idx) -> int:
+    """``J_w = 1`` if Sunday of week ``w-1`` or Mon/Tue of week ``w`` is engaged.
+
+    ``status[d] == 0`` is engaged. A missing path (all engaged) returns 1.
+    """
+    if status is None:
+        return 1
+    status = np.asarray(status)
+    for offset in (0, 1, 2):
+        idx = int(sunday_idx) + int(offset)
+        if 0 <= idx < status.size and int(status[idx]) == 0:
+            return 1
+    return 0
+
+
 class OnlineEnv:
     @staticmethod
     def _dropout_seed_sequence(seed, uid) -> np.random.SeedSequence:
@@ -310,6 +325,7 @@ class OnlineEnv:
     def __init__(
         self, env, nweek=None, seed=None, start_dow=1,
         df_fit_11week_csv=None, df_fit_full=None, params_dir=None,
+        ste_mode: bool = False,
     ):
         # ``start_dow``: civil weekday index in ``{1,…,7}`` with **1 = Monday** (``df_fit`` / study).
         # ``df_fit_full``: optional pre-loaded df_fit for week-0 Ê_w from the
@@ -318,8 +334,12 @@ class OnlineEnv:
         # ``initial_Ew_hat_for_user``'s default 2.0, not 0.0.
         if seed is not None:
             rd.seed(seed)
+        # STE mode: I_w = 1 every week; J_w is the Sun–Tue engagement window
+        # (not forced to 1, not a random draw).
+        self.ste_mode = bool(ste_mode)
         # Activity path and the legacy constant-hazard draw. The main episode
         # RNG above is ``rd.seed(seed)`` and does not include the participant.
+        # Shared across policies via SeedSequence([seed, uid, 771337]).
         self._dropout_rng = np.random.default_rng(
             self._dropout_seed_sequence(seed, env.cfg.userid)
         )
@@ -1090,7 +1110,9 @@ class OnlineEnv:
         # so every generated variable, including recent burden, evolves as
         # under A = 0. The agent's chosen action is still recorded by the caller.
         Ah = 0.0 if self._content_unobserved(d_global) else float(action)
-        if self.dropped_out:
+        # STE check-in stays I_w = 1 after dropout. J_w is the observation
+        # indicator. RLSVI still closes the week after dropout.
+        if self.dropped_out and not self.ste_mode:
             I_w = 0
 
         self.activitySuggestionsSentLast7DaysAll[step_idx] = (
@@ -1407,12 +1429,16 @@ class OnlineEnv:
         u1 = self.env.gen_tool_U1(pu, sim_w)
         u2 = self.env.gen_tool_U2(pu, sim_w)
         j_draw = self.env.gen_week_present(pu, weekly_idx)
-        # Sunday slot plus Monday and Tuesday. The last week reads the 2-day extension.
-        forced_j = all(
-            not self._day_is_active(d_global + offset) for offset in (0, 1, 2)
-        )
-        j_w = 0.0 if forced_j else j_draw
-        hide_weekly = self.dropped_out or forced_j
+        # Sunday of this week plus Monday and Tuesday of the next week.
+        if self.ste_mode:
+            j_w = float(checkin_window_jw(self._activity_status, d_global))
+            window_closed = j_w < 0.5
+        else:
+            window_closed = all(
+                not self._day_is_active(d_global + offset) for offset in (0, 1, 2)
+            )
+            j_w = 0.0 if window_closed else j_draw
+        hide_weekly = self.dropped_out or window_closed
 
         self.CAE_all[weekly_idx] = cae
         self.CAE_mean_all[weekly_idx] = cae_mean
@@ -2741,6 +2767,7 @@ def _make_online_env(
     activity_lambda=None, activity_pi=None, activity_process_mode=None,
     activity_stayer_fraction=None, activity_stayer_recalibrate=None,
     activity=None, misspec=None, nweek=None, misspec_strengths=None,
+    ste_mode: bool = False,
 ):
     params_dir = resolve_params_dir(params_dir)
     cfg = EnvConfig(
@@ -2769,7 +2796,9 @@ def _make_online_env(
         cfg.activity_pi = float(activity_pi)
     nweek = cfg.nweek
     env = Env(cfg, noise="ar1")
-    oenv = OnlineEnv(env, nweek=nweek, seed=seed, params_dir=params_dir)
+    oenv = OnlineEnv(
+        env, nweek=nweek, seed=seed, params_dir=params_dir, ste_mode=ste_mode,
+    )
     return cfg, env, oenv
 
 

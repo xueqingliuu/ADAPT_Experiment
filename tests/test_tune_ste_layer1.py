@@ -113,24 +113,33 @@ def test_heavy_burden_centering_keeps_never_send_cae(tmp_path, monkeypatch):
     assert "stayer_variants" in dst_block
 
 
-def test_layer1_dry_run_lists_seven_targets(capsys):
+def test_tune_dry_run_lists_two_action_targets(capsys):
+    from tune_ste import build_parser
+
+    args = build_parser().parse_args(["tune", "--dry-run"])
+    args.func(args)
+    out = capsys.readouterr().out
+    for name in STE_LAYER1_DIRS:
+        assert name in out
+    assert "env_para_ste0.2" in out
+    assert "env_para_ste0.5" in out
+    assert "env_para_ste0.8" not in out
+    assert "kappa_m=kappa_b" in out
+    assert "knob=action" in out
+    assert "knob=benefit_only" not in out
+    assert "knob=heavy_burden" not in out
+    assert "benefitonly" not in out
+    assert "heavyburden" not in out
+    assert "activity on" in out
+
+
+def test_layer1_is_tune_alias(capsys):
     from tune_ste import build_parser
 
     args = build_parser().parse_args(["layer1", "--dry-run"])
     args.func(args)
     out = capsys.readouterr().out
-    for name in STE_LAYER1_DIRS:
-        assert name in out
-    assert "kappa_m=kappa_b" in out
-    assert "kappa_m=0" in out
-    assert "kappa_m=2" in out
-    assert "1.5" in out
-    assert "1.0" in out
+    assert "env_para_ste0.2" in out
+    assert "env_para_ste0.5" in out
     assert "knob=action" in out
-    assert "knob=benefit_only" in out
-    assert "knob=heavy_burden" in out
-    assert "env_para_ste0.2_benefit " not in out
-    assert "env_para_ste0.2_burden" not in out
-    assert "knob=benefit_path" not in out
-    assert "knob=burden_path" not in out
-    assert "scan to kappa=0" not in out
+    assert "knob=benefit_only" not in out

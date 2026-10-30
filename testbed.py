@@ -1,6 +1,6 @@
 """Testbed spec: params dir, activity, stayer fraction, and misspecification.
 
-A testbed is the four-tuple used by the 28-environment catalog. The same
+A testbed is the four-tuple used by the 30-environment catalog. The same
 object is read from ``ADAPR_*`` environment variables or CLI flags, written
 into run metadata, and turned into a results-folder suffix so two specs
 never share an output directory.
@@ -8,7 +8,7 @@ never share an output directory.
 Activity ``off`` is the existing ``activity_lambda = 0`` hook (every day
 engaged). Activity ``on`` is the pooled activity process. Stayer fraction is
 ignored, with a warning, when activity is off. Misspec ``D`` requires
-activity on.
+activity on. The official catalog is activity on for every testbed.
 """
 
 from __future__ import annotations
@@ -26,17 +26,12 @@ from vani_env import resolve_params_dir
 ACTIVITY_CHOICES = ("on", "off")
 MISSPEC_CHOICES = ("none", "A", "B", "C", "D")
 STAYER_CHOICES = (0.0, 0.25, 0.5)
-STE_PARAM_DIRS = ("env_para_ste0.2", "env_para_ste0.5", "env_para_ste0.8")
+STE_PARAM_DIRS = ("env_para_ste0.2", "env_para_ste0.5")
 STE_UNIFORM_DIRS = STE_PARAM_DIRS
-STE_LAYER1_DIRS = (
-    "env_para_ste0.2",
-    "env_para_ste0.5",
-    "env_para_ste0.8",
-    "env_para_ste0.2_benefitonly",
-    "env_para_ste0.8_benefitonly",
-    "env_para_ste0.2_heavyburden",
-    "env_para_ste0.8_heavyburden",
-)
+STE_TUNE_DIRS = STE_PARAM_DIRS
+# Backward-compatible alias used by 05_check_refit / older tests.
+STE_LAYER1_DIRS = STE_PARAM_DIRS
+TUNE_STAYER_FRACTION = 0.5
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -142,9 +137,8 @@ class TestbedSpec:
 
     @property
     def ste_results_root(self) -> str:
-        """STE always uses activity off; the folder still records that fact."""
-        ste = self.with_activity("off")
-        return f"results_ste_{ste.suffix}"
+        """STE uses this spec's activity and ψ (default: the testbed itself)."""
+        return f"results_ste_{self.suffix}"
 
     def with_activity(self, activity: str) -> "TestbedSpec":
         misspec = "none" if parse_activity(activity) == "off" and self.misspec == "D" else self.misspec
@@ -173,9 +167,23 @@ class TestbedSpec:
             "ADAPR_MISSPEC": self.misspec,
         }
 
-    def ste_spec(self) -> "TestbedSpec":
-        """STE always uses activity off; misspec D is dropped with that."""
-        return self.with_activity("off")
+    def ste_spec(self, ste_activity: str | None = None) -> "TestbedSpec":
+        """STE of this testbed: same activity and ψ, unless ``ste_activity='off'``.
+
+        The optional diagnostic ``ste_activity='off'`` is the old no-gap STE
+        (misspec D is dropped with that). Default is this spec unchanged.
+        """
+        if ste_activity is None:
+            return self
+        if parse_activity(ste_activity) == "off":
+            return self.with_activity("off")
+        return TestbedSpec(
+            params_dir=self.params_dir,
+            activity=ste_activity,
+            stayer_fraction=self.stayer_fraction,
+            misspec=self.misspec,
+            layer=self.layer,
+        )
 
 
 def resolve_testbed_spec(
@@ -240,34 +248,37 @@ def add_testbed_arguments(parser: argparse.ArgumentParser, *, params_dir: bool =
 
 
 def catalog(params_root: Path | None = None) -> list[TestbedSpec]:
-    """The 28 official testbeds (7 Layer 1 + 9 Layer 2 + 12 Layer 3).
+    """The 30 official testbeds.
 
-    Layers 2 and 3 use only the three uniform (action-knob) folders.
+    ``{ste0.2, ste0.5} × ψ ∈ {0, 0.25, 0.5} × {none, A, B, C, D}``.
+    Layer 1 is misspec none (6); Layer 2 is A–D (24). Activity is on.
     """
     root = Path(params_root) if params_root is not None else Path(".")
     rows: list[TestbedSpec] = []
-    for name in STE_LAYER1_DIRS:
-        rows.append(
-            TestbedSpec(root / name, "off", 0.0, "none", layer=1)
-        )
-    for name in STE_UNIFORM_DIRS:
+    for name in STE_PARAM_DIRS:
         for psi in STAYER_CHOICES:
             rows.append(
-                TestbedSpec(root / name, "on", psi, "none", layer=2)
+                TestbedSpec(root / name, "on", psi, "none", layer=1)
             )
-    for name in STE_UNIFORM_DIRS:
-        for miss in ("A", "B", "C", "D"):
-            rows.append(
-                TestbedSpec(root / name, "on", 0.0, miss, layer=3)
-            )
-    if len(rows) != 28:
-        raise RuntimeError(f"expected 28 testbeds, got {len(rows)}")
+    for name in STE_PARAM_DIRS:
+        for psi in STAYER_CHOICES:
+            for miss in ("A", "B", "C", "D"):
+                rows.append(
+                    TestbedSpec(root / name, "on", psi, miss, layer=2)
+                )
+    if len(rows) != 30:
+        raise RuntimeError(f"expected 30 testbeds, got {len(rows)}")
     return rows
 
 
 def catalog_24(params_root: Path | None = None) -> list[TestbedSpec]:
-    """Alias for :func:`catalog` (28 testbeds)."""
+    """Alias for :func:`catalog` (30 testbeds)."""
     return catalog(params_root)
+
+
+def catalog_layer2(params_root: Path | None = None) -> list[TestbedSpec]:
+    """The 24 Layer-2 misspecification testbeds."""
+    return [s for s in catalog(params_root) if s.layer == 2]
 
 
 MISSPEC_BLURBS = {
@@ -279,19 +290,29 @@ MISSPEC_BLURBS = {
 }
 
 
-def log_ste_activity_off(requested: TestbedSpec | None = None) -> str:
-    """STE tuning/eval always run with activity off. Print and return the line."""
-    extra = ""
-    if requested is not None and requested.activity != "off":
-        extra = (
-            f" (testbed activity={requested.activity} "
-            f"stayer={requested.stayer_fraction:g} ignored for no-gap STE)"
+def log_ste_spec(spec: TestbedSpec, *, diagnostic_off: bool = False) -> str:
+    """Print the activity / ψ used for this STE run."""
+    if diagnostic_off or spec.activity == "off":
+        msg = (
+            f"STE: activity off (diagnostic no-gap)  "
+            f"stayer={spec.stayer_fraction:g} misspec={spec.misspec}"
         )
-    if requested is not None and requested.misspec == "D":
-        extra += " (misspec D disabled because STE has no gaps)"
-    msg = f"STE: activity off (no-gap, lambda=0){extra}"
+    else:
+        msg = (
+            f"STE: activity {spec.activity}  "
+            f"stayer={spec.stayer_fraction:g} misspec={spec.misspec}"
+        )
     print(msg, flush=True)
     return msg
+
+
+def log_ste_activity_off(requested: TestbedSpec | None = None) -> str:
+    """Deprecated alias: diagnostic no-gap STE log."""
+    if requested is None:
+        spec = TestbedSpec(Path("."), "off", 0.0, "none")
+    else:
+        spec = requested.ste_spec("off")
+    return log_ste_spec(spec, diagnostic_off=True)
 
 
 def apply_spec_to_env_config(cfg, spec: TestbedSpec) -> None:
@@ -305,3 +326,32 @@ def apply_spec_to_env_config(cfg, spec: TestbedSpec) -> None:
         cfg.activity_lambda = 0.0
     if spec.misspec == "D" and spec.activity != "on":
         raise ValueError("misspec D requires activity on")
+
+
+def format_catalog_row(index: int, spec: TestbedSpec) -> str:
+    return (
+        f"{index:2d}  {spec.suffix}  layer={spec.layer}  "
+        f"{Path(spec.params_dir).name}  activity={spec.activity}  "
+        f"psi={spec.stayer_fraction:g}  misspec={spec.misspec}"
+    )
+
+
+def main(argv=None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="List the 30 official testbeds.")
+    parser.add_argument(
+        "--params-root",
+        type=Path,
+        default=None,
+        help="Root that contains env_para_ste0.2 / 0.5 (default: cwd).",
+    )
+    args = parser.parse_args(argv)
+    rows = catalog(args.params_root)
+    for i, spec in enumerate(rows):
+        print(format_catalog_row(i, spec))
+    print(f"{len(rows)} testbeds (indices 0..{len(rows) - 1})")
+
+
+if __name__ == "__main__":
+    main()
