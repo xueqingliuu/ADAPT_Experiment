@@ -42,6 +42,7 @@ pf_cmp2_log_*.txt
 *.pkl
 *.png
 *.pdf
+!tests/fixtures/*.npz
 /RL_agents/
 check_trend_outputs/
 figures/

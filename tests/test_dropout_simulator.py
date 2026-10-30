@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from dropout_utils import calibrate_constant_daily_hazard
+from tests.param_fingerprint import require_matching_fingerprint
 from vani_env import EnvConfig, PARAMS_DIR
 import experiment
 
@@ -146,6 +147,7 @@ def test_activity_process_and_constant_hazard_do_not_stack(tmp_path):
 
 def test_hazard_zero_matches_golden_random_send():
     gold = np.load(GOLDEN)
+    require_matching_fingerprint(gold, PARAMS, uids=[int(u) for u in gold["uids"]])
     seed = int(gold["seed"])
     for uid in gold["uids"]:
         uid = int(uid)
