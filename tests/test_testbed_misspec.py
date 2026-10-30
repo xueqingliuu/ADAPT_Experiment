@@ -207,15 +207,66 @@ def test_misspec_d_requires_activity_on():
 
 def test_calibrate_misspec_defaults_to_12_weeks():
     """A and B both use 12-week random-0.5, activity-off episodes."""
-    from calibrate_misspec import _run_A_episode, build_parser
+    from calibrate_misspec import STE_PARAM_DIRS, _run_A_episode, _target_dirs, build_parser
 
     args = build_parser().parse_args([])
     assert args.nweek == 12
     assert args.nweek_b == 12
     assert args.max_episodes == 256
+    assert args.n_boot == 200
+    assert args.params_dir is None
+    assert _target_dirs(args) == list(STE_PARAM_DIRS)
+    vanilla = build_parser().parse_args(["--params-dir", "env_para_vanilla"])
+    assert _target_dirs(vanilla) == ["env_para_vanilla"]
     X, y = _run_A_episode(PARAMS, 13, 1, args.nweek, 0.3, 0.3)
     assert y.size == 12
     assert X.shape == (12, 4)
+
+
+def test_paired_bootstrap_se_tighter_than_single_env():
+    """Joint (participant, episode) resampling of CRN pairs is more precise than either side."""
+    from calibrate_misspec import bootstrap_diff_se, fit_side
+
+    rng = np.random.default_rng(1)
+    n_cl, n_w = 40, 12
+    clu_u, clu_m = [], []
+    for _ in range(n_cl):
+        fw = rng.normal(size=n_w)
+        ylag = rng.normal(size=n_w)
+        eps = rng.normal(scale=0.4, size=n_w)
+        X = np.column_stack([np.ones(n_w), ylag, fw])
+        yu = 0.2 + 0.4 * ylag + 0.15 * fw + eps
+        ym = yu + 0.03 * fw
+        clu_u.append({"y": yu, "Xb": X})
+        clu_m.append({"y": ym, "Xb": X.copy()})
+    _bu, seu = fit_side(clu_u, "Xb")
+    _bm, sem = fit_side(clu_m, "Xb")
+    se_d = bootstrap_diff_se(
+        clu_u, clu_m, xkey="Xb", idxs=(2,), n_boot=250, rng=rng,
+    )
+    assert se_d.shape == (1,)
+    assert se_d[0] < float(seu[2])
+    assert se_d[0] < float(sem[2])
+
+
+def test_beta_d_closes_paired_fw_gap():
+    """Direct beta_D = b_unmod - b_B(0) closes the paired f_w gap on a fixed-seed run."""
+    from calibrate_misspec import MATCH_TOL, _match_met, beta_d_from_paired
+
+    uids = [int(u) for u in np.loadtxt(PARAMS / "user_ids.txt", dtype=int)[:2]]
+    beta_d, grow_rows, at_beta = beta_d_from_paired(
+        PARAMS, uids, nweek=12, episodes=2, seed0=20261026,
+    )
+    assert np.isfinite(beta_d)
+    assert grow_rows[0]["name"] == "f_w"
+    row = at_beta[0]
+    assert row["name"] == "f_w"
+    gap0 = abs(float(grow_rows[0]["diff"]))
+    assert gap0 > 0.0
+    assert _match_met(row["diff"], row["coef_unmodified"], MATCH_TOL), (
+        f"beta_D={beta_d:.4f} left paired f_w diff={row['diff']:.4f} "
+        f"(unmod={row['coef_unmodified']:.4f}, gap at beta_D=0 was {gap0:.4f})"
+    )
 
 
 def test_load_confirmation_ratio_from_ste_tuning(tmp_path):

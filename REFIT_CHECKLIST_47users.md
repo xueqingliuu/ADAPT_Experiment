@@ -158,13 +158,19 @@ after the 47-user refit. STE tuning and confirmation use activity on and
       Dry run: `python tune_ste.py tune --dry-run`.
 - [ ] (ii) Calibrate misspec A and B once per params dir:
       ```
-      python calibrate_misspec.py --params-dir env_para_ste0.2
-      python calibrate_misspec.py --params-dir env_para_ste0.5
+      python calibrate_misspec.py
       ```
-      or `python calibrate_misspec.py --all-ste`. Both use `--nweek 12`
-      (random-0.5, engagement off, CRN vs the unmodified environment).
-      Writes `misspec_calibration.json` (`lam_SC`, `lam_AA` for A; `beta_D`
-      for B). No re-tuning.
+      (default: `env_para_ste0.2` then `env_para_ste0.5`; or pass
+      `--params-dir` / `--all-ste`). Both use `--nweek 12` (random-0.5,
+      engagement off, CRN vs the unmodified environment). Doubles episodes
+      until the cluster-bootstrap `SE(diff)` of each target coefficient
+      (modified − unmodified) is `< 2%` of `|coef_unmodified|`, cap 256.
+      A searches `(lam_SC, lam_AA)` so each paired difference is within 5%
+      of `|coef_unmodified|`. B sets `beta_D = b_unmod - b_B(0)` and
+      verifies on fresh seeds (one secant step if needed). Writes
+      `misspec_calibration.json`. Prints wall time per doubling step and a
+      projected total. No re-tuning. Vanilla only with
+      `--params-dir env_para_vanilla`.
 - [ ] (iii) Screen the 24 Layer-2 testbeds with the proxy STE:
       `python proxy_ste.py --screen-layer3`. Flag any with proxy STE < 0.1.
       The proxy uses engagement on. Also reports a *scaled proxy STE* =

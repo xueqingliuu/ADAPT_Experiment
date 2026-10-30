@@ -66,8 +66,12 @@ writes `env_para_ste0.2` / `0.5`. `python proxy_ste.py` reports the
 engagement-on proxy STE and a scaled proxy STE (proxy × the
 confirmed/proxy ratio at ψ = 0.5 of the same environment).
 `python calibrate_misspec.py` writes A/B strengths into
-`<params_dir>/misspec_calibration.json` (both on 12-week random-0.5
-episodes, engagement off).
+`<params_dir>/misspec_calibration.json` (default dirs: `env_para_ste0.2`
+and `env_para_ste0.5`; both on 12-week random-0.5 episodes, engagement
+off). Precision is the cluster-bootstrap SE of the paired CRN coefficient
+difference (`SE(diff) < 2%` of `|coef_unmodified|`). B sets
+`beta_D = b_unmod - b_B(0)` and verifies on fresh seeds. Vanilla only with
+`--params-dir env_para_vanilla`.
 
 Misspecifications (off by default; the simulator is unchanged when they are off):
 
