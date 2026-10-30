@@ -21,7 +21,7 @@ Run from the repository root. `ADAPR_COMBINED_DIR` is the extract folder.
 | 07 | `07_fit_testbed.py` | CLUSTER | `df_fit.csv`, `week1_cae_inputs.csv`, `std_params.json` | generator coefficients, `user_ids.txt`, `df_fit_11week.csv`, `testbed_diagnostics.json` | Hierarchical mediator and CAE fits, including the week-1 baseline |
 | 08 | `08_est_ew_weights.py` | CLUSTER | `df_fit.csv`, `user_ids.txt` | `Ew_pooled_linear_coefs.json` | Pooled linear filter for the engagement state |
 | 09 | `09_est_prior.py` | CLUSTER | `df_fit_11week.csv` | `rl_priors.json`, `loo_priors/` | RLSVI priors. The module remains `est_prior.py` |
-| 10 | `10_stability.py` | CLUSTER | `params_env_*.json` | `stability_skeleton.json` | Engagement and outcome gains. The module remains `stability.py` |
+| 10 | `10_stability.py` | CLUSTER | `params_env_*.json` | `stability_skeleton.json` | Engagement and outcome gains (`--cap 0.95` on the vanilla refit). The module remains `stability.py` |
 
 After the refit, on the cluster: `tune_ste.py` (via `run_tune_ste.sh`) builds the
 STE parameter folders; `run_array.sh` and `run_ste.sh` launch experiments;

@@ -54,6 +54,7 @@ df_merged.csv
 week1_cae_inputs.csv
 docs/**/*.csv
 env_para_*/df_*.csv
+env_para_vanilla_c47/
 results*/
 archive/results/
 archive/backups/
@@ -63,5 +64,8 @@ analysis/figures/out/
 CODE_REVIEW*.md
 rl_failure_diagnosis.md
 joint_model_subsection.tex
-docs/
+docs/*
+!docs/stability_345/
+docs/stability_345/*
+!docs/stability_345/*.md
 ipynb/

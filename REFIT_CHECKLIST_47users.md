@@ -131,7 +131,10 @@ a check before the next.
       - [ ] PF priors fitted on all 47; reward/Q priors on CAE users only
       - [ ] fourSC dimension unchanged (17) unless the covariate set changed
 - [ ] `python 09_est_prior.py --loo` → `env_para_vanilla/loo_priors/held_out_<uid>.json`, 47 files
-- [ ] `python 10_stability.py` → max |g^E|, |g^Y| < 1 for all 47 × {never, always}
+- [ ] `python 10_stability.py --cap 0.95` → max |g^E|, |g^Y| < 1 for all 47 × {never, always};
+      participants with signed max g ≥ 0.95 have their AR coefficient reduced
+      (recorded in `stability_cap`). `05_check_refit.py --stage priors` PASSes
+      if every gain is < 1 and WARNs the capped uids.
 - [ ] `python 05_check_refit.py --stage priors`
       (2000 activity paths, stability, loo files, and pytest, including RL_agents when present)
 - [ ] Copy `rl_priors.json` to `RL_agents/rl/rl_priors.json` and record the diff of `nu_0`.

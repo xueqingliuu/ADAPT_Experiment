@@ -69,7 +69,7 @@ fi
 if [[ "$STAGE" == "all" || "$STAGE" == "priors" ]]; then
   step "$PY" 09_est_prior.py
   step "$PY" 09_est_prior.py --loo
-  step "$PY" 10_stability.py
+  step "$PY" 10_stability.py --cap 0.95
   step "$PY" 05_check_refit.py --stage priors
 fi
 

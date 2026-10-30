@@ -372,6 +372,21 @@ def _pytest(report: Report, args: list[str], label: str) -> None:
         report.line("FAIL", f"pytest {label} exited {proc.returncode}")
 
 
+def _stability_ok(report: Report, stability: dict) -> None:
+    g_e = abs(float(stability["max_abs_gE"]))
+    g_y = abs(float(stability["max_abs_gY"]))
+    if g_e < 1 and g_y < 1:
+        report.line("PASS", f"stability max |gE|={g_e:.3f} |gY|={g_y:.3f}")
+    else:
+        report.line("FAIL", f"stability max |gE|={g_e:.3f} |gY|={g_y:.3f}")
+    capped = [int(u) for u in stability.get("capped_participants") or []]
+    if capped:
+        report.line(
+            "WARN",
+            "stability cap applied to " + ", ".join(str(u) for u in capped),
+        )
+
+
 def stage_priors(report: Report) -> None:
     folder = params_dir()
     priors = folder / "rl_priors.json"
@@ -388,13 +403,7 @@ def stage_priors(report: Report) -> None:
     if not stability_path.is_file():
         report.line("FAIL", "missing stability_skeleton.json")
     else:
-        stability = json.loads(stability_path.read_text(encoding="utf-8"))
-        g_e = abs(float(stability["max_abs_gE"]))
-        g_y = abs(float(stability["max_abs_gY"]))
-        if g_e < 1 and g_y < 1:
-            report.line("PASS", f"stability max |gE|={g_e:.3f} |gY|={g_y:.3f}")
-        else:
-            report.line("FAIL", f"stability max |gE|={g_e:.3f} |gY|={g_y:.3f}")
+        _stability_ok(report, json.loads(stability_path.read_text(encoding="utf-8")))
     _simulate_band(report, folder)
     _pytest(report, ["tests"], "tests")
     if (ROOT / "RL_agents").is_dir():

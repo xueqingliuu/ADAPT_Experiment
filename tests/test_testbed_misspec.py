@@ -96,6 +96,16 @@ def test_fit_divergence_tolerance(capsys):
     assert "FAIL 06 divergences=30" in out
     assert report.failed
 
+    cap_report = check.Report()
+    check._stability_ok(
+        cap_report,
+        {"max_abs_gE": 0.47, "max_abs_gY": 0.95, "capped_participants": [345]},
+    )
+    cap_out = capsys.readouterr().out
+    assert "PASS stability max |gE|=0.470 |gY|=0.950" in cap_out
+    assert "WARN stability cap applied to 345" in cap_out
+    assert not cap_report.failed
+
 
 def test_results_suffix_changes_with_each_axis():
     a = results_suffix("env_para_ste0.5", "on", 0.25, "A")
