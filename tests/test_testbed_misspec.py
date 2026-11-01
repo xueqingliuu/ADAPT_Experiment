@@ -107,6 +107,62 @@ def test_fit_divergence_tolerance(capsys):
     assert not cap_report.failed
 
 
+def test_fit_stage_reports_07_activity_exclusions(capsys):
+    from importlib.machinery import SourceFileLoader
+
+    check = SourceFileLoader(
+        "check_refit_05_activity", str(ROOT / "05_check_refit.py")
+    ).load_module()
+    report06 = check.Report()
+    check._activity_filter_ok(
+        report06,
+        "06",
+        {
+            "zero_check": 0,
+            "person_days_inactive": 10,
+            "person_days_outside_window": 1,
+            "person_weeks_inactive": 2,
+            "person_weeks_outside_window": 0,
+        },
+    )
+    out06 = capsys.readouterr().out
+    assert "PASS 06 zero check is 0" in out06
+    assert "WARN 06 exclusions person-days inactive=10" in out06
+    assert not report06.failed
+
+    report = check.Report()
+    check._activity_filter_ok(
+        report,
+        "07",
+        {
+            "zero_check": 0,
+            "excluded_rows": {
+                "fourSC": 0,
+                "anticipated_affect": 0,
+                "CAE": 0,
+                "CAE_short": 0,
+                "prior2hour": 0,
+                "active_status": 0,
+                "ws_interaction": 219,
+            },
+        },
+    )
+    out = capsys.readouterr().out
+    assert "PASS 07 zero check is 0" in out
+    assert "WARN 07 exclusions" in out
+    assert "ws_interaction=219" in out
+    assert "fourSC=0" in out
+    assert not report.failed
+
+    fail = check.Report()
+    check._activity_filter_ok(fail, "07", None)
+    check._activity_filter_ok(fail, "07", {"zero_check": 3})
+    fail_out = capsys.readouterr().out
+    assert "FAIL 07 diagnostics have no activity-filter zero check" in fail_out
+    assert "FAIL 07 zero check is 3" in fail_out
+    assert fail.failed
+
+
 def test_results_suffix_changes_with_each_axis():
     a = results_suffix("env_para_ste0.5", "on", 0.25, "A")
     b = results_suffix("env_para_ste0.5", "off", 0.25, "A")

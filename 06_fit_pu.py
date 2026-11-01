@@ -176,6 +176,26 @@ def _lookup_active(activity_lookup, uid, day) -> float:
     return activity_lookup.get(key, np.nan)
 
 
+def fit_rows_active_mask(df: pd.DataFrame, activity_lookup) -> np.ndarray:
+    """True iff the row's calendar day has ``active_any = 1``.
+
+    ``activity_lookup is None`` keeps every row, matching
+    :func:`_lookup_active`. A date absent from the lookup is not active
+    (the same "outside" bucket the PU emission filter uses).
+    """
+    if activity_lookup is None:
+        return np.ones(len(df), dtype=bool)
+    uid = df["ParticipantIdentifier"].to_numpy()
+    date = df["Date"].to_numpy()
+    return np.array(
+        [
+            _activity_bucket(_lookup_active(activity_lookup, u, d)) is None
+            for u, d in zip(uid, date)
+        ],
+        dtype=bool,
+    )
+
+
 def _window_active(activity_lookup, uid, anchor, completion_days: int) -> float:
     """1 if any day in the check-in window is active, else 0 or missing.
 

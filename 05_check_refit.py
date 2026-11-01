@@ -232,6 +232,30 @@ def _diag_ok(report: Report, label: str, record: dict) -> None:
     report.line(div_status, div_msg)
 
 
+def _activity_filter_ok(report: Report, label: str, filt) -> None:
+    """PASS/WARN/FAIL the activity-filter block written by 06 or 07."""
+    if not isinstance(filt, dict) or "zero_check" not in filt:
+        report.line("FAIL", f"{label} diagnostics have no activity-filter zero check")
+        return
+    if int(filt["zero_check"]) != 0:
+        report.line("FAIL", f"{label} zero check is {filt['zero_check']}")
+        return
+    report.line("PASS", f"{label} zero check is 0")
+    excluded = filt.get("excluded_rows")
+    if isinstance(excluded, dict) and excluded:
+        parts = " ".join(f"{name}={excluded[name]}" for name in excluded)
+        report.line("WARN", f"{label} exclusions {parts}")
+        return
+    report.line(
+        "WARN",
+        f"{label} exclusions "
+        f"person-days inactive={filt.get('person_days_inactive')} "
+        f"outside_window={filt.get('person_days_outside_window')} "
+        f"person-weeks inactive={filt.get('person_weeks_inactive')} "
+        f"outside_window={filt.get('person_weeks_outside_window')}",
+    )
+
+
 def stage_fit(report: Report) -> None:
     folder = params_dir()
     pu_path = folder / "pu_hier_diagnostics.json"
@@ -241,29 +265,17 @@ def stage_fit(report: Report) -> None:
     else:
         pu = json.loads(pu_path.read_text(encoding="utf-8"))
         _diag_ok(report, "06", pu)
-        filt = pu.get("activity_filter")
-        if not isinstance(filt, dict) or "zero_check" not in filt:
-            report.line("FAIL", "06 diagnostics have no activity-filter zero check")
-        elif int(filt["zero_check"]) == 0:
-            report.line("PASS", "06 zero check is 0")
-            report.line(
-                "WARN",
-                "06 exclusions "
-                f"person-days inactive={filt.get('person_days_inactive')} "
-                f"outside_window={filt.get('person_days_outside_window')} "
-                f"person-weeks inactive={filt.get('person_weeks_inactive')} "
-                f"outside_window={filt.get('person_weeks_outside_window')}",
-            )
-        else:
-            report.line("FAIL", f"06 zero check is {filt['zero_check']}")
+        _activity_filter_ok(report, "06", pu.get("activity_filter"))
     if not tb_path.is_file():
         report.line("FAIL", f"missing {tb_path.name}")
     else:
-        models = json.loads(tb_path.read_text(encoding="utf-8")).get("models", [])
+        tb = json.loads(tb_path.read_text(encoding="utf-8"))
+        models = tb.get("models", [])
         if not models:
             report.line("FAIL", "07 diagnostics list no models")
         for i, model in enumerate(models, start=1):
             _diag_ok(report, f"07 model {i}", model)
+        _activity_filter_ok(report, "07", tb.get("activity_filter"))
     ids_path = folder / "user_ids.txt"
     if not ids_path.is_file():
         report.line("FAIL", "missing user_ids.txt")

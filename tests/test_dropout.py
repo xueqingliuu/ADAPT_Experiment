@@ -265,3 +265,49 @@ def test_activity_filter_keeps_weekly_means_and_drops_inactive_emissions():
     assert len(plain_data["pv"]) == 14
     assert len(plain_data["ju"]) == 2
     assert plain_data["activity_filter"]["person_days_inactive"] == 0
+
+
+def _load_fit_pu():
+    path = Path(__file__).resolve().parents[1] / "06_fit_pu.py"
+    spec = importlib.util.spec_from_file_location("pu_bayes_activity_mask", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_fit_rows_active_mask_matches_lookup_definition():
+    pu = _load_fit_pu()
+    df = pd.DataFrame(
+        {
+            "ParticipantIdentifier": [1, 1, 2],
+            "Date": ["2025-01-06", "2025-01-07", "2025-01-06"],
+        }
+    )
+    lookup = {("1", "2025-01-06"): 1.0, ("1", "2025-01-07"): 0.0}
+    mask = pu.fit_rows_active_mask(df, lookup)
+    assert mask.tolist() == [True, False, False]
+    assert pu.fit_rows_active_mask(df, None).all()
+
+
+def test_ws_interaction_mask_drops_inactive_forced_zeros():
+    """07 keeps C^AS only on active_any=1; inactive delivered slots are 0."""
+    pu = _load_fit_pu()
+    df = pd.DataFrame(
+        {
+            "ParticipantIdentifier": [13, 13, 13, 13],
+            "Date": ["2025-01-06", "2025-01-06", "2025-01-07", "2025-01-07"],
+            "Interacted_walk": [1.0, 0.0, 0.0, np.nan],
+            "WalkingSuggestion": [1.0, 1.0, 1.0, 1.0],
+        }
+    )
+    lookup = {("13", "2025-01-06"): 1.0, ("13", "2025-01-07"): 0.0}
+    day_ok = pu.fit_rows_active_mask(df, lookup)
+    y = df["Interacted_walk"].to_numpy(dtype=float)
+    sent = df["WalkingSuggestion"].to_numpy(dtype=float)
+    raw = np.isfinite(y) & (sent == 1.0)
+    filt = raw & day_ok
+    assert raw.tolist() == [True, True, True, False]
+    assert filt.tolist() == [True, True, False, False]
+    assert int((raw & ~filt).sum()) == 1
+    assert float(y[raw & ~filt][0]) == 0.0

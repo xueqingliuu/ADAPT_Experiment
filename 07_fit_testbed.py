@@ -8,6 +8,13 @@ or as a hierarchical Bayesian model:
 
 The fitting panel (MRT weeks 2-12, renumbered 1-11) is built in ``03_standardize.py``.
 
+Walking-suggestion interaction (C^AS) is fit only on days with
+``active_any = 1`` in ``participant_dropout_daily.csv`` (same
+``load_activity_lookup`` as ``06_fit_pu.py``). The simulator forces that
+mediator to 0 on disengaged days. fourSC, anticipated affect, CAE,
+CAE_short, prior-2h steps, and self-reported active status are already
+missing on those days and are not filtered again.
+
 Script 1 writes the modelled cohort. This script checks that ``df_fit.csv``
 is that set and raises if it is not. Low wear, missing surveys, and zero CAE
 weeks are retained.
@@ -18,6 +25,7 @@ Does not overwrite the E_w / PV / FW / PJ blocks from ``06_fit_pu.py`` (includin
 the ``J_w`` ``query_Jw_*`` suffix on PV/FW/PJ).
 Next: ``08_est_ew_weights.py``.
 """
+import importlib.util
 import json
 import os
 import shutil
@@ -40,6 +48,20 @@ from vani_env import (
     mask_dropout_fit_outcomes,
     resolve_params_dir,
 )
+
+
+def _load_fit_pu():
+    """Import ``06_fit_pu`` so the activity-day definition stays identical."""
+    path = Path(__file__).resolve().parent / "06_fit_pu.py"
+    spec = importlib.util.spec_from_file_location("adapr_fit_pu", path)
+    mod = importlib.util.module_from_spec(spec)
+    if spec.loader is None:
+        raise SystemExit(f"cannot load {path}")
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_fit_pu = _load_fit_pu()
 
 PROJECT_ROOT = Path(
     os.environ.get("ADAPR_PROJECT_ROOT", Path(__file__).resolve().parent)
@@ -82,6 +104,10 @@ file_user_ids = str(work_folder / 'user_ids.txt')
 # lags) is built in 03_standardize.py and shared with ``06_fit_pu.py``.
 df_fit["Date"] = pd.to_datetime(df_fit["Date"], errors="coerce")
 assert_complete_week_slots(df_fit)
+_activity_path = _fit_pu.resolve_activity_daily_path(folder)
+_activity_lookup = _fit_pu.load_activity_lookup(_activity_path)
+_fit_pu.assert_activity_covers_fit(df_fit, _activity_lookup)
+print(f"activity table {_activity_path}", flush=True)
 
 
 def json_float(x, digits=3):
@@ -825,11 +851,15 @@ THETA_CAE_SHORT_AVG_NAMES = [
     "CAE_avg",
 ]
 
-def other_variable_designs(dat_user):
+def other_variable_designs(dat_user, activity_lookup=None):
     """Designs, outcomes and observed-row masks for the additional variables.
 
     Missing predictors are replaced by the participant mean (same rule as the
     CAE-related models). Returns ``{name: (X, y, observed_mask)}``.
+
+    Walking-suggestion interaction is kept only on ``active_any = 1`` days
+    when ``activity_lookup`` is set (simulator forces C^AS to 0 otherwise).
+    prior-2h steps and active status are already missing on those days.
     """
     dt = dat_user["DecisionTime"].to_numpy(dtype=float)
     we = dat_user["is_weekend"].to_numpy(dtype=float)
@@ -847,24 +877,66 @@ def other_variable_designs(dat_user):
     y_as = dat_user["Interacted_walk"].to_numpy(dtype=float)
     sent = dat_user["WalkingSuggestion"].to_numpy(dtype=float)
     X_as = np.column_stack([one, frac_inter, we, dt])
+    day_ok = _fit_pu.fit_rows_active_mask(dat_user, activity_lookup)
     return {
         "prior2hour": (X_p2h, y_p2h, np.isfinite(y_p2h)),
         # active status is the end-of-day answer; one row per day (morning row)
         "active_status": (X_ad, y_ad, (dt == 0) & np.isfinite(y_ad)),
-        # interaction is defined only when a suggestion was delivered
-        "ws_interaction": (X_as, y_as, np.isfinite(y_as) & (sent == 1.0)),
+        # interaction is defined only when a suggestion was delivered, and
+        # only on engaged days (C^AS is a forced 0 when active_any = 0)
+        "ws_interaction": (X_as, y_as, np.isfinite(y_as) & (sent == 1.0) & day_ok),
     }
 
 
-def pooled_other_variable_data(df_fit, userids):
+def pooled_other_variable_data(df_fit, userids, activity_lookup=None):
     """Stack :func:`other_variable_designs` over participants (observed rows only)."""
     out = {k: ([], [], []) for k in ("prior2hour", "active_status", "ws_interaction")}
     for uid in userids:
         dat_user = df_fit[df_fit["ParticipantIdentifier"] == uid].sort_values(
             ["Date", "DecisionTime"], na_position="last").reset_index(drop=True)
-        for k, (X, y, m) in other_variable_designs(dat_user).items():
+        for k, (X, y, m) in other_variable_designs(
+            dat_user, activity_lookup=activity_lookup
+        ).items():
             out[k][0].append(X[m]); out[k][1].append(y[m]); out[k][2].append(np.full(int(m.sum()), uid))
     return {k: (np.vstack(Xs), np.concatenate(ys), np.concatenate(gs)) for k, (Xs, ys, gs) in out.items()}
+
+
+TESTBED_ACTIVITY_OUTCOMES = (
+    "fourSC",
+    "anticipated_affect",
+    "CAE",
+    "CAE_short",
+    "prior2hour",
+    "active_status",
+    "ws_interaction",
+)
+
+
+def testbed_activity_filter_report(df, userids, activity_lookup):
+    """Excluded 07 fit rows on days that are not ``active_any = 1``.
+
+    Only walking-suggestion interaction is dropped. The other outcomes
+    stay at 0 because they are already missing on disengaged days.
+    """
+    excluded = {name: 0 for name in TESTBED_ACTIVITY_OUTCOMES}
+    nonzero = {name: 0 for name in TESTBED_ACTIVITY_OUTCOMES}
+    for uid in userids:
+        dat_user = df[df["ParticipantIdentifier"] == uid].sort_values(
+            ["Date", "DecisionTime"], na_position="last"
+        ).reset_index(drop=True)
+        raw = other_variable_designs(dat_user, activity_lookup=None)
+        filt = other_variable_designs(dat_user, activity_lookup=activity_lookup)
+        for name in ("prior2hour", "active_status", "ws_interaction"):
+            dropped = raw[name][2] & ~filt[name][2]
+            excluded[name] += int(dropped.sum())
+            y = np.asarray(raw[name][1], dtype=float)
+            nonzero[name] += int(np.sum(dropped & np.isfinite(y) & (y != 0.0)))
+    return {
+        "excluded_rows": excluded,
+        "nonzero_excluded": nonzero,
+        "zero_check": int(sum(nonzero.values())),
+        "filtered_outcomes": ["ws_interaction"],
+    }
 
 
 def participant_theta(result, userid):
@@ -916,6 +988,24 @@ if no_cae_userids.size > 0:
     )
 if userid_all.size == 0:
     raise ValueError("No users with observed CAE values remain after filtering.")
+
+_ACTIVITY_FILTER = testbed_activity_filter_report(
+    df_fit, userid_all, _activity_lookup
+)
+print(
+    "activity filter: excluded fit rows "
+    + ", ".join(
+        f"{name}={_ACTIVITY_FILTER['excluded_rows'][name]}"
+        for name in TESTBED_ACTIVITY_OUTCOMES
+    )
+    + f"; nonzero_excluded={_ACTIVITY_FILTER['nonzero_excluded']}",
+    flush=True,
+)
+if _ACTIVITY_FILTER["zero_check"]:
+    raise SystemExit(
+        "Excluded 07 outcomes are not forced zeros: "
+        f"{_ACTIVITY_FILTER['nonzero_excluded']}"
+    )
 
 # ============================================================
 # Fit CAE random-coefficient model as one joint Bayesian hierarchical fit
@@ -1171,7 +1261,9 @@ print(f"FourSC Bayesian fit converged: {mixedlm_fourSC.converged}")
 # Additional time-varying variables: joint hierarchical fits (same model
 # class as above; Bernoulli likelihood for the binary outcomes).
 # ============================================================
-_other = pooled_other_variable_data(df_fit, userid_all)
+_other = pooled_other_variable_data(
+    df_fit, userid_all, activity_lookup=_activity_lookup
+)
 mixedlm_prior2hour = fit_bayesian_random_coef_model(
     y=_other["prior2hour"][1], X=_other["prior2hour"][0], groups=_other["prior2hour"][2],
     predictor_names=list(THETA_PRIOR2HOUR_STEP_COUNT_NAMES),
@@ -1298,7 +1390,7 @@ for i, userid in enumerate(userid_all):
     # Participant coefficients = posterior mean of beta + b_i from the joint
     # hierarchical fits above (a participant without observations of an
     # outcome gets the population coefficients).
-    designs = other_variable_designs(dat_user)
+    designs = other_variable_designs(dat_user, activity_lookup=_activity_lookup)
 
     X_p2h, prior2hour_step_count, idx_obs_prior2hour_step_count = designs["prior2hour"]
     theta_prior2hour_step_count_mean = participant_theta(mixedlm_prior2hour, userid)
@@ -1698,7 +1790,23 @@ pd.DataFrame(cae_baseline_rows).sort_values("uid").to_csv(
 # from all participants' params_env files (no separate population file).
 _diag_path = work_folder / "testbed_diagnostics.json"
 _diag_path.write_text(
-    json.dumps({"models": _FIT_DIAGNOSTICS}, indent=2) + "\n",
+    json.dumps(
+        {
+            "models": _FIT_DIAGNOSTICS,
+            "activity_filter": {
+                "excluded_rows": {
+                    k: int(v) for k, v in _ACTIVITY_FILTER["excluded_rows"].items()
+                },
+                "nonzero_excluded": {
+                    k: int(v) for k, v in _ACTIVITY_FILTER["nonzero_excluded"].items()
+                },
+                "zero_check": int(_ACTIVITY_FILTER["zero_check"]),
+                "filtered_outcomes": list(_ACTIVITY_FILTER["filtered_outcomes"]),
+            },
+        },
+        indent=2,
+    )
+    + "\n",
     encoding="utf-8",
 )
 print(f"Wrote {_diag_path} ({len(_FIT_DIAGNOSTICS)} models)")
