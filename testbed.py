@@ -14,6 +14,7 @@ activity on. The official catalog is activity on for every testbed.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import warnings
 from dataclasses import asdict, dataclass
@@ -32,6 +33,7 @@ STE_TUNE_DIRS = STE_PARAM_DIRS
 # Backward-compatible alias used by 05_check_refit / older tests.
 STE_LAYER1_DIRS = STE_PARAM_DIRS
 TUNE_STAYER_FRACTION = 0.5
+TUNING_DESIGN = "single-dial, activity on, psi=0.5, 30 testbeds"
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -186,6 +188,35 @@ class TestbedSpec:
         )
 
 
+def require_tuning_design(params_dir) -> None:
+    """Refuse ``env_para_ste0.2`` / ``ste0.5`` unless ``ste_tuning.json`` matches.
+
+    Folders written before the single-dial 30-testbed design have no tag,
+    or a different one. Vanilla and other parameter folders are not checked.
+    """
+    path = Path(params_dir)
+    if path.name not in STE_PARAM_DIRS:
+        return
+    report_path = path / "ste_tuning.json"
+    if not report_path.is_file():
+        raise SystemExit(
+            f"{path.name} has no ste_tuning.json design tag "
+            f"(expected {TUNING_DESIGN!r}). Retune with TUNE_PHASE=tune."
+        )
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{report_path} is not valid JSON") from exc
+    got = report.get("design")
+    if got != TUNING_DESIGN:
+        raise SystemExit(
+            f"{path.name}/ste_tuning.json design is {got!r}, "
+            f"expected {TUNING_DESIGN!r}. "
+            "This folder is from an earlier design. "
+            "Retune with TUNE_OVERWRITE=1."
+        )
+
+
 def resolve_testbed_spec(
     params_dir=None,
     activity=None,
@@ -193,6 +224,7 @@ def resolve_testbed_spec(
     misspec=None,
     *,
     warn_stayer: bool = True,
+    check_design: bool = True,
 ) -> TestbedSpec:
     """Build a spec from explicit values, else ``ADAPR_*`` / defaults."""
     params = resolve_params_dir(params_dir)
@@ -207,9 +239,12 @@ def resolve_testbed_spec(
         )
     if miss == "D" and act != "on":
         raise ValueError("misspec D requires activity on")
-    return TestbedSpec(
+    spec = TestbedSpec(
         params_dir=params, activity=act, stayer_fraction=stayer, misspec=miss
     )
+    if check_design:
+        require_tuning_design(spec.params_dir)
+    return spec
 
 
 def spec_from_env(params_dir=None) -> TestbedSpec:

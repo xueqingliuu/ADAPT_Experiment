@@ -75,8 +75,9 @@
 #   TUNE_KAPPAS       scan grid                                default "0.25 0.5 1 2 4"
 #   TUNE_EPISODES     paired episodes per arm                  default 100
 #   TUNE_POLICY_GRID  Bernoulli rates to add as extra arms     default "" (CQL only)
-#   TUNE_DQN_EXP      transferred DiscreteCQL exp              default 8
-#                     (28-user vanilla). "" only if TUNE_POLICY_GRID is set.
+#   TUNE_DQN_EXP      transferred DiscreteCQL exp              default 9
+#                     (47-user vanilla, activity on, psi=0.5).
+#                     "" only if TUNE_POLICY_GRID is set.
 #   TUNE_NOISE        ar1|random|sequential                    default ar1
 #   TUNE_OUT_PREFIX   tuned dirs are <prefix><target><suffix>  default env_para_ste
 #   TUNE_OUT_SUFFIX   e.g. _burden → env_para_ste0.2_burden    default ""
@@ -152,7 +153,7 @@ else
 fi
 TUNE_EPISODES="${TUNE_EPISODES:-100}"
 TUNE_POLICY_GRID="${TUNE_POLICY_GRID:-}"
-TUNE_DQN_EXP="${TUNE_DQN_EXP:-8}"
+TUNE_DQN_EXP="${TUNE_DQN_EXP:-9}"
 TUNE_NOISE="${TUNE_NOISE:-ar1}"
 TUNE_OUT_PREFIX="${TUNE_OUT_PREFIX:-env_para_ste}"
 TUNE_OUT_SUFFIX="${TUNE_OUT_SUFFIX:-}"
@@ -177,7 +178,7 @@ echo "Host: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "TUNE_PHASE=${TUNE_PHASE}  TUNE_PARAMS_DIR=${TUNE_PARAMS_DIR}  (${NUM_USERS} participants)"
 echo "TUNE_KNOB=${TUNE_KNOB}  TUNE_EPISODES=${TUNE_EPISODES}  TUNE_JOBS=${TUNE_JOBS}"
-echo "ADAPR_ACTIVITY=off (forced for STE)  ADAPR_MISSPEC=${ADAPR_MISSPEC}  ADAPR_STAYER_FRACTION=${ADAPR_STAYER_FRACTION}"
+echo "ADAPR_ACTIVITY=${ADAPR_ACTIVITY}  ADAPR_STAYER_FRACTION=${ADAPR_STAYER_FRACTION}  ADAPR_MISSPEC=${ADAPR_MISSPEC}"
 echo "TUNE_SCRATCH=${TUNE_SCRATCH}  TUNE_OUT_PREFIX=${TUNE_OUT_PREFIX}  TUNE_OUT_SUFFIX=${TUNE_OUT_SUFFIX:-<none>}"
 if [[ "${TUNE_PHASE}" == "apply" ]]; then
   echo "TUNE_KAPPA=${TUNE_KAPPA}  TUNE_OUT_DIR=${TUNE_OUT_DIR}  TUNE_APPLY_EVAL=${TUNE_APPLY_EVAL}"
@@ -232,7 +233,7 @@ try_dqn_exp() {
   fi
   if [[ "${status}" == DIM* ]]; then
     echo "DiscreteCQL in ${dir} cannot be rolled: ${status}." \
-         "Need state_dim matching the frozen 21-d STE map (exp 5)." >&2
+         "Need state_dim matching the frozen STE map (exp 9)." >&2
   elif [[ "${status}" == "ALGO" ]]; then
     echo "DiscreteCQL arm: ${dir} is not discrete_cql (old DQN)." >&2
   fi
@@ -243,27 +244,13 @@ DQN_ARGS=()
 if [[ -n "${TUNE_DQN_EXP}" ]]; then
   if try_dqn_exp "${TUNE_DQN_EXP}"; then
     :
+  elif [[ -z "${TUNE_POLICY_GRID}" ]]; then
+    echo "ERROR: transferred CQL exp ${TUNE_DQN_EXP} is not usable." >&2
+    echo "Train exp 9 with:" >&2
+    echo "  sbatch --array=0-46 --export=ALL,STE_EXP=9,ADAPR_PARAMS_DIR=env_para_vanilla run_ste.sh" >&2
+    exit 1
   else
-    echo "Searching vanilla CQL folders 8, 5, 4, 3." >&2
-    used=""
-    for fallback in 8 5 4 3; do
-      if [[ "${fallback}" == "${TUNE_DQN_EXP}" ]]; then
-        continue
-      fi
-      if try_dqn_exp "${fallback}"; then
-        echo "Using DiscreteCQL from d3rlpy_logs/ste_exp_${fallback}." >&2
-        used="${fallback}"
-        break
-      fi
-    done
-    if [[ -z "${used}" ]]; then
-      if [[ -z "${TUNE_POLICY_GRID}" ]]; then
-        echo "Transferred CQL is required (empty TUNE_POLICY_GRID) but no" \
-             "discrete_cql checkpoints were found. Train exp 8 first." >&2
-        exit 1
-      fi
-      echo "DiscreteCQL arm: OFF. Proxy STE uses the Bernoulli grid only." >&2
-    fi
+    echo "DiscreteCQL arm: OFF. Proxy STE uses the Bernoulli grid only." >&2
   fi
 fi
 
@@ -310,9 +297,14 @@ submit_one_validation() {
   # env_para_ste0.8 → ste0.8 and env_para_burden_shift_large → burden_shift_large.
   exp_name="$(basename "${dir}")"
   exp_name="${exp_name#env_para_}"
+  # #SBATCH in run_ste.sh is not used: the array is this folder's user_ids.txt.
+  local n_users array_spec
+  n_users=$(( $(wc -l < "${dir}/user_ids.txt") ))
+  array_spec="0-$((n_users - 1))"
+  echo "sbatch --parsable --job-name=\"ste_${exp_name}\" --array=${array_spec} --export=ALL,ADAPR_PARAMS_DIR=${dir},STE_EXP=${exp_name},STE_USER_IDS=${dir}/user_ids.txt,STE_PHASE=all ${SLURM_SUBMIT_DIR:-$PWD}/run_ste.sh"
   jid=$(sbatch --parsable \
     --job-name="ste_${exp_name}" \
-    --array="0-$(( $(wc -l < "${dir}/user_ids.txt") - 1 ))" \
+    --array="${array_spec}" \
     --export="ALL,ADAPR_PARAMS_DIR=${dir},STE_EXP=${exp_name},STE_USER_IDS=${dir}/user_ids.txt,STE_PHASE=all" \
     "${SLURM_SUBMIT_DIR:-$PWD}/run_ste.sh")
   echo "Submitted ${jid}: full DQN train+eval in ${dir} (results_ste/exp${exp_name})"

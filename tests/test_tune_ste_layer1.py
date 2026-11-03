@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -143,3 +145,86 @@ def test_layer1_is_tune_alias(capsys):
     assert "env_para_ste0.5" in out
     assert "knob=action" in out
     assert "knob=benefit_only" not in out
+
+
+def test_tune_refuses_an_existing_folder(tmp_path, monkeypatch, capsys):
+    from tune_ste import build_parser, cmd_tune
+
+    dest = tmp_path / "env_para_ste0.2"
+    dest.mkdir()
+    (dest / "ste_tuning.json").write_text(
+        json.dumps({
+            "knob": "burden_path",
+            "kappa": 0.8,
+            "activity": "off",
+            "stayer_fraction": 0.0,
+            "date": "2026-09-01T00:00:00",
+            "commit": "abc123",
+        }),
+        encoding="utf-8",
+    )
+
+    def fake_out(prefix, target, suffix=""):
+        if float(target) == 0.2:
+            return dest
+        return tmp_path / f"absent_{target}"
+
+    monkeypatch.setattr("tune_ste.calibrated_out_dir", fake_out)
+    args = build_parser().parse_args(["tune"])
+    with pytest.raises(SystemExit):
+        cmd_tune(args)
+    out = capsys.readouterr().out
+    assert "TUNE_OVERWRITE=1" in out
+    assert "knob='burden_path'" in out
+    assert "kappa=0.8" in out
+    assert "activity='off'" in out
+    assert "stayer_fraction=0.0" in out
+    assert "2026-09-01T00:00:00" in out
+    assert "abc123" in out
+
+
+def _write_ids(path: Path, n: int) -> None:
+    path.write_text("".join(f"{i}\n" for i in range(n)), encoding="utf-8")
+
+
+def _run_ste_array_check(ids: Path, **extra: str) -> subprocess.CompletedProcess:
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "SLURM_ARRAY_TASK_MIN": "0",
+        "SLURM_ARRAY_TASK_MAX": "46",
+        "SLURM_ARRAY_TASK_COUNT": "47",
+        "SLURM_ARRAY_TASK_ID": "0",
+        "STE_PHASE": "train",
+        "STE_ARRAY_CHECK_ONLY": "1",
+        "STE_USER_IDS": str(ids),
+    }
+    env.update(extra)
+    return subprocess.run(
+        ["bash", str(ROOT / "run_ste.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_run_ste_array_must_cover_user_ids(tmp_path):
+    ids37 = tmp_path / "ids37.txt"
+    ids47 = tmp_path / "ids47.txt"
+    _write_ids(ids37, 37)
+    _write_ids(ids47, 47)
+
+    short = _run_ste_array_check(ids37)
+    assert short.returncode != 0
+    assert "does not match" in short.stderr
+    assert "STE_ALLOW_PARTIAL=1" in short.stderr
+
+    partial = _run_ste_array_check(ids37, STE_ALLOW_PARTIAL="1")
+    assert partial.returncode == 0
+    assert "STE_ALLOW_PARTIAL=1" in partial.stderr
+    assert "does not match" not in partial.stderr
+
+    full = _run_ste_array_check(ids47)
+    assert full.returncode == 0, full.stderr
+    assert "STE array 0-46 matches 47 lines" in full.stdout

@@ -360,6 +360,28 @@ def test_load_confirmation_ratio_from_ste_tuning(tmp_path):
     assert "scaled proxy STE = 0.5000" in line
 
 
+def test_tuned_folder_requires_current_design(tmp_path):
+    from testbed import TUNING_DESIGN, require_tuning_design
+
+    vanilla = tmp_path / "env_para_vanilla"
+    vanilla.mkdir()
+    require_tuning_design(vanilla)
+
+    ste = tmp_path / "env_para_ste0.2"
+    ste.mkdir()
+    with pytest.raises(SystemExit, match="design tag"):
+        require_tuning_design(ste)
+    (ste / "ste_tuning.json").write_text(
+        json.dumps({"design": "burden_path"}), encoding="utf-8"
+    )
+    with pytest.raises(SystemExit, match="burden_path"):
+        require_tuning_design(ste)
+    (ste / "ste_tuning.json").write_text(
+        json.dumps({"design": TUNING_DESIGN}), encoding="utf-8"
+    )
+    require_tuning_design(ste)
+
+
 def test_ste_logs_activity_off():
     spec = resolve_testbed_spec(PARAMS, activity="on", stayer_fraction=0.25, misspec="none")
     buf = io.StringIO()

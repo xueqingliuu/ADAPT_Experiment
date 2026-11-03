@@ -32,6 +32,7 @@ from testbed import (
     add_testbed_arguments,
     catalog_layer2,
     log_ste_spec,
+    require_tuning_design,
     resolve_testbed_spec,
 )
 from tune_ste import (
@@ -108,6 +109,7 @@ def _proxy_spec(args) -> ProxySpec:
 
 def measure_spec(spec, args) -> dict:
     params_dir = Path(spec.params_dir).expanduser().resolve()
+    require_tuning_design(params_dir)
     user_ids = load_user_ids(params_dir)
     require_fitted_blocks(params_dir, user_ids)
     proxy = _proxy_spec(args)

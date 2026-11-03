@@ -63,7 +63,7 @@ main effects only.
 The proxy STE (what "target 0.2/0.5/0.8" means here)
 ----------------------------------------------------
 For each participant the proxy is ``max(0, Δ̂_i) / σ̂_i`` under the
-**transferred** vanilla DiscreteCQL (``--dqn-exp``, default 8), averaged
+**transferred** vanilla DiscreteCQL (``--dqn-exp``, default 9), averaged
 over users. Never-send is in the class, so the oracle Δ cannot be
 negative; clipping both the proxy and confirmation at 0 (no SE gate)
 keeps that floor. Transferred CQL is feasible in the candidate folder,
@@ -152,10 +152,13 @@ Use a tuned folder instead of vanilla::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
+import subprocess
 import time
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -782,12 +785,12 @@ def _two_dial_report_fields(knob: KnobSpec, kappa: float | None = None) -> dict:
     """κ_b / κ_m recorded on every two-dial write."""
     if knob.name == "action":
         kb = None if kappa is None else float(kappa)
-        return {"kappa_b": kb, "kappa_m": kb, "design": "uniform"}
+        return {"kappa_b": kb, "kappa_m": kb, "dial": "uniform"}
     if knob.name == "benefit_only":
         return {
             "kappa_b": None if kappa is None else float(kappa),
             "kappa_m": 0.0,
-            "design": "benefit_only",
+            "dial": "benefit_only",
         }
     if knob.heavy or knob.name == "heavy_burden":
         return {
@@ -795,7 +798,7 @@ def _two_dial_report_fields(knob: KnobSpec, kappa: float | None = None) -> dict:
             "kappa_m": float(
                 knob.kappa_m if knob.kappa_m is not None else HEAVY_BURDEN_KAPPA_M
             ),
-            "design": "heavy_burden",
+            "dial": "heavy_burden",
             "me_to_e_floor": _fatigue_me_to_e_min(),
             "e_to_my_shift": _fatigue_e_shift(0.0),
         }
@@ -1555,6 +1558,7 @@ def evaluate(
             stayer_fraction=stayer_fraction,
             misspec=misspec,
             warn_stayer=False,
+            check_design=False,
         )
         log_ste_spec(requested.ste_spec())
     spec_kwargs = asdict(spec)
@@ -2070,8 +2074,9 @@ def require_dqn_checkpoints(
     if missing:
         raise SystemExit(
             f"{model_dir} has no checkpoint for {len(missing)} of {len(user_ids)} "
-            f"participants: {missing}\nTrain them with `python ste_vanilla.py train "
-            "<jobid> --exp <exp>` (one job per user_ids.txt index)."
+            f"participants: {missing}\n"
+            "Train exp 9 with:\n"
+            "  sbatch --array=0-46 --export=ALL,STE_EXP=9,ADAPR_PARAMS_DIR=env_para_vanilla run_ste.sh"
         )
     wrong_algo = []
     wrong_dim = []
@@ -2102,8 +2107,8 @@ def require_dqn_checkpoints(
         raise SystemExit(
             f"{model_dir} observation dim is not the frozen STE map "
             f"(trained state_dim={wrong_dim[0][1]}, STE_OBS_DIM={STE_OBS_DIM}). "
-            "Point TUNE_DQN_EXP at DiscreteCQL trained on this 20-d vector "
-            "(vanilla CQL is exp 8)."
+            "Point TUNE_DQN_EXP at DiscreteCQL trained on this vector "
+            "(vanilla CQL is exp 9)."
         )
     if wrong_gamma:
         raise SystemExit(
@@ -2113,9 +2118,9 @@ def require_dqn_checkpoints(
     if stale:
         raise SystemExit(
             f"{model_dir} checkpoints were not trained on the current fit of {src} "
-            f"({len(stale)} of {len(user_ids)} participants, e.g. {stale[:5]}). "
-            f"Retrain: ADAPR_PARAMS_DIR={src.name} sbatch run_ste.sh, then point "
-            "TUNE_DQN_EXP at the new exp."
+            f"({len(stale)} of {len(user_ids)} participants, e.g. {stale[:5]}).\n"
+            "Train exp 9 with:\n"
+            "  sbatch --array=0-46 --export=ALL,STE_EXP=9,ADAPR_PARAMS_DIR=env_para_vanilla run_ste.sh"
         )
     print(f"DiscreteCQL arm: {len(user_ids)} checkpoints from {model_dir} "
           f"(trained on the current fit of {src.name})")
@@ -2172,6 +2177,86 @@ def _json_safe(obj):
     return obj
 
 
+def vanilla_params_fingerprint(params_dir: Path | None = None) -> str:
+    """Cohort sha256 of the vanilla fit, matching ``tests/param_fingerprint.py``.
+
+    Hashes each ``params_env_<uid>.json`` plus the shared calibration files.
+    ``df_fit_11week.csv`` is included when it is present.
+    """
+    folder = Path(params_dir) if params_dir is not None else Path(PARAMS_DIR)
+    names = [f"params_env_{int(uid)}.json" for uid in load_user_ids(folder)]
+    names.extend((
+        "std_params.json",
+        "generator_calibration.json",
+        "Ew_pooled_linear_coefs.json",
+    ))
+    if (folder / "df_fit_11week.csv").is_file():
+        names.append("df_fit_11week.csv")
+    lines = []
+    for name in names:
+        path = folder / name
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 16), b""):
+                digest.update(chunk)
+        lines.append(f"{name}={digest.hexdigest()}")
+    manifest = "\n".join(lines) + "\n"
+    return hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+
+
+def _git_head() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return out.strip() or "unknown"
+
+
+def stamp_tuning_report(report: dict, env: dict | None = None) -> dict:
+    """Record the current testbed design, commit, and vanilla fit fingerprint."""
+    from testbed import TUNING_DESIGN
+
+    env = env or {}
+    report["design"] = TUNING_DESIGN
+    report["commit"] = _git_head()
+    report["date"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    report["vanilla_params_fingerprint"] = vanilla_params_fingerprint(PARAMS_DIR)
+    report["activity"] = env.get("activity", report.get("activity", "on"))
+    if "stayer_fraction" in env:
+        report["stayer_fraction"] = float(env["stayer_fraction"])
+    elif "stayer_fraction" not in report:
+        report["stayer_fraction"] = 0.5
+    return report
+
+
+def describe_existing_tuning(out_dir: Path) -> str:
+    """knob, kappa, activity, stayer fraction, date, and commit of a folder."""
+    path = Path(out_dir)
+    report_path = path / "ste_tuning.json"
+    if not report_path.is_file():
+        return f"{path}: exists but has no ste_tuning.json"
+    try:
+        rep = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return f"{report_path}: exists but is not valid JSON"
+    date = rep.get("date")
+    if not date:
+        date = (
+            datetime.fromtimestamp(report_path.stat().st_mtime).isoformat(timespec="seconds")
+            + " (file mtime)"
+        )
+    return (
+        f"{report_path}: knob={rep.get('knob')!r} kappa={rep.get('kappa')!r} "
+        f"activity={rep.get('activity')!r} stayer_fraction={rep.get('stayer_fraction')!r} "
+        f"date={date} commit={rep.get('commit')!r} design={rep.get('design')!r}"
+    )
+
+
 def write_report(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -2198,7 +2283,7 @@ def make_spec(args) -> ProxySpec:
     if not spec.policy_grid and not spec.dqn_model_dir:
         raise SystemExit(
             "Proxy needs a treatment arm: default is transferred DiscreteCQL "
-            "(--dqn-exp 8). Pass --dqn-exp / --dqn-model-dir, or "
+            "(--dqn-exp 9). Pass --dqn-exp / --dqn-model-dir, or "
             "--policy-grid 0.5 1.0 for Bernoulli arms."
         )
     return spec
@@ -2611,6 +2696,7 @@ def cmd_calibrate(args) -> None:
             **result,
         }
         report["params_dir"] = str(out_dir)
+        stamp_tuning_report(report, env_kw)
         _attach_burden_share(
             report,
             base_dir,
@@ -2750,6 +2836,7 @@ def cmd_apply(args) -> None:
             **env_kw,
         )
 
+    stamp_tuning_report(report, _env_from_args(args))
     write_report(out_dir / "ste_tuning.json", report)
 
 
@@ -2892,6 +2979,21 @@ def cmd_tune(args) -> None:
                 f"target={job['target']}  kappa_m={layer1_kappa_m_display(job)}"
             )
         return
+
+    if not getattr(args, "overwrite", False):
+        blocked = []
+        for job in jobs:
+            dest = calibrated_out_dir(args.out_prefix, job["target"], job["suffix"])
+            if dest.exists():
+                blocked.append(describe_existing_tuning(dest))
+        if blocked:
+            text = (
+                "Refuse to write into an existing tuned folder. "
+                "Set TUNE_OVERWRITE=1 (or pass --overwrite) to replace it.\n"
+                + "\n".join(blocked)
+            )
+            print(text)
+            raise SystemExit(text)
 
     scratch = Path(args.scratch)
     stamps = {}
@@ -3155,10 +3257,11 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument(
             "--dqn-exp",
-            default="8",
+            default="9",
             help=(
                 "Transferred DiscreteCQL arm from d3rlpy_logs/ste_exp_<EXP>/ "
-                "(default 8 = 28-user vanilla). Empty string to omit."
+                "(default 9 = 47-user vanilla, activity on, psi=0.5). "
+                "Empty string to omit."
             ),
         )
         sp.add_argument(
