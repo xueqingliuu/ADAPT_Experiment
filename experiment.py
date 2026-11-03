@@ -85,6 +85,48 @@ def _seeded_ewm(generated, base, window=EWM_WINDOW):
     return dc.seeded_last_ewma(generated, base, window)
 
 
+class OnlineContextFill:
+    """Causal fill for one episode's agent-visible context columns.
+
+    A finite value is kept and then added to that column's running sum.
+    A non-finite value is the mean of finite values strictly earlier in
+    this episode, or the fitting-panel fallback when none have been seen.
+    An imputed value is not an observation. ``reset`` at each episode.
+    A repeat read of the same ``(column, time)`` does not count twice.
+    """
+
+    def __init__(self, fallback: dict):
+        self.fallback = {str(k): float(v) for k, v in fallback.items()}
+        self.reset()
+
+    def reset(self) -> None:
+        self._sum = {k: 0.0 for k in self.fallback}
+        self._count = {k: 0 for k in self.fallback}
+        self._seen: dict[tuple[str, int], float] = {}
+
+    def apply(self, column: str, value, time: int) -> float:
+        column = str(column)
+        if column not in self.fallback:
+            raise KeyError(column)
+        key = (column, int(time))
+        cached = self._seen.get(key)
+        if cached is not None:
+            return cached
+        try:
+            observed = float(value)
+        except (TypeError, ValueError):
+            observed = float("nan")
+        if np.isfinite(observed):
+            out = observed
+            self._sum[column] += observed
+            self._count[column] += 1
+        else:
+            n = self._count[column]
+            out = self._sum[column] / n if n else self.fallback[column]
+        self._seen[key] = out
+        return out
+
+
 def _participant_column_mean(df_csv, userid, col, default=0.0):
     """Participant mean of ``col`` in the fitting panel (missing-predictor imputation value)."""
     try:
@@ -494,10 +536,11 @@ class OnlineEnv:
             df_fit_11week_csv, self.env.cfg.userid, "Interacted_7d_walk",
             default=self._ws_interaction_initial,
         )
-        # Missing predictors in the RL feature map are the participant's
-        # mean in the fitting panel (``est_prior._fill_nan``). These are
-        # that mean for each context column, used only when the logged
-        # agent-visible value is non-finite.
+        # Fallback only: the participant's fitting-panel mean, used when
+        # this episode has no finite value of that column yet.
+        # ``OnlineContextFill`` then uses the mean of finite values
+        # strictly earlier in the episode. ``est_prior._fill_nan`` is
+        # unchanged (batch column mean).
         self._yesterday_step_fill = _participant_column_mean(
             df_fit_11week_csv, self.env.cfg.userid, "YesterdayStepCount_norm",
         )
@@ -515,6 +558,13 @@ class OnlineEnv:
                 df_fit_11week_csv, self.env.cfg.userid, "recentBurdenEma_norm",
             ),
         )
+        self._context_fill = OnlineContextFill({
+            "yesterday_steps": self._yesterday_step_fill,
+            "prior2h": self._prior2h_fill,
+            "active_days": self._active_days_fill,
+            "suggestions": self._suggestions_fill,
+            "interact": self._interact7_fill,
+        })
 
         self.activityStatusTodayAll = np.zeros(self.D)
 
@@ -945,6 +995,7 @@ class OnlineEnv:
 
     def _reset_episode_state(self):
         """Reset mutable episode histories before simulating a policy."""
+        self._context_fill.reset()
         self._hist_daily_pv = []
         self.s["pageViewLast7DaysEma"] = self._pageViewLast7DaysEma_initial
         self._hist_daily_suggestions = []
@@ -1594,19 +1645,6 @@ class OnlineEnv:
         antic_wk = self.dailyAnticipatedAffectObsAll[day_start:day_stop]
         return build_pf_CAE_features(0.0, foursc_wk, antic_wk)
 
-    def _finite_context(self, value, fill: float) -> float:
-        """Agent-visible context entry, or the fitting-panel mean if missing.
-
-        Same rule as ``est_prior._fill_nan``: a non-finite predictor is the
-        participant's mean of that column, not a new imputation and not a
-        dropout indicator. ``build_phi_state`` reads this vector unchanged.
-        """
-        try:
-            v = float(value)
-        except (TypeError, ValueError):
-            v = float("nan")
-        return v if np.isfinite(v) else float(fill)
-
     def _rl_context_vector(self, k, d, t):
         d_global = self._day_idx(k, d)
         step_idx = self._step_idx(k, d, t)
@@ -1614,19 +1652,20 @@ class OnlineEnv:
             p2h = float(self.prior2HourStepCountAll[step_idx])
         else:
             p2h = float(self.s.get("prior2HourStepCount", self._initial_prior2hour))
+        fill = self._context_fill.apply
         return build_rl_context_vector(
-            yesterdayStepCount=self._finite_context(
-                self.logYesterdayStepCount[d_global], self._yesterday_step_fill
+            yesterdayStepCount=fill(
+                "yesterday_steps", self.logYesterdayStepCount[d_global], step_idx
             ),
-            prior2HourStepCount=self._finite_context(p2h, self._prior2h_fill),
-            activeDaysLast7Days=self._finite_context(
-                self.s["activeDaysLast7Days"], self._active_days_fill
+            prior2HourStepCount=fill("prior2h", p2h, step_idx),
+            activeDaysLast7Days=fill(
+                "active_days", self.s["activeDaysLast7Days"], step_idx
             ),
-            activitySuggestionsSentLast7Days=self._finite_context(
-                self.s["activitySuggestionsSentLast7Days"], self._suggestions_fill
+            activitySuggestionsSentLast7Days=fill(
+                "suggestions", self.s["activitySuggestionsSentLast7Days"], step_idx
             ),
-            activitySuggestionInteractLast7Days=self._finite_context(
-                self.s["activitySuggestionInteractLast7Days"], self._interact7_fill
+            activitySuggestionInteractLast7Days=fill(
+                "interact", self.s["activitySuggestionInteractLast7Days"], step_idx
             ),
         )
 

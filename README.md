@@ -50,6 +50,8 @@ the dropout table. `algorithm_helpers.py`, `derived_covariates.py`,
 `est_prior.py` and `stability.py` stay importable under those names.
 `ste_vanilla.py` is the STE evaluation used by `tune_ste.py`.
 
+A missing agent-visible context entry (`OnlineEnv._rl_context_vector`, shared by the RL agents and STE) is the mean of that feature's finite values strictly earlier in the episode. Before any observation, the fill is that participant's fitting-panel mean. Running sums make this O(1) per step and reset each episode. `STE_OBS_DIM` stays 20. `est_prior._fill_nan` still uses the column mean: the prior is a batch regression on the fitting panel, not a causal filter.
+
 ## 30 testbeds
 
 A testbed is `(params dir, activity, stayer fraction, misspec)`. Select it

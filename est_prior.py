@@ -242,7 +242,10 @@ def _cae_users(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fill_nan(x: np.ndarray, default: float = 0.0) -> np.ndarray:
-    """Replace NaNs with the column mean; if all NaN, fall back to ``default``."""
+    """Replace NaNs with the column mean; if all NaN, fall back to ``default``.
+
+    Online episodes use ``OnlineContextFill`` (earlier observations only). A column mean is acceptable here because this is a batch regression on the fitting panel, not a causal filter.
+    """
     x = np.asarray(x, dtype=float)
     if not np.isfinite(x).any():
         return np.full_like(x, default, dtype=float)

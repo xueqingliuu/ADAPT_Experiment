@@ -36,9 +36,10 @@ Eval rows:   ``results_ste/exp<EXP>/res<EXP>_<uid>.txt``
 
 The DiscreteCQL observation is ``STE_OBS_DIM`` = 20 (see the note next to
 that constant). It is the frozen map in ``build_ste_phi_state``, not a
-later change to RLSVI ``build_phi_state``. Missing entries in the shared
-RL context use the fitting-panel mean; mediator NaNs stay in the matrices
-and are skipped by the same within-week EWMA.
+later change to RLSVI ``build_phi_state``. A missing entry in the shared
+RL context is the mean of that feature's finite values earlier in the
+episode (the fitting-panel mean before any observation). Mediator NaNs
+stay in the matrices and are skipped by the same within-week EWMA.
 
 Point at a tuned parameter folder with ``ADAPR_PARAMS_DIR``. Cluster:
 ``sbatch run_ste.sh``. Requires ``d3rlpy``.
@@ -174,10 +175,12 @@ STE_OBSERVATION_SCALER = "none"
 # because salience is no longer simulated. The RL map has no current-day
 # engaged bit and no dropout bit (engagement enters only as the 7-day
 # active fraction already in the context), so this dimension does not
-# grow. A non-finite context entry is that column's fitting-panel mean,
-# the same fill as ``est_prior._fill_nan``. Mediator NaNs are not filled
-# before the EWMA; ``_within_week_ewma`` skips them and returns 0 when
-# the visible window is empty.
+# grow. A non-finite context entry is the mean of that column's finite
+# values strictly earlier in the episode (``OnlineContextFill``, shared
+# with the RL agents). Before any finite value, the fill is the
+# participant's fitting-panel mean. ``est_prior._fill_nan`` still uses
+# the batch column mean. Mediator NaNs are not filled before the EWMA;
+# ``_within_week_ewma`` skips them and returns 0 when the window is empty.
 STE_BTILDE_INDEX = 9
 STE_OBS_DIM = 20
 STE_STATE_NAMES = (
