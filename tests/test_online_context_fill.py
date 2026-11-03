@@ -1,34 +1,41 @@
-"""Online context fill: past observations only, panel mean before any."""
+"""Online context fill: past observations only, no external fallback."""
 
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from experiment import OnlineContextFill
 
-FALLBACK = 0.5
-# Finite values 2, 4, 8. Missing at the start, in the middle, and after dropout.
-SEQUENCE = [np.nan, 2.0, 4.0, np.nan, 8.0, np.nan, np.nan, np.nan]
-EXPECTED = [0.5, 2.0, 4.0, 3.0, 8.0, 14.0 / 3.0, 14.0 / 3.0, 14.0 / 3.0]
+# Finite values 1 (study entry), 2, 4, 8. Missing in the middle and after dropout.
+SEQUENCE = [1.0, 2.0, 4.0, np.nan, 8.0, np.nan, np.nan, np.nan]
+EXPECTED = [1.0, 2.0, 4.0, 7.0 / 3.0, 8.0, 15.0 / 4.0, 15.0 / 4.0, 15.0 / 4.0]
 
 
-def _fill(fallback=FALLBACK):
-    return OnlineContextFill({"yesterday_steps": fallback, "prior2h": -1.0})
+def _fill():
+    return OnlineContextFill(("yesterday_steps", "prior2h"))
 
 
-def test_running_mean_and_panel_fallback_across_gaps_and_dropout():
+def test_running_mean_across_gaps_and_dropout():
     fill = _fill()
     got = [fill.apply("yesterday_steps", v, t) for t, v in enumerate(SEQUENCE)]
     np.testing.assert_allclose(got, EXPECTED)
     # The other column does not borrow yesterday's observations.
-    assert fill.apply("prior2h", np.nan, 0) == -1.0
-    assert fill.apply("prior2h", np.nan, 1) == -1.0
-    assert fill.apply("prior2h", 3.0, 2) == 3.0
-    assert fill.apply("prior2h", np.nan, 3) == 3.0
-    # Imputed values are not observations: three finite yesterday steps.
-    assert fill._count["yesterday_steps"] == 3
+    assert fill.apply("prior2h", 3.0, 0) == 3.0
+    assert fill.apply("prior2h", np.nan, 1) == 3.0
+    # Imputed values are not observations: four finite yesterday steps.
+    assert fill._count["yesterday_steps"] == 4
+
+
+def test_missing_before_any_observation_raises():
+    fill = _fill()
+    with pytest.raises(RuntimeError, match="before any finite value"):
+        fill.apply("prior2h", np.nan, 0)
+    fill = _fill()
+    fill.apply("prior2h", 1.0, 0)
     fill.reset()
-    assert fill.apply("yesterday_steps", np.nan, 0) == FALLBACK
+    with pytest.raises(RuntimeError):
+        fill.apply("prior2h", np.nan, 0)
 
 
 def test_value_at_t_does_not_depend_on_the_present_or_future():

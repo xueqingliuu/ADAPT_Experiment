@@ -38,8 +38,10 @@ The DiscreteCQL observation is ``STE_OBS_DIM`` = 20 (see the note next to
 that constant). It is the frozen map in ``build_ste_phi_state``, not a
 later change to RLSVI ``build_phi_state``. A missing entry in the shared
 RL context is the mean of that feature's finite values earlier in the
-episode (the fitting-panel mean before any observation). Mediator NaNs
-stay in the matrices and are skipped by the same within-week EWMA.
+episode; every column starts from the participant's study-entry value.
+The context reads observed quantities only, never the simulator's true state.
+Mediator NaNs stay in the matrices and are skipped by the same within-week
+EWMA.
 
 Point at a tuned parameter folder with ``ADAPR_PARAMS_DIR``. Cluster:
 ``sbatch run_ste.sh``. Requires ``d3rlpy``.
@@ -172,13 +174,19 @@ STE_OBSERVATION_SCALER = "none"
 # five within-week mediator EWMAs, and the 5-d RL context from
 # ``OnlineEnv._rl_context_vector``. Two frozen extras remain: E_w / b_hat
 # interactions with weekend and slot, and a salience slot that is 0
-# because salience is no longer simulated. The RL map has no current-day
-# engaged bit and no dropout bit (engagement enters only as the 7-day
-# active fraction already in the context), so this dimension does not
-# grow. A non-finite context entry is the mean of that column's finite
-# values strictly earlier in the episode (``OnlineContextFill``, shared
-# with the RL agents). Before any finite value, the fill is the
-# participant's fitting-panel mean. ``est_prior._fill_nan`` still uses
+# because salience is no longer simulated. The RL map has no engagement
+# indicator and no dropout bit. (The 7-day "active" fraction in the
+# context is the self-reported active day from the daily survey, C^AD, not
+# the engagement status Z.) A non-finite context entry is the mean of that
+# column's finite values strictly earlier in the episode
+# (``OnlineContextFill``, shared with the RL agents); every column starts
+# from the participant's study-entry value, so there is no external
+# fallback. Context entries come from observed quantities only: prior-2h
+# steps are NaN on disengaged days; burden counts suggestions SENT; the
+# interaction fraction is over sent suggestions with the observed
+# interaction (0 on a disengaged day); the 7-day active fraction uses
+# self-reports from completed daily surveys only.
+# ``est_prior._fill_nan`` still uses
 # the batch column mean. Mediator NaNs are not filled before the EWMA;
 # ``_within_week_ewma`` skips them and returns 0 when the window is empty.
 STE_BTILDE_INDEX = 9

@@ -459,14 +459,25 @@ def test_suggestion_on_inactive_day_acts_as_no_suggestion():
     sent, skipped = run(1), run(0)
     sat = slice(5 * sent.K, 6 * sent.K)
     assert np.all(sent.action_all[sat] == 0.0)
+    # The data-generating process (including the simulator's burden
+    # covariate, which counts delivered suggestions) is unaffected.
     for name in (
         "stepCountNext4HourTruthAll",
         "dailyAnticipatedAffectAll",
-        "activitySuggestionsSentLast7DaysAll",
         "CAE_all",
         "pu_all",
     ):
         np.testing.assert_array_equal(getattr(sent, name), getattr(skipped, name))
+    assert sent.s["activitySuggestionsSentLast7Days"] == (
+        skipped.s["activitySuggestionsSentLast7Days"]
+    )
+    # The agent-visible burden counts suggestions SENT, which the agent knows,
+    # so it does see the Saturday sends.
+    after = slice(6 * sent.K, None)
+    a_sent = sent.activitySuggestionsSentLast7DaysAll[after]
+    a_skip = skipped.activitySuggestionsSentLast7DaysAll[after]
+    ok = np.isfinite(a_sent) & np.isfinite(a_skip)
+    assert ok.any() and np.any(a_sent[ok] != a_skip[ok])
 
 
 def test_agent_freezes_after_dropout_week_and_omits_td():

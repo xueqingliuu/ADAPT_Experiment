@@ -90,23 +90,27 @@ class OnlineContextFill:
 
     A finite value is kept and then added to that column's running sum.
     A non-finite value is the mean of finite values strictly earlier in
-    this episode, or the fitting-panel fallback when none have been seen.
-    An imputed value is not an observation. ``reset`` at each episode.
-    A repeat read of the same ``(column, time)`` does not count twice.
+    this episode. An imputed value is not an observation. ``reset`` at each
+    episode. A repeat read of the same ``(column, time)`` does not count twice.
+
+    There is no external fallback: every column starts from the
+    participant's study-entry value (first panel row, a pre-study
+    observation), so a column is finite at its first read. A missing value
+    before any finite one is a bug and raises.
     """
 
-    def __init__(self, fallback: dict):
-        self.fallback = {str(k): float(v) for k, v in fallback.items()}
+    def __init__(self, columns):
+        self.columns = tuple(str(c) for c in columns)
         self.reset()
 
     def reset(self) -> None:
-        self._sum = {k: 0.0 for k in self.fallback}
-        self._count = {k: 0 for k in self.fallback}
+        self._sum = {k: 0.0 for k in self.columns}
+        self._count = {k: 0 for k in self.columns}
         self._seen: dict[tuple[str, int], float] = {}
 
     def apply(self, column: str, value, time: int) -> float:
         column = str(column)
-        if column not in self.fallback:
+        if column not in self._count:
             raise KeyError(column)
         key = (column, int(time))
         cached = self._seen.get(key)
@@ -122,7 +126,13 @@ class OnlineContextFill:
             self._count[column] += 1
         else:
             n = self._count[column]
-            out = self._sum[column] / n if n else self.fallback[column]
+            if n == 0:
+                raise RuntimeError(
+                    f"context column {column!r} is missing at time {time} "
+                    "before any finite value in this episode; its study-entry "
+                    "value should have been finite"
+                )
+            out = self._sum[column] / n
         self._seen[key] = out
         return out
 
@@ -136,6 +146,20 @@ def _participant_column_mean(df_csv, userid, col, default=0.0):
         return m if np.isfinite(m) else float(default)
     except (FileNotFoundError, ValueError, KeyError):
         return float(default)
+
+
+def _agent_seeded_ewm(history, seed, window=7):
+    """Seeded EWM over the last ``window`` agent observations; NaN if none finite.
+
+    Like :func:`derived_covariates.seeded_last_ewma` (left-padded with the
+    study-entry ``seed`` until ``window`` values exist), but a window with no
+    finite value returns NaN, so the caller's online fill decides the value
+    instead of silently reverting to the study-entry seed.
+    """
+    h = [float(v) for v in list(history)[-int(window):]]
+    seed = float(seed) if np.isfinite(seed) else np.nan
+    vals = np.asarray([seed] * (int(window) - len(h)) + h, dtype=float)
+    return float(ewma_gamma(vals, empty=np.nan))
 
 
 # parameters for rolling mean
@@ -529,42 +553,38 @@ class OnlineEnv:
             self._ws_interaction_initial = 0.0
         self._hist_ws_action: list[float] = []
         self._hist_ws_interaction: list[float] = []
-        # Imputation value when no suggestion was delivered in the window:
-        # the participant's mean of the summary in the fitting panel (the same
-        # rule the fits use for a missing predictor).
+        # SIMULATOR side. Imputation value when no suggestion was delivered in
+        # the window: the participant's mean of the summary in the fitting
+        # panel (the rule 07 uses for a missing predictor, fill_nan_with_mean).
+        # It feeds s["activitySuggestionInteractLast7Days"], a covariate of the
+        # data-generating models only.
         self._interact7_fill = _participant_column_mean(
             df_fit_11week_csv, self.env.cfg.userid, "Interacted_7d_walk",
             default=self._ws_interaction_initial,
         )
-        # Fallback only: the participant's fitting-panel mean, used when
-        # this episode has no finite value of that column yet.
-        # ``OnlineContextFill`` then uses the mean of finite values
-        # strictly earlier in the episode. ``est_prior._fill_nan`` is
-        # unchanged (batch column mean).
-        self._yesterday_step_fill = _participant_column_mean(
-            df_fit_11week_csv, self.env.cfg.userid, "YesterdayStepCount_norm",
+        # AGENT side. Agent-visible context is built from observed quantities
+        # only (never from ``self.s`` or ``*TruthAll``): see ``_rl_context_vector``.
+        # A missing entry is the running mean of the participant's earlier
+        # finite values in the episode (``OnlineContextFill``). Every column
+        # starts from the participant's study-entry value, so no external
+        # fallback is needed. ``est_prior._fill_nan`` is unchanged.
+        # Agent-side histories (reset per episode in ``_reset_episode_state``).
+        #   _hist_agent_ws_sent / _hist_agent_ws_inter: per slot, the action the
+        #     agent SENT (known to it) and the OBSERVED interaction (0 when the
+        #     participant was disengaged, NaN after dropout).
+        #   _hist_daily_sent: suggestions sent per day (agent-side burden).
+        #   _hist_active_obs: observed self-reported active day (NaN unobserved).
+        self._hist_agent_ws_sent: list[float] = []
+        self._hist_agent_ws_inter: list[float] = []
+        self._hist_daily_sent: list[float] = []
+        self._hist_active_obs: list[float] = []
+        self._today_sent = np.zeros(self.K)
+        self._agent_interact7 = self._ws_interaction_initial
+        self._agent_active_days7 = float("nan")   # set after the initial state
+        self._agent_burden = float("nan")          # set after the initial state
+        self._context_fill = OnlineContextFill(
+            ("yesterday_steps", "prior2h", "active_days", "suggestions", "interact")
         )
-        self._prior2h_fill = _participant_column_mean(
-            df_fit_11week_csv, self.env.cfg.userid, "prior2hour_step_norm",
-        )
-        self._active_days_fill = _participant_column_mean(
-            df_fit_11week_csv, self.env.cfg.userid, "active_status_fraction_7days",
-        )
-        self._suggestions_fill = _participant_column_mean(
-            df_fit_11week_csv,
-            self.env.cfg.userid,
-            "recent_burden_norm",
-            default=_participant_column_mean(
-                df_fit_11week_csv, self.env.cfg.userid, "recentBurdenEma_norm",
-            ),
-        )
-        self._context_fill = OnlineContextFill({
-            "yesterday_steps": self._yesterday_step_fill,
-            "prior2h": self._prior2h_fill,
-            "active_days": self._active_days_fill,
-            "suggestions": self._suggestions_fill,
-            "interact": self._interact7_fill,
-        })
 
         self.activityStatusTodayAll = np.zeros(self.D)
 
@@ -661,6 +681,10 @@ class OnlineEnv:
             self.env.cfg.recent_burden_scale,
         )
         self._hist_daily_suggestions: list[float] = []
+        # Agent-side summaries start at the study-entry values (pre-study
+        # history from the participant's first panel row, like baseline CAE).
+        self._agent_burden = self._activitySuggestionsSentLast7Days_initial
+        self._agent_active_days7 = self._active_days7_initial
 
     def _weekly_idx(self, sim_w: int) -> int:
         """Weekly arrays reserve index 0 for the pre-RL baseline."""
@@ -993,9 +1017,36 @@ class OnlineEnv:
             frac if np.isfinite(frac) else self._interact7_fill
         )
 
+    def _record_agent_ws_interaction(self, sent, observed_interaction):
+        """Agent-side 14-slot interaction fraction among suggestions SENT.
+
+        A suggestion sent on a disengaged day counts as not interacted (the
+        observed interaction is 0), matching the MRT covariate
+        (``derived_covariates``: delivered = sent, missing interaction = 0).
+        After dropout the interaction is unobserved (NaN) and skipped. If no
+        sent suggestion with an observed interaction is in the window, the
+        value is NaN and ``OnlineContextFill`` supplies it.
+        """
+        self._hist_agent_ws_sent.append(float(sent))
+        self._hist_agent_ws_inter.append(float(observed_interaction))
+        self._agent_interact7 = dc.seeded_last_ewma_masked(
+            self._hist_agent_ws_inter,
+            [a == 1.0 for a in self._hist_agent_ws_sent],
+            self._ws_interaction_initial,
+            dc.WINDOW_SLOTS,
+        )
+
     def _reset_episode_state(self):
         """Reset mutable episode histories before simulating a policy."""
         self._context_fill.reset()
+        self._hist_agent_ws_sent = []
+        self._hist_agent_ws_inter = []
+        self._hist_daily_sent = []
+        self._hist_active_obs = []
+        self._today_sent[:] = 0.0
+        self._agent_interact7 = self._ws_interaction_initial
+        self._agent_burden = self._activitySuggestionsSentLast7Days_initial
+        self._agent_active_days7 = self._active_days7_initial
         self._hist_daily_pv = []
         self.s["pageViewLast7DaysEma"] = self._pageViewLast7DaysEma_initial
         self._hist_daily_suggestions = []
@@ -1187,17 +1238,19 @@ class OnlineEnv:
         if self.dropped_out and not self.ste_mode:
             I_w = 0
 
+        # Agent-visible logs (PF rows): agent-side summaries, not self.s.
         self.activitySuggestionsSentLast7DaysAll[step_idx] = (
             np.nan
             if self.dropped_out
-            else float(self.s["activitySuggestionsSentLast7Days"])
+            else self._context_fill.apply("suggestions", self._agent_burden, step_idx)
         )
         self.logActivitySuggestionInteractLast7Days[step_idx] = (
             np.nan
             if self.dropped_out
-            else float(self.s.get("activitySuggestionInteractLast7Days", 0.0))
+            else self._context_fill.apply("interact", self._agent_interact7, step_idx)
         )
         self.action_all[step_idx] = Ah
+        self._today_sent[t_sim] = float(action)
 
         slot = int(t_sim)
 
@@ -1246,8 +1299,13 @@ class OnlineEnv:
             self._z_to_log(prior2HourStepCount, self.env.cfg.prior2hour_log_shift, self.env.cfg.prior2hour_log_scale)
         )
 
-        # Update rolling delivered-only interaction fraction after this slot.
+        # Update rolling delivered-only interaction fraction after this slot
+        # (simulator covariate), and the agent-side fraction over SENT
+        # suggestions with the observed interaction.
         self._record_ws_interaction(Ah, ws_interaction)
+        self._record_agent_ws_interaction(
+            float(action), float(self.ws_interaction_all[step_idx])
+        )
 
         if t_sim == self.K - 1:
             self._end_day(sim_w, d_w, d_global)
@@ -1273,8 +1331,13 @@ class OnlineEnv:
             self.logMorningFitbitWearLast7Days[d_global] = np.nan
         else:
             self.logIsWeekend[d_global] = float(self.s["isWeekend"])
-            self.logActiveDaysLast7Days[d_global] = float(
-                self.s.get("activeDaysLast7Days", 0.0)
+            # Agent-side 7-day active fraction (observed self-reports only);
+            # s["activeDaysLast7Days"] also counts unobserved days' true
+            # reports and stays a simulator covariate.
+            self.logActiveDaysLast7Days[d_global] = self._context_fill.apply(
+                "active_days",
+                self._agent_active_days7,
+                self._step_idx(sim_w, d_w, 0),
             )
             self.logPageViewLast7DaysEma[d_global] = float(
                 self.s["pageViewLast7DaysEma"]
@@ -1292,6 +1355,13 @@ class OnlineEnv:
             self.env.cfg.recent_burden_shift,
             self.env.cfg.recent_burden_scale,
         )
+        # Agent-side burden: suggestions SENT, which the agent always knows
+        # (the simulator's burden above counts only delivered suggestions).
+        self._agent_burden = zscore_value(
+            _seeded_ewm(self._hist_daily_sent, self._burden_raw_seed),
+            self.env.cfg.recent_burden_shift,
+            self.env.cfg.recent_burden_scale,
+        )
         self._ensure_activity_day(d_global)
 
         # Antic / fitbit / daily are drawn in _end_day (today’s WS). gen_pageview uses
@@ -1300,6 +1370,7 @@ class OnlineEnv:
         self._today_fourSC[:] = 0.0
         self._today_pageview[:] = 0.0
         self._today_action[:] = 0.0
+        self._today_sent[:] = 0.0
 
     def _end_day(self, sim_w, d_w, d_global):
         # "Yesterday's step count" and the daily page-view summary are built
@@ -1356,6 +1427,12 @@ class OnlineEnv:
         self.logTodayStepCount[d_global] = daily_sum_step_agent
 
         survey_present = (not self.dropped_out) and float(daily_pres) == 1.0
+        # The self-reported active day is a daily-survey item: observed only
+        # when today's daily survey is completed (M^{E,PJ} = 1). A disengaged
+        # day has no daily survey. The simulator keeps the true report in
+        # s["activityStatusToday"].
+        if not survey_present:
+            self.activityStatusTodayAll[d_global] = np.nan
         antic_obs, antic_agent = self._agent_antic(antic, survey_present)
         if self.dropped_out:
             antic_obs = np.nan
@@ -1402,6 +1479,7 @@ class OnlineEnv:
 
         daily_suggestions = float(self._today_action[0] + self._today_action[1])
         self._hist_daily_suggestions.append(daily_suggestions)
+        self._hist_daily_sent.append(float(np.sum(self._today_sent)))
 
         self._antic_wk[d_w] = antic
         self._dw_wk[d_w] = fitbit
@@ -1410,6 +1488,11 @@ class OnlineEnv:
         self._hist_active_days.append(float(self.s.get("activityStatusToday", 0.0)))
         self.s["activeDaysLast7Days"] = _seeded_ewm(
             self._hist_active_days, self._active_days7_initial
+        )
+        # Agent side: observed self-report only (NaN on unobserved days).
+        self._hist_active_obs.append(float(self.activityStatusTodayAll[d_global]))
+        self._agent_active_days7 = _agent_seeded_ewm(
+            self._hist_active_obs, self._active_days7_initial, EWM_WINDOW
         )
 
     def _finalize_week(self, sim_w):
@@ -1433,13 +1516,15 @@ class OnlineEnv:
             self.activitySuggestionsSentLast7DaysAll[step_idx] = (
                 np.nan
                 if self.dropped_out
-                else float(self.s["activitySuggestionsSentLast7Days"])
+                else self._context_fill.apply(
+                    "suggestions", self._agent_burden, step_idx
+                )
             )
             self.logActivitySuggestionInteractLast7Days[step_idx] = (
                 np.nan
                 if self.dropped_out
-                else float(
-                    self.s.get("activitySuggestionInteractLast7Days", 0.0)
+                else self._context_fill.apply(
+                    "interact", self._agent_interact7, step_idx
                 )
             )
             self.action_all[step_idx] = Ah
@@ -1472,6 +1557,9 @@ class OnlineEnv:
             # Sunday has no walking suggestion; still occupies a slot in the
             # 14-slot delivered-only interaction window.
             self._record_ws_interaction(0.0, 0.0)
+            self._record_agent_ws_interaction(
+                0.0, float(self.ws_interaction_all[step_idx])
+            )
 
         self._end_day(sim_w, d_w_sun, d_global)
 
@@ -1616,7 +1704,7 @@ class OnlineEnv:
         ws_a = float(self.action_all[base + 1])
         rb = float(self.activitySuggestionsSentLast7DaysAll[base])
         if not np.isfinite(rb):
-            rb = float(self.s.get("activitySuggestionsSentLast7Days", 0.0))
+            rb = float(self._agent_burden) if np.isfinite(self._agent_burden) else 0.0
         return build_antic_features(
             dailyAnticipatedAffectYesterday=self.logDailyAnticipatedAffectYesterday[d_global],
             activeDaysLast7Days=self.logActiveDaysLast7Days[d_global],
@@ -1646,26 +1734,31 @@ class OnlineEnv:
         return build_pf_CAE_features(0.0, foursc_wk, antic_wk)
 
     def _rl_context_vector(self, k, d, t):
+        """Agent-visible context ``C``: observed quantities only.
+
+        Never read ``self.s`` or ``*TruthAll`` here; those hold the simulator's
+        true state, including values on disengaged days. A missing entry is
+        filled by ``OnlineContextFill`` (running mean of earlier finite values
+        in the episode, else the pooled fitting-panel mean).
+        """
         d_global = self._day_idx(k, d)
         step_idx = self._step_idx(k, d, t)
-        if np.isfinite(self.prior2HourStepCountAll[step_idx]):
-            p2h = float(self.prior2HourStepCountAll[step_idx])
-        else:
-            p2h = float(self.s.get("prior2HourStepCount", self._initial_prior2hour))
         fill = self._context_fill.apply
         return build_rl_context_vector(
             yesterdayStepCount=fill(
                 "yesterday_steps", self.logYesterdayStepCount[d_global], step_idx
             ),
-            prior2HourStepCount=fill("prior2h", p2h, step_idx),
+            prior2HourStepCount=fill(
+                "prior2h", self.prior2HourStepCountAll[step_idx], step_idx
+            ),
             activeDaysLast7Days=fill(
-                "active_days", self.s["activeDaysLast7Days"], step_idx
+                "active_days", self._agent_active_days7, step_idx
             ),
             activitySuggestionsSentLast7Days=fill(
-                "suggestions", self.s["activitySuggestionsSentLast7Days"], step_idx
+                "suggestions", self._agent_burden, step_idx
             ),
             activitySuggestionInteractLast7Days=fill(
-                "interact", self.s["activitySuggestionInteractLast7Days"], step_idx
+                "interact", self._agent_interact7, step_idx
             ),
         )
 
