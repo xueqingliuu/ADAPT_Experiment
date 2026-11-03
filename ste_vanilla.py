@@ -34,9 +34,11 @@ The saved checkpoint is the one with the largest selection-set
 Checkpoints: ``d3rlpy_logs/ste_exp_<EXP>/user<uid>_model.d3``
 Eval rows:   ``results_ste/exp<EXP>/res<EXP>_<uid>.txt``
 
-The DiscreteCQL observation is frozen at 21 dimensions (see
-``build_ste_phi_state``). It does not follow later RLSVI ``build_phi_state``
-changes.
+The DiscreteCQL observation is ``STE_OBS_DIM`` = 20 (see the note next to
+that constant). It is the frozen map in ``build_ste_phi_state``, not a
+later change to RLSVI ``build_phi_state``. Missing entries in the shared
+RL context use the fitting-panel mean; mediator NaNs stay in the matrices
+and are skipped by the same within-week EWMA.
 
 Point at a tuned parameter folder with ``ADAPR_PARAMS_DIR``. Cluster:
 ``sbatch run_ste.sh``. Requires ``d3rlpy``.
@@ -162,11 +164,48 @@ TEST_SEED0 = 300_000
 # Holdout diagnostic only (does not drop CQL). c=1 is ~84% one-sided.
 VAL_FALLBACK_C = 1.0
 STE_OBSERVATION_SCALER = "none"
-# Frozen DiscreteCQL observation. Independent of the RLSVI
-# ``build_phi_state`` rewrite: 10-d interaction base, drop ``b_tilde`` at
-# index 9, 5 mediator EWMAs in the original order, 6-d C.
+# Manuscript note (STE_OBS_DIM).
+# DiscreteCQL's saved observation is 20. ``build_ste_phi_state`` is 21
+# and the saved vector drops ``b_tilde`` at index 9. The blocks are the
+# agent-visible ones ``build_phi_state`` reads: E_w, lagged CAE (b_hat),
+# five within-week mediator EWMAs, and the 5-d RL context from
+# ``OnlineEnv._rl_context_vector``. Two frozen extras remain: E_w / b_hat
+# interactions with weekend and slot, and a salience slot that is 0
+# because salience is no longer simulated. The RL map has no current-day
+# engaged bit and no dropout bit (engagement enters only as the 7-day
+# active fraction already in the context), so this dimension does not
+# grow. A non-finite context entry is that column's fitting-panel mean,
+# the same fill as ``est_prior._fill_nan``. Mediator NaNs are not filled
+# before the EWMA; ``_within_week_ewma`` skips them and returns 0 when
+# the visible window is empty.
 STE_BTILDE_INDEX = 9
 STE_OBS_DIM = 20
+STE_STATE_NAMES = (
+    "intercept",
+    "weekend",
+    "slot_pm",
+    "E_w",
+    "weekend_x_E",
+    "slot_x_E",
+    "b_hat",
+    "weekend_x_b_hat",
+    "slot_x_b_hat",
+    "ewma_fourSC",
+    "ewma_antic",
+    "ewma_pageview",
+    "ewma_wear",
+    "ewma_survey",
+    "yesterday_steps",
+    "prior2h_steps",
+    "active_days_7d",
+    "suggestions_sent_7d",
+    "salience_yesterday",
+    "suggestion_interact_7d",
+)
+if len(STE_STATE_NAMES) != STE_OBS_DIM:
+    raise RuntimeError(
+        f"STE_STATE_NAMES has {len(STE_STATE_NAMES)} entries, STE_OBS_DIM is {STE_OBS_DIM}"
+    )
 
 try:
     import d3rlpy
@@ -291,6 +330,42 @@ def build_ste_phi_state(state, d, t, *, b_hat=0.0, b_tilde=0.0) -> np.ndarray:
 # ``b_tilde`` is the last coordinate of the 10-d interaction base.
 
 
+def assert_ste_finite(array, *, what: str, columns: tuple[str, ...] | None = None) -> None:
+    """Exit non-zero if any entry is NaN or Inf.
+
+    Prints the offending column names and up to eight row indices.
+    """
+    arr = np.asarray(array)
+    if arr.size == 0:
+        return
+    if not np.issubdtype(arr.dtype, np.number):
+        arr = np.asarray(arr, dtype=float)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim != 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    bad = ~np.isfinite(arr)
+    if not np.any(bad):
+        return
+    if columns is None:
+        columns = tuple(f"col{j}" for j in range(arr.shape[1]))
+    if len(columns) != arr.shape[1]:
+        raise RuntimeError(
+            f"{what}: {len(columns)} column names for an array of width {arr.shape[1]}"
+        )
+    lines = [f"ERROR: non-finite {what}."]
+    for j, name in enumerate(columns):
+        rows = np.flatnonzero(bad[:, j])
+        if rows.size == 0:
+            continue
+        preview = ", ".join(str(int(i)) for i in rows[:8])
+        extra = "" if rows.size <= 8 else f" (+{int(rows.size) - 8} more)"
+        lines.append(
+            f"  {name}: {int(rows.size)} non-finite rows, indices {preview}{extra}"
+        )
+    raise SystemExit("\n".join(lines))
+
+
 def build_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int) -> np.ndarray:
     """Continuing-task DiscreteCQL state (frozen 20-d map).
 
@@ -304,7 +379,13 @@ def build_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int) -> np.ndarra
         raise RuntimeError(
             f"STE phi has {phi.size} entries, expected {STE_OBS_DIM + 1}"
         )
-    return np.delete(phi, STE_BTILDE_INDEX)
+    vec = np.delete(phi, STE_BTILDE_INDEX)
+    assert_ste_finite(
+        vec,
+        what=f"STE state at week {k} day {d} slot {t}",
+        columns=STE_STATE_NAMES,
+    )
+    return vec
 
 
 def prepare_ste_state_vector(oenv: OnlineEnv, k: int, d: int, t: int) -> np.ndarray:
@@ -364,11 +445,10 @@ def collect_mdp_episode(
                 if d == TERMINAL_D and t_slot == TERMINAL_T:
                     oenv._finalize_week(k)
                     weekly_idx = oenv._weekly_idx(k)
-                    r = (
-                        float(oenv.CAE_all[weekly_idx])
-                        if not np.isnan(oenv.CAE_all[weekly_idx])
-                        else 0.0
-                    )
+                    # True weekly CAE, including weeks after dropout. A
+                    # missing value stays non-finite so the pre-fit check
+                    # rejects it instead of training on a silent zero.
+                    r = float(oenv.CAE_all[weekly_idx])
                     term = 0
                     tout = 0
                 else:
@@ -644,10 +724,18 @@ def train_dqn_ste(
     stayer_fraction: float | None = None,
 ) -> dict:
     _require_d3()
+    assert_ste_finite(buffer["states"], what="training states", columns=STE_STATE_NAMES)
+    assert_ste_finite(buffer["actions"], what="training actions")
+    assert_ste_finite(buffer["rewards"], what="training rewards")
+    assert_ste_finite(buffer["terminals"], what="training terminals")
     d3rlpy.seed(seed)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     logger_dir.mkdir(parents=True, exist_ok=True)
-    tensorboard_dir.mkdir(parents=True, exist_ok=True)
+    # ``tensorboard_dir`` is unused. Tensorboard's watch_model calls
+    # add_histogram, which raises "The histogram is empty" on NaN
+    # gradients and aborts the job after training. File metrics stay;
+    # gradient histograms do not.
+    del tensorboard_dir
 
     dataset = d3rlpy.dataset.MDPDataset(
         observations=buffer["states"],
@@ -661,12 +749,16 @@ def train_dqn_ste(
     )
 
     encoder_factory = d3rlpy.models.VectorEncoderFactory(hidden_units=STE_HIDDEN_UNITS)
-    logger_adapter = d3rlpy.logging.CombineAdapterFactory(
-        [
-            d3rlpy.logging.FileAdapterFactory(root_dir=str(logger_dir)),
-            d3rlpy.logging.TensorboardAdapterFactory(root_dir=str(tensorboard_dir)),
-        ]
-    )
+
+    class _FileNoWatchFactory(d3rlpy.logging.FileAdapterFactory):
+        """File metrics only. ``watch_model`` is a no-op."""
+
+        def create(self, algo, experiment_name, n_steps_per_epoch):
+            adapter = super().create(algo, experiment_name, n_steps_per_epoch)
+            adapter.watch_model = lambda epoch, step: None
+            return adapter
+
+    logger_adapter = _FileNoWatchFactory(root_dir=str(logger_dir))
 
     dqn = d3rlpy.algos.DiscreteCQLConfig(
         batch_size=batch_size,
@@ -807,17 +899,17 @@ def rollout_total_cae(
             d_global = oenv._day_idx(k, d)
             oenv._ensure_day_started(k, d, d_global)
             for t_slot in range(N_RL_SLOTS):
+                # Every evaluation decision, including after dropout and
+                # under never-send, builds the same state the buffer uses.
+                s_vec = prepare_ste_state_vector(oenv, k, d, t_slot)
                 if oenv.dropped_out or policy == "zero":
                     a = 0
                 elif policy == "bernoulli":
                     a = int(rng.random() < walk_prob)
                 elif policy == "dqn_greedy":
-                    s_vec = prepare_ste_state_vector(oenv, k, d, t_slot)
                     a = ste_policy_action(dqn, s_vec)
                 else:
                     raise ValueError(policy)
-                if policy != "dqn_greedy" and not oenv.dropped_out:
-                    prepare_ste_state_vector(oenv, k, d, t_slot)
                 n_decisions += 1
                 n_treat += int(a)
                 oenv.step_action(k, d, t_slot, float(a), i_w)

@@ -494,6 +494,27 @@ class OnlineEnv:
             df_fit_11week_csv, self.env.cfg.userid, "Interacted_7d_walk",
             default=self._ws_interaction_initial,
         )
+        # Missing predictors in the RL feature map are the participant's
+        # mean in the fitting panel (``est_prior._fill_nan``). These are
+        # that mean for each context column, used only when the logged
+        # agent-visible value is non-finite.
+        self._yesterday_step_fill = _participant_column_mean(
+            df_fit_11week_csv, self.env.cfg.userid, "YesterdayStepCount_norm",
+        )
+        self._prior2h_fill = _participant_column_mean(
+            df_fit_11week_csv, self.env.cfg.userid, "prior2hour_step_norm",
+        )
+        self._active_days_fill = _participant_column_mean(
+            df_fit_11week_csv, self.env.cfg.userid, "active_status_fraction_7days",
+        )
+        self._suggestions_fill = _participant_column_mean(
+            df_fit_11week_csv,
+            self.env.cfg.userid,
+            "recent_burden_norm",
+            default=_participant_column_mean(
+                df_fit_11week_csv, self.env.cfg.userid, "recentBurdenEma_norm",
+            ),
+        )
 
         self.activityStatusTodayAll = np.zeros(self.D)
 
@@ -1573,6 +1594,19 @@ class OnlineEnv:
         antic_wk = self.dailyAnticipatedAffectObsAll[day_start:day_stop]
         return build_pf_CAE_features(0.0, foursc_wk, antic_wk)
 
+    def _finite_context(self, value, fill: float) -> float:
+        """Agent-visible context entry, or the fitting-panel mean if missing.
+
+        Same rule as ``est_prior._fill_nan``: a non-finite predictor is the
+        participant's mean of that column, not a new imputation and not a
+        dropout indicator. ``build_phi_state`` reads this vector unchanged.
+        """
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = float("nan")
+        return v if np.isfinite(v) else float(fill)
+
     def _rl_context_vector(self, k, d, t):
         d_global = self._day_idx(k, d)
         step_idx = self._step_idx(k, d, t)
@@ -1581,12 +1615,18 @@ class OnlineEnv:
         else:
             p2h = float(self.s.get("prior2HourStepCount", self._initial_prior2hour))
         return build_rl_context_vector(
-            yesterdayStepCount=self.logYesterdayStepCount[d_global],
-            prior2HourStepCount=p2h,
-            activeDaysLast7Days=float(self.s["activeDaysLast7Days"]),
-            activitySuggestionsSentLast7Days=float(self.s["activitySuggestionsSentLast7Days"]),
-            activitySuggestionInteractLast7Days=float(
-                self.s["activitySuggestionInteractLast7Days"]
+            yesterdayStepCount=self._finite_context(
+                self.logYesterdayStepCount[d_global], self._yesterday_step_fill
+            ),
+            prior2HourStepCount=self._finite_context(p2h, self._prior2h_fill),
+            activeDaysLast7Days=self._finite_context(
+                self.s["activeDaysLast7Days"], self._active_days_fill
+            ),
+            activitySuggestionsSentLast7Days=self._finite_context(
+                self.s["activitySuggestionsSentLast7Days"], self._suggestions_fill
+            ),
+            activitySuggestionInteractLast7Days=self._finite_context(
+                self.s["activitySuggestionInteractLast7Days"], self._interact7_fill
             ),
         )
 
