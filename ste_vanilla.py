@@ -1250,12 +1250,21 @@ def train_ste_job(
 
 
 def _resolve_ste_eval_dir(exp: str, spec=None) -> Path:
+    """Results folder of ``exp``.
+
+    With a ``spec``, only that spec's folder is accepted: falling back to the
+    legacy ``results_ste/exp<exp>`` could silently read a run from an older
+    design. The legacy folder is used only when no spec is given.
+    """
     if spec is not None:
         path = ste_eval_dir(exp, spec)
-        if path.is_dir():
-            return path
-    legacy = Path("results_ste") / f"exp{exp}"
-    return legacy
+        if not path.is_dir():
+            raise FileNotFoundError(
+                f"{path} does not exist (legacy results_ste/exp{exp} is not "
+                "used when a testbed spec is given)"
+            )
+        return path
+    return Path("results_ste") / f"exp{exp}"
 
 
 def aggregate_ste(

@@ -3156,7 +3156,8 @@ def cmd_ratio(args) -> None:
     kappa near the solution. Confirm the recalibrated folder once more; if it
     is still off by more than the tolerance, repeat this step.
     """
-    from ste_vanilla import aggregate_ste
+    from ste_vanilla import aggregate_ste, resolve_ste_run_spec, ste_eval_dir
+    from testbed import TUNE_STAYER_FRACTION
 
     out_dir = Path(args.out_dir).expanduser()
     if not out_dir.is_absolute():
@@ -3164,7 +3165,25 @@ def cmd_ratio(args) -> None:
     report_path = out_dir / "ste_tuning.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
     exp = args.exp or out_dir.name.removeprefix("env_para_")
-    confirmed = float(aggregate_ste(exp, userid_path=out_dir / "user_ids.txt"))
+    # The confirmation runs at the tuning setting (activity on, psi = 0.5, no
+    # misspecification) and writes to that spec's results folder, not the
+    # legacy ``results_ste/exp<exp>`` (which may hold an older design's run).
+    _requested, spec = resolve_ste_run_spec(
+        params_dir=out_dir,
+        activity="on",
+        stayer_fraction=TUNE_STAYER_FRACTION,
+        misspec="none",
+    )
+    eval_dir = ste_eval_dir(exp, spec)
+    if not eval_dir.is_dir():
+        raise SystemExit(
+            f"No confirmation results in {eval_dir}; run the confirmation "
+            f"(TUNE_PHASE=validate) for {out_dir.name} first."
+        )
+    print(f"  confirmation results: {eval_dir}")
+    confirmed = float(
+        aggregate_ste(exp, userid_path=out_dir / "user_ids.txt", spec=spec)
+    )
     applied = float(report.get("proxy_to_true", 1.0) or 1.0)
     achieved = report.get("achieved_mean_ste")
     if achieved is None:
